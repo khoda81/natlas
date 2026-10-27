@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>natlas</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <header class="bar">
+      <strong class="brand">natlas</strong>
+      <select id="dataset" aria-label="dataset"></select>
+      <span id="title" class="title"></span>
+      <span id="lens" class="lens" hidden>
+        <label>p <select id="p" aria-label="height measure p"></select></label>
+        <button id="swap" type="button" title="swap p and q (s)">⇄</button>
+        <label>q <select id="q" aria-label="width measure q"></select></label>
+      </span>
+      <span id="legend" class="legend"></span>
+      <span class="spacer"></span>
+      <span id="readout" class="readout"></span>
+      <button id="units" type="button" title="toggle units (b)">nats</button>
+      <button id="help-toggle" type="button" title="controls (?)">?</button>
+    </header>
+
+    <main class="stage"><canvas id="canvas"></canvas></main>
+
+    <aside id="inspect" class="inspect" hidden></aside>
+    <div id="status" class="status" hidden></div>
+
+    <section id="help" class="help" hidden>
+      <h2>Reading it</h2>
+      <p>
+        Each node's interval is split among its children. Height is the child's probability under
+        <b>p</b>; width is its surprisal under <b>q</b>, −log q. With p = q the boxes of a node add up
+        to its entropy in area; otherwise to its cross-entropy, and color shows ln(p/q).
+      </p>
+      <p>Faded boxes are not expanded yet; gray ones aggregate unlisted or sub-pixel children.</p>
+      <h2>Moving</h2>
+      <dl>
+        <dt>wheel · → ←</dt>
+        <dd>go deeper or shallower; the view zooms vertically with depth</dd>
+        <dt>drag</dt>
+        <dd>grab and move</dd>
+        <dt>shift + wheel · ↑ ↓</dt>
+        <dd>move along the interval</dd>
+        <dt>ctrl + wheel · pinch · + −</dt>
+        <dd>horizontal scale, the base of the log</dd>
+        <dt>double-click</dt>
+        <dd>glide to a box</dd>
+        <dt>0</dt>
+        <dd>back to the root</dd>
+        <dt>s · b</dt>
+        <dd>swap p and q · nats or bits</dd>
+      </dl>
+    </section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package natlas.v1;
+
+// natlas draws an append-only nested interval tree.
+//
+// Every node owns one interval. Its children are an ordered list of slots that
+// partition that interval. A slot carries one conditional weight per measure
+// (for example one next-token probability per model). The client picks one
+// measure p for slot heights and one measure q for slot widths, -ln q.
+//
+// Slots are listed progressively: a node lists a prefix of its slots plus, per
+// measure, the exact aggregate weight of the unlisted remainder (its tail). A
+// slot becomes a node once the server expands it. Node ids are dense and
+// assigned in publication order with the root at 0, so a client resumes a
+// stream from its node count and replays are verified rather than repaired.
+
+// First message of every stream.
+message Hello {
+  string title = 1;
+  // Measure names. Every Page carries one weight vector per measure, in order.
+  repeated string measures = 2;
+}
+
+// Publish one node. Its slot in the parent must already be listed.
+message Node {
+  uint64 id = 1;
+  uint64 parent = 2; // ignored for the root
+  uint32 slot = 3; // ignored for the root
+  uint32 size = 4; // total slot count; 0 is a terminal node
+  Page page = 5; // first listed slots, starting at slot 0; its node is ignored
+}
+
+// List more slots of an existing node.
+message Page {
+  uint64 node = 1;
+  // At most the node's listed count. Overlapping slots must match exactly.
+  uint32 start = 2;
+  repeated string labels = 3;
+  // One vector per measure, each with one weight per label.
+  repeated Weights weights = 4;
+  // Per measure: aggregate weight of slots [start + len(labels), size).
+  repeated double tail = 5;
+}
+
+message Weights {
+  repeated double values = 1;
+}
+
+message ServerMessage {
+  oneof kind {
+    Hello hello = 1;
+    Node node = 2;
+    Page page = 3;
+  }
+}
+
+message ClientMessage {
+  oneof kind {
+    Expand expand = 1;
+    List list = 2;
+  }
+}
+
+// Ask the server to publish one listed slot as a node.
+message Expand {
+  uint64 node = 1;
+  uint32 slot = 2;
+}
+
+// Ask the server to list a node's slots up to, but excluding, stop.
+message List {
+  uint64 node = 1;
+  uint32 stop = 2;
+}
+
+// A recorded server stream, used for static datasets.
+message Snapshot {
+  repeated ServerMessage messages = 1;
+}

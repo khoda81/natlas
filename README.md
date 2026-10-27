@@ -58,12 +58,16 @@ Datasets live in `public/data/` (git-ignored) with a `manifest.json`; a `.pb`
 snapshot can also be dropped onto the page.
 
 ```bash
-npm run data                      # Zen of Python character n-grams, no ML needed
-cd export && uv run hf.py         # Qwen3-1.7B (p) vs Qwen3-0.6B (q)
+npm run data      # Zen of Python character n-grams, no ML needed
+cd export
+uv run hf.py      # Qwen3-1.7B as p, Qwen3-0.6B as q
+uv run hf.py --p HuggingFaceTB/SmolLM2-360M --tokenizer HuggingFaceTB/SmolLM2-360M \
+  --q context:4 --q temperature:1.6
 ```
 
 Both use natwalk's own search to discover the tree, then evaluate the other
-measures on the same paths.
+measures on the same paths. A q measure is another model with the same
+tokenizer, `context:N` (p seeing only its last N tokens) or `temperature:T`.
 
 ## Development
 

@@ -118,6 +118,13 @@ export function draw(
     ctx.restore();
   }
 
+  if (frame.boxes.length === 0) {
+    ctx.fillStyle = scheme.inkMuted;
+    ctx.textAlign = "center";
+    ctx.fillText("Nothing discovered here · press 0 for the root", view.width / 2, view.height / 2);
+    ctx.textAlign = "left";
+  }
+
   outline(ctx, frame, cam, view, state, scheme.ink);
   ruler(ctx, cam, view, state.units, palette);
 }

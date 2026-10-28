@@ -31,7 +31,6 @@ from pathlib import Path
 import lm
 from natlas_export import snapshots, write
 from natwalk import Session
-from transformers import AutoTokenizer
 
 _HF_APP = Path(__file__).resolve().parents[2] / "natwalk" / "examples" / "hf_app.py"
 
@@ -73,16 +72,15 @@ def main() -> None:
 
     hf_app = _hf_app()
     device = args.device
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    language = lm.Transformers(args.p, device, args.dtype, tokenizer=args.tokenizer)
     # The tree's root is the empty text; natwalk searches from the prompt down.
-    root = lm.start_of_text(tokenizer)
-    prompt = tuple(int(token) for token in tokenizer.encode(args.prompt, add_special_tokens=False))
-    eos = (int(tokenizer.eos_token_id),)
+    root = language.start
+    prompt = tuple(language.encode(args.prompt))
+    eos = tuple(language.eos)
 
     print(f"discovering {args.nodes} nodes with {args.p} …", file=sys.stderr)
-    p_model = lm.load(args.p, device, args.dtype)
     cursor = hf_app.HFCursor(
-        p_model,
+        language.model,
         root + prompt,
         eos_token_ids=eos,
         terminal=False,
@@ -104,7 +102,7 @@ def main() -> None:
         return lambda path: measure.log_probs(root + tuple(path)).exp().tolist()
 
     print(f"evaluating {', '.join(specs)} on the discovered tree …", file=sys.stderr)
-    measures = lm.measures(args.p, p_model, specs, device, args.dtype)
+    measures = lm.measures(language, specs, lambda spec: lm.open_language(spec, device, args.dtype))
     recorded = snapshots(
         tree,
         extra=tuple(weights(measure) for measure in measures[1:]),
@@ -115,7 +113,7 @@ def main() -> None:
     write(
         args.name or stem,
         f"{args.prompt} · {args.p}",
-        lm.token_bytes(tokenizer, lm.vocabulary_size(tokenizer, p_model)),
+        language.token_bytes(),
         [measure.name for measure in measures],
         recorded,
         start=prompt,

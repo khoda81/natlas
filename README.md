@@ -99,6 +99,18 @@ Models load in float32 by default, which is both more precise and, on a GTX
 1660 Ti, about 5× faster than float16; `--dtype` trades that for memory on
 larger models.
 
+`--p` also takes a `.gguf` file, which llama.cpp runs with every layer on the
+GPU (`--gpu-layers`, and `--n-ctx` for the deepest path it can hold).
+llama-cpp-python is built for CUDA on first run, which takes a while. A
+request that shares a prefix with the previous one reuses its KV cache, so
+walking down a path costs one token per step.
+
+```bash
+uv run serve.py "Once upon a time" \
+  --p ~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-GGUF/snapshots/*/Qwen3-4B-Q6_K.gguf \
+  --q temperature:1.6
+```
+
 ## Data
 
 Datasets live in `public/data/` (git-ignored) with a `manifest.json`: per

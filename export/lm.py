@@ -4,6 +4,9 @@ A measure is a model's next-token log-probabilities over the whole
 vocabulary, given the tokens so far. Besides the model itself, a measure spec
 names another model sharing its tokenizer, ``context:N`` for the model seeing
 only the last N tokens, or ``temperature:T`` for the model at temperature T.
+
+A model is a Hugging Face id, run by transformers, or a .gguf file, run by
+llama.cpp.
 """
 
 from __future__ import annotations
@@ -12,9 +15,12 @@ import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
 
+import numpy as np
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 type LogProbs = Callable[[Sequence[int]], torch.Tensor]
 
@@ -50,22 +56,119 @@ def log_probs(model, tokens: Sequence[int], device: str, temperature: float = 1.
     return torch.log_softmax(logits / temperature, dim=-1)
 
 
-def measures(model_id: str, model, specs: Sequence[str], device: str, dtype: str = "float32") -> list[Measure]:
-    """The model itself, then one measure per spec."""
+class TooLong(Exception):
+    """More tokens than the model's context holds."""
+
+
+class Language(Protocol):
+    """A model and the tokenizer it reads."""
+
+    name: str
+    # Labels the model can emit.
+    vocabulary: int
+    # What the model reads before a text's first token.
+    start: tuple[int, ...]
+    # Tokens that end a text.
+    eos: frozenset[int]
+
+    def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor: ...
+    def encode(self, text: str) -> list[int]: ...
+    def token_bytes(self) -> list[bytes]: ...
+
+
+class Transformers:
+    def __init__(self, model_id: str, device: str, dtype: str = "float32", tokenizer: str | None = None):
+        self.name = model_id
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer or model_id)
+        self.model = load(model_id, device, dtype)
+        self.device = device
+        self.vocabulary = vocabulary_size(self.tokenizer, self.model)
+        self.start = start_of_text(self.tokenizer)
+        eos = self.tokenizer.eos_token_id
+        self.eos = frozenset() if eos is None else frozenset({int(eos)})
+
+    def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor:
+        return log_probs(self.model, tokens, self.device, temperature)
+
+    def encode(self, text: str) -> list[int]:
+        return [int(token) for token in self.tokenizer.encode(text, add_special_tokens=False)]
+
+    def token_bytes(self) -> list[bytes]:
+        return token_bytes(self.tokenizer, self.vocabulary)
+
+
+class LlamaCpp:
+    """A GGUF model run by llama.cpp, its layers on the GPU as far as ``gpu_layers``
+    says (-1 for all). Requests that share a prefix with the last one reuse
+    its KV cache, so walking down a path costs a token per step."""
+
+    def __init__(self, path: Path, context: int = 8192, gpu_layers: int = -1):
+        from llama_cpp import Llama
+
+        self.name = path.stem
+        try:
+            self.llm = Llama(str(path), n_ctx=context, n_gpu_layers=gpu_layers, logits_all=False, verbose=False)
+        except ValueError as error:
+            # llama.cpp says why only in its own log, and a full GPU is the usual reason.
+            raise RuntimeError(
+                f"llama.cpp could not load {path}: is the GPU's memory taken (nvidia-smi)? "
+                "Fewer --gpu-layers or a smaller --n-ctx need less of it."
+            ) from error
+        self.vocabulary = self.llm.n_vocab()
+        bos, eos = self.llm.token_bos(), self.llm.token_eos()
+        if bos < 0 and eos < 0:
+            raise ValueError(f"{path} has no start- or end-of-text token to begin a text with")
+        self.start = (bos if bos >= 0 else eos,)
+        self.eos = frozenset({eos} if eos >= 0 else ())
+
+    def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor:
+        tokens = [int(token) for token in tokens]
+        if len(tokens) > self.llm.n_ctx():
+            raise TooLong(f"{len(tokens)} tokens, but the context holds {self.llm.n_ctx()}")
+        cached = self.llm.input_ids
+        shared = len(tokens)
+        for index, (have, want) in enumerate(zip(cached, tokens)):
+            if have != want:
+                shared = index
+                break
+        else:
+            shared = min(len(cached), len(tokens))
+        # The logits on hand are the last evaluated position's.
+        if not shared == len(tokens) == len(cached):
+            self.llm.n_tokens = min(shared, len(tokens) - 1)
+            self.llm.eval(tokens[self.llm.n_tokens :])
+        logits = np.ctypeslib.as_array(self.llm._ctx.get_logits(), shape=(self.vocabulary,))  # noqa: SLF001
+        return torch.log_softmax(torch.from_numpy(logits.astype(np.float64)) / temperature, dim=-1)
+
+    def encode(self, text: str) -> list[int]:
+        return self.llm.tokenize(text.encode(), add_bos=False, special=False)
+
+    def token_bytes(self) -> list[bytes]:
+        return [self.llm.detokenize([token], special=True) for token in range(self.vocabulary)]
+
+
+def open_language(spec: str, device: str, dtype: str = "float32", tokenizer: str | None = None, **llama) -> Language:
+    """A .gguf file through llama.cpp, taking ``llama``'s options, else a Hugging Face model."""
+    if spec.endswith(".gguf"):
+        return LlamaCpp(Path(spec).expanduser(), **llama)
+    return Transformers(spec, device, dtype, tokenizer)
+
+
+def measures(own: Language, specs: Sequence[str], other: Callable[[str], Language]) -> list[Measure]:
+    """The model itself, then one measure per spec; ``other`` opens a model a spec names."""
 
     def measure(spec: str) -> Measure:
         kind, _, value = spec.partition(":")
         if kind == "context":
             n = int(value)
-            return Measure(f"{model_id} · last {n} tokens", lambda tokens: log_probs(model, tokens[-n:], device))
+            return Measure(f"{own.name} · last {n} tokens", lambda tokens: own.log_probs(tokens[-n:]))
         if kind == "temperature":
             t = float(value)
-            return Measure(f"{model_id} · T={t:g}", lambda tokens: log_probs(model, tokens, device, t))
-        other = load(spec, device, dtype)
-        return Measure(spec, lambda tokens: log_probs(other, tokens, device))
+            return Measure(f"{own.name} · T={t:g}", lambda tokens: own.log_probs(tokens, t))
+        language = other(spec)
+        return Measure(language.name, language.log_probs)
 
-    own = Measure(model_id, lambda tokens: log_probs(model, tokens, device))
-    return [own, *(measure(spec) for spec in specs)]
+    return [Measure(own.name, own.log_probs), *(measure(spec) for spec in specs)]
 
 
 def start_of_text(tokenizer) -> tuple[int, ...]:

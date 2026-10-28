@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
+#   "llama-cpp-python>=0.3.16",
 #   "numpy>=1.26",
 #   "protobuf>=7.36.1",
 #   "starlette>=0.40",
@@ -8,6 +9,10 @@
 #   "transformers>=4.51",
 #   "uvicorn>=0.30",
 # ]
+#
+# # llama.cpp for the GPU, built once; CMAKE_CUDA_ARCHITECTURES=75 is the GTX 1660 Ti.
+# [tool.uv]
+# config-settings-package = { llama-cpp-python = { "cmake.define.GGML_CUDA" = "ON", "cmake.define.CMAKE_CUDA_ARCHITECTURES" = "75" } }
 # ///
 
 """Serve a language model's tree of texts to natlas, live.
@@ -47,7 +52,6 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
-from transformers import AutoTokenizer
 
 # Connect envelopes: one flags byte, a big-endian length, the message.
 _COMPRESSED = 0x01
@@ -82,7 +86,7 @@ class BadLabel(Exception):
 class Model:
     """The tree of texts under each measure, computed on demand."""
 
-    def __init__(self, root: tuple[int, ...], eos: set[int], labels: int, measures: list[lm.Measure]):
+    def __init__(self, root: tuple[int, ...], eos: frozenset[int], labels: int, measures: list[lm.Measure]):
         # What the model reads before the root's children: a start-of-text token.
         self.root = root
         self.eos = eos
@@ -173,6 +177,8 @@ def app(model: Model, manifest: list[dict], labels: bytes) -> Starlette:
                 return _stream([_end({"code": "not_found", "message": str(error)})])
             except BadLabel as error:
                 return _stream([_end({"code": "invalid_argument", "message": str(error)})])
+            except lm.TooLong as error:
+                return _stream([_end({"code": "out_of_range", "message": str(error)})])
 
             def chunks():
                 yield _envelope(0, pb.ExpandResponse(node=handle).SerializeToString())
@@ -219,7 +225,7 @@ def main() -> None:
         default="The most interesting consequence of information theory is",
         help="where the client starts; the server serves every text alike",
     )
-    parser.add_argument("--p", default="HuggingFaceTB/SmolLM2-360M", help="the model")
+    parser.add_argument("--p", default="HuggingFaceTB/SmolLM2-360M", help="the model: a Hugging Face id or a .gguf file")
     parser.add_argument(
         "--q",
         action="append",
@@ -229,30 +235,33 @@ def main() -> None:
     parser.add_argument("--tokenizer", help="default: p's own")
     parser.add_argument("--device", default=lm.default_device())
     parser.add_argument("--dtype", choices=lm.DTYPES, default="float32")
+    parser.add_argument("--n-ctx", type=int, default=8192, help="llama.cpp: tokens of context, the deepest node")
+    parser.add_argument("--gpu-layers", type=int, default=-1, help="llama.cpp: layers on the GPU, -1 for all")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8421)
     args = parser.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.p)
-    root = lm.start_of_text(tokenizer)
-    prompt = [int(token) for token in tokenizer.encode(args.prompt, add_special_tokens=False)]
-    print(f"loading {args.p} on {args.device} …", file=sys.stderr)
-    p_model = lm.load(args.p, args.device, args.dtype)
-    measures = lm.measures(args.p, p_model, args.q, args.device, args.dtype)
-    vocabulary = lm.vocabulary_size(tokenizer, p_model)
-    labels = labels_json(lm.token_bytes(tokenizer, vocabulary))
-    eos = {int(tokenizer.eos_token_id)} if tokenizer.eos_token_id is not None else set()
+    print(f"loading {args.p} …", file=sys.stderr)
+
+    def open_language(spec: str) -> lm.Language:
+        llama = {"context": args.n_ctx, "gpu_layers": args.gpu_layers}
+        return lm.open_language(spec, args.device, args.dtype, args.tokenizer if spec == args.p else None, **llama)
+
+    language = open_language(args.p)
+    prompt = language.encode(args.prompt)
+    measures = lm.measures(language, args.q, open_language)
+    labels = labels_json(language.token_bytes())
 
     manifest = [
         {
-            "name": f"live-{_slug(args.p.split('/')[-1])}",
-            "title": f"{args.p} · live",
+            "name": f"live-{_slug(language.name.split('/')[-1])}",
+            "title": f"{language.name} · live",
             "labels": "labels.json",
             "start": prompt,
             "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
         }
     ]
-    model = Model(root, eos, vocabulary, measures)
+    model = Model(language.start, language.eos, language.vocabulary, measures)
     uvicorn.run(app(model, manifest, labels.encode()), host=args.host, port=args.port, access_log=False)
 
 

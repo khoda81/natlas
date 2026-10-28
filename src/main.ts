@@ -62,6 +62,8 @@ class App {
   private tree: IntervalTree | null = null;
   private expander: Expander | null = null;
   private dataset: Dataset | null = null;
+  /** Per node, the unfinished character its path's bytes end in. */
+  private unfinished = new Map<NodeId, Uint8Array>();
   private lens: Lens = { p: 0, q: 0 };
   private cam: Camera = { x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
   private view: Viewport = { width: 1, height: 1 };
@@ -129,6 +131,7 @@ class App {
     const tree = new IntervalTree(dataset.measures.length);
     this.dataset = dataset;
     this.tree = tree;
+    this.unfinished = new Map();
     this.expander = new Expander(tree, dataset.sources);
     this.expander.onError = (error) => this.setStatus(String(error));
     tree.subscribe(() => this.invalidate());
@@ -234,7 +237,7 @@ class App {
       hover: this.hover,
       ancestors,
       units: this.units,
-      text: (label) => visible(this.text(label)),
+      text: (node, label) => visible(this.text(node, label)),
     });
     this.updateReadout();
     if (this.focus || this.held.size > 0) this.invalidate();
@@ -440,16 +443,37 @@ class App {
     this.shown = key;
     const where = this.where;
     where.style.minHeight = this.pointer === null ? "" : `${where.offsetHeight}px`;
-    const tokens = tree.path(node).map((step) => token(this.text(step)));
-    if (label !== null) tokens.push(token(this.text(label), "current"));
+    const tokens = (this.dataset?.labels.along(tree.path(node)) ?? []).map((text) => token(text));
+    if (label !== null) tokens.push(token(this.text(node, label), "current"));
     else if (box !== undefined) tokens.push(token(box.kind === "merged" ? ` ${box.count} children` : " …", "more"));
     where.replaceChildren(...tokens);
     where.hidden = false;
     where.scrollTop = where.scrollHeight;
   }
 
-  private text(label: number): string {
-    return this.dataset?.labels[label] ?? `#${label}`;
+  /** The child with ``label`` of ``node``, read after the bytes of the path to it. */
+  private text(node: NodeId, label: number): string {
+    return this.dataset?.labels.shown(this.unfinishedAt(node), label) ?? `#${label}`;
+  }
+
+  private unfinishedAt(id: NodeId): Uint8Array {
+    const tree = this.tree!;
+    const labels = this.dataset!.labels;
+    const pending: TreeNode[] = [];
+    let before: Uint8Array = new Uint8Array();
+    for (let node = tree.node(id); node.parent !== null; node = tree.node(node.parent)) {
+      const known = this.unfinished.get(node.id);
+      if (known !== undefined) {
+        before = known;
+        break;
+      }
+      pending.push(node);
+    }
+    for (const node of pending.reverse()) {
+      before = labels.after(before, node.label).unfinished;
+      this.unfinished.set(node.id, before);
+    }
+    return before;
   }
 
   private fmt(nats: number): string {
@@ -474,7 +498,7 @@ class App {
       return;
     }
     const node = tree.node(box.node);
-    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : visible(this.text(box.label));
+    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : visible(this.text(box.node, box.label));
     const chips = [chip(last)];
 
     const { p, q } = this.lens;

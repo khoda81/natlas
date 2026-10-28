@@ -6,6 +6,7 @@ import { createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { decode, encode, type WireEdge } from "./codec";
 import { type ExpandResponse, Natlas, SnapshotSchema } from "./gen/natlas/v1/natlas_pb";
+import { Labels } from "./labels";
 import type { Handle, Label } from "./tree";
 
 /** A node as a request names it: the child with ``label`` of the node the server gave ``parent`` to. */
@@ -100,7 +101,7 @@ async function* edgesOf(stream: AsyncIterator<ExpandResponse>): AsyncIterable<Wi
 export interface DatasetEntry {
   name: string;
   title: string;
-  /** JSON array of label texts, indexed by label. */
+  /** JSON array of label bytes in base64, indexed by label. */
   labels?: string;
   /** Each measure is a recorded snapshot file or a live service's base URL. */
   measures: { name: string; file?: string; url?: string }[];
@@ -114,7 +115,7 @@ export interface Dataset {
   title: string;
   measures: string[];
   sources: Source[];
-  labels: string[];
+  labels: Labels;
   start: number[];
 }
 
@@ -147,7 +148,9 @@ async function fetchOk(url: URL): Promise<Response> {
 export async function fetchDataset(entry: DatasetEntry): Promise<Dataset> {
   const base = entry.base ?? dataDirectory();
   const labels =
-    entry.labels === undefined ? [] : fetchOk(new URL(entry.labels, base)).then((r) => r.json() as Promise<string[]>);
+    entry.labels === undefined
+      ? Labels.none()
+      : fetchOk(new URL(entry.labels, base)).then(async (r) => Labels.parse(await r.text()));
   const sources = Promise.all(
     entry.measures.map(async ({ name, file, url }): Promise<Source> => {
       if (url !== undefined) return new ConnectSource(new URL(url, base).href);
@@ -173,7 +176,7 @@ export async function droppedDataset(files: File[]): Promise<Dataset> {
     title: snapshots.map((file) => file.name).join(" · "),
     measures: snapshots.map((file) => file.name.replace(/\.pb$/, "")),
     sources: await Promise.all(snapshots.map(async (file) => new SnapshotSource(new Uint8Array(await file.arrayBuffer())))),
-    labels: labelFile === undefined ? [] : (JSON.parse(await labelFile.text()) as string[]),
+    labels: labelFile === undefined ? Labels.none() : Labels.parse(await labelFile.text()),
     start: [],
   };
 }

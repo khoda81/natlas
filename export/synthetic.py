@@ -114,7 +114,7 @@ def main() -> None:
     write(
         "zen-ngram",
         "Zen of Python · character n-grams",
-        [label(symbol) for symbol in alphabet],
+        [label(symbol).encode() for symbol in alphabet],
         ("trigram", "bigram", "unigram"),
         recorded,
     )

@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from natlas.v1 import natlas_pb2 as pb  # noqa: E402
-from natlas_codec import encode  # noqa: E402
+from natlas_codec import encode, labels_json  # noqa: E402
 from natwalk import Tree  # noqa: E402
 from natwalk.tree import NodeId  # noqa: E402
 
@@ -178,7 +178,7 @@ def _ln(weight: float) -> float:
 def write(
     name: str,
     title: str,
-    labels: Sequence[str],
+    labels: Sequence[bytes],
     measures: Sequence[str],
     recorded: Sequence[pb.Snapshot],
     start: Sequence[int] = (),
@@ -189,7 +189,7 @@ def write(
         raise ValueError("one measure name per snapshot")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     label_file = f"{name}.labels.json"
-    (DATA_DIR / label_file).write_text(json.dumps(list(labels), ensure_ascii=False))
+    (DATA_DIR / label_file).write_text(labels_json(labels))
     paths = []
     entries = []
     for index, (measure, snapshot) in enumerate(zip(measures, recorded, strict=True)):

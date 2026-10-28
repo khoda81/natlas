@@ -1,7 +1,9 @@
-"""The natlas listing codec, mirroring src/codec.ts."""
+"""The natlas listing codec, mirroring src/codec.ts, and the labels file of src/labels.ts."""
 
 from __future__ import annotations
 
+import base64
+import json
 import math
 import sys
 from collections.abc import Sequence
@@ -48,3 +50,8 @@ def ln_sigmoid(value: float) -> float:
     if value >= 0:
         return -math.log1p(math.exp(-value))
     return value - math.log1p(math.exp(value))
+
+
+def labels_json(labels: Sequence[bytes]) -> str:
+    """A labels file: each label's bytes in base64, as proto3 JSON writes bytes."""
+    return json.dumps([base64.b64encode(label).decode() for label in labels])

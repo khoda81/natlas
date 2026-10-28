@@ -2,6 +2,7 @@
 
 import { type Palette, rampPosition } from "./color";
 import type { Box, Camera, Frame, Lens, Viewport } from "./layout";
+import type { NodeId } from "./tree";
 
 export interface Units {
   name: string;
@@ -17,8 +18,8 @@ export interface DrawState {
   /** ``node:slot`` keys of the hovered box's ancestor slots. */
   ancestors: Set<string>;
   units: Units;
-  /** Display text of a label. */
-  text: (label: number) => string;
+  /** Display text of the child with ``label`` of node ``node``. */
+  text: (node: NodeId, label: number) => string;
 }
 
 const FAMILY = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
@@ -105,7 +106,7 @@ export function draw(
     );
 
     if (box.kind !== "merged" && height >= LABEL_MIN_HEIGHT && width >= LABEL_MIN_WIDTH) {
-      labels.push({ box, rect, text: box.label === null ? "…" : state.text(box.label), ink, grows: box.label !== null });
+      labels.push({ box, rect, text: box.label === null ? "…" : state.text(box.node, box.label), ink, grows: box.label !== null });
     }
   }
 

@@ -87,7 +87,7 @@ service, `/0/` for the model and `/1/`, `/2/`, … for the `--q` measures, over
 the Connect protocol. Its root is the empty text, the start-of-text token
 alone, and every text is a node like any other: the prompt is only where the
 client starts, a path of token labels in `GET /manifest.json` that the client
-fetches its way down on load. `/labels.json` holds each token's text. With
+fetches its way down on load. `/labels.json` holds each token's bytes. With
 `bun run dev` running, the page finds a local server on its own and lists it
 first; `?server=URL` points it elsewhere.
 
@@ -102,7 +102,10 @@ larger models.
 ## Data
 
 Datasets live in `public/data/` (git-ignored) with a `manifest.json`: per
-dataset, one `.pb` snapshot per measure and a `.labels.json` of label texts.
+dataset, one `.pb` snapshot per measure and a `.labels.json` of label bytes,
+base64 in a JSON array. A token can hold part of a character, so the client
+decodes a path's bytes together and shows each box as the characters its
+token finishes after its ancestors, or as hex where it finishes none.
 Snapshots, with or without a labels file, can also be dropped onto the page.
 
 ```bash

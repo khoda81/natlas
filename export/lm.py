@@ -8,6 +8,8 @@ only the last N tokens, or ``temperature:T`` for the model at temperature T.
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -80,11 +82,49 @@ def vocabulary_size(tokenizer, model) -> int:
     return max(len(tokenizer), int(model.config.vocab_size))
 
 
-def token_texts(tokenizer, size: int) -> list[str]:
-    """The text of every token id below ``size``, as decoded; the client makes whitespace visible."""
-    pieces = tokenizer.batch_decode(
-        [[token] for token in range(size)],
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )
-    return [piece or f"<token:{token}>" for token, piece in enumerate(pieces)]
+def _byte_level_alphabet() -> dict[str, int]:
+    """GPT-2's byte-level BPE writes each byte as one printable character."""
+    printable = [*range(ord("!"), ord("~") + 1), *range(ord("¡"), ord("¬") + 1), *range(ord("®"), ord("ÿ") + 1)]
+    shifted = [byte for byte in range(256) if byte not in printable]
+    return {
+        **{chr(byte): byte for byte in printable},
+        **{chr(256 + index): byte for index, byte in enumerate(shifted)},
+    }
+
+
+def _decoders(tokenizer) -> set[str]:
+    decoder = json.loads(tokenizer.backend_tokenizer.to_str()).get("decoder") or {}
+    return {decoder.get("type"), *(step.get("type") for step in decoder.get("decoders", []))}
+
+
+def token_bytes(tokenizer, size: int) -> list[bytes]:
+    """The bytes of every token id below ``size``.
+
+    A token can hold part of a UTF-8 character, which decoding it alone turns
+    into U+FFFD, so this reads the bytes from the token's piece: through the
+    byte-level alphabet, or SentencePiece's ▁ and <0xNN> byte fallback.
+    Special tokens are their text; anything else is decoded alone.
+    """
+    kinds = _decoders(tokenizer)
+    alphabet = _byte_level_alphabet() if "ByteLevel" in kinds else None
+    special = {int(token) for token in tokenizer.all_special_ids} | {
+        int(token) for token in tokenizer.added_tokens_decoder
+    }
+    fallback = re.compile(r"<0x([0-9A-Fa-f]{2})>")
+    result = []
+    for token in range(size):
+        piece = tokenizer.convert_ids_to_tokens(token) if token < len(tokenizer) else None
+        if piece is None:
+            result.append(f"<token:{token}>".encode())
+        elif token in special:
+            result.append(piece.encode())
+        elif alphabet is not None and all(char in alphabet for char in piece):
+            result.append(bytes(alphabet[char] for char in piece))
+        elif "ByteFallback" in kinds and (byte := fallback.fullmatch(piece)):
+            result.append(bytes([int(byte.group(1), 16)]))
+        elif "Metaspace" in kinds or "Replace" in kinds:
+            result.append(piece.replace("▁", " ").encode())
+        else:
+            result.append(tokenizer.decode([token], clean_up_tokenization_spaces=False).encode())
+    return result
+

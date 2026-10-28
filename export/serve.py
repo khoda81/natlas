@@ -17,7 +17,7 @@ node below it is a text, and its children are the next tokens. Every measure
 is one Natlas service under its own path prefix, /0/ for the model itself and
 /1/, /2/, … for the --q measures, speaking the Connect protocol's server
 streaming. GET /manifest.json describes them to the client, with the prompt's
-tokens as the place to start, and GET /labels.json holds the token texts.
+tokens as the place to start, and GET /labels.json holds the token bytes.
 
 A node's handle hashes its path, so handles survive a restart, but the
 server cannot invert them: it remembers each node it has expanded, one parent
@@ -40,7 +40,7 @@ import anyio.to_thread
 import lm
 import numpy as np
 import uvicorn
-from natlas_codec import encode, pb
+from natlas_codec import encode, labels_json, pb
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -190,10 +190,10 @@ def app(model: Model, manifest: list[dict], labels: bytes) -> Starlette:
     async def manifest_json(_: Request) -> Response:
         return JSONResponse(manifest)
 
-    async def labels_json(_: Request) -> Response:
+    async def labels_file(_: Request) -> Response:
         return Response(labels, media_type="application/json")
 
-    routes = [Route("/manifest.json", manifest_json), Route("/labels.json", labels_json)]
+    routes = [Route("/manifest.json", manifest_json), Route("/labels.json", labels_file)]
     routes += [
         Route(f"/{index}/natlas.v1.Natlas/Expand", service(index), methods=["POST"])
         for index in range(len(model.measures))
@@ -240,7 +240,7 @@ def main() -> None:
     p_model = lm.load(args.p, args.device, args.dtype)
     measures = lm.measures(args.p, p_model, args.q, args.device, args.dtype)
     vocabulary = lm.vocabulary_size(tokenizer, p_model)
-    labels = json.dumps(lm.token_texts(tokenizer, vocabulary), ensure_ascii=False)
+    labels = labels_json(lm.token_bytes(tokenizer, vocabulary))
     eos = {int(tokenizer.eos_token_id)} if tokenizer.eos_token_id is not None else set()
 
     manifest = [

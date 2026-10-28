@@ -115,7 +115,7 @@ def main() -> None:
     write(
         args.name or stem,
         f"{args.prompt} · {args.p}",
-        lm.token_texts(tokenizer, lm.vocabulary_size(tokenizer, p_model)),
+        lm.token_bytes(tokenizer, lm.vocabulary_size(tokenizer, p_model)),
         [measure.name for measure in measures],
         recorded,
         start=prompt,

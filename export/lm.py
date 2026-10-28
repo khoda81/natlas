@@ -100,14 +100,23 @@ class Transformers:
 class LlamaCpp:
     """A GGUF model run by llama.cpp, its layers on the GPU as far as ``gpu_layers``
     says (-1 for all). Requests that share a prefix with the last one reuse
-    its KV cache, so walking down a path costs a token per step."""
+    its KV cache, so walking down a path costs a token per step. Every token
+    is evaluated alone, so a node's log-probabilities depend on its path only."""
 
     def __init__(self, path: Path, context: int = 8192, gpu_layers: int = -1):
         from llama_cpp import Llama
 
         self.name = path.stem
         try:
-            self.llm = Llama(str(path), n_ctx=context, n_gpu_layers=gpu_layers, logits_all=False, verbose=False)
+            self.llm = Llama(
+                str(path),
+                n_ctx=context,
+                n_gpu_layers=gpu_layers,
+                # With no layers on the GPU, keep the KV cache off it too.
+                offload_kqv=gpu_layers != 0,
+                logits_all=False,
+                verbose=False,
+            )
         except ValueError as error:
             # llama.cpp says why only in its own log, and a full GPU is the usual reason.
             raise RuntimeError(
@@ -125,7 +134,9 @@ class LlamaCpp:
         tokens = [int(token) for token in tokens]
         if len(tokens) > self.llm.n_ctx():
             raise TooLong(f"{len(tokens)} tokens, but the context holds {self.llm.n_ctx()}")
-        cached = self.llm.input_ids
+        # input_ids is the whole context buffer: past n_tokens it holds tokens
+        # already dropped from the KV cache.
+        cached = self.llm.input_ids[: self.llm.n_tokens]
         shared = len(tokens)
         for index, (have, want) in enumerate(zip(cached, tokens)):
             if have != want:
@@ -136,7 +147,16 @@ class LlamaCpp:
         # The logits on hand are the last evaluated position's.
         if not shared == len(tokens) == len(cached):
             self.llm.n_tokens = min(shared, len(tokens) - 1)
-            self.llm.eval(tokens[self.llm.n_tokens :])
+            try:
+                # One token at a time: llama.cpp's kernels round a batch
+                # differently, so a node's numbers would hang on what was
+                # asked before it.
+                for token in tokens[self.llm.n_tokens :]:
+                    self.llm.eval([token])
+            except Exception:
+                # What a failed batch left in the cache is unknown.
+                self.llm.reset()
+                raise
         logits = np.ctypeslib.as_array(self.llm._ctx.get_logits(), shape=(self.vocabulary,))  # noqa: SLF001
         return torch.log_softmax(torch.from_numpy(logits.astype(np.float64)) / temperature, dim=-1)
 

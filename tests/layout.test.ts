@@ -67,6 +67,14 @@ describe("layout", () => {
     expect(cam.a).toBeCloseTo(0.3, 15);
   });
 
+  it("stops at the root's left edge", () => {
+    const cam: Camera = { x: 0.5, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
+    moveDepth(cam, -2, 0.5);
+    expect(cam.x).toBe(0);
+    moveDepth(cam, -1, 0.5);
+    expect(cam.x).toBe(0);
+  });
+
   it("scales horizontally without moving anything vertically", () => {
     const tree = chainTree([0.6, 0.3, 0.1], [0, 1]);
     const cam: Camera = { x: 1.2, k: 100, anchor: { node: 2, slot: 0 }, a: 0.3 };

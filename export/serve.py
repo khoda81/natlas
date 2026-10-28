@@ -39,6 +39,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 from collections import OrderedDict
 
 import anyio.to_thread
@@ -179,6 +180,10 @@ def app(model: Model, manifest: list[dict], labels: bytes) -> Starlette:
                 return _stream([_end({"code": "invalid_argument", "message": str(error)})])
             except lm.TooLong as error:
                 return _stream([_end({"code": "out_of_range", "message": str(error)})])
+            except Exception as error:
+                # Answered as Connect, inside CORS, so the page sees why.
+                traceback.print_exc()
+                return _stream([_end({"code": "internal", "message": f"{type(error).__name__}: {error}"})])
 
             def chunks():
                 yield _envelope(0, pb.ExpandResponse(node=handle).SerializeToString())

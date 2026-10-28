@@ -6,10 +6,13 @@ import { type Camera, logView } from "./layout";
 export const MIN_SCALE = 1e-3;
 export const MAX_SCALE = 1e7;
 
-/** Move the left edge ``dx`` nats deeper, zooming vertically about view fraction ``fy``. */
+/**
+ * Move the left edge ``dx`` nats deeper, zooming vertically about view
+ * fraction ``fy``. It stops at the root's left edge, depth 0.
+ */
 export function moveDepth(cam: Camera, dx: number, fy: number): void {
   const before = logView(cam);
-  cam.x += dx;
+  cam.x = Math.max(0, cam.x + dx);
   cam.a = fy + (cam.a - fy) * Math.exp(before - logView(cam));
 }
 

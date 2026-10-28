@@ -133,8 +133,17 @@ class App {
     this.tree = tree;
     this.unfinished = new Map();
     this.expander = new Expander(tree, dataset.sources);
-    this.expander.onError = (error) => this.setStatus(String(error));
-    tree.subscribe(() => this.invalidate());
+    // A failed listing is asked for again; its error stays until one lands.
+    let failing = false;
+    this.expander.onError = (error) => {
+      failing = true;
+      this.setStatus(String(error));
+    };
+    tree.subscribe(() => {
+      if (failing) this.setStatus("");
+      failing = false;
+      this.invalidate();
+    });
     element("title").textContent = dataset.title;
     for (const select of [this.pSelect, this.qSelect]) {
       select.replaceChildren(...dataset.measures.map((name, index) => new Option(name, String(index))));
@@ -186,7 +195,7 @@ class App {
   private reset(): void {
     const { width, height } = this.view;
     const k = width / Math.log(Math.max(8, height / 4));
-    this.cam = { x: -24 / k, k, anchor: { node: 0, slot: 0 }, a: 0 };
+    this.cam = { x: 0, k, anchor: { node: 0, slot: 0 }, a: 0 };
     this.focus = null;
     this.invalidate();
   }

@@ -16,6 +16,7 @@ import {
   type Viewport,
 } from "./layout";
 import { BITS, draw, NATS, RULER_HEIGHT, screenRect, slotKey, type Units } from "./render";
+import type { Glyph, Reading } from "./reading";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "./source";
 import { IntervalTree, type NodeId, type Slots, type TreeNode } from "./tree";
 
@@ -62,8 +63,7 @@ class App {
   private tree: IntervalTree | null = null;
   private expander: Expander | null = null;
   private dataset: Dataset | null = null;
-  /** Per node, the unfinished character its path's bytes end in. */
-  private unfinished = new Map<NodeId, Uint8Array>();
+  private reading: Reading | null = null;
   private lens: Lens = { p: 0, q: 0 };
   private cam: Camera = { x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
   private view: Viewport = { width: 1, height: 1 };
@@ -80,7 +80,9 @@ class App {
   private scheduled = false;
 
   constructor() {
-    new ResizeObserver(() => this.resize()).observe(this.canvas);
+    // ResizeObserver runs after animation callbacks, before paint. Resetting
+    // the bitmap here would expose a blank canvas until the next frame.
+    new ResizeObserver(() => this.invalidate()).observe(this.canvas);
     matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
       this.palette = Palette.current();
       this.updateLegend();
@@ -131,7 +133,7 @@ class App {
     const tree = new IntervalTree(dataset.measures.length);
     this.dataset = dataset;
     this.tree = tree;
-    this.unfinished = new Map();
+    this.reading = dataset.labels.read(tree);
     this.expander = new Expander(tree, dataset.sources);
     // A failed listing is asked for again; its error stays until one lands.
     let failing = false;
@@ -205,11 +207,13 @@ class App {
     const { clientWidth: width, clientHeight: height } = this.canvas;
     const first = this.view.width === 1;
     this.view = { width, height: Math.max(1, height - RULER_HEIGHT) };
-    this.canvas.width = Math.round(width * ratio);
-    this.canvas.height = Math.round(height * ratio);
+    const pixelWidth = Math.round(width * ratio);
+    const pixelHeight = Math.round(height * ratio);
+    // Even assigning the current size clears the bitmap and drawing state.
+    if (this.canvas.width !== pixelWidth) this.canvas.width = pixelWidth;
+    if (this.canvas.height !== pixelHeight) this.canvas.height = pixelHeight;
     this.ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     if (first && this.tree) this.reset();
-    this.invalidate();
   }
 
   private invalidate(): void {
@@ -222,6 +226,9 @@ class App {
   }
 
   private render(time: number): void {
+    // Resize and draw in the same callback, so a cleared bitmap is never
+    // presented between a hover-driven panel resize and its redraw.
+    this.resize();
     const tree = this.tree;
     if (tree === null) return;
     if (this.focus) this.stepFocus(time);
@@ -246,7 +253,7 @@ class App {
       hover: this.hover,
       ancestors,
       units: this.units,
-      text: (node, label) => visible(this.text(node, label)),
+      glyph: (node, label) => this.glyph(node, label),
     });
     this.updateReadout();
     if (this.focus || this.held.size > 0) this.invalidate();
@@ -341,6 +348,10 @@ class App {
           this.focus = null;
           this.invalidate();
         }
+        return;
+      }
+      if (this.reading?.key?.(event)) {
+        event.preventDefault();
         return;
       }
       const cam = this.cam;
@@ -439,50 +450,26 @@ class App {
   }
 
   /**
-   * Show the text from the root down to child ``label`` of ``node``, or to
+   * Show the path from the root down to child ``label`` of ``node``, or to
    * ``node`` itself for a tail or merged box, until another box is hovered.
    * While the pointer is over the canvas the panel only grows, so that a
    * shorter text cannot shrink it, resize the canvas, and move the box under
    * the pointer.
    */
   private showPath(node: NodeId, label: number | null, box?: Box): void {
-    const tree = this.tree;
     const key = `${node}:${box?.slot ?? label}:${box?.kind ?? ""}`;
-    if (tree === null || key === this.shown) return;
+    if (this.reading === null || key === this.shown) return;
     this.shown = key;
     const where = this.where;
     where.style.minHeight = this.pointer === null ? "" : `${where.offsetHeight}px`;
-    const tokens = (this.dataset?.labels.along(tree.path(node)) ?? []).map((text) => token(text));
-    if (label !== null) tokens.push(token(this.text(node, label), "current"));
-    else if (box !== undefined) tokens.push(token(box.kind === "merged" ? ` ${box.count} children` : " …", "more"));
-    where.replaceChildren(...tokens);
     where.hidden = false;
+    this.reading.show(where, node, label, box?.kind === "merged" ? ` ${box.count} children` : " …");
     where.scrollTop = where.scrollHeight;
   }
 
-  /** The child with ``label`` of ``node``, read after the bytes of the path to it. */
-  private text(node: NodeId, label: number): string {
-    return this.dataset?.labels.shown(this.unfinishedAt(node), label) ?? `#${label}`;
-  }
-
-  private unfinishedAt(id: NodeId): Uint8Array {
-    const tree = this.tree!;
-    const labels = this.dataset!.labels;
-    const pending: TreeNode[] = [];
-    let before: Uint8Array = new Uint8Array();
-    for (let node = tree.node(id); node.parent !== null; node = tree.node(node.parent)) {
-      const known = this.unfinished.get(node.id);
-      if (known !== undefined) {
-        before = known;
-        break;
-      }
-      pending.push(node);
-    }
-    for (const node of pending.reverse()) {
-      before = labels.after(before, node.label).unfinished;
-      this.unfinished.set(node.id, before);
-    }
-    return before;
+  /** How the child with ``label`` of ``node`` reads. */
+  private glyph(node: NodeId, label: number): Glyph {
+    return this.reading?.glyph(node, label) ?? { text: `#${label}` };
   }
 
   private fmt(nats: number): string {
@@ -507,7 +494,7 @@ class App {
       return;
     }
     const node = tree.node(box.node);
-    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : visible(this.text(box.node, box.label));
+    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : this.glyph(box.node, box.label).text;
     const chips = [chip(last)];
 
     const { p, q } = this.lens;
@@ -599,11 +586,6 @@ function rootLike(lnMass: number, x1: number): number {
   return Math.min(-lnMass, x1);
 }
 
-/** Whitespace made visible, for a label shown on its own. */
-function visible(text: string): string {
-  return text.replace(/[ \n\r\t]/g, (c) => ({ " ": "␠", "\n": "↵", "\r": "↩", "\t": "⇥" })[c]!);
-}
-
 /**
  * The live server to ask for datasets: ``?server=URL``, else a local one when
  * the page itself is local, so a deployed page never probes the visitor's
@@ -613,13 +595,6 @@ function liveServer(): string | undefined {
   const server = new URLSearchParams(location.search).get("server");
   if (server !== null) return new URL(server.endsWith("/") ? server : `${server}/`, location.href).href;
   return ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) ? LOCAL_SERVER : undefined;
-}
-
-function token(text: string, kind?: string): HTMLElement {
-  const span = document.createElement("span");
-  span.className = kind === undefined ? "token" : `token ${kind}`;
-  span.textContent = text;
-  return span;
 }
 
 function chip(text: string): HTMLElement {

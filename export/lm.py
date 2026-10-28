@@ -20,7 +20,6 @@ from typing import Protocol
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 type LogProbs = Callable[[Sequence[int]], torch.Tensor]
 
@@ -41,6 +40,8 @@ DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.
 
 
 def load(model_id: str, device: str, dtype: str = "float32"):
+    from transformers import AutoModelForCausalLM
+
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=DTYPES[dtype])
     return model.to(device).eval()
 
@@ -78,6 +79,8 @@ class Language(Protocol):
 
 class Transformers:
     def __init__(self, model_id: str, device: str, dtype: str = "float32", tokenizer: str | None = None):
+        from transformers import AutoTokenizer
+
         self.name = model_id
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer or model_id)
         self.model = load(model_id, device, dtype)

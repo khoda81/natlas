@@ -41,6 +41,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
+from collections.abc import Callable
 
 import anyio.to_thread
 import lm
@@ -87,10 +88,17 @@ class BadLabel(Exception):
 class Model:
     """The tree of texts under each measure, computed on demand."""
 
-    def __init__(self, root: tuple[int, ...], eos: frozenset[int], labels: int, measures: list[lm.Measure]):
+    def __init__(
+        self,
+        root: tuple[int, ...],
+        ends: Callable[[tuple[int, ...]], bool],
+        labels: int,
+        measures: list[lm.Measure],
+    ):
         # What the model reads before the root's children: a start-of-text token.
         self.root = root
-        self.eos = eos
+        # Whether a path is finished, with no children.
+        self.ends = ends
         self.labels = labels
         self.measures = measures
         self.parents: dict[int, tuple[int, int]] = {}
@@ -121,7 +129,7 @@ class Model:
                 path = self.path(child.parent) + (child.label,)
                 handle = _child_handle(child.parent, child.label)
                 self.parents.setdefault(handle, (child.parent, child.label))
-            if horizon == 0 or (path and path[-1] in self.eos):
+            if horizon == 0 or self.ends(path):
                 return handle, []
             cached = handle in self.cache[measure]
             labels, nats = self.listing(measure, handle, path)
@@ -159,7 +167,8 @@ def _end(error: dict | None = None) -> bytes:
     return _envelope(_END_STREAM, json.dumps({} if error is None else {"error": error}).encode())
 
 
-def app(model: Model, manifest: list[dict], labels: bytes) -> Starlette:
+def app(model: Model, manifest: list[dict], files: dict[str, tuple[bytes, str]]) -> Starlette:
+    """The measures' services, the manifest, and ``files``: each published path's bytes and media type."""
     def service(measure: int):
         async def expand(request: Request) -> Response:
             if request.headers.get("content-type") != _CONTENT_TYPE:
@@ -201,10 +210,14 @@ def app(model: Model, manifest: list[dict], labels: bytes) -> Starlette:
     async def manifest_json(_: Request) -> Response:
         return JSONResponse(manifest)
 
-    async def labels_file(_: Request) -> Response:
-        return Response(labels, media_type="application/json")
+    def file(content: bytes, media_type: str):
+        async def serve(_: Request) -> Response:
+            return Response(content, media_type=media_type)
 
-    routes = [Route("/manifest.json", manifest_json), Route("/labels.json", labels_file)]
+        return serve
+
+    routes = [Route("/manifest.json", manifest_json)]
+    routes += [Route(f"/{path}", file(*served)) for path, served in files.items()]
     routes += [
         Route(f"/{index}/natlas.v1.Natlas/Expand", service(index), methods=["POST"])
         for index in range(len(model.measures))
@@ -266,8 +279,9 @@ def main() -> None:
             "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
         }
     ]
-    model = Model(language.start, language.eos, language.vocabulary, measures)
-    uvicorn.run(app(model, manifest, labels.encode()), host=args.host, port=args.port, access_log=False)
+    model = Model(language.start, lambda path: bool(path) and path[-1] in language.eos, language.vocabulary, measures)
+    files = {"labels.json": (labels.encode(), "application/json")}
+    uvicorn.run(app(model, manifest, files), host=args.host, port=args.port, access_log=False)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,9 @@ import { createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { decode, encode, type WireEdge } from "./codec";
 import { type ExpandResponse, Natlas, SnapshotSchema } from "./gen/natlas/v1/natlas_pb";
-import { Labels } from "./labels";
+import { TextLabels } from "./labels";
+import { type NotesFile, NoteLabels } from "./notes";
+import type { Labels } from "./reading";
 import type { Handle, Label } from "./tree";
 
 /** A node as a request names it: the child with ``label`` of the node the server gave ``parent`` to. */
@@ -101,7 +103,7 @@ async function* edgesOf(stream: AsyncIterator<ExpandResponse>): AsyncIterable<Wi
 export interface DatasetEntry {
   name: string;
   title: string;
-  /** JSON array of label bytes in base64, indexed by label. */
+  /** A labels file: a JSON array of label bytes in base64, indexed by label, or a notes file. */
   labels?: string;
   /** Each measure is a recorded snapshot file or a live service's base URL. */
   measures: { name: string; file?: string; url?: string }[];
@@ -149,8 +151,11 @@ export async function fetchDataset(entry: DatasetEntry): Promise<Dataset> {
   const base = entry.base ?? dataDirectory();
   const labels =
     entry.labels === undefined
-      ? Labels.none()
-      : fetchOk(new URL(entry.labels, base)).then(async (r) => Labels.parse(await r.text()));
+      ? TextLabels.none()
+      : (async () => {
+          const url = new URL(entry.labels!, base);
+          return parseLabels(await (await fetchOk(url)).text(), url);
+        })();
   const sources = Promise.all(
     entry.measures.map(async ({ name, file, url }): Promise<Source> => {
       if (url !== undefined) return new ConnectSource(new URL(url, base).href);
@@ -176,7 +181,15 @@ export async function droppedDataset(files: File[]): Promise<Dataset> {
     title: snapshots.map((file) => file.name).join(" · "),
     measures: snapshots.map((file) => file.name.replace(/\.pb$/, "")),
     sources: await Promise.all(snapshots.map(async (file) => new SnapshotSource(new Uint8Array(await file.arrayBuffer())))),
-    labels: labelFile === undefined ? Labels.none() : Labels.parse(await labelFile.text()),
+    labels: labelFile === undefined ? TextLabels.none() : parseLabels(await labelFile.text(), null),
     start: [],
   };
+}
+
+/** A labels file, read by its kind; ``url`` is where it came from, which its own references are relative to. */
+export function parseLabels(json: string, url: URL | null): Labels {
+  const parsed = JSON.parse(json) as string[] | { kind?: string };
+  if (Array.isArray(parsed)) return TextLabels.fromJson(parsed);
+  if (parsed.kind === "notes") return new NoteLabels(parsed as NotesFile, url);
+  throw new Error(`labels of an unknown kind: ${parsed.kind}`);
 }

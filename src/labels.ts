@@ -4,7 +4,8 @@
 // it shows the characters its own bytes complete. A labels file is a JSON
 // array of base64 strings, indexed by label, as proto3 JSON writes bytes.
 
-import type { Label } from "./tree";
+import { type Glyph, type Labels, type Reading, States } from "./reading";
+import type { IntervalTree, Label, NodeId } from "./tree";
 
 /** The bytes a decoder holds back after ``bytes``: an unfinished UTF-8 character, at most 3 bytes. */
 function unfinished(bytes: Uint8Array): Uint8Array {
@@ -29,18 +30,36 @@ function hex(bytes: Uint8Array): string {
   return `‹${Array.from(bytes, (byte) => byte.toString(16).toUpperCase().padStart(2, "0")).join("\u2009")}›`;
 }
 
-export class Labels {
+export class TextLabels implements Labels {
   private readonly decoder = new TextDecoder();
 
   constructor(private readonly bytes: readonly Uint8Array[]) {}
 
-  static parse(json: string): Labels {
-    const encoded = JSON.parse(json) as string[];
-    return new Labels(encoded.map((text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0))));
+  /** Labels from a labels file's array of base64 strings. */
+  static fromJson(encoded: string[]): TextLabels {
+    return new TextLabels(encoded.map((text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0))));
   }
 
-  static none(): Labels {
-    return new Labels([]);
+  static parse(json: string): TextLabels {
+    return TextLabels.fromJson(JSON.parse(json) as string[]);
+  }
+
+  static none(): TextLabels {
+    return new TextLabels([]);
+  }
+
+  read(tree: IntervalTree): Reading {
+    // Per node, the unfinished character its path's bytes end in.
+    const unfinished = new States<Uint8Array>(tree, new Uint8Array(), (before, label) => this.after(before, label).unfinished);
+    return {
+      glyph: (node: NodeId, label: Label): Glyph => ({ text: visible(this.shown(unfinished.at(node), label)) }),
+      show: (panel: HTMLElement, node: NodeId, label: Label | null, more: string) => {
+        const tokens = this.along(tree.path(node)).map((text) => token(text));
+        tokens.push(label === null ? token(more, "more") : token(this.shown(unfinished.at(node), label), "current"));
+        panel.dataset.kind = "text";
+        panel.replaceChildren(...tokens);
+      },
+    };
   }
 
   /**
@@ -76,4 +95,16 @@ export class Labels {
       return read.text;
     });
   }
+}
+
+/** Whitespace made visible, for a label shown on its own. */
+function visible(text: string): string {
+  return text.replace(/[ \n\r\t]/g, (c) => ({ " ": "␠", "\n": "↵", "\r": "↩", "\t": "⇥" })[c]!);
+}
+
+function token(text: string, kind?: string): HTMLElement {
+  const span = document.createElement("span");
+  span.className = kind === undefined ? "token" : `token ${kind}`;
+  span.textContent = text;
+  return span;
 }

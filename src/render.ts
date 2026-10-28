@@ -2,6 +2,7 @@
 
 import { type Palette, rampPosition } from "./color";
 import type { Box, Camera, Frame, Lens, Viewport } from "./layout";
+import type { Glyph, Mark } from "./reading";
 import type { NodeId } from "./tree";
 
 export interface Units {
@@ -18,8 +19,8 @@ export interface DrawState {
   /** ``node:slot`` keys of the hovered box's ancestor slots. */
   ancestors: Set<string>;
   units: Units;
-  /** Display text of the child with ``label`` of node ``node``. */
-  text: (node: NodeId, label: number) => string;
+  /** How the child with ``label`` of node ``node`` reads. */
+  glyph: (node: NodeId, label: number) => Glyph;
 }
 
 const FAMILY = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
@@ -32,6 +33,10 @@ const LABEL_MAX_SIZE = 96;
 const LABEL_HEIGHT_FILL = 0.6;
 const LABEL_MIN_WIDTH = 14;
 const GAP_MIN = 4;
+/** A mark's width, and the space after it, in ems. */
+const MARK_WIDTH = 0.8;
+const MARK_GAP = 0.3;
+const MORE: Glyph = { text: "…" };
 export const RULER_HEIGHT = 22;
 // Canvas coordinates far outside the view lose precision and can stall rasterizing.
 const OVERSCAN = 64;
@@ -76,7 +81,7 @@ export function draw(
   ctx.font = FONT;
   ctx.textBaseline = "middle";
 
-  const labels: { box: Box; rect: ScreenRect; text: string; ink: string; grows: boolean }[] = [];
+  const labels: { box: Box; rect: ScreenRect; glyph: Glyph; ink: string; grows: boolean }[] = [];
   for (const box of frame.boxes) {
     const rect = screenRect(box, cam, view);
     const width = rect.x1 - rect.x0;
@@ -106,7 +111,7 @@ export function draw(
     );
 
     if (box.kind !== "merged" && height >= LABEL_MIN_HEIGHT && width >= LABEL_MIN_WIDTH) {
-      labels.push({ box, rect, text: box.label === null ? "…" : state.text(box.node, box.label), ink, grows: box.label !== null });
+      labels.push({ box, rect, glyph: box.label === null ? MORE : state.glyph(box.node, box.label), ink, grows: box.label !== null });
     }
   }
 
@@ -115,12 +120,13 @@ export function draw(
   // the box's left, centered, and slides right past the left screen edge and
   // up or down into view, stopping at the box's own edges. A label that still
   // does not fit stays its size and is clipped.
-  for (const { box, rect, text, ink, grows } of labels) {
+  for (const { box, rect, glyph, ink, grows } of labels) {
     const boxLeft = (box.x0 - cam.x) * cam.k;
     const width = (box.x1 - box.x0) * cam.k - 2;
     const top = box.y0 * view.height;
     const bottom = box.y1 * view.height;
-    const textWidth = ctx.measureText(text).width / BASE_SIZE;
+    const marked = glyph.mark === undefined ? 0 : MARK_WIDTH + (glyph.text === "" ? 0 : MARK_GAP);
+    const textWidth = ctx.measureText(glyph.text).width / BASE_SIZE + marked;
     // At size s the text spans textWidth·s, plus s/4 of padding on each side.
     const fit = Math.min((bottom - top) * LABEL_HEIGHT_FILL, width / (textWidth + 0.5));
     const size = grows ? Math.min(LABEL_MAX_SIZE, fit) : BASE_SIZE;
@@ -134,8 +140,9 @@ export function draw(
     ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0 - 2, rect.y1 - rect.y0);
     ctx.clip();
     ctx.font = `${size}px ${FAMILY}`;
+    if (glyph.mark !== undefined) mark(ctx, glyph.mark, x, y, size, glyph.tint ?? ink, ink);
     ctx.fillStyle = ink;
-    ctx.fillText(text, x, y);
+    ctx.fillText(glyph.text, x + marked * size, y);
     ctx.restore();
   }
 
@@ -148,6 +155,65 @@ export function draw(
 
   outline(ctx, frame, cam, view, state, scheme.ink);
   ruler(ctx, cam, view, state.units, palette);
+}
+
+/** ``kind`` drawn ``size`` tall from ``x``, centered on ``y``: filled with ``tint``, edged in ``ink``. */
+function mark(ctx: CanvasRenderingContext2D, kind: Mark, x: number, y: number, size: number, tint: string, ink: string): void {
+  const r = (MARK_WIDTH * size) / 2;
+  const cx = x + r;
+  ctx.fillStyle = tint;
+  ctx.strokeStyle = ink;
+  ctx.lineWidth = Math.max(1, size / 12);
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  switch (kind) {
+    case "onset":
+      // A note head, tilted as on a staff.
+      ctx.ellipse(cx, y, r, r * 0.72, -0.35, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.stroke();
+      break;
+    case "offset":
+      ctx.ellipse(cx, y, r * 0.92, r * 0.66, -0.35, 0, 2 * Math.PI);
+      ctx.strokeStyle = tint;
+      ctx.lineWidth = Math.max(1.5, size / 7);
+      ctx.stroke();
+      break;
+    case "tie":
+      ctx.arc(cx, y + r * 0.9, r, Math.PI * 1.15, Math.PI * 1.85);
+      ctx.strokeStyle = tint;
+      ctx.lineWidth = Math.max(1.5, size / 7);
+      ctx.stroke();
+      break;
+    case "hit":
+      ctx.moveTo(cx - r * 0.75, y - r * 0.75);
+      ctx.lineTo(cx + r * 0.75, y + r * 0.75);
+      ctx.moveTo(cx + r * 0.75, y - r * 0.75);
+      ctx.lineTo(cx - r * 0.75, y + r * 0.75);
+      ctx.strokeStyle = tint;
+      ctx.lineWidth = Math.max(1.5, size / 6);
+      ctx.stroke();
+      break;
+    case "time":
+      // A clock face.
+      ctx.arc(cx, y, r * 0.85, 0, 2 * Math.PI);
+      ctx.moveTo(cx, y);
+      ctx.lineTo(cx, y - r * 0.6);
+      ctx.moveTo(cx, y);
+      ctx.lineTo(cx + r * 0.45, y);
+      ctx.stroke();
+      break;
+    case "instrument":
+      ctx.roundRect(cx - r * 0.85, y - r * 0.85, r * 1.7, r * 1.7, r * 0.4);
+      ctx.fill();
+      ctx.stroke();
+      break;
+    case "end":
+      ctx.rect(cx - r * 0.7, y - r * 0.7, r * 1.4, r * 1.4);
+      ctx.fillStyle = ink;
+      ctx.fill();
+      break;
+  }
 }
 
 function outline(

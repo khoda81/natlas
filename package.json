@@ -9,10 +9,13 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "proto": "scripts/gen-proto.sh",
-    "data": "cd export && uv run synthetic.py"
+    "data": "cd export && uv run synthetic.py",
+    "live": "cd export && uv run serve.py"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "2.16.0"
+    "@bufbuild/protobuf": "2.16.0",
+    "@connectrpc/connect": "2.2.0",
+    "@connectrpc/connect-web": "2.2.0"
   },
   "devDependencies": {
     "@bufbuild/protoc-gen-es": "2.16.0",

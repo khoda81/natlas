@@ -1,9 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { create, toBinary } from "@bufbuild/protobuf";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { encode } from "../src/codec";
 import { Expander } from "../src/expand";
 import { SnapshotSchema } from "../src/gen/natlas/v1/natlas_pb";
-import { type Reply, SnapshotSource } from "../src/source";
+import { type Reply, type Source, SnapshotSource } from "../src/source";
 import { childHandle, IntervalTree, ROOT } from "../src/tree";
 
 const weights = [0.5, 0.2, 0.1, 0.05, 0.01];
@@ -53,5 +54,45 @@ describe("Expander", () => {
     expect(root.horizon).toBe(6);
     expect(root.labels).toEqual([0, 1, 2, 3]);
     expect(root.leftover).toBeCloseTo(0.15, 6);
+  });
+});
+
+/** A server that, like the live one, only knows handles it has listed, and can forget them. */
+class Forgetful implements Source {
+  known = new Set([ROOT]);
+  calls: bigint[] = [];
+
+  expand(node: bigint, horizon: number): Reply {
+    this.calls.push(node);
+    if (!this.known.has(node)) {
+      return { complete: horizon, edges: (async function* () { throw new ConnectError("not listed", Code.NotFound); })() };
+    }
+    for (const label of [0, 1, 2, 3]) this.known.add(childHandle(node, label));
+    return { complete: horizon, edges: snapshot().expand(ROOT, horizon).edges };
+  }
+}
+
+describe("Expander after a server restart", () => {
+  it("expands the ancestors again to teach the server the path", async () => {
+    const tree = new IntervalTree(1);
+    const server = new Forgetful();
+    const expander = new Expander(tree, [server]);
+    const fetch = async (node: ReturnType<IntervalTree["child"]>) => {
+      const fetched = new Promise<void>((resolve) => {
+        const stop = tree.subscribe(() => (stop(), resolve()));
+      });
+      expander.request([{ node, measure: 0, horizon: 2, priority: 1 }]);
+      await fetched;
+    };
+    await fetch(tree.root);
+    const child = tree.child(0, 1);
+    await fetch(child);
+    const grandchild = tree.child(child.id, 0);
+
+    server.known = new Set([ROOT]);
+    server.calls = [];
+    await fetch(grandchild);
+    expect(server.calls).toEqual([grandchild.handle, ROOT, child.handle, grandchild.handle]);
+    expect(grandchild.listing(0)?.labels).toEqual([0, 1, 2, 3]);
   });
 });

@@ -12,21 +12,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from natlas.v1 import natlas_pb2 as pb  # noqa: E402
+from natlas_codec import ROOT, child_handle, encode  # noqa: E402
 from natwalk import Tree  # noqa: E402
 from natwalk.tree import NodeId  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "public" / "data"
 
-ROOT = 0
-SATURATED = (1 << 31) - 1
-_LOWEST = -(1 << 31)
 # A node without children lists nothing at any horizon.
 _LEAF_HORIZON = (1 << 32) - 1
-_MASK = (1 << 64) - 1
-_GOLDEN = 0x9E3779B97F4A7C15
 
 # The weight of every label at one node under one further measure, indexed by label.
 type Measure = Callable[[NodeId], Sequence[float]]
+# The same for a path of labels from the root.
+type Ancestry = Callable[[Sequence[int]], Sequence[float]]
 
 
 def listed_count(
@@ -53,6 +51,8 @@ def snapshots(
     tree: Tree,
     *,
     extra: Sequence[Measure] = (),
+    start: Sequence[int] = (),
+    ancestry: Sequence[Ancestry] = (),
     min_list: int = 16,
     max_list: int = 128,
     coverage: float = 0.999,
@@ -62,13 +62,29 @@ def snapshots(
     A node's listing goes down to the whole bit below its ``listed_count``-th
     child: natwalk's discovered children always fit, and so does every child
     at least that heavy, as Expand requires.
+
+    natwalk's root sits at ``start``, a path of labels from the tree's root;
+    ``ancestry`` gives every measure's weights, natwalk's own first, at each
+    node on that path, whose listing then reaches at least the next label.
     """
+    if start and len(ancestry) != 1 + len(extra):
+        raise ValueError("a start path needs the weights along it under every measure")
+    path_handles = [ROOT]
+    for label in start:
+        path_handles.append(child_handle(path_handles[-1], label))
+
     handles: dict[NodeId, int] = {}
     for node_id, node in enumerate(tree.nodes):
         parent = node.parent
-        handles[node_id] = ROOT if parent is None else child_handle(handles[parent], tree.token(node_id))
+        handles[node_id] = path_handles[-1] if parent is None else child_handle(handles[parent], tree.token(node_id))
 
-    own = pb.Snapshot()
+    def along_start(measure: int) -> list[pb.Expansion]:
+        return [
+            _expansion_of(path_handles[depth], ancestry[measure](start[:depth]), min_list, max_list, coverage, label)
+            for depth, label in enumerate(start)
+        ]
+
+    own = pb.Snapshot(expansions=along_start(0) if start else [])
     for node_id, node in enumerate(tree.nodes):
         distribution = node.distribution
         count = listed_count(tree, node_id, min_list=min_list, max_list=max_list, coverage=coverage)
@@ -89,54 +105,38 @@ def snapshots(
         )
 
     recorded = [own]
-    for measure in extra:
-        snapshot = pb.Snapshot()
+    for index, measure in enumerate(extra, start=1):
+        snapshot = pb.Snapshot(expansions=along_start(index) if start else [])
         for node_id in range(len(tree.nodes)):
             # A sequence natwalk has ended has no continuation under any measure.
             weights = measure(node_id) if len(tree[node_id].distribution) else []
-            top = heapq.nlargest(max_list, range(len(weights)), key=weights.__getitem__)
-            count = _coverage_count([weights[label] for label in top], min_list, max_list, coverage)
-            horizon = _horizon(_ln(weights[top[count - 1]])) if count else _LEAF_HORIZON
-            floor = -horizon * math.log(2)
-            # Ties within the last bit can reach past the first max_list.
-            threshold = math.exp(floor) if count else math.inf
-            heavy = [label for label, weight in enumerate(weights) if weight >= threshold]
-            listed = sorted(heavy, key=lambda label: (-weights[label], label))
-            snapshot.expansions.append(
-                _expansion(handles[node_id], horizon, listed, [_ln(weights[label]) for label in listed])
-            )
+            snapshot.expansions.append(_expansion_of(handles[node_id], weights, min_list, max_list, coverage))
         recorded.append(snapshot)
     return recorded
 
 
-def encode(labels: Sequence[int], ln_weights: Sequence[float], horizon: int) -> list[pb.Edge]:
-    """Edges for children sorted by decreasing weight, given as natural logs, down to 2^-horizon.
-
-    Mirrors src/codec.ts: each fraction is taken against the previous weight
-    as the client decodes it, so rounding never accumulates.
-    """
-    unit = _step(horizon)
-    floor = -horizon * math.log(2)
-    edges = []
-    previous = 0.0
-    for label, ln_weight in zip(labels, ln_weights, strict=True):
-        if not ln_weight >= floor:
-            break
-        ln_g = min(0.0, ln_weight - previous)
-        odds = SATURATED
-        if ln_g < 0 and unit > 0:
-            odds = max(_LOWEST, min(SATURATED, round((ln_g - math.log(-math.expm1(ln_g))) / unit)))
-        edges.append(pb.Edge(label=label, odds=odds))
-        previous += _ln_sigmoid(math.inf if odds == SATURATED else odds * unit)
-    return edges
-
-
-def child_handle(parent: int, label: int) -> int:
-    """Handle of the child with ``label`` of the node with handle ``parent``."""
-    z = (parent + _GOLDEN * (label + 1)) & _MASK
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK
-    return z ^ (z >> 31)
+def _expansion_of(
+    handle: int,
+    weights: Sequence[float],
+    min_list: int,
+    max_list: int,
+    coverage: float,
+    include: int | None = None,
+) -> pb.Expansion:
+    """A node's listing from the weight of every label, down to the bit below
+    ``coverage``, and at least down to label ``include``."""
+    top = heapq.nlargest(max_list, range(len(weights)), key=weights.__getitem__)
+    count = _coverage_count([weights[label] for label in top], min_list, max_list, coverage)
+    if not count:
+        return _expansion(handle, _LEAF_HORIZON, [], [])
+    horizon = _horizon(_ln(weights[top[count - 1]]))
+    if include is not None:
+        horizon = max(horizon, _horizon(_ln(weights[include])))
+    # Ties within the last bit can reach past the first max_list.
+    threshold = math.exp(-horizon * math.log(2))
+    heavy = [label for label, weight in enumerate(weights) if weight >= threshold]
+    listed = sorted(heavy, key=lambda label: (-weights[label], label))
+    return _expansion(handle, horizon, listed, [_ln(weights[label]) for label in listed])
 
 
 def _expansion(handle: int, horizon: int, labels: Sequence[int], ln_weights: Sequence[float]) -> pb.Expansion:
@@ -163,18 +163,6 @@ def _horizon(ln_weight: float) -> int:
     return horizon
 
 
-def _step(horizon: int) -> float:
-    return horizon * math.log(2) / 2**31
-
-
-def _ln_sigmoid(value: float) -> float:
-    if value == math.inf:
-        return 0.0
-    if value >= 0:
-        return -math.log1p(math.exp(-value))
-    return value - math.log1p(math.exp(value))
-
-
 def _ln(weight: float) -> float:
     return math.log(weight) if weight > 0 else -math.inf
 
@@ -185,8 +173,10 @@ def write(
     labels: Sequence[str],
     measures: Sequence[str],
     recorded: Sequence[pb.Snapshot],
+    start: Sequence[int] = (),
 ) -> list[Path]:
-    """Write one snapshot per measure and the label texts, and register them in the manifest."""
+    """Write one snapshot per measure and the label texts, and register them in
+    the manifest, with ``start`` as the path the client opens at."""
     if len(measures) != len(recorded):
         raise ValueError("one measure name per snapshot")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -205,7 +195,10 @@ def write(
     manifest_path = DATA_DIR / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
     manifest = [entry for entry in manifest if "name" in entry and entry["name"] != name]
-    manifest.append({"name": name, "title": title, "labels": label_file, "measures": entries})
+    entry = {"name": name, "title": title, "labels": label_file, "measures": entries}
+    if start:
+        entry["start"] = list(start)
+    manifest.append(entry)
     manifest.sort(key=lambda entry: entry["name"])
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
     return paths

@@ -4,7 +4,7 @@ import { listing } from "./build";
 
 describe("childHandle", () => {
   it("matches the exporter's handles", () => {
-    // Computed by export/natlas_export.py:child_handle.
+    // Computed by export/natlas_codec.py:child_handle.
     expect(childHandle(ROOT, 0)).toBe(0xe220a8397b1dcdafn);
     expect(childHandle(childHandle(ROOT, 3), 0)).toBe(0x4e213bb3324a7b38n);
     expect(childHandle(ROOT, 151935)).toBe(0xfa81401303fadabcn);

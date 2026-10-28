@@ -196,9 +196,37 @@ select:hover {
   color: #fff;
 }
 
-.chip.muted {
+/* The text down to the last hovered box: grows with it, then scrolls. */
+.where {
+  margin: 0 8px 8px;
+  padding: 6px 10px;
+  max-height: 30vh;
+  overflow-y: auto;
+  flex: none;
+  background: var(--plane);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.where[hidden] {
+  display: none;
+}
+
+/* Alternate shading shows where one token ends and the next begins. */
+.where .token:nth-child(even) {
+  background: var(--chip);
+}
+
+.where .token.current {
+  background: var(--accent);
+  color: #fff;
+}
+
+.where .token.more {
   color: var(--ink-muted);
-  background: transparent;
 }
 
 .kind {

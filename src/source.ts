@@ -1,9 +1,11 @@
 // Tree sources: one per measure, each answering Expand. A recorded snapshot
-// answers from memory; a live server will answer the same calls over Connect.
+// answers from memory; a live server answers over Connect.
 
 import { fromBinary } from "@bufbuild/protobuf";
+import { createClient } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-web";
 import { decode, encode, type WireEdge } from "./codec";
-import { SnapshotSchema } from "./gen/natlas/v1/natlas_pb";
+import { Natlas, SnapshotSchema } from "./gen/natlas/v1/natlas_pb";
 import type { Handle } from "./tree";
 
 export interface Reply {
@@ -45,12 +47,30 @@ export class SnapshotSource implements Source {
   }
 }
 
+/** A live server: every response honors the requested horizon. */
+export class ConnectSource implements Source {
+  private readonly client;
+
+  constructor(baseUrl: string) {
+    this.client = createClient(Natlas, createConnectTransport({ baseUrl, useBinaryFormat: true }));
+  }
+
+  expand(node: Handle, horizon: number): Reply {
+    return { complete: horizon, edges: this.client.expand({ node, horizon }) };
+  }
+}
+
 export interface DatasetEntry {
   name: string;
   title: string;
   /** JSON array of label texts, indexed by label. */
   labels?: string;
-  measures: { name: string; file: string }[];
+  /** Each measure is a recorded snapshot file or a live service's base URL. */
+  measures: { name: string; file?: string; url?: string }[];
+  /** What the entry's paths are relative to; the static data directory by default. */
+  base?: string;
+  /** Labels from the root to the node the client opens at. */
+  start?: number[];
 }
 
 export interface Dataset {
@@ -58,26 +78,53 @@ export interface Dataset {
   measures: string[];
   sources: Source[];
   labels: string[];
+  start: number[];
 }
 
-export async function manifest(): Promise<DatasetEntry[]> {
-  const response = await fetch("data/manifest.json");
-  if (!response.ok) return [];
-  return (await response.json()) as DatasetEntry[];
+/** The static data directory, beside the page. */
+function dataDirectory(): string {
+  return new URL("data/", location.href).href;
 }
 
-async function fetchOk(file: string): Promise<Response> {
-  const response = await fetch(`data/${file}`);
-  if (!response.ok) throw new Error(`could not load ${file}: ${response.status}`);
+/** Datasets in the static data directory, then those a live server at ``server`` offers. */
+export async function manifest(server?: string): Promise<DatasetEntry[]> {
+  const listed = async (base: string) => {
+    try {
+      const response = await fetch(new URL("manifest.json", base));
+      if (!response.ok) return [];
+      return ((await response.json()) as DatasetEntry[]).map((entry) => ({ ...entry, base }));
+    } catch {
+      return [];
+    }
+  };
+  const [live, recorded] = await Promise.all([server === undefined ? [] : listed(server), listed(dataDirectory())]);
+  return [...live, ...recorded];
+}
+
+async function fetchOk(url: URL): Promise<Response> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`could not load ${url}: ${response.status}`);
   return response;
 }
 
 export async function fetchDataset(entry: DatasetEntry): Promise<Dataset> {
-  const labels = entry.labels === undefined ? [] : fetchOk(entry.labels).then((r) => r.json() as Promise<string[]>);
+  const base = entry.base ?? dataDirectory();
+  const labels =
+    entry.labels === undefined ? [] : fetchOk(new URL(entry.labels, base)).then((r) => r.json() as Promise<string[]>);
   const sources = Promise.all(
-    entry.measures.map(async ({ file }) => new SnapshotSource(new Uint8Array(await (await fetchOk(file)).arrayBuffer()))),
+    entry.measures.map(async ({ name, file, url }): Promise<Source> => {
+      if (url !== undefined) return new ConnectSource(new URL(url, base).href);
+      if (file === undefined) throw new Error(`measure ${name} has neither a file nor a url`);
+      return new SnapshotSource(new Uint8Array(await (await fetchOk(new URL(file, base))).arrayBuffer()));
+    }),
   );
-  return { title: entry.title, measures: entry.measures.map(({ name }) => name), sources: await sources, labels: await labels };
+  return {
+    title: entry.title,
+    measures: entry.measures.map(({ name }) => name),
+    sources: await sources,
+    labels: await labels,
+    start: entry.start ?? [],
+  };
 }
 
 /** Dropped files: each .pb is one measure, a .json holds the labels. */
@@ -90,5 +137,6 @@ export async function droppedDataset(files: File[]): Promise<Dataset> {
     measures: snapshots.map((file) => file.name.replace(/\.pb$/, "")),
     sources: await Promise.all(snapshots.map(async (file) => new SnapshotSource(new Uint8Array(await file.arrayBuffer())))),
     labels: labelFile === undefined ? [] : (JSON.parse(await labelFile.text()) as string[]),
+    start: [],
   };
 }

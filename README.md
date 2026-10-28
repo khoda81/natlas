@@ -40,6 +40,7 @@ exact geometry 80 halvings deep.
 | shift + wheel, ↑ ↓ | along the interval |
 | ctrl + wheel, pinch, + − | horizontal scale |
 | double-click | glide until a box stands like the root, its children filling the view |
+| hover | show the text down to the box above the canvas; it stays until the next hover |
 | 0 · s · b | root · swap p and q · nats/bits |
 
 ## Protocol
@@ -66,6 +67,30 @@ Comparing p with q means asking two servers about the same handles. A
 `Snapshot` is a recorded server, one `Expand` per node; that is what the client
 loads today, re-encoding it for each request.
 
+## Live
+
+```bash
+bun run live      # SmolLM2-360M on the GPU, at http://localhost:8421
+cd export
+uv run serve.py "Once upon a time" --p HuggingFaceTB/SmolLM2-360M \
+  --q context:4 --q temperature:1.6
+```
+
+`export/serve.py` loads the model and serves each measure as its own `Natlas`
+service, `/0/` for the model and `/1/`, `/2/`, … for the `--q` measures, over
+the Connect protocol. Its root is the empty text, the start-of-text token
+alone, and every text is a node like any other: the prompt is only where the
+client starts, a path of token labels in `GET /manifest.json` that the client
+fetches its way down on load. `/labels.json` holds each token's text. With
+`bun run dev` running, the page finds a local server on its own and lists it
+first; `?server=URL` points it elsewhere.
+
+The server learns paths from its own listings, since handles cannot be
+inverted. After a restart the client teaches it again, expanding each
+ancestor of a node it asks about. Models load in float32 by default, which is
+both more precise and, on a GTX 1660 Ti, about 5× faster than float16;
+`--dtype` trades that for memory on larger models.
+
 ## Data
 
 Datasets live in `public/data/` (git-ignored) with a `manifest.json`: per
@@ -82,7 +107,9 @@ uv run hf.py --p HuggingFaceTB/SmolLM2-360M --tokenizer HuggingFaceTB/SmolLM2-36
 
 Both use natwalk's own search to discover the tree, then evaluate the other
 measures on the same paths, each listed in its own order down to the bit
-below its coverage. A q measure is another model with the same
+below its coverage. `hf.py` roots the tree at the empty text too: it records
+the path down to the prompt, where natwalk's search begins, and the page opens
+there. A q measure is another model with the same
 tokenizer, `context:N` (p seeing only its last N tokens) or `temperature:T`.
 
 ## Development

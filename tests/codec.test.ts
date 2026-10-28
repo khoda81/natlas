@@ -5,7 +5,7 @@ const ln = (weights: number[]) => weights.map(Math.log);
 
 describe("encode", () => {
   it("matches the exporter's edges", () => {
-    // Computed by export/natlas_export.py:encode.
+    // Computed by export/natlas_codec.py:encode.
     const weights = [0.5, 0.3, 0.3, 0.15, 0.001, 1e-6];
     expect(encode([7, 3, 9, 1, 4, 2], ln(weights), 12)).toEqual([
       { label: 7, odds: 0 },

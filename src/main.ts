@@ -1,16 +1,29 @@
 import { drag, moveDepth, panVertical, scaleAt } from "./camera";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
 import { Expander, wants } from "./expand";
-import { type Box, type Camera, clamp, type Frame, type Lens, layout, normalize, reanchor, repair, type Viewport } from "./layout";
+import {
+  type Box,
+  type Camera,
+  clamp,
+  type Frame,
+  type Lens,
+  layout,
+  logView,
+  normalize,
+  place,
+  reanchor,
+  repair,
+  type Viewport,
+} from "./layout";
 import { BITS, draw, NATS, RULER_HEIGHT, screenRect, slotKey, type Units } from "./render";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "./source";
-import { IntervalTree, type Slots } from "./tree";
+import { IntervalTree, type NodeId, type Slots, type TreeNode } from "./tree";
 
 const KEY_DEPTH_PX = 80;
 const KEY_PAN = 0.1;
 const KEY_SCALE = 1.25;
 const FOCUS_MS = 450;
-const PATH_CHIPS = 24;
+const LOCAL_SERVER = "http://localhost:8421/";
 
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -26,6 +39,9 @@ class App {
   private readonly canvas = element<HTMLCanvasElement>("canvas");
   private readonly ctx = this.canvas.getContext("2d")!;
   private readonly inspect = element<HTMLElement>("inspect");
+  private readonly where = element<HTMLElement>("where");
+  /** The box the path panel shows, as ``node:slot``. */
+  private shown = "";
   private readonly readout = element<HTMLElement>("readout");
   private readonly legend = element<HTMLElement>("legend");
   private readonly status = element<HTMLElement>("status");
@@ -67,12 +83,7 @@ class App {
 
   async start(): Promise<void> {
     const select = element<HTMLSelectElement>("dataset");
-    let entries: DatasetEntry[] = [];
-    try {
-      entries = await manifest();
-    } catch {
-      // No manifest; files can still be dropped in.
-    }
+    const entries = await manifest(liveServer());
     for (const entry of entries) select.add(new Option(entry.title, entry.name));
     const load = (name: string) => {
       const entry = entries.find((candidate) => candidate.name === name) ?? entries[0];
@@ -116,6 +127,36 @@ class App {
     element("lens").hidden = !multiple;
     this.setLens({ p: 0, q: 0 });
     this.reset();
+    this.shown = "";
+    this.where.hidden = true;
+    void this.travel(dataset.start).catch((error: unknown) => this.setStatus(String(error)));
+  }
+
+  /** Fetch the way down ``path`` from the root, then stand at its end. */
+  private async travel(path: number[]): Promise<void> {
+    const tree = this.tree!;
+    const expander = this.expander!;
+    let node = tree.root;
+    for (const label of path) {
+      if (!(await expander.reach(node, this.lens.p, label))) break;
+      node = tree.child(node.id, label);
+    }
+    // The dataset may have changed, or the view moved on, meanwhile.
+    if (tree !== this.tree || node.parent === null) return;
+    this.standAt(node);
+    this.showPath(node.parent, node.label);
+  }
+
+  /** Put ``node`` where the root stands, its children filling the view, as a double-click does. */
+  private standAt(node: TreeNode): void {
+    const tree = this.tree!;
+    const { lnMass, x1 } = place(tree, this.lens, node.id);
+    const slot = tree.node(node.parent!).slots(this.lens).slotOf(node.label)!;
+    this.focus = null;
+    this.cam.anchor = normalize(tree, this.lens, { node: node.parent!, slot });
+    this.cam.x = rootLike(lnMass, x1);
+    this.cam.a = 0.5 - Math.exp(lnMass - logView(this.cam)) / 2;
+    this.invalidate();
   }
 
   private setLens(lens: Lens): void {
@@ -179,7 +220,7 @@ class App {
       hover: this.hover,
       ancestors,
       units: this.units,
-      text: (label) => this.text(label),
+      text: (label) => visible(this.text(label)),
     });
     this.updateReadout();
     if (this.focus) this.invalidate();
@@ -215,6 +256,8 @@ class App {
     canvas.addEventListener("pointerup", release);
     canvas.addEventListener("pointercancel", release);
     canvas.addEventListener("pointerleave", () => {
+      // The path panel may fit its text again.
+      this.where.style.minHeight = "";
       if (this.dragging) return;
       this.pointer = null;
       this.invalidate();
@@ -307,7 +350,7 @@ class App {
       box,
       start: performance.now(),
       fromX: this.cam.x,
-      toX: rootLike(box),
+      toX: rootLike(box.lnMass, box.x1),
       fromCenter: (box.y0 + box.y1) / 2,
     };
     this.invalidate();
@@ -342,6 +385,29 @@ class App {
     const covered = pointer !== null && pointer.x < this.view.width * 0.45 && pointer.y > this.view.height * 0.55;
     this.inspect.classList.toggle("right", covered);
     this.updateInspect();
+    if (this.hover !== null) this.showPath(this.hover.node, this.hover.label, this.hover);
+  }
+
+  /**
+   * Show the text from the root down to child ``label`` of ``node``, or to
+   * ``node`` itself for a tail or merged box, until another box is hovered.
+   * While the pointer is over the canvas the panel only grows, so that a
+   * shorter text cannot shrink it, resize the canvas, and move the box under
+   * the pointer.
+   */
+  private showPath(node: NodeId, label: number | null, box?: Box): void {
+    const tree = this.tree;
+    const key = `${node}:${box?.slot ?? label}:${box?.kind ?? ""}`;
+    if (tree === null || key === this.shown) return;
+    this.shown = key;
+    const where = this.where;
+    where.style.minHeight = this.pointer === null ? "" : `${where.offsetHeight}px`;
+    const tokens = tree.path(node).map((step) => token(this.text(step)));
+    if (label !== null) tokens.push(token(this.text(label), "current"));
+    else if (box !== undefined) tokens.push(token(box.kind === "merged" ? ` ${box.count} children` : " …", "more"));
+    where.replaceChildren(...tokens);
+    where.hidden = false;
+    where.scrollTop = where.scrollHeight;
   }
 
   private text(label: number): string {
@@ -370,11 +436,8 @@ class App {
       return;
     }
     const node = tree.node(box.node);
-    const labels = tree.path(box.node).map((label) => this.text(label));
-    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : this.text(box.label);
-    const chips = labels.slice(-PATH_CHIPS).map((label) => chip(label, false));
-    if (labels.length > PATH_CHIPS) chips.unshift(chip(`… ${labels.length - PATH_CHIPS}`, false, true));
-    chips.push(chip(last, true));
+    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : visible(this.text(box.label));
+    const chips = [chip(last)];
 
     const { p, q } = this.lens;
     const names = this.dataset?.measures ?? [];
@@ -457,17 +520,40 @@ class App {
 }
 
 /**
- * Depth at which ``box`` fills the view, -ln of its p mass, since the view
- * spans e^-x of the root. With p = q that is also where its children start;
- * otherwise stop where they start, if sooner, so they stay on screen.
+ * Depth at which a box of ln p mass ``lnMass`` fills the view, since the view
+ * spans e^-x of the root. With p = q that is also where its children start,
+ * at ``x1``; otherwise stop there, if sooner, so they stay on screen.
  */
-function rootLike(box: Box): number {
-  return Math.min(-box.lnMass, box.x1);
+function rootLike(lnMass: number, x1: number): number {
+  return Math.min(-lnMass, x1);
 }
 
-function chip(text: string, current: boolean, muted = false): HTMLElement {
+/** Whitespace made visible, for a label shown on its own. */
+function visible(text: string): string {
+  return text.replace(/[ \n\r\t]/g, (c) => ({ " ": "␠", "\n": "↵", "\r": "↩", "\t": "⇥" })[c]!);
+}
+
+/**
+ * The live server to ask for datasets: ``?server=URL``, else a local one when
+ * the page itself is local, so a deployed page never probes the visitor's
+ * machine.
+ */
+function liveServer(): string | undefined {
+  const server = new URLSearchParams(location.search).get("server");
+  if (server !== null) return new URL(server.endsWith("/") ? server : `${server}/`, location.href).href;
+  return ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) ? LOCAL_SERVER : undefined;
+}
+
+function token(text: string, kind?: string): HTMLElement {
   const span = document.createElement("span");
-  span.className = `chip${current ? " current" : ""}${muted ? " muted" : ""}`;
+  span.className = kind === undefined ? "token" : `token ${kind}`;
+  span.textContent = text;
+  return span;
+}
+
+function chip(text: string): HTMLElement {
+  const span = document.createElement("span");
+  span.className = "chip current";
   span.textContent = text;
   return span;
 }

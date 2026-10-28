@@ -23,6 +23,8 @@
       <button id="help-toggle" type="button" title="controls (?)">?</button>
     </header>
 
+    <section id="where" class="where" hidden aria-label="text down to the hovered box"></section>
+
     <main class="stage"><canvas id="canvas"></canvas></main>
 
     <aside id="inspect" class="inspect" hidden></aside>
@@ -46,6 +48,8 @@
         <dd>move along the interval</dd>
         <dt>ctrl + wheel · pinch · + −</dt>
         <dd>horizontal scale, the base of the log</dd>
+        <dt>hover</dt>
+        <dd>show the text down to a box above the canvas, until the next hover</dd>
         <dt>double-click</dt>
         <dd>glide until a box stands like the root, its children filling the view</dd>
         <dt>0</dt>

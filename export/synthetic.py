@@ -82,7 +82,7 @@ class NGramCursor:
 
 
 def label(symbol: str) -> str:
-    return {" ": "␠", _END: "∎"}.get(symbol, symbol)
+    return "∎" if symbol == _END else symbol
 
 
 def main() -> None:

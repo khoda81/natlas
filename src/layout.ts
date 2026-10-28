@@ -69,6 +69,11 @@ export interface Frame {
   boxes: Box[];
   /** Nodes whose slots were laid out, with their ln p mass and left edge in nats. */
   walked: { node: NodeId; lnMass: number; x: number }[];
+  /**
+   * Children not expanded yet whose own children would start on screen, even
+   * where their box itself ends at or left of the screen's left edge.
+   */
+  unexpanded: { node: NodeId; label: Label; lnMass: number; x1: number }[];
   /** Slot boundaries inside the view, re-anchoring candidates. */
   boundaries: { boundary: Boundary; y: number }[];
   /** Root interval edges in view heights; bounds, once an ancestor covers the view. */
@@ -153,6 +158,7 @@ export function layout(
   const mergeUnits = mergePx / view.height;
   const boxes: Box[] = [];
   const walked: Frame["walked"] = [];
+  const unexpanded: Frame["unexpanded"] = [];
   const boundaries: Frame["boundaries"] = [];
 
   const boundary = (node: TreeNode, slot: number, y: number) => {
@@ -205,7 +211,9 @@ export function layout(
     push({ node: node.id, slot, count: 1, kind, label, p: pw, q: qw, lnMass: childMass, x0: x, x1, y0, y1 });
     boundary(node, slot, y0);
     boundary(node, slot + 1, y1);
-    if (kind !== "node" || x1 >= right) return;
+    if (x1 >= right) return;
+    if (kind === "leaf") unexpanded.push({ node: node.id, label: label!, lnMass: childMass, x1 });
+    if (kind !== "node") return;
     if (downward) down(child!, 0, y0, scaled(pw, scale), x1, childMass);
     else up(child!, child!.slots(lens).count - 1, y1, scaled(pw, scale), x1, childMass);
   };
@@ -321,7 +329,7 @@ export function layout(
     if (top <= 0 && bottom >= 1 && x <= cam.x) break;
   }
 
-  return { boxes, walked, boundaries, rootTop: top, rootBottom: bottom };
+  return { boxes, walked, unexpanded, boundaries, rootTop: top, rootBottom: bottom };
 }
 
 /** The anchor chain, each node's slot in its parent, and each node's ln p mass. */
@@ -334,6 +342,19 @@ function walk(tree: IntervalTree, lens: Lens, cam: Camera) {
     lnMasses[i] = lnMasses[i - 1]! + Math.log(chain[i - 1]!.slots(lens).p[slots[i]!]!);
   }
   return { chain, slots, lnMasses };
+}
+
+/** ``id``'s ln p mass and the right edge of its box in nats, -Σ ln q along its path. */
+export function place(tree: IntervalTree, lens: Lens, id: NodeId): { lnMass: number; x1: number } {
+  let lnMass = 0;
+  let x1 = 0;
+  for (const node of tree.chain(id).slice(1)) {
+    const slots = tree.node(node.parent!).slots(lens);
+    const slot = slotIn(tree, lens, node);
+    lnMass += Math.log(slots.p[slot]!);
+    x1 += nats(slots.q[slot]!);
+  }
+  return { lnMass, x1 };
 }
 
 /** Root interval edges in view heights, walking the whole anchor chain. */

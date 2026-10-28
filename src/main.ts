@@ -1,4 +1,3 @@
-import "./style.css";
 import { drag, moveDepth, panVertical, scaleAt } from "./camera";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
 import { type Box, type Camera, clamp, type Frame, type Lens, layout, normalize, reanchor, type Viewport } from "./layout";
@@ -224,7 +223,7 @@ class App {
   }
 
   private bindKeys(): void {
-    addEventListener("keydown", (event) => {
+    window.addEventListener("keydown", (event) => {
       if (event.target instanceof HTMLSelectElement || event.ctrlKey || event.metaKey || event.altKey) return;
       const { width } = this.view;
       const cam = this.cam;
@@ -267,8 +266,8 @@ class App {
   }
 
   private bindDrop(): void {
-    addEventListener("dragover", (event) => event.preventDefault());
-    addEventListener("drop", async (event) => {
+    window.addEventListener("dragover", (event) => event.preventDefault());
+    window.addEventListener("drop", async (event) => {
       event.preventDefault();
       const file = event.dataTransfer?.files[0];
       if (!file) return;

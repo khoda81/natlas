@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { moveDepth } from "../src/camera";
 import { type Camera, clamp, layout, reanchor, rootExtent } from "../src/layout";
 import { chainTree } from "./build";

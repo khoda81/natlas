@@ -11,7 +11,7 @@
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "types": ["vite/client"]
+    "types": ["bun"]
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests", "serve.ts"]
 }

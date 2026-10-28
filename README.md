@@ -67,7 +67,7 @@ Datasets live in `public/data/` (git-ignored) with a `manifest.json`; a `.pb`
 snapshot can also be dropped onto the page.
 
 ```bash
-npm run data      # Zen of Python character n-grams, no ML needed
+bun run data      # Zen of Python character n-grams, no ML needed
 cd export
 uv run hf.py      # Qwen3-1.7B as p, Qwen3-0.6B as q
 uv run hf.py --p HuggingFaceTB/SmolLM2-360M --tokenizer HuggingFaceTB/SmolLM2-360M \
@@ -80,9 +80,13 @@ tokenizer, `context:N` (p seeing only its last N tokens) or `temperature:T`.
 
 ## Development
 
+[Bun](https://bun.sh) runs everything: install, the dev server (`serve.ts`,
+which bundles the page and serves `public/`), tests and the static build.
+
 ```bash
-npm install
-npm run dev
-npm test
-npm run proto   # after editing the .proto; needs protoc
+bun install
+bun run dev     # http://localhost:5173, PORT to change
+bun test
+bun run build   # static site in dist/, datasets included
+bun run proto   # after editing the .proto; needs protoc
 ```

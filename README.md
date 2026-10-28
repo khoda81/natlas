@@ -1,9 +1,26 @@
 # natlas
 
 A web navigator for nested interval trees, built as the visual client for
-[natwalk](../natwalk). It knows nothing about tokens or models: a tree is
-nodes whose children partition their interval, with one weight per child under
-each *measure*, and children are numbered labels whose text comes separately.
+[natwalk](https://github.com/khoda81/natwalk). It knows nothing about tokens or
+models: a tree is nodes whose children partition their interval, with one
+weight per child under each *measure*, and children are numbered labels whose
+meaning comes separately.
+
+![SmolLM2-360M continuing "The most interesting consequence of information theory is"](docs/text.png)
+
+A language model's tree of texts: each box is a token, as tall as its
+probability and as wide as its surprisal, so a node's boxes cover its entropy.
+
+![MuScriptor transcribing a guitar, with a piano roll of the transcription so far](docs/music.png)
+
+[MuScriptor](https://github.com/muscriptor/muscriptor) transcribing a
+recording: the boxes are its events (time shifts, here), and the panel above
+is a piano roll of the path to the hovered box.
+
+![MuScriptor hearing the recording against MuScriptor hearing silence](docs/music-silence.png)
+
+The same model with q hearing silence instead: red boxes are events the audio
+made likelier, and their extra width is what it told the model, KL(p‖q).
 
 ## The picture
 
@@ -111,6 +128,45 @@ uv run serve.py "Once upon a time" \
   --q temperature:1.6
 ```
 
+### Music
+
+```bash
+cd export
+uv run scribe.py song.mp3 --at 30 --q silence
+```
+
+`export/scribe.py` serves [MuScriptor](https://github.com/muscriptor/muscriptor)'s transcriptions of a
+recording from `--at` seconds on. MuScriptor writes music 5 seconds at a time,
+as MIDI-like events: a tie prologue naming the notes sustained into the
+window, then time shifts, instruments, note-ons and note-offs, pitches, drum
+hits and an EOS. A path is one transcription of the whole recording, scrolling
+through the windows as `TranscriptionModel.transcribe` does, as in natwalk's
+MuScriptor demo: EOS is the model's decision to move on, each later window's
+prologue is forced from the notes the path leaves sounding (probability one),
+a window at MuScriptor's 2000-event limit gets a forced EOS, and the last
+window's EOS ends the path. A path's probability is the one MuScriptor's
+chunked decoder gives that transcription.
+
+The measures are the model (`--p small|medium|large`) and each `--q`: another
+size hearing the same audio, `silence` for the model hearing nothing (p
+against it shows what the audio told the model), `instruments:piano,drums`
+for the model told what to expect, or `temperature:T`. Each measure keeps a
+few KV caches (`--slots`), one per window in reach, stepped back to the prefix
+a request shares with what they hold.
+
+Its `/labels.json` is a notes file rather than an array of bytes:
+`{"kind": "notes", "frameRate", "window", "windows", "at", "audio", "events":
+[[type, value], …], "instruments", "drums"}`. The client reads its kind and
+draws each box as its event: a note head for a note-on and a ring for a
+note-off in the instrument's color, a tie, a drum ×, a clock with the time in
+the recording for a shift, a stop for an EOS. The panel above the canvas
+becomes a piano roll of the path, following the window being written: the
+hovered event's notes are outlined and a cursor marks the time written so
+far. Drag its corner to make it taller; wheel or drag to scroll pitches and
+time, ctrl + wheel to zoom time, double-click to follow again. Hovering a
+note names it. Space plays the transcription in view, shift + space plays it
+over the recording (`/audio.wav`).
+
 ## Data
 
 Datasets live in `public/data/` (git-ignored) with a `manifest.json`: per
@@ -147,3 +203,12 @@ bun test
 bun run build   # static site in dist/, datasets included
 bun run proto   # after editing the .proto; needs protoc
 ```
+
+The exporters (`export/hf.py`, `export/synthetic.py`) use a
+[natwalk](https://github.com/khoda81/natwalk) checkout beside this one;
+the live servers need only what their script headers declare, which `uv run`
+installs.
+
+## License
+
+[MIT](LICENSE)

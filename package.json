@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "proto": "scripts/gen-proto.sh",
     "data": "cd export && uv run synthetic.py",
-    "live": "cd export && uv run serve.py"
+    "live": "cd export && uv run serve.py",
+    "scribe": "cd export && uv run scribe.py"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.16.0",
@@ -21,5 +22,7 @@
     "@bufbuild/protoc-gen-es": "2.16.0",
     "@types/bun": "1.4.2",
     "typescript": "7.0.2"
-  }
+  },
+  "license": "MIT",
+  "repository": "https://github.com/khoda81/natlas"
 }

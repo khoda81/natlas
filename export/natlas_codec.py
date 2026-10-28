@@ -1,4 +1,4 @@
-"""The natlas listing codec and node handles, mirroring src/codec.ts and src/tree.ts."""
+"""The natlas listing codec, mirroring src/codec.ts."""
 
 from __future__ import annotations
 
@@ -11,11 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from natlas.v1 import natlas_pb2 as pb  # noqa: E402
 
-ROOT = 0
 SATURATED = (1 << 31) - 1
 _LOWEST = -(1 << 31)
-_MASK = (1 << 64) - 1
-_GOLDEN = 0x9E3779B97F4A7C15
 
 
 def encode(labels: Sequence[int], ln_weights: Sequence[float], horizon: int) -> list[pb.Edge]:
@@ -38,14 +35,6 @@ def encode(labels: Sequence[int], ln_weights: Sequence[float], horizon: int) -> 
         edges.append(pb.Edge(label=label, odds=odds))
         previous += ln_sigmoid(math.inf if odds == SATURATED else odds * unit)
     return edges
-
-
-def child_handle(parent: int, label: int) -> int:
-    """Handle of the child with ``label`` of the node with handle ``parent``."""
-    z = (parent + _GOLDEN * (label + 1)) & _MASK
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK
-    return z ^ (z >> 31)
 
 
 def step(horizon: int) -> float:

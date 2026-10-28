@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from natlas.v1 import natlas_pb2 as pb  # noqa: E402
-from natlas_codec import ROOT, child_handle, encode  # noqa: E402
+from natlas_codec import encode  # noqa: E402
 from natwalk import Tree  # noqa: E402
 from natwalk.tree import NodeId  # noqa: E402
 
@@ -69,18 +69,22 @@ def snapshots(
     """
     if start and len(ancestry) != 1 + len(extra):
         raise ValueError("a start path needs the weights along it under every measure")
-    path_handles = [ROOT]
-    for label in start:
-        path_handles.append(child_handle(path_handles[-1], label))
+    # Handles are the recording's own: the nodes on the start path by depth,
+    # then natwalk's nodes by id after them, natwalk's root last on the path.
+    def along(depth: int) -> pb.Child | None:
+        return None if depth == 0 else pb.Child(parent=depth - 1, label=start[depth - 1])
 
-    handles: dict[NodeId, int] = {}
-    for node_id, node in enumerate(tree.nodes):
-        parent = node.parent
-        handles[node_id] = path_handles[-1] if parent is None else child_handle(handles[parent], tree.token(node_id))
+    def handle(node_id: NodeId) -> int:
+        return len(start) + node_id
+
+    def named(node_id: NodeId) -> tuple[pb.Child | None, int]:
+        parent = tree[node_id].parent
+        request = along(len(start)) if parent is None else pb.Child(parent=handle(parent), label=tree.token(node_id))
+        return request, handle(node_id)
 
     def along_start(measure: int) -> list[pb.Expansion]:
         return [
-            _expansion_of(path_handles[depth], ancestry[measure](start[:depth]), min_list, max_list, coverage, label)
+            _expansion_of((along(depth), depth), ancestry[measure](start[:depth]), min_list, max_list, coverage, label)
             for depth, label in enumerate(start)
         ]
 
@@ -97,7 +101,7 @@ def snapshots(
             listed.append(len(listed))
         own.expansions.append(
             _expansion(
-                handles[node_id],
+                named(node_id),
                 horizon,
                 [distribution.token(rank) for rank in listed],
                 [-distribution.nats(rank) for rank in listed],
@@ -110,13 +114,13 @@ def snapshots(
         for node_id in range(len(tree.nodes)):
             # A sequence natwalk has ended has no continuation under any measure.
             weights = measure(node_id) if len(tree[node_id].distribution) else []
-            snapshot.expansions.append(_expansion_of(handles[node_id], weights, min_list, max_list, coverage))
+            snapshot.expansions.append(_expansion_of(named(node_id), weights, min_list, max_list, coverage))
         recorded.append(snapshot)
     return recorded
 
 
 def _expansion_of(
-    handle: int,
+    named: tuple[pb.Child | None, int],
     weights: Sequence[float],
     min_list: int,
     max_list: int,
@@ -128,7 +132,7 @@ def _expansion_of(
     top = heapq.nlargest(max_list, range(len(weights)), key=weights.__getitem__)
     count = _coverage_count([weights[label] for label in top], min_list, max_list, coverage)
     if not count:
-        return _expansion(handle, _LEAF_HORIZON, [], [])
+        return _expansion(named, _LEAF_HORIZON, [], [])
     horizon = _horizon(_ln(weights[top[count - 1]]))
     if include is not None:
         horizon = max(horizon, _horizon(_ln(weights[include])))
@@ -136,12 +140,16 @@ def _expansion_of(
     threshold = math.exp(-horizon * math.log(2))
     heavy = [label for label, weight in enumerate(weights) if weight >= threshold]
     listed = sorted(heavy, key=lambda label: (-weights[label], label))
-    return _expansion(handle, horizon, listed, [_ln(weights[label]) for label in listed])
+    return _expansion(named, horizon, listed, [_ln(weights[label]) for label in listed])
 
 
-def _expansion(handle: int, horizon: int, labels: Sequence[int], ln_weights: Sequence[float]) -> pb.Expansion:
-    request = pb.ExpandRequest(node=handle, horizon=horizon)
-    return pb.Expansion(request=request, edges=encode(labels, ln_weights, horizon))
+def _expansion(
+    named: tuple[pb.Child | None, int], horizon: int, labels: Sequence[int], ln_weights: Sequence[float]
+) -> pb.Expansion:
+    """``named`` is how a request names the node, and the handle the recording gives it."""
+    child, node = named
+    request = pb.ExpandRequest(node=child, horizon=horizon)
+    return pb.Expansion(request=request, node=node, edges=encode(labels, ln_weights, horizon))
 
 
 def _coverage_count(weights: Sequence[float], min_list: int, max_list: int, coverage: float) -> int:

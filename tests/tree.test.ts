@@ -1,15 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { childHandle, IntervalTree, ROOT, Slots } from "../src/tree";
+import { IntervalTree, Slots } from "../src/tree";
 import { listing } from "./build";
-
-describe("childHandle", () => {
-  it("matches the exporter's handles", () => {
-    // Computed by export/natlas_codec.py:child_handle.
-    expect(childHandle(ROOT, 0)).toBe(0xe220a8397b1dcdafn);
-    expect(childHandle(childHandle(ROOT, 3), 0)).toBe(0x4e213bb3324a7b38n);
-    expect(childHandle(ROOT, 151935)).toBe(0xfa81401303fadabcn);
-  });
-});
 
 describe("Slots", () => {
   it("lists p's children in p's order and keeps p's leftover as one tail slot", () => {
@@ -42,12 +33,14 @@ describe("Slots", () => {
 });
 
 describe("IntervalTree", () => {
-  it("names children by label path", () => {
-    const tree = new IntervalTree(1);
+  it("names children by label path, and learns handles per measure", () => {
+    const tree = new IntervalTree(2);
     const child = tree.child(0, 5);
     const grandchild = tree.child(child.id, 2);
-    expect(child.handle).toBe(childHandle(ROOT, 5));
-    expect(tree.byHandle(grandchild.handle)).toBe(grandchild);
+    expect(child.handle(0)).toBeUndefined();
+    child.setHandle(1, 42n);
+    expect(child.handle(0)).toBeUndefined();
+    expect(child.handle(1)).toBe(42n);
     expect(tree.child(0, 5)).toBe(child);
     expect(tree.path(grandchild.id)).toEqual([5, 2]);
   });

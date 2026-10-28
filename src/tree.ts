@@ -11,22 +11,10 @@
 import type { Listing } from "./codec";
 
 export type NodeId = number;
+/** What one server calls a node; the client only learns it. */
 export type Handle = bigint;
 /** A child's name among its siblings; its meaning is agreed outside the protocol. */
 export type Label = number;
-
-export const ROOT: Handle = 0n;
-
-const MASK = (1n << 64n) - 1n;
-const GOLDEN = 0x9e3779b97f4a7c15n;
-
-/** Handle of the child with ``label`` of the node with handle ``parent``. */
-export function childHandle(parent: Handle, label: Label): Handle {
-  let z = (parent + GOLDEN * BigInt(label + 1)) & MASK;
-  z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & MASK;
-  z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & MASK;
-  return z ^ (z >> 31n);
-}
 
 /** Measure indices sizing slot heights (p) and slot widths (-ln q). */
 export interface Lens {
@@ -121,15 +109,24 @@ export class Slots {
 export class TreeNode {
   readonly children = new Map<Label, NodeId>();
   private readonly listings: (Fetched | undefined)[] = [];
+  private readonly handles: (Handle | undefined)[] = [];
   private readonly views = new Map<string, Slots>();
 
   constructor(
     readonly id: NodeId,
-    readonly handle: Handle,
     readonly parent: NodeId | null,
     /** Label of the edge from the parent; -1 for the root. */
     readonly label: Label,
   ) {}
+
+  /** The handle ``measure``'s server gave this node, if it has. */
+  handle(measure: number): Handle | undefined {
+    return this.handles[measure];
+  }
+
+  setHandle(measure: number, handle: Handle | undefined): void {
+    this.handles[measure] = handle;
+  }
 
   listing(measure: number): Fetched | undefined {
     return this.listings[measure];
@@ -158,8 +155,7 @@ export class TreeNode {
 }
 
 export class IntervalTree {
-  readonly nodes: TreeNode[] = [new TreeNode(0, ROOT, null, -1)];
-  private readonly ids = new Map<Handle, NodeId>([[ROOT, 0]]);
+  readonly nodes: TreeNode[] = [new TreeNode(0, null, -1)];
   private listeners = new Set<() => void>();
 
   constructor(readonly measures: number) {}
@@ -174,19 +170,13 @@ export class IntervalTree {
     return node;
   }
 
-  byHandle(handle: Handle): TreeNode | undefined {
-    const id = this.ids.get(handle);
-    return id === undefined ? undefined : this.nodes[id];
-  }
-
   /** The child of ``parent`` with ``label``, created on first use. */
   child(parent: NodeId, label: Label): TreeNode {
     const owner = this.node(parent);
     const id = owner.children.get(label);
     if (id !== undefined) return this.node(id);
-    const node = new TreeNode(this.nodes.length, childHandle(owner.handle, label), parent, label);
+    const node = new TreeNode(this.nodes.length, parent, label);
     this.nodes.push(node);
-    this.ids.set(node.handle, node.id);
     owner.children.set(label, node.id);
     return node;
   }

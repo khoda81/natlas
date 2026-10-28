@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x16natlas/v1/natlas.proto\x12\tnatlas.v1\".\n\rExpandRequest\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x0f\n\x07horizon\x18\x02 \x01(\r\"#\n\x04\x45\x64ge\x12\r\n\x05label\x18\x01 \x01(\r\x12\x0c\n\x04odds\x18\x02 \x01(\x0f\"4\n\x08Snapshot\x12(\n\nexpansions\x18\x01 \x03(\x0b\x32\x14.natlas.v1.Expansion\"V\n\tExpansion\x12)\n\x07request\x18\x01 \x01(\x0b\x32\x18.natlas.v1.ExpandRequest\x12\x1e\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x0f.natlas.v1.Edge2?\n\x06Natlas\x12\x35\n\x06\x45xpand\x12\x18.natlas.v1.ExpandRequest\x1a\x0f.natlas.v1.Edge0\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x16natlas/v1/natlas.proto\x12\tnatlas.v1\"@\n\rExpandRequest\x12\x1e\n\x04node\x18\x01 \x01(\x0b\x32\x10.natlas.v1.Child\x12\x0f\n\x07horizon\x18\x02 \x01(\r\"&\n\x05\x43hild\x12\x0e\n\x06parent\x18\x01 \x01(\x06\x12\r\n\x05label\x18\x02 \x01(\r\"I\n\x0e\x45xpandResponse\x12\x0e\n\x04node\x18\x01 \x01(\x06H\x00\x12\x1f\n\x04\x65\x64ge\x18\x02 \x01(\x0b\x32\x0f.natlas.v1.EdgeH\x00\x42\x06\n\x04part\"#\n\x04\x45\x64ge\x12\r\n\x05label\x18\x01 \x01(\r\x12\x0c\n\x04odds\x18\x02 \x01(\x0f\"4\n\x08Snapshot\x12(\n\nexpansions\x18\x01 \x03(\x0b\x32\x14.natlas.v1.Expansion\"d\n\tExpansion\x12)\n\x07request\x18\x01 \x01(\x0b\x32\x18.natlas.v1.ExpandRequest\x12\x0c\n\x04node\x18\x02 \x01(\x06\x12\x1e\n\x05\x65\x64ges\x18\x03 \x03(\x0b\x32\x0f.natlas.v1.Edge2I\n\x06Natlas\x12?\n\x06\x45xpand\x12\x18.natlas.v1.ExpandRequest\x1a\x19.natlas.v1.ExpandResponse0\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,13 +32,17 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'natlas.v1.natlas_pb2', _glo
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_EXPANDREQUEST']._serialized_start=37
-  _globals['_EXPANDREQUEST']._serialized_end=83
-  _globals['_EDGE']._serialized_start=85
-  _globals['_EDGE']._serialized_end=120
-  _globals['_SNAPSHOT']._serialized_start=122
-  _globals['_SNAPSHOT']._serialized_end=174
-  _globals['_EXPANSION']._serialized_start=176
-  _globals['_EXPANSION']._serialized_end=262
-  _globals['_NATLAS']._serialized_start=264
-  _globals['_NATLAS']._serialized_end=327
+  _globals['_EXPANDREQUEST']._serialized_end=101
+  _globals['_CHILD']._serialized_start=103
+  _globals['_CHILD']._serialized_end=141
+  _globals['_EXPANDRESPONSE']._serialized_start=143
+  _globals['_EXPANDRESPONSE']._serialized_end=216
+  _globals['_EDGE']._serialized_start=218
+  _globals['_EDGE']._serialized_end=253
+  _globals['_SNAPSHOT']._serialized_start=255
+  _globals['_SNAPSHOT']._serialized_end=307
+  _globals['_EXPANSION']._serialized_start=309
+  _globals['_EXPANSION']._serialized_end=409
+  _globals['_NATLAS']._serialized_start=411
+  _globals['_NATLAS']._serialized_end=484
 # @@protoc_insertion_point(module_scope)

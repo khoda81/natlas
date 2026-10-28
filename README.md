@@ -46,12 +46,17 @@ exact geometry 80 halvings deep.
 ## Protocol
 
 `proto/natlas/v1/natlas.proto`. One server serves one measure through one
-call, `Expand(node, horizon)`, which streams the node's children heaviest
-first, down to 2^−horizon of its weight, as `Edge { label, odds }`.
+call, `Expand(node, horizon)`, which streams the node's handle and then its
+children heaviest first, down to 2^−horizon of its weight, as
+`Edge { label, odds }`.
 
 - A child is a 32-bit label; what labels mean (a vocabulary) is agreed
-  outside the protocol. Nodes are 64-bit handles hashed from their label path,
-  root 0, so the client names any node it has seen listed.
+  outside the protocol. Nodes are 64-bit handles the server chooses and the
+  client only learns: a request names a node by its parent's handle and its
+  label, or names nothing for the root, and the reply starts with the node's
+  own handle. A server that has forgotten a handle answers `NOT_FOUND`, and
+  the client names that parent again the same way, going up only as far as
+  the server has forgotten. Horizon 0 asks for the handle alone.
 - Each weight is a fraction g of the previous child's, sent as the log-odds of
   g in steps of horizon·ln 2 / 2³¹ nat. Listings are sorted by construction and
   every prefix is valid: the client sums nothing up front, and whatever the
@@ -63,9 +68,10 @@ first, down to 2^−horizon of its weight, as `Edge { label, odds }`.
   width is a lower bound; the tail is drawn the same way, at least as wide as
   the horizon.
 
-Comparing p with q means asking two servers about the same handles. A
-`Snapshot` is a recorded server, one `Expand` per node; that is what the client
-loads today, re-encoding it for each request.
+Comparing p with q means asking two servers about the same nodes, each by
+its own handles. A `Snapshot` is a recorded server, one `Expand` per node with
+the handle it answered; the client replays it, re-encoding it for each
+request.
 
 ## Live
 
@@ -85,11 +91,13 @@ fetches its way down on load. `/labels.json` holds each token's text. With
 `bun run dev` running, the page finds a local server on its own and lists it
 first; `?server=URL` points it elsewhere.
 
-The server learns paths from its own listings, since handles cannot be
-inverted. After a restart the client teaches it again, expanding each
-ancestor of a node it asks about. Models load in float32 by default, which is
-both more precise and, on a GTX 1660 Ti, about 5× faster than float16;
-`--dtype` trades that for memory on larger models.
+The server's handles hash label paths, so they survive a restart, but it
+cannot invert them: it remembers the parent and label of each node it has
+expanded. After a restart the client names the forgotten ancestors again,
+asking for handles alone, which costs round trips but no forward passes.
+Models load in float32 by default, which is both more precise and, on a GTX
+1660 Ti, about 5× faster than float16; `--dtype` trades that for memory on
+larger models.
 
 ## Data
 

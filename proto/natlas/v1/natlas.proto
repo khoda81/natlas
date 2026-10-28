@@ -8,34 +8,47 @@ package natlas.v1;
 //
 // Every node owns one interval, partitioned by its children. A child is named
 // by a 32-bit label whose meaning (a vocabulary, for a language model) is
-// agreed outside this protocol; siblings have distinct labels. Nodes are named
-// by handles hashed from their path of labels, so a client names any node it
-// has seen listed without asking:
+// agreed outside this protocol; siblings have distinct labels.
 //
-//   handle(root)                     = 0
-//   handle(child of h with label l)  = mix64(h + 0x9e3779b97f4a7c15 * (l + 1))
+// Nodes are named by 64-bit handles that the server chooses and the client
+// only learns: a request names a node by its parent's handle and its own
+// label, and the response begins with the node's handle, by which the client
+// names its children in turn. The root needs no name. A handle means
+// something only to the server that gave it.
 //
-// with arithmetic mod 2^64 and mix64 the SplitMix64 finalizer:
-//
-//   z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9
-//   z = (z ^ z >> 27) * 0x94d049bb133111eb
-//   z =  z ^ z >> 31
-//
-// mix64 is a bijection, so siblings never collide; other collisions are left
-// to chance at 64 bits.
+// A server that has forgotten a handle, as after a restart, answers
+// NOT_FOUND. The client then names that parent afresh by its own parent,
+// going up only as far as the server still knows.
 
 service Natlas {
-  // The children of a node, heaviest first, down to 2^-horizon of its weight.
-  // The client may cancel at any point: every prefix is a valid listing.
-  rpc Expand(ExpandRequest) returns (stream Edge);
+  // A node's handle, then its children, heaviest first, down to 2^-horizon of
+  // its weight. The client may cancel at any point: every prefix is a valid
+  // listing.
+  rpc Expand(ExpandRequest) returns (stream ExpandResponse);
 }
 
 message ExpandRequest {
-  fixed64 node = 1;
+  // The root when unset.
+  Child node = 1;
   // In bits. The server lists every child of conditional weight at least
   // 2^-horizon and stops there, so every child it leaves out is lighter. It
-  // also sets the step of Edge.odds.
+  // also sets the step of Edge.odds. At 0 the server lists nothing: the
+  // client asks only for the handle.
   uint32 horizon = 2;
+}
+
+// The child with `label` of the node the server gave `parent` to.
+message Child {
+  fixed64 parent = 1;
+  uint32 label = 2;
+}
+
+message ExpandResponse {
+  oneof part {
+    // The first message, and only the first: the node's handle.
+    fixed64 node = 1;
+    Edge edge = 2;
+  }
 }
 
 // One child. Its weight w_k is a fraction g_k of the previous child's,
@@ -61,5 +74,6 @@ message Snapshot {
 
 message Expansion {
   ExpandRequest request = 1;
-  repeated Edge edges = 2;
+  fixed64 node = 2;
+  repeated Edge edges = 3;
 }

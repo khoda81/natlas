@@ -8,7 +8,7 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { Decoder } from "./codec";
 import { type Camera, type Frame, logView, type Viewport } from "./layout";
-import type { Source } from "./source";
+import type { Reply, Source } from "./source";
 import type { IntervalTree, Lens, TreeNode } from "./tree";
 
 /** Extra bits asked for beyond a want. */
@@ -100,16 +100,6 @@ export class Expander {
     }
   }
 
-  private async fetch(node: TreeNode, measure: number, horizon: number): Promise<void> {
-    try {
-      await this.fetchOnce(node, measure, horizon);
-    } catch (error) {
-      if (ConnectError.from(error).code !== Code.NotFound) throw error;
-      await this.relearn(node);
-      await this.fetchOnce(node, measure, horizon);
-    }
-  }
-
   /**
    * Fetch ``node``'s listing under ``measure`` deep enough to list ``label``,
    * doubling the horizon until it does; false if no horizon does.
@@ -123,29 +113,45 @@ export class Expander {
     return true;
   }
 
-  /**
-   * Teach a server that does not know ``node``, as after a restart, the way
-   * there: expand each ancestor again as it was listed, root first. Servers
-   * learn handles from their own listings.
-   */
-  private async relearn(node: TreeNode): Promise<void> {
-    const chain = this.tree.chain(node.id);
-    for (let i = 0; i + 1 < chain.length; i++) {
-      const ancestor = chain[i]!;
-      const label = chain[i + 1]!.label;
-      const measure = this.sources.findIndex((_, m) => ancestor.listing(m)?.labels.includes(label));
-      if (measure < 0) continue;
-      const reply = this.sources[measure]!.expand(ancestor.handle, ancestor.listing(measure)!.horizon);
-      for await (const _ of reply.edges);
-    }
-  }
-
-  private async fetchOnce(node: TreeNode, measure: number, horizon: number): Promise<void> {
-    const reply = this.sources[measure]!.expand(node.handle, horizon);
+  private async fetch(node: TreeNode, measure: number, horizon: number): Promise<void> {
+    const reply = await this.open(node, measure, horizon);
     const decoder = new Decoder(horizon, reply.complete);
     for await (const edge of reply.edges) if (!decoder.push(edge)) break;
     // A deeper listing that landed first stays: listings only grow.
     if (horizon < (node.listing(measure)?.horizon ?? -1)) return;
     this.tree.setListing(node.id, measure, { ...decoder.listing(), horizon });
+  }
+
+  /**
+   * Expand ``node`` under ``measure``, naming it by its parent's handle. An
+   * ancestor without one is named first, from the nearest one with a handle,
+   * asking for the handle alone; a handle the server has forgotten, as after
+   * a restart, is dropped and its node named again the same way.
+   */
+  private async open(node: TreeNode, measure: number, horizon: number): Promise<Reply> {
+    const source = this.sources[measure]!;
+    const chain = this.tree.chain(node.id);
+    for (let depth = chain.length - 1; ; ) {
+      const target = chain[depth]!;
+      const parent = chain[depth - 1];
+      const handle = parent?.handle(measure);
+      if (parent !== undefined && handle === undefined) {
+        depth--;
+        continue;
+      }
+      const last = depth === chain.length - 1;
+      let reply: Reply;
+      try {
+        reply = await source.expand(parent && { parent: handle!, label: target.label }, last ? horizon : 0);
+      } catch (error) {
+        if (parent === undefined || ConnectError.from(error).code !== Code.NotFound) throw error;
+        parent.setHandle(measure, undefined);
+        continue;
+      }
+      target.setHandle(measure, reply.node);
+      if (last) return reply;
+      for await (const _ of reply.edges) break;
+      depth++;
+    }
   }
 }

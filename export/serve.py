@@ -19,8 +19,9 @@ is one Natlas service under its own path prefix, /0/ for the model itself and
 streaming. GET /manifest.json describes them to the client, with the prompt's
 tokens as the place to start, and GET /labels.json holds the token texts.
 
-Handles hash paths, so the server learns paths from its own listings: a node
-can be expanded once some listing of any measure has named it.
+A node's handle hashes its path, so handles survive a restart, but the
+server cannot invert them: it remembers each node it has expanded, one parent
+handle and label apiece, and asks the client to name any other again.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ import anyio.to_thread
 import lm
 import numpy as np
 import uvicorn
-from natlas_codec import ROOT, child_handle, encode, pb
+from natlas_codec import encode, pb
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -57,18 +58,35 @@ _CHUNK = 1024
 # Sorted listings kept per measure, about 12 bytes per vocabulary entry each.
 _CACHED = 64
 
+_ROOT = 0
+_MASK = (1 << 64) - 1
+_GOLDEN = 0x9E3779B97F4A7C15
+
+
+def _child_handle(parent: int, label: int) -> int:
+    """SplitMix64 of the parent's handle and the label: siblings never collide."""
+    z = (parent + _GOLDEN * (label + 1)) & _MASK
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK
+    return z ^ (z >> 31)
+
 
 class UnknownNode(Exception):
+    pass
+
+
+class BadLabel(Exception):
     pass
 
 
 class Model:
     """The tree of texts under each measure, computed on demand."""
 
-    def __init__(self, root: tuple[int, ...], eos: set[int], measures: list[lm.Measure]):
+    def __init__(self, root: tuple[int, ...], eos: set[int], labels: int, measures: list[lm.Measure]):
         # What the model reads before the root's children: a start-of-text token.
         self.root = root
         self.eos = eos
+        self.labels = labels
         self.measures = measures
         self.parents: dict[int, tuple[int, int]] = {}
         self.cache: list[OrderedDict[int, tuple[np.ndarray, np.ndarray]]] = [OrderedDict() for _ in measures]
@@ -78,33 +96,39 @@ class Model:
 
     def path(self, handle: int) -> tuple[int, ...]:
         labels = []
-        while handle != ROOT:
+        while handle != _ROOT:
             entry = self.parents.get(handle)
             if entry is None:
-                raise UnknownNode(f"node {handle:016x} has not been listed")
+                raise UnknownNode(f"node {handle:016x} is unknown here")
             handle, label = entry
             labels.append(label)
         return tuple(reversed(labels))
 
-    def expand(self, measure: int, handle: int, horizon: int) -> list[pb.Edge]:
+    def expand(self, measure: int, child: pb.Child | None, horizon: int) -> tuple[int, list[pb.Edge]]:
+        """The node's handle, and its listing down to 2^-horizon."""
         with self.lock:
             started = time.perf_counter()
-            path = self.path(handle)
-            if path and path[-1] in self.eos:
-                return []
+            if child is None:
+                handle, path = _ROOT, ()
+            else:
+                if child.label >= self.labels:
+                    raise BadLabel(f"label {child.label} is past the vocabulary's {self.labels}")
+                path = self.path(child.parent) + (child.label,)
+                handle = _child_handle(child.parent, child.label)
+                self.parents.setdefault(handle, (child.parent, child.label))
+            if horizon == 0 or (path and path[-1] in self.eos):
+                return handle, []
             cached = handle in self.cache[measure]
             labels, nats = self.listing(measure, handle, path)
             count = int(np.searchsorted(nats, horizon * math.log(2), side="right"))
             edges = encode(labels[:count].tolist(), (-nats[:count]).tolist(), horizon)
-            for edge in edges:
-                self.parents.setdefault(child_handle(handle, edge.label), (handle, edge.label))
             elapsed = (time.perf_counter() - started) * 1000
             source = "cached" if cached else "computed"
             print(
                 f"expand m{measure} depth {len(path)} horizon {horizon}: {len(edges)} edges, {source}, {elapsed:.0f} ms",
                 file=sys.stderr,
             )
-            return edges
+            return handle, edges
 
     def listing(self, measure: int, handle: int, path: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
         """Every label at a node, heaviest first, with its surprisal in nats."""
@@ -142,16 +166,21 @@ def app(model: Model, manifest: list[dict], labels: bytes) -> Starlette:
             if flags & _COMPRESSED:
                 return _stream([_end({"code": "unimplemented", "message": "compressed requests"})])
             request_message = pb.ExpandRequest.FromString(body[5 : 5 + length])
+            child = request_message.node if request_message.HasField("node") else None
             try:
-                edges = await anyio.to_thread.run_sync(
-                    model.expand, measure, request_message.node, request_message.horizon
-                )
+                handle, edges = await anyio.to_thread.run_sync(model.expand, measure, child, request_message.horizon)
             except UnknownNode as error:
                 return _stream([_end({"code": "not_found", "message": str(error)})])
+            except BadLabel as error:
+                return _stream([_end({"code": "invalid_argument", "message": str(error)})])
 
             def chunks():
+                yield _envelope(0, pb.ExpandResponse(node=handle).SerializeToString())
                 for start in range(0, len(edges), _CHUNK):
-                    yield b"".join(_envelope(0, edge.SerializeToString()) for edge in edges[start : start + _CHUNK])
+                    yield b"".join(
+                        _envelope(0, pb.ExpandResponse(edge=edge).SerializeToString())
+                        for edge in edges[start : start + _CHUNK]
+                    )
                 yield _end()
 
             return _stream(chunks())
@@ -210,7 +239,8 @@ def main() -> None:
     print(f"loading {args.p} on {args.device} …", file=sys.stderr)
     p_model = lm.load(args.p, args.device, args.dtype)
     measures = lm.measures(args.p, p_model, args.q, args.device, args.dtype)
-    labels = json.dumps(lm.token_texts(tokenizer, lm.vocabulary_size(tokenizer, p_model)), ensure_ascii=False)
+    vocabulary = lm.vocabulary_size(tokenizer, p_model)
+    labels = json.dumps(lm.token_texts(tokenizer, vocabulary), ensure_ascii=False)
     eos = {int(tokenizer.eos_token_id)} if tokenizer.eos_token_id is not None else set()
 
     manifest = [
@@ -222,7 +252,7 @@ def main() -> None:
             "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
         }
     ]
-    model = Model(root, eos, measures)
+    model = Model(root, eos, vocabulary, measures)
     uvicorn.run(app(model, manifest, labels.encode()), host=args.host, port=args.port, access_log=False)
 
 

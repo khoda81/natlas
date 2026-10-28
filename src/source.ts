@@ -5,10 +5,18 @@ import { fromBinary } from "@bufbuild/protobuf";
 import { createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { decode, encode, type WireEdge } from "./codec";
-import { Natlas, SnapshotSchema } from "./gen/natlas/v1/natlas_pb";
-import type { Handle } from "./tree";
+import { type ExpandResponse, Natlas, SnapshotSchema } from "./gen/natlas/v1/natlas_pb";
+import type { Handle, Label } from "./tree";
+
+/** A node as a request names it: the child with ``label`` of the node the server gave ``parent`` to. */
+export interface Child {
+  parent: Handle;
+  label: Label;
+}
 
 export interface Reply {
+  /** The node's handle, to name its children by. */
+  node: Handle;
   /**
    * Every child left out weighs less than 2^-complete. A live server honors
    * the requested horizon; a recording can only vouch for its own.
@@ -18,7 +26,8 @@ export interface Reply {
 }
 
 export interface Source {
-  expand(node: Handle, horizon: number): Reply;
+  /** Expand ``node``, or the root when undefined. */
+  expand(node: Child | undefined, horizon: number): Promise<Reply>;
 }
 
 async function* replay(edges: WireEdge[]): AsyncIterable<WireEdge> {
@@ -27,24 +36,37 @@ async function* replay(edges: WireEdge[]): AsyncIterable<WireEdge> {
 
 /** A recorded server: one Expand per node, re-encoded for each request. */
 export class SnapshotSource implements Source {
-  private readonly recorded = new Map<Handle, { horizon: number; labels: number[]; lnWeights: number[] }>();
+  private readonly recorded = new Map<string, { node: Handle; horizon: number; labels: number[]; lnWeights: number[] }>();
+  /** Given to every node not recorded: no recorded node has it, so nothing is recorded under it either. */
+  private readonly unrecorded: Handle;
 
   constructor(bytes: Uint8Array) {
-    for (const { request, edges } of fromBinary(SnapshotSchema, bytes).expansions) {
+    const handles = new Set<Handle>();
+    for (const { request, node, edges } of fromBinary(SnapshotSchema, bytes).expansions) {
       if (request === undefined) throw new Error("expansion without a request");
       const { labels, lnWeights } = decode(edges, request.horizon);
-      this.recorded.set(request.node, { horizon: request.horizon, labels, lnWeights });
+      this.recorded.set(key(request.node), { node, horizon: request.horizon, labels, lnWeights });
+      handles.add(node);
+      if (request.node !== undefined) handles.add(request.node.parent);
     }
+    let unrecorded = 0n;
+    while (handles.has(unrecorded)) unrecorded++;
+    this.unrecorded = unrecorded;
   }
 
-  expand(node: Handle, horizon: number): Reply {
-    const recorded = this.recorded.get(node);
-    if (recorded === undefined) return { complete: 0, edges: replay([]) };
+  async expand(node: Child | undefined, horizon: number): Promise<Reply> {
+    const recorded = this.recorded.get(key(node));
+    if (recorded === undefined) return { node: this.unrecorded, complete: 0, edges: replay([]) };
     return {
+      node: recorded.node,
       complete: Math.min(horizon, recorded.horizon),
-      edges: replay(encode(recorded.labels, recorded.lnWeights, horizon)),
+      edges: replay(horizon === 0 ? [] : encode(recorded.labels, recorded.lnWeights, horizon)),
     };
   }
+}
+
+function key(node: Child | undefined): string {
+  return node === undefined ? "root" : `${node.parent}:${node.label}`;
 }
 
 /** A live server: every response honors the requested horizon. */
@@ -55,8 +77,23 @@ export class ConnectSource implements Source {
     this.client = createClient(Natlas, createConnectTransport({ baseUrl, useBinaryFormat: true }));
   }
 
-  expand(node: Handle, horizon: number): Reply {
-    return { complete: horizon, edges: this.client.expand({ node, horizon }) };
+  async expand(node: Child | undefined, horizon: number): Promise<Reply> {
+    const stream = this.client.expand({ node, horizon })[Symbol.asyncIterator]();
+    const first = await stream.next();
+    if (first.done || first.value.part.case !== "node") throw new Error("an expansion must begin with its node's handle");
+    return { node: first.value.part.value, complete: horizon, edges: edgesOf(stream) };
+  }
+}
+
+/** The rest of an expansion; stopping early cancels the call. */
+async function* edgesOf(stream: AsyncIterator<ExpandResponse>): AsyncIterable<WireEdge> {
+  try {
+    for (let next = await stream.next(); !next.done; next = await stream.next()) {
+      if (next.value.part.case !== "edge") throw new Error("a handle after the start of an expansion");
+      yield next.value.part.value;
+    }
+  } finally {
+    await stream.return?.();
   }
 }
 

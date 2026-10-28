@@ -10,21 +10,24 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file natlas/v1/natlas.proto.
  */
 export const file_natlas_v1_natlas: GenFile = /*@__PURE__*/
-  fileDesc("ChZuYXRsYXMvdjEvbmF0bGFzLnByb3RvEgluYXRsYXMudjEiLgoNRXhwYW5kUmVxdWVzdBIMCgRub2RlGAEgASgGEg8KB2hvcml6b24YAiABKA0iIwoERWRnZRINCgVsYWJlbBgBIAEoDRIMCgRvZGRzGAIgASgPIjQKCFNuYXBzaG90EigKCmV4cGFuc2lvbnMYASADKAsyFC5uYXRsYXMudjEuRXhwYW5zaW9uIlYKCUV4cGFuc2lvbhIpCgdyZXF1ZXN0GAEgASgLMhgubmF0bGFzLnYxLkV4cGFuZFJlcXVlc3QSHgoFZWRnZXMYAiADKAsyDy5uYXRsYXMudjEuRWRnZTI/CgZOYXRsYXMSNQoGRXhwYW5kEhgubmF0bGFzLnYxLkV4cGFuZFJlcXVlc3QaDy5uYXRsYXMudjEuRWRnZTABYgZwcm90bzM");
+  fileDesc("ChZuYXRsYXMvdjEvbmF0bGFzLnByb3RvEgluYXRsYXMudjEiQAoNRXhwYW5kUmVxdWVzdBIeCgRub2RlGAEgASgLMhAubmF0bGFzLnYxLkNoaWxkEg8KB2hvcml6b24YAiABKA0iJgoFQ2hpbGQSDgoGcGFyZW50GAEgASgGEg0KBWxhYmVsGAIgASgNIkkKDkV4cGFuZFJlc3BvbnNlEg4KBG5vZGUYASABKAZIABIfCgRlZGdlGAIgASgLMg8ubmF0bGFzLnYxLkVkZ2VIAEIGCgRwYXJ0IiMKBEVkZ2USDQoFbGFiZWwYASABKA0SDAoEb2RkcxgCIAEoDyI0CghTbmFwc2hvdBIoCgpleHBhbnNpb25zGAEgAygLMhQubmF0bGFzLnYxLkV4cGFuc2lvbiJkCglFeHBhbnNpb24SKQoHcmVxdWVzdBgBIAEoCzIYLm5hdGxhcy52MS5FeHBhbmRSZXF1ZXN0EgwKBG5vZGUYAiABKAYSHgoFZWRnZXMYAyADKAsyDy5uYXRsYXMudjEuRWRnZTJJCgZOYXRsYXMSPwoGRXhwYW5kEhgubmF0bGFzLnYxLkV4cGFuZFJlcXVlc3QaGS5uYXRsYXMudjEuRXhwYW5kUmVzcG9uc2UwAWIGcHJvdG8z");
 
 /**
  * @generated from message natlas.v1.ExpandRequest
  */
 export type ExpandRequest = Message<"natlas.v1.ExpandRequest"> & {
   /**
-   * @generated from field: fixed64 node = 1;
+   * The root when unset.
+   *
+   * @generated from field: natlas.v1.Child node = 1;
    */
-  node: bigint;
+  node?: Child | undefined;
 
   /**
    * In bits. The server lists every child of conditional weight at least
    * 2^-horizon and stops there, so every child it leaves out is lighter. It
-   * also sets the step of Edge.odds.
+   * also sets the step of Edge.odds. At 0 the server lists nothing: the
+   * client asks only for the handle.
    *
    * @generated from field: uint32 horizon = 2;
    */
@@ -37,6 +40,61 @@ export type ExpandRequest = Message<"natlas.v1.ExpandRequest"> & {
  */
 export const ExpandRequestSchema: GenMessage<ExpandRequest> = /*@__PURE__*/
   messageDesc(file_natlas_v1_natlas, 0);
+
+/**
+ * The child with `label` of the node the server gave `parent` to.
+ *
+ * @generated from message natlas.v1.Child
+ */
+export type Child = Message<"natlas.v1.Child"> & {
+  /**
+   * @generated from field: fixed64 parent = 1;
+   */
+  parent: bigint;
+
+  /**
+   * @generated from field: uint32 label = 2;
+   */
+  label: number;
+};
+
+/**
+ * Describes the message natlas.v1.Child.
+ * Use `create(ChildSchema)` to create a new message.
+ */
+export const ChildSchema: GenMessage<Child> = /*@__PURE__*/
+  messageDesc(file_natlas_v1_natlas, 1);
+
+/**
+ * @generated from message natlas.v1.ExpandResponse
+ */
+export type ExpandResponse = Message<"natlas.v1.ExpandResponse"> & {
+  /**
+   * @generated from oneof natlas.v1.ExpandResponse.part
+   */
+  part: {
+    /**
+     * The first message, and only the first: the node's handle.
+     *
+     * @generated from field: fixed64 node = 1;
+     */
+    value: bigint;
+    case: "node";
+  } | {
+    /**
+     * @generated from field: natlas.v1.Edge edge = 2;
+     */
+    value: Edge;
+    case: "edge";
+  } | { case: undefined; value?: undefined };
+};
+
+/**
+ * Describes the message natlas.v1.ExpandResponse.
+ * Use `create(ExpandResponseSchema)` to create a new message.
+ */
+export const ExpandResponseSchema: GenMessage<ExpandResponse> = /*@__PURE__*/
+  messageDesc(file_natlas_v1_natlas, 2);
 
 /**
  * One child. Its weight w_k is a fraction g_k of the previous child's,
@@ -71,7 +129,7 @@ export type Edge = Message<"natlas.v1.Edge"> & {
  * Use `create(EdgeSchema)` to create a new message.
  */
 export const EdgeSchema: GenMessage<Edge> = /*@__PURE__*/
-  messageDesc(file_natlas_v1_natlas, 1);
+  messageDesc(file_natlas_v1_natlas, 3);
 
 /**
  * A recorded server, used for static datasets: one Expand per node.
@@ -90,7 +148,7 @@ export type Snapshot = Message<"natlas.v1.Snapshot"> & {
  * Use `create(SnapshotSchema)` to create a new message.
  */
 export const SnapshotSchema: GenMessage<Snapshot> = /*@__PURE__*/
-  messageDesc(file_natlas_v1_natlas, 2);
+  messageDesc(file_natlas_v1_natlas, 4);
 
 /**
  * @generated from message natlas.v1.Expansion
@@ -102,7 +160,12 @@ export type Expansion = Message<"natlas.v1.Expansion"> & {
   request?: ExpandRequest | undefined;
 
   /**
-   * @generated from field: repeated natlas.v1.Edge edges = 2;
+   * @generated from field: fixed64 node = 2;
+   */
+  node: bigint;
+
+  /**
+   * @generated from field: repeated natlas.v1.Edge edges = 3;
    */
   edges: Edge[];
 };
@@ -112,22 +175,23 @@ export type Expansion = Message<"natlas.v1.Expansion"> & {
  * Use `create(ExpansionSchema)` to create a new message.
  */
 export const ExpansionSchema: GenMessage<Expansion> = /*@__PURE__*/
-  messageDesc(file_natlas_v1_natlas, 3);
+  messageDesc(file_natlas_v1_natlas, 5);
 
 /**
  * @generated from service natlas.v1.Natlas
  */
 export const Natlas: GenService<{
   /**
-   * The children of a node, heaviest first, down to 2^-horizon of its weight.
-   * The client may cancel at any point: every prefix is a valid listing.
+   * A node's handle, then its children, heaviest first, down to 2^-horizon of
+   * its weight. The client may cancel at any point: every prefix is a valid
+   * listing.
    *
    * @generated from rpc natlas.v1.Natlas.Expand
    */
   expand: {
     methodKind: "server_streaming";
     input: typeof ExpandRequestSchema;
-    output: typeof EdgeSchema;
+    output: typeof ExpandResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_natlas_v1_natlas, 0);

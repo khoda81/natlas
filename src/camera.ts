@@ -18,11 +18,12 @@ export function panVertical(cam: Camera, dy: number): void {
   cam.a += dy;
 }
 
-/** Multiply the horizontal scale about screen x ``sx`` (px) and view fraction ``fy``. */
-export function scaleAt(cam: Camera, factor: number, sx: number, fy: number): void {
-  const depth = cam.x + sx / cam.k;
+/**
+ * Multiply the horizontal scale about the left edge. The view's height follows
+ * the depth there, so keeping it fixed is what leaves the vertical view alone.
+ */
+export function scale(cam: Camera, factor: number): void {
   cam.k = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.k * factor));
-  moveDepth(cam, depth - sx / cam.k - cam.x, fy);
 }
 
 /** Drag: content follows the pointer by (dx, dy) px, zooming about its y. */

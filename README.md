@@ -38,7 +38,7 @@ exact geometry 80 halvings deep.
 | wheel, ← → | deeper / shallower, zooming about the pointer |
 | drag | grab and move |
 | shift + wheel, ↑ ↓ | along the interval |
-| ctrl + wheel, pinch, + − | horizontal scale |
+| ctrl + wheel, pinch, + − | horizontal scale, about the left edge, leaving the vertical view alone |
 | double-click | glide until a box stands like the root, its children filling the view |
 | hover | show the text down to the box above the canvas; it stays until the next hover |
 | 0 · s · b | root · swap p and q · nats/bits |

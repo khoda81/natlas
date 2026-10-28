@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { moveDepth } from "../src/camera";
+import { moveDepth, scale } from "../src/camera";
 import { type Camera, clamp, layout, reanchor, repair, rootExtent } from "../src/layout";
 import { chainTree, listing } from "./build";
 
@@ -65,6 +65,20 @@ describe("layout", () => {
     const cam: Camera = { x: 1, k: 100, anchor: { node: 2, slot: 1 }, a: 0.3 };
     moveDepth(cam, 1.5, 0.3);
     expect(cam.a).toBeCloseTo(0.3, 15);
+  });
+
+  it("scales horizontally without moving anything vertically", () => {
+    const tree = chainTree([0.6, 0.3, 0.1], [0, 1]);
+    const cam: Camera = { x: 1.2, k: 100, anchor: { node: 2, slot: 0 }, a: 0.3 };
+    const before = layout(tree, lens, cam, view);
+    scale(cam, 3);
+    const after = layout(tree, lens, cam, view);
+    expect(cam.x).toBe(1.2);
+    const key = (box: { node: number; slot: number }) => `${box.node}:${box.slot}`;
+    const rows = new Map(before.boxes.map((box) => [key(box), [box.y0, box.y1]]));
+    const shared = after.boxes.filter((box) => rows.has(key(box)));
+    expect(shared.length).toBeGreaterThan(0);
+    for (const box of shared) expect([box.y0, box.y1]).toEqual(rows.get(key(box))!);
   });
 
   it("clamps the view inside the root interval", () => {

@@ -1,4 +1,4 @@
-import { drag, moveDepth, panVertical, scaleAt } from "./camera";
+import { drag, moveDepth, panVertical, scale } from "./camera";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
 import { Expander, wants } from "./expand";
 import {
@@ -19,8 +19,18 @@ import { BITS, draw, NATS, RULER_HEIGHT, screenRect, slotKey, type Units } from 
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "./source";
 import { IntervalTree, type NodeId, type Slots, type TreeNode } from "./tree";
 
-const KEY_DEPTH_PX = 80;
-const KEY_PAN = 0.1;
+/** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
+const KEY_DEPTH_SPEED = 900;
+const KEY_PAN_SPEED = 1.2;
+/** A frame after a stall moves at most this far, so the view never jumps. */
+const MAX_FRAME_MS = 50;
+/** Held arrow keys: depth direction (+1 deeper) and pan direction (+1 content down). */
+const ARROWS: Record<string, { depth: number; pan: number }> = {
+  ArrowRight: { depth: 1, pan: 0 },
+  ArrowLeft: { depth: -1, pan: 0 },
+  ArrowUp: { depth: 0, pan: 1 },
+  ArrowDown: { depth: 0, pan: -1 },
+};
 const KEY_SCALE = 1.25;
 const FOCUS_MS = 450;
 const LOCAL_SERVER = "http://localhost:8421/";
@@ -62,6 +72,9 @@ class App {
   private pointer: { x: number; y: number } | null = null;
   private dragging: { id: number; x: number; y: number } | null = null;
   private focus: Focus | null = null;
+  /** Arrow keys held down, and the time of the last frame that moved by them. */
+  private readonly held = new Set<string>();
+  private heldSince: number | null = null;
   private scheduled = false;
 
   constructor() {
@@ -200,6 +213,7 @@ class App {
     const tree = this.tree;
     if (tree === null) return;
     if (this.focus) this.stepFocus(time);
+    this.stepKeys(time);
     repair(tree, this.lens, this.cam);
     clamp(tree, this.lens, this.cam);
     const frame = layout(tree, this.lens, this.cam, this.view);
@@ -223,7 +237,7 @@ class App {
       text: (label) => visible(this.text(label)),
     });
     this.updateReadout();
-    if (this.focus) this.invalidate();
+    if (this.focus || this.held.size > 0) this.invalidate();
   }
 
   // Pointer and wheel.
@@ -275,33 +289,57 @@ class App {
     const dy = event.deltaY * unit;
     const fy = event.offsetY / this.view.height;
     this.focus = null;
-    if (event.ctrlKey || event.metaKey) scaleAt(this.cam, Math.exp(-dy * 0.01), event.offsetX, fy);
+    if (event.ctrlKey || event.metaKey) scale(this.cam, Math.exp(-dy * 0.01));
     else if (event.shiftKey) panVertical(this.cam, -(dy || dx) / this.view.height);
     else moveDepth(this.cam, (dx - dy) / this.cam.k, fy);
     this.invalidate();
   }
 
+  /** Move by the held arrow keys for the time since the last frame, like movement in a game. */
+  private stepKeys(time: number): void {
+    if (this.held.size === 0) {
+      this.heldSince = null;
+      return;
+    }
+    const dt = Math.min(MAX_FRAME_MS, time - (this.heldSince ?? time)) / 1000;
+    this.heldSince = time;
+    let depth = 0;
+    let pan = 0;
+    for (const key of this.held) {
+      depth += ARROWS[key]!.depth;
+      pan += ARROWS[key]!.pan;
+    }
+    if (depth !== 0) moveDepth(this.cam, (depth * KEY_DEPTH_SPEED * dt) / this.cam.k, 0.5);
+    if (pan !== 0) panVertical(this.cam, pan * KEY_PAN_SPEED * dt);
+  }
+
   private bindKeys(): void {
+    const release = () => this.held.clear();
+    window.addEventListener("blur", release);
+    window.addEventListener("keyup", (event) => {
+      if (this.held.delete(event.key)) event.preventDefault();
+    });
     window.addEventListener("keydown", (event) => {
       if (event.target instanceof HTMLSelectElement || event.ctrlKey || event.metaKey || event.altKey) return;
-      const { width } = this.view;
+      if (event.key in ARROWS) {
+        // Repeats change nothing: the key moves the view for as long as it is down.
+        event.preventDefault();
+        if (!this.held.has(event.key)) {
+          this.held.add(event.key);
+          this.focus = null;
+          this.invalidate();
+        }
+        return;
+      }
       const cam = this.cam;
       const handled = (() => {
         switch (event.key) {
-          case "ArrowRight":
-            return moveDepth(cam, KEY_DEPTH_PX / cam.k, 0.5), true;
-          case "ArrowLeft":
-            return moveDepth(cam, -KEY_DEPTH_PX / cam.k, 0.5), true;
-          case "ArrowUp":
-            return panVertical(cam, KEY_PAN), true;
-          case "ArrowDown":
-            return panVertical(cam, -KEY_PAN), true;
           case "+":
           case "=":
-            return scaleAt(cam, KEY_SCALE, width / 2, 0.5), true;
+            return scale(cam, KEY_SCALE), true;
           case "-":
           case "_":
-            return scaleAt(cam, 1 / KEY_SCALE, width / 2, 0.5), true;
+            return scale(cam, 1 / KEY_SCALE), true;
           case "0":
           case "Home":
             return this.reset(), true;

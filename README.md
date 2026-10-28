@@ -2,8 +2,8 @@
 
 A web navigator for nested interval trees, built as the visual client for
 [natwalk](../natwalk). It knows nothing about tokens or models: a tree is
-nodes whose ordered slots partition their interval, each slot carrying one
-weight per *measure*.
+nodes whose children partition their interval, with one weight per child under
+each *measure*, and children are numbered labels whose text comes separately.
 
 ## The picture
 
@@ -39,32 +39,38 @@ exact geometry 80 halvings deep.
 | drag | grab and move |
 | shift + wheel, ↑ ↓ | along the interval |
 | ctrl + wheel, pinch, + − | horizontal scale |
-| double-click | glide to a box |
+| double-click | glide until a box stands like the root, its children filling the view |
 | 0 · s · b | root · swap p and q · nats/bits |
 
 ## Protocol
 
-`proto/natlas/v1/natlas.proto`. A server streams `ServerMessage`s: one `Hello`
-naming the measures and the log scale, then `Run`s, each listing some children
-of one node by decreasing weight under measure 0.
+`proto/natlas/v1/natlas.proto`. One server serves one measure through one
+call, `Expand(node, horizon)`, which streams the node's children heaviest
+first, down to 2^−horizon of its weight, as `Edge { label, odds }`.
 
-- Weights are only relative. Every weight is an integer log against the node's
-  first child (1/256 nat in the exporters), so measure 0 travels as unsigned
-  gaps between consecutive ranks. The client normalizes each node into its own
-  interval; nothing on the wire has to sum to 1.
-- The unlisted remainder is one rest per measure, drawn as a tail slot. The
-  latest run to reach the end of a node's listing replaces it.
-- Nodes are named by 64-bit handles hashed from their path of ranks, so client
-  and server both derive them; no ids are assigned.
+- A child is a 32-bit label; what labels mean (a vocabulary) is agreed
+  outside the protocol. Nodes are 64-bit handles hashed from their label path,
+  root 0, so the client names any node it has seen listed.
+- Each weight is a fraction g of the previous child's, sent as the log-odds of
+  g in steps of horizon·ln 2 / 2³¹ nat. Listings are sorted by construction and
+  every prefix is valid: the client sums nothing up front, and whatever the
+  listed children leave is the rest. One horizon sets both where the server
+  stops and how precise the weights are.
+- The client asks for what the view needs: a box's children down to a pixel
+  under p and, when q differs, every child that could end short of the right
+  edge under q. Children q has not listed have an upper bound on q, so their
+  width is a lower bound; the tail is drawn the same way, at least as wide as
+  the horizon.
 
-Clients steer with `Focus`: an anchor and a node budget, explored best first
-below the anchor. A `Snapshot` is a recorded stream for a focus on the root;
-that is what the client loads today.
+Comparing p with q means asking two servers about the same handles. A
+`Snapshot` is a recorded server, one `Expand` per node; that is what the client
+loads today, re-encoding it for each request.
 
 ## Data
 
-Datasets live in `public/data/` (git-ignored) with a `manifest.json`; a `.pb`
-snapshot can also be dropped onto the page.
+Datasets live in `public/data/` (git-ignored) with a `manifest.json`: per
+dataset, one `.pb` snapshot per measure and a `.labels.json` of label texts.
+Snapshots, with or without a labels file, can also be dropped onto the page.
 
 ```bash
 bun run data      # Zen of Python character n-grams, no ML needed
@@ -75,7 +81,8 @@ uv run hf.py --p HuggingFaceTB/SmolLM2-360M --tokenizer HuggingFaceTB/SmolLM2-36
 ```
 
 Both use natwalk's own search to discover the tree, then evaluate the other
-measures on the same paths. A q measure is another model with the same
+measures on the same paths, each listed in its own order down to the bit
+below its coverage. A q measure is another model with the same
 tokenizer, `context:N` (p seeing only its last N tokens) or `temperature:T`.
 
 ## Development

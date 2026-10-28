@@ -2,7 +2,6 @@
 
 import { type Palette, rampPosition } from "./color";
 import type { Box, Camera, Frame, Lens, Viewport } from "./layout";
-import type { IntervalTree } from "./tree";
 
 export interface Units {
   name: string;
@@ -18,10 +17,18 @@ export interface DrawState {
   /** ``node:slot`` keys of the hovered box's ancestor slots. */
   ancestors: Set<string>;
   units: Units;
+  /** Display text of a label. */
+  text: (label: number) => string;
 }
 
-const FONT = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-const LABEL_MIN_HEIGHT = 14;
+const FAMILY = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+const BASE_SIZE = 12;
+const FONT = `${BASE_SIZE}px ${FAMILY}`;
+const LABEL_MIN_HEIGHT = 8;
+/** Labels grow to fit their box's height or width, whichever binds first, within these sizes. */
+const LABEL_MAX_SIZE = 96;
+/** Fraction of the visible box height a label may fill. */
+const LABEL_HEIGHT_FILL = 0.6;
 const LABEL_MIN_WIDTH = 14;
 const GAP_MIN = 4;
 export const RULER_HEIGHT = 22;
@@ -52,7 +59,6 @@ export function screenRect(box: Box, cam: Camera, view: Viewport): ScreenRect {
 
 export function draw(
   ctx: CanvasRenderingContext2D,
-  tree: IntervalTree,
   frame: Frame,
   cam: Camera,
   view: Viewport,
@@ -69,7 +75,7 @@ export function draw(
   ctx.font = FONT;
   ctx.textBaseline = "middle";
 
-  const labels: { rect: ScreenRect; text: string; ink: string }[] = [];
+  const labels: { box: Box; rect: ScreenRect; text: string; ink: string; grows: boolean }[] = [];
   for (const box of frame.boxes) {
     const rect = screenRect(box, cam, view);
     const width = rect.x1 - rect.x0;
@@ -98,23 +104,37 @@ export function draw(
       height >= GAP_MIN ? height - 1 : height,
     );
 
-    if (box.kind !== "merged" && height >= LABEL_MIN_HEIGHT && Math.min(rect.x1, view.width) - Math.max(rect.x0, 0) >= LABEL_MIN_WIDTH) {
-      labels.push({ rect, text: tree.node(box.node).label(box.slot), ink });
+    if (box.kind !== "merged" && height >= LABEL_MIN_HEIGHT && width >= LABEL_MIN_WIDTH) {
+      labels.push({ box, rect, text: box.label === null ? "…" : state.text(box.label), ink, grows: box.label !== null });
     }
   }
 
-  // Labels stick to the visible part of their box.
-  for (const { rect, text, ink } of labels) {
-    const left = Math.max(rect.x0, 0);
-    const top = Math.max(rect.y0, 0);
-    const bottom = Math.min(rect.y1, view.height);
-    if (bottom - top < LABEL_MIN_HEIGHT) continue;
+  // A label's size follows its whole box, never the viewport. Within its box,
+  // a label moves toward the viewport as far as the box allows: it starts at
+  // the box's left, centered, and slides right past the left screen edge and
+  // up or down into view, stopping at the box's own edges. A label that still
+  // does not fit stays its size and is clipped.
+  for (const { box, rect, text, ink, grows } of labels) {
+    const boxLeft = (box.x0 - cam.x) * cam.k;
+    const width = (box.x1 - box.x0) * cam.k - 2;
+    const top = box.y0 * view.height;
+    const bottom = box.y1 * view.height;
+    const textWidth = ctx.measureText(text).width / BASE_SIZE;
+    // At size s the text spans textWidth·s, plus s/4 of padding on each side.
+    const fit = Math.min((bottom - top) * LABEL_HEIGHT_FILL, width / (textWidth + 0.5));
+    const size = grows ? Math.min(LABEL_MAX_SIZE, fit) : BASE_SIZE;
+    const pad = Math.max(4, size / 4);
+    const span = textWidth * size;
+    const x = within(pad, boxLeft + pad, boxLeft + width - pad - span);
+    const y = within(within((top + bottom) / 2, size / 2, view.height - size / 2), top + size / 2, bottom - size / 2);
+    if (x > view.width || x + span < 0 || y - size / 2 > view.height || y + size / 2 < 0) continue;
     ctx.save();
     ctx.beginPath();
-    ctx.rect(left, top, Math.min(rect.x1, view.width) - left - 2, bottom - top);
+    ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0 - 2, rect.y1 - rect.y0);
     ctx.clip();
+    ctx.font = `${size}px ${FAMILY}`;
     ctx.fillStyle = ink;
-    ctx.fillText(text, left + 4, (top + bottom) / 2);
+    ctx.fillText(text, x, y);
     ctx.restore();
   }
 
@@ -150,6 +170,11 @@ function outline(
   ctx.lineWidth = 2;
   const rect = screenRect(state.hover, cam, view);
   ctx.strokeRect(rect.x0 + 1, rect.y0 + 1, Math.max(0, rect.x1 - rect.x0 - 3), Math.max(0, rect.y1 - rect.y0 - 3));
+}
+
+/** ``value`` moved into [low, high]; ``low`` wins when the range is empty. */
+function within(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value));
 }
 
 function niceStep(raw: number): number {

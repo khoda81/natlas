@@ -1,15 +1,15 @@
 import { drag, moveDepth, panVertical, scaleAt } from "./camera";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
-import { type Box, type Camera, clamp, type Frame, type Lens, layout, normalize, reanchor, type Viewport } from "./layout";
+import { Expander, wants } from "./expand";
+import { type Box, type Camera, clamp, type Frame, type Lens, layout, normalize, reanchor, repair, type Viewport } from "./layout";
 import { BITS, draw, NATS, RULER_HEIGHT, screenRect, slotKey, type Units } from "./render";
-import { type DatasetEntry, fetchSnapshot, fromSnapshot, manifest } from "./source";
-import type { IntervalTree, TreeNode } from "./tree";
+import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "./source";
+import { IntervalTree, type Slots } from "./tree";
 
 const KEY_DEPTH_PX = 80;
 const KEY_PAN = 0.1;
 const KEY_SCALE = 1.25;
 const FOCUS_MS = 450;
-const FOCUS_MARGIN = 0.12;
 const PATH_CHIPS = 24;
 
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -34,6 +34,8 @@ class App {
   private readonly unitsButton = element<HTMLButtonElement>("units");
 
   private tree: IntervalTree | null = null;
+  private expander: Expander | null = null;
+  private dataset: Dataset | null = null;
   private lens: Lens = { p: 0, q: 0 };
   private cam: Camera = { x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
   private view: Viewport = { width: 1, height: 1 };
@@ -71,38 +73,46 @@ class App {
     } catch {
       // No manifest; files can still be dropped in.
     }
-    for (const entry of entries) select.add(new Option(entry.title, entry.file));
+    for (const entry of entries) select.add(new Option(entry.title, entry.name));
+    const load = (name: string) => {
+      const entry = entries.find((candidate) => candidate.name === name) ?? entries[0];
+      if (entry !== undefined) void this.load(entry);
+    };
     select.addEventListener("change", () => {
       location.hash = select.value;
-      void this.load(select.value);
+      load(select.value);
     });
-    const initial = decodeURIComponent(location.hash.slice(1)) || entries[0]?.file;
+    const initial = decodeURIComponent(location.hash.slice(1)) || entries[0]?.name;
     if (initial === undefined) {
-      this.setStatus("No datasets in data/manifest.json. Drop a .pb snapshot here.");
+      this.setStatus("No datasets in data/manifest.json. Drop .pb snapshots, one per measure, and a labels .json here.");
       return;
     }
     select.value = initial;
-    await this.load(initial);
+    load(initial);
   }
 
-  private async load(file: string): Promise<void> {
-    this.setStatus(`Loading ${file} …`);
+  private async load(entry: DatasetEntry): Promise<void> {
+    this.setStatus(`Loading ${entry.title} …`);
     try {
-      this.setTree(await fetchSnapshot(file));
+      this.setDataset(await fetchDataset(entry));
       this.setStatus("");
     } catch (error) {
       this.setStatus(String(error));
     }
   }
 
-  private setTree(tree: IntervalTree): void {
+  private setDataset(dataset: Dataset): void {
+    const tree = new IntervalTree(dataset.measures.length);
+    this.dataset = dataset;
     this.tree = tree;
+    this.expander = new Expander(tree, dataset.sources);
+    this.expander.onError = (error) => this.setStatus(String(error));
     tree.subscribe(() => this.invalidate());
-    element("title").textContent = tree.title;
+    element("title").textContent = dataset.title;
     for (const select of [this.pSelect, this.qSelect]) {
-      select.replaceChildren(...tree.measures.map((name, index) => new Option(name, String(index))));
+      select.replaceChildren(...dataset.measures.map((name, index) => new Option(name, String(index))));
     }
-    const multiple = tree.measures.length > 1;
+    const multiple = dataset.measures.length > 1;
     element("lens").hidden = !multiple;
     this.setLens({ p: 0, q: 0 });
     this.reset();
@@ -147,23 +157,29 @@ class App {
 
   private render(time: number): void {
     const tree = this.tree;
-    if (tree === null || tree.root === undefined) return;
+    if (tree === null) return;
     if (this.focus) this.stepFocus(time);
+    repair(tree, this.lens, this.cam);
     clamp(tree, this.lens, this.cam);
     const frame = layout(tree, this.lens, this.cam, this.view);
     this.frame = frame;
+    this.expander?.request(wants(tree, this.lens, this.cam, this.view, frame));
     // The anchor is fixed while focusing, so the target stays exactly addressable.
     if (!this.focus) reanchor(this.cam, frame);
     this.updateHover();
     const ancestors = new Set<string>();
     if (this.hover) {
       ancestors.add(slotKey(this.hover.node, this.hover.slot));
-      for (const node of tree.chain(this.hover.node).slice(1)) ancestors.add(slotKey(node.parent!, node.slot));
+      for (const node of tree.chain(this.hover.node).slice(1)) {
+        const slot = tree.node(node.parent!).slots(this.lens).slotOf(node.label);
+        if (slot !== undefined) ancestors.add(slotKey(node.parent!, slot));
+      }
     }
-    draw(this.ctx, tree, frame, this.cam, this.view, this.lens, this.palette, {
+    draw(this.ctx, frame, this.cam, this.view, this.lens, this.palette, {
       hover: this.hover,
       ancestors,
       units: this.units,
+      text: (label) => this.text(label),
     });
     this.updateReadout();
     if (this.focus) this.invalidate();
@@ -269,28 +285,29 @@ class App {
     window.addEventListener("dragover", (event) => event.preventDefault());
     window.addEventListener("drop", async (event) => {
       event.preventDefault();
-      const file = event.dataTransfer?.files[0];
-      if (!file) return;
+      const files = [...(event.dataTransfer?.files ?? [])];
+      if (files.length === 0) return;
       try {
-        this.setTree(fromSnapshot(new Uint8Array(await file.arrayBuffer())));
+        this.setDataset(await droppedDataset(files));
         this.setStatus("");
       } catch (error) {
-        this.setStatus(`${file.name}: ${String(error)}`);
+        this.setStatus(String(error));
       }
     });
   }
 
-  // Focus animation: glide so the box sits near the left edge, centered.
+  // Focus animation: glide until the box stands where the root does, its
+  // children starting at the left edge and filling the view.
 
   private startFocus(box: Box): void {
     if (this.tree === null) return;
-    this.cam.anchor = normalize(this.tree, { node: box.node, slot: box.slot });
+    this.cam.anchor = normalize(this.tree, this.lens, { node: box.node, slot: box.slot });
     this.cam.a = box.y0;
     this.focus = {
       box,
       start: performance.now(),
       fromX: this.cam.x,
-      toX: box.x0 - (FOCUS_MARGIN * this.view.width) / this.cam.k,
+      toX: rootLike(box),
       fromCenter: (box.y0 + box.y1) / 2,
     };
     this.invalidate();
@@ -327,6 +344,10 @@ class App {
     this.updateInspect();
   }
 
+  private text(label: number): string {
+    return this.dataset?.labels[label] ?? `#${label}`;
+  }
+
   private fmt(nats: number): string {
     const value = nats / this.units.nats;
     if (!Number.isFinite(value)) return "∞";
@@ -349,27 +370,34 @@ class App {
       return;
     }
     const node = tree.node(box.node);
-    const labels = tree.path(box.node);
-    const last = box.kind === "merged" ? `${box.count} slots` : node.label(box.slot);
+    const labels = tree.path(box.node).map((label) => this.text(label));
+    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : this.text(box.label);
     const chips = labels.slice(-PATH_CHIPS).map((label) => chip(label, false));
     if (labels.length > PATH_CHIPS) chips.unshift(chip(`… ${labels.length - PATH_CHIPS}`, false, true));
     chips.push(chip(last, true));
 
     const { p, q } = this.lens;
-    const names = tree.measures;
+    const names = this.dataset?.measures ?? [];
+    const slots = node.slots(this.lens);
+    // A tail's q, and q of a child q has not listed, are upper bounds.
+    const qBound = box.kind === "tail" || (box.kind !== "merged" && slots.qBound[box.slot] === true);
+    const [atMost, atLeast] = qBound ? ["≤ ", "≥ "] : ["", ""];
     const rows: [string, string][] = [
       [`p · ${names[p]}`, `${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
     ];
-    if (p !== q) rows.push([`q · ${names[q]}`, `${box.q.toPrecision(4)}  (${this.fmt(-Math.log(box.q))})`]);
-    rows.push(["p · −log q", this.fmt(-box.p * Math.log(box.q))]);
+    if (p !== q || box.kind === "tail") {
+      rows.push([`q · ${names[q]}`, `${atMost}${box.q.toPrecision(4)}  (${atLeast}${this.fmt(-Math.log(box.q))})`]);
+    }
+    rows.push(["p · −log q", `${atLeast}${this.fmt(-box.p * Math.log(box.q))}`]);
     rows.push(["−log P (path)", this.fmt(-box.lnMass)]);
-    const stats = nodeStats(node, this.lens);
-    const bound = node.hasTail ? "≥ " : "";
+    const stats = nodeStats(slots, this.lens);
+    const bound = slots.count > slots.listed || slots.qBound.some(Boolean) ? "≥ " : "";
     if (p === q) rows.push(["H at node", `${bound}${this.fmt(stats.entropy)}`]);
     else {
       rows.push(["H(p) at node", `${bound}${this.fmt(stats.entropy)}`]);
       rows.push(["H(p, q) at node", `${bound}${this.fmt(stats.cross)}`]);
-      rows.push(["KL(p ‖ q) at node", `${bound}${this.fmt(stats.cross - stats.entropy)}`]);
+      // A difference of two lower bounds bounds nothing.
+      rows.push(["KL(p ‖ q) at node", `${bound === "" ? "" : "≈ "}${this.fmt(stats.cross - stats.entropy)}`]);
     }
 
     const list = document.createElement("dl");
@@ -428,6 +456,15 @@ class App {
   }
 }
 
+/**
+ * Depth at which ``box`` fills the view, -ln of its p mass, since the view
+ * spans e^-x of the root. With p = q that is also where its children start;
+ * otherwise stop where they start, if sooner, so they stay on screen.
+ */
+function rootLike(box: Box): number {
+  return Math.min(-box.lnMass, box.x1);
+}
+
 function chip(text: string, current: boolean, muted = false): HTMLElement {
   const span = document.createElement("span");
   span.className = `chip${current ? " current" : ""}${muted ? " muted" : ""}`;
@@ -435,15 +472,16 @@ function chip(text: string, current: boolean, muted = false): HTMLElement {
   return span;
 }
 
-/** Coarse entropy and cross-entropy over a node's slots; the tail counts as one slot. */
-function nodeStats(node: TreeNode, lens: Lens): { entropy: number; cross: number } {
+/** Lower bounds on entropy and cross-entropy over a node's slots; the tail counts as one slot. */
+function nodeStats(slots: Slots, lens: Lens): { entropy: number; cross: number } {
   let entropy = 0;
   let cross = 0;
-  for (let slot = 0; slot < node.slots; slot++) {
-    const p = node.weight(lens.p, slot);
+  for (let slot = 0; slot < slots.count; slot++) {
+    const p = slots.p[slot]!;
     if (p === 0) continue;
-    entropy -= p * Math.log(p);
-    cross -= p * Math.log(node.weight(lens.q, slot));
+    // With p = q, q bounds the tail's heaviest child, which is tighter than the tail as a whole.
+    entropy -= p * Math.log(slots.isTail(slot) && lens.p === lens.q ? slots.q[slot]! : p);
+    cross -= p * Math.log(slots.q[slot]!);
   }
   return { entropy, cross };
 }

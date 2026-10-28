@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { moveDepth } from "../src/camera";
-import { type Camera, clamp, layout, reanchor, rootExtent } from "../src/layout";
-import { chainTree } from "./build";
+import { type Camera, clamp, layout, reanchor, repair, rootExtent } from "../src/layout";
+import { chainTree, listing } from "./build";
 
 const view = { width: 1000, height: 800 };
 const lens = { p: 0, q: 0 };
@@ -73,5 +73,15 @@ describe("layout", () => {
     clamp(tree, lens, cam);
     expect(rootExtent(tree, lens, cam).top).toBeCloseTo(0, 15);
     expect(cam.a).toBeCloseTo(0, 15);
+  });
+
+  it("moves the anchor up to what p lists", () => {
+    // Measure 1 lists only the root's first child, so node 2 is out of reach under it.
+    const tree = chainTree([0.5, 0.5], [1, 0]);
+    for (const node of tree.nodes) tree.setListing(node.id, 1, listing([1]));
+    const cam: Camera = { x: 1, k: 100, anchor: { node: 2, slot: 1 }, a: 0.4 };
+    repair(tree, { p: 1, q: 1 }, cam);
+    expect(cam.anchor).toEqual({ node: 0, slot: 0 });
+    expect(() => layout(tree, { p: 1, q: 1 }, cam, view)).not.toThrow();
   });
 });

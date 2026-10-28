@@ -2,24 +2,18 @@ syntax = "proto3";
 
 package natlas.v1;
 
-// natlas draws a nested interval tree that a server explores on demand.
+// natlas draws a nested interval tree that a server measures on demand. One
+// server serves one measure; comparing two measures means asking two servers
+// about the same nodes.
 //
-// Every node owns one interval, partitioned by its children. The server lists
-// a node's children in runs, by decreasing weight under measure 0, and the
-// client fits them into the node's own interval. Weights are therefore only
-// relative: each one is a log measured against the node's first child under
-// the same measure, in integer units of 1/log_scale nat, and the client
-// normalizes. Nothing on the wire has to sum to anything.
+// Every node owns one interval, partitioned by its children. A child is named
+// by a 32-bit label whose meaning (a vocabulary, for a language model) is
+// agreed outside this protocol; siblings have distinct labels. Nodes are named
+// by handles hashed from their path of labels, so a client names any node it
+// has seen listed without asking:
 //
-// The weight of the children not yet listed travels as one rest per measure.
-// A run that reaches the end of a node's listing replaces its rest: the latest
-// run wins, so a server that refines a node can only cause rounding jitter.
-//
-// Nodes are named by handles derived from their path of ranks, so either side
-// can name any node without a round trip:
-//
-//   handle(root)                 = 0
-//   handle(child of h at rank r) = mix64(h + 0x9e3779b97f4a7c15 * (r + 1))
+//   handle(root)                     = 0
+//   handle(child of h with label l)  = mix64(h + 0x9e3779b97f4a7c15 * (l + 1))
 //
 // with arithmetic mod 2^64 and mix64 the SplitMix64 finalizer:
 //
@@ -30,63 +24,42 @@ package natlas.v1;
 // mix64 is a bijection, so siblings never collide; other collisions are left
 // to chance at 64 bits.
 
-// First message of every stream.
-message Hello {
-  string title = 1;
-  // Measure names. Measure 0 orders every node's children.
-  repeated string measures = 2;
-  // Log weights count units of 1/log_scale nat.
-  uint32 log_scale = 3;
+service Natlas {
+  // The children of a node, heaviest first, down to 2^-horizon of its weight.
+  // The client may cancel at any point: every prefix is a valid listing.
+  rpc Expand(ExpandRequest) returns (stream Edge);
 }
 
-// Children [start, start + len(labels)) of one node. The node itself must be
-// the root or a listed child of a node the stream already has.
-message Run {
+message ExpandRequest {
   fixed64 node = 1;
-  // At most the node's listed count. Overlapping children must match exactly.
-  uint32 start = 2;
-  repeated string labels = 3;
-  // Each per-child array below has one entry per child of the run except rank
-  // 0, whose log weight is 0 by definition.
-  // Measure 0: the drop from the previous rank, ln(w[r - 1] / w[r]).
-  repeated uint32 gaps = 4;
-  // Measures 1 and up, in order: ln(w[0] / w[r]) under that measure.
-  repeated Logs others = 5;
-  // Per measure: ln(w[0] / weight of every child after this run). Absent when
-  // the run lists the node's last child; then a run with no children marks a
-  // leaf. Present only with at least one child listed.
-  Logs rest = 6;
+  // In bits. The server lists every child of conditional weight at least
+  // 2^-horizon and stops there, so every child it leaves out is lighter. It
+  // also sets the step of Edge.odds.
+  uint32 horizon = 2;
 }
 
-message Logs {
-  repeated sint32 values = 1;
+// One child. Its weight w_k is a fraction g_k of the previous child's,
+// w_k = g_k * w_{k-1} with w_{-1} = 1, so a listing is sorted by construction.
+// The client sums nothing up front; what the listed children leave of 1 is
+// the weight of the rest.
+message Edge {
+  uint32 label = 1;
+  // ln(g / (1 - g)) in steps of horizon * ln 2 / 2^31 nat. 2^31 - 1 means
+  // g = 1: a tie with the previous child or, for the first, the whole interval.
+  // Since w_k >= 2^-horizon, every value fits.
+  //
+  // A server encodes each g against the previous weight as the client decodes
+  // it, so rounding never accumulates. Nothing stops a server from listing
+  // more than the whole interval; a client may stop reading where it does.
+  sfixed32 odds = 2;
 }
 
-message ServerMessage {
-  oneof kind {
-    Hello hello = 1;
-    Run run = 2;
-  }
-}
-
-message ClientMessage {
-  oneof kind {
-    Focus focus = 1;
-  }
-}
-
-// Explore from an anchor, replacing any earlier focus. The server lists
-// children best first, by path weight under measure 0 below the anchor, until
-// it has expanded `budget` nodes. Runs already sent stay valid.
-message Focus {
-  // A handle the stream has named, or the root's.
-  fixed64 from = 1;
-  // Ranks from `from` down to the anchor.
-  repeated uint32 path = 2;
-  uint32 budget = 3;
-}
-
-// A recorded server stream, used for static datasets: a focus on the root.
+// A recorded server, used for static datasets: one Expand per node.
 message Snapshot {
-  repeated ServerMessage messages = 1;
+  repeated Expansion expansions = 1;
+}
+
+message Expansion {
+  ExpandRequest request = 1;
+  repeated Edge edges = 2;
 }

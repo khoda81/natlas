@@ -1,87 +1,63 @@
 import { describe, expect, it } from "bun:test";
-import { childHandle, IntervalTree, ROOT } from "../src/tree";
-import { hello, run } from "./build";
-
-const children = (labels: string[], weights: number[], rest?: number) => ({
-  labels,
-  weights: [weights],
-  rest: rest === undefined ? undefined : [rest],
-});
+import { childHandle, IntervalTree, ROOT, Slots } from "../src/tree";
+import { listing } from "./build";
 
 describe("childHandle", () => {
   it("matches the exporter's handles", () => {
     // Computed by export/natlas_export.py:child_handle.
     expect(childHandle(ROOT, 0)).toBe(0xe220a8397b1dcdafn);
     expect(childHandle(childHandle(ROOT, 3), 0)).toBe(0x4e213bb3324a7b38n);
+    expect(childHandle(ROOT, 151935)).toBe(0xfa81401303fadabcn);
+  });
+});
+
+describe("Slots", () => {
+  it("lists p's children in p's order and keeps p's leftover as one tail slot", () => {
+    const slots = new Slots(listing([0.5, 0.3], [10, 20], 2), undefined);
+    expect(slots.labels).toEqual([10, 20]);
+    expect(slots.count).toBe(3);
+    expect(slots.isTail(2)).toBe(true);
+    expect(slots.p[2]).toBeCloseTo(0.2, 9);
+    expect(slots.suffix(1)).toBeCloseTo(0.5, 9);
+    expect(slots.slotOf(20)).toBe(1);
+  });
+
+  it("bounds q where q has not listed a child", () => {
+    // q lists b and c: anything else weighs at most its leftover, 0.1.
+    const p = listing([0.5, 0.3], [0, 1], 2);
+    const q = listing([0.6, 0.3], [1, 2], 2);
+    const slots = new Slots(p, q);
+    expect([...slots.q].map((weight) => Number(weight.toFixed(9)))).toEqual([0.1, 0.6, 0.3]);
+    // The tail holds c, which q lists at 0.3.
+    expect(slots.qBound).toEqual([true, false, true]);
+  });
+
+  it("bounds a tail's children by the horizon and the lightest listed child", () => {
+    const p = listing([0.5, 0.3], [0, 1], 2);
+    const slots = new Slots(p, p);
+    expect(slots.q[2]).toBeCloseTo(0.2, 9);
+    const deep = new Slots({ ...p, complete: 4 }, { ...p, complete: 4 });
+    expect(deep.q[2]).toBe(2 ** -4);
   });
 });
 
 describe("IntervalTree", () => {
-  it("normalizes relative weights and keeps the rest as one tail slot", () => {
-    const tree = new IntervalTree();
-    // Unnormalized: only ratios travel.
-    tree.applyAll([hello(["p"]), run(ROOT, children(["a", "b"], [10, 5], 5))]);
-    const root = tree.node(0);
-    expect(root.slots).toBe(3);
-    expect(root.isTail(2)).toBe(true);
-    expect(root.weight(0, 0)).toBeCloseTo(0.5, 5);
-    expect(root.suffix(0, 1)).toBeCloseTo(0.5, 5);
+  it("names children by label path", () => {
+    const tree = new IntervalTree(1);
+    const child = tree.child(0, 5);
+    const grandchild = tree.child(child.id, 2);
+    expect(child.handle).toBe(childHandle(ROOT, 5));
+    expect(tree.byHandle(grandchild.handle)).toBe(grandchild);
+    expect(tree.child(0, 5)).toBe(child);
+    expect(tree.path(grandchild.id)).toEqual([5, 2]);
   });
 
-  it("lets a run that extends the listing replace the rest", () => {
-    const tree = new IntervalTree();
-    const all = { labels: ["a", "b", "c", "d"], weights: [[0.5, 0.25, 0.15, 0.1]] };
-    tree.applyAll([hello(["p"]), run(ROOT, { ...all, rest: [0.25] }, 0, 2)]);
-    tree.apply(run(ROOT, all, 2, 4));
-    const root = tree.node(0);
-    expect(root.slots).toBe(4);
-    expect(root.hasTail).toBe(false);
-    expect(root.weight(0, 3)).toBeCloseTo(0.1, 5);
-
-    // A replay that stops short of the listing leaves it alone.
-    tree.apply(run(ROOT, { ...all, rest: [0.25] }, 0, 2));
-    expect(root.hasTail).toBe(false);
-  });
-
-  it("measures other measures from their own first child", () => {
-    const tree = new IntervalTree();
-    tree.applyAll([
-      hello(["p", "q"]),
-      run(ROOT, { labels: ["a", "b"], weights: [[0.6, 0.3], [0.1, 0.4]], rest: [0.1, 0.5] }),
-    ]);
-    const root = tree.node(0);
-    expect([0, 1, 2].map((slot) => root.weight(1, slot))).toEqual([
-      expect.closeTo(0.1, 5),
-      expect.closeTo(0.4, 5),
-      expect.closeTo(0.5, 5),
-    ]);
-  });
-
-  it("creates nodes from runs addressed by path handles", () => {
-    const tree = new IntervalTree();
-    const b = childHandle(ROOT, 1);
-    tree.applyAll([hello(["p"]), run(ROOT, children(["a", "b"], [2, 1])), run(b, children([], []))]);
-    const leaf = tree.node(1);
-    expect(leaf.parent).toBe(0);
-    expect(leaf.slot).toBe(1);
-    expect(leaf.slots).toBe(0);
-    expect(tree.node(0).children.get(1)).toBe(1);
-    expect(tree.path(1)).toEqual(["b"]);
-  });
-
-  it("verifies replays and rejects conflicts, gaps and unknown nodes", () => {
-    const tree = new IntervalTree();
-    const root = run(ROOT, children(["a", "b"], [3, 1]));
-    tree.applyAll([hello(["p"]), root]);
-    expect(() => tree.apply(root)).not.toThrow();
-    expect(() => tree.apply(run(ROOT, children(["a", "x"], [3, 1])))).toThrow(/conflicting/);
-    expect(() => tree.apply(run(ROOT, children(["a", "b", "c", "d"], [3, 1, 1, 1]), 3))).toThrow(/missing/);
-    expect(() => tree.apply(run(childHandle(ROOT, 2), children(["x"], [1])))).toThrow(/unknown node/);
-  });
-
-  it("rejects a rest without a child to measure it against", () => {
-    const tree = new IntervalTree();
-    tree.apply(hello(["p"]));
-    expect(() => tree.apply(run(ROOT, { labels: [], weights: [[]], rest: [Number.NaN] }))).toThrow(/rest but no children/);
+  it("tells an unexpanded node from one with nothing within the horizon", () => {
+    const tree = new IntervalTree(1);
+    expect(tree.root.expanded(0)).toBe(false);
+    tree.setListing(0, 0, { ...listing([]), complete: 0 });
+    expect(tree.root.expanded(0)).toBe(false);
+    tree.setListing(0, 0, listing([]));
+    expect(tree.root.expanded(0)).toBe(true);
   });
 });

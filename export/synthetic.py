@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from natlas_export import fsum_except, snapshot, write
+from natlas_export import snapshots, write
 from natwalk import Session
 
 _START = "^"
@@ -101,23 +101,23 @@ def main() -> None:
         session.search.discover()
 
     def measure(model: NGram):
-        def weights(node_id: int, tokens: Sequence[int]) -> tuple[list[float], float]:
-            history = "".join(alphabet[token] for token in session.tree.path(node_id))
-            distribution = model.distribution(history)
-            return [distribution[token] for token in tokens], fsum_except(distribution, tokens)
+        def weights(node_id: int) -> list[float]:
+            return model.distribution("".join(alphabet[token] for token in session.tree.path(node_id)))
 
         return weights
 
-    title = "Zen of Python · character n-grams"
-    data = snapshot(
+    recorded = snapshots(
         session.tree,
-        title=title,
-        measures=("trigram", "bigram", "unigram"),
-        label=lambda token: label(alphabet[token]),
         extra=(measure(bigram), measure(unigram)),
         min_list=len(alphabet),
     )
-    write("zen-ngram", title, data)
+    write(
+        "zen-ngram",
+        "Zen of Python · character n-grams",
+        [label(symbol) for symbol in alphabet],
+        ("trigram", "bigram", "unigram"),
+        recorded,
+    )
 
 
 if __name__ == "__main__":

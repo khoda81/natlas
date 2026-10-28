@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from natlas_export import snapshot, write
+from natlas_export import snapshots, write
 from natwalk import Session
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -120,27 +120,24 @@ def main() -> None:
         return spec, lambda tokens: _probabilities(model, tokens, device)
 
     def weights(probabilities: Callable[[Sequence[int]], np.ndarray]):
-        def at(node_id: int, tokens: Sequence[int]) -> tuple[np.ndarray, float]:
-            values = probabilities(prompt + tree.path(node_id))
-            rest = np.ones(len(values), dtype=bool)
-            rest[list(tokens)] = False
-            return values[list(tokens)], float(np.sum(values[rest]))
+        def at(node_id: int) -> list[float]:
+            return probabilities(prompt + tree.path(node_id)).tolist()
 
         return at
 
     print(f"evaluating {', '.join(specs)} on the discovered tree …", file=sys.stderr)
     measures = [measure(spec) for spec in specs]
+    recorded = snapshots(tree, extra=tuple(weights(probabilities) for _, probabilities in measures))
     display = hf_app.TokenDisplay(tokenizer)
-    title = f"{args.prompt} · {args.p}"
-    data = snapshot(
-        tree,
-        title=title,
-        measures=(args.p, *(name for name, _ in measures)),
-        label=display,
-        extra=tuple(weights(probabilities) for _, probabilities in measures),
-    )
+    vocabulary = max(len(tokenizer), int(p_model.config.vocab_size))
     stem = "-".join(_slug(part.split("/")[-1]) for part in (args.p, *specs))
-    write(args.name or stem, title, data)
+    write(
+        args.name or stem,
+        f"{args.prompt} · {args.p}",
+        [display(token) for token in range(vocabulary)],
+        (args.p, *(name for name, _ in measures)),
+        recorded,
+    )
 
 
 if __name__ == "__main__":

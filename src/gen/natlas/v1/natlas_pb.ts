@@ -2,220 +2,87 @@
 // @generated from file natlas/v1/natlas.proto (package natlas.v1, syntax proto3)
 /* eslint-disable */
 
-import type { GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2";
-import { fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
+import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
+import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv2";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file natlas/v1/natlas.proto.
  */
 export const file_natlas_v1_natlas: GenFile = /*@__PURE__*/
-  fileDesc("ChZuYXRsYXMvdjEvbmF0bGFzLnByb3RvEgluYXRsYXMudjEiOwoFSGVsbG8SDQoFdGl0bGUYASABKAkSEAoIbWVhc3VyZXMYAiADKAkSEQoJbG9nX3NjYWxlGAMgASgNIoABCgNSdW4SDAoEbm9kZRgBIAEoBhINCgVzdGFydBgCIAEoDRIOCgZsYWJlbHMYAyADKAkSDAoEZ2FwcxgEIAMoDRIfCgZvdGhlcnMYBSADKAsyDy5uYXRsYXMudjEuTG9ncxIdCgRyZXN0GAYgASgLMg8ubmF0bGFzLnYxLkxvZ3MiFgoETG9ncxIOCgZ2YWx1ZXMYASADKBEiWQoNU2VydmVyTWVzc2FnZRIhCgVoZWxsbxgBIAEoCzIQLm5hdGxhcy52MS5IZWxsb0gAEh0KA3J1bhgCIAEoCzIOLm5hdGxhcy52MS5SdW5IAEIGCgRraW5kIjoKDUNsaWVudE1lc3NhZ2USIQoFZm9jdXMYASABKAsyEC5uYXRsYXMudjEuRm9jdXNIAEIGCgRraW5kIjMKBUZvY3VzEgwKBGZyb20YASABKAYSDAoEcGF0aBgCIAMoDRIOCgZidWRnZXQYAyABKA0iNgoIU25hcHNob3QSKgoIbWVzc2FnZXMYASADKAsyGC5uYXRsYXMudjEuU2VydmVyTWVzc2FnZWIGcHJvdG8z");
+  fileDesc("ChZuYXRsYXMvdjEvbmF0bGFzLnByb3RvEgluYXRsYXMudjEiLgoNRXhwYW5kUmVxdWVzdBIMCgRub2RlGAEgASgGEg8KB2hvcml6b24YAiABKA0iIwoERWRnZRINCgVsYWJlbBgBIAEoDRIMCgRvZGRzGAIgASgPIjQKCFNuYXBzaG90EigKCmV4cGFuc2lvbnMYASADKAsyFC5uYXRsYXMudjEuRXhwYW5zaW9uIlYKCUV4cGFuc2lvbhIpCgdyZXF1ZXN0GAEgASgLMhgubmF0bGFzLnYxLkV4cGFuZFJlcXVlc3QSHgoFZWRnZXMYAiADKAsyDy5uYXRsYXMudjEuRWRnZTI/CgZOYXRsYXMSNQoGRXhwYW5kEhgubmF0bGFzLnYxLkV4cGFuZFJlcXVlc3QaDy5uYXRsYXMudjEuRWRnZTABYgZwcm90bzM");
 
 /**
- * First message of every stream.
- *
- * @generated from message natlas.v1.Hello
+ * @generated from message natlas.v1.ExpandRequest
  */
-export type Hello = Message<"natlas.v1.Hello"> & {
-  /**
-   * @generated from field: string title = 1;
-   */
-  title: string;
-
-  /**
-   * Measure names. Measure 0 orders every node's children.
-   *
-   * @generated from field: repeated string measures = 2;
-   */
-  measures: string[];
-
-  /**
-   * Log weights count units of 1/log_scale nat.
-   *
-   * @generated from field: uint32 log_scale = 3;
-   */
-  logScale: number;
-};
-
-/**
- * Describes the message natlas.v1.Hello.
- * Use `create(HelloSchema)` to create a new message.
- */
-export const HelloSchema: GenMessage<Hello> = /*@__PURE__*/
-  messageDesc(file_natlas_v1_natlas, 0);
-
-/**
- * Children [start, start + len(labels)) of one node. The node itself must be
- * the root or a listed child of a node the stream already has.
- *
- * @generated from message natlas.v1.Run
- */
-export type Run = Message<"natlas.v1.Run"> & {
+export type ExpandRequest = Message<"natlas.v1.ExpandRequest"> & {
   /**
    * @generated from field: fixed64 node = 1;
    */
   node: bigint;
 
   /**
-   * At most the node's listed count. Overlapping children must match exactly.
+   * In bits. The server lists every child of conditional weight at least
+   * 2^-horizon and stops there, so every child it leaves out is lighter. It
+   * also sets the step of Edge.odds.
    *
-   * @generated from field: uint32 start = 2;
+   * @generated from field: uint32 horizon = 2;
    */
-  start: number;
-
-  /**
-   * @generated from field: repeated string labels = 3;
-   */
-  labels: string[];
-
-  /**
-   * Each per-child array below has one entry per child of the run except rank
-   * 0, whose log weight is 0 by definition.
-   * Measure 0: the drop from the previous rank, ln(w[r - 1] / w[r]).
-   *
-   * @generated from field: repeated uint32 gaps = 4;
-   */
-  gaps: number[];
-
-  /**
-   * Measures 1 and up, in order: ln(w[0] / w[r]) under that measure.
-   *
-   * @generated from field: repeated natlas.v1.Logs others = 5;
-   */
-  others: Logs[];
-
-  /**
-   * Per measure: ln(w[0] / weight of every child after this run). Absent when
-   * the run lists the node's last child; then a run with no children marks a
-   * leaf. Present only with at least one child listed.
-   *
-   * @generated from field: natlas.v1.Logs rest = 6;
-   */
-  rest?: Logs | undefined;
+  horizon: number;
 };
 
 /**
- * Describes the message natlas.v1.Run.
- * Use `create(RunSchema)` to create a new message.
+ * Describes the message natlas.v1.ExpandRequest.
+ * Use `create(ExpandRequestSchema)` to create a new message.
  */
-export const RunSchema: GenMessage<Run> = /*@__PURE__*/
+export const ExpandRequestSchema: GenMessage<ExpandRequest> = /*@__PURE__*/
+  messageDesc(file_natlas_v1_natlas, 0);
+
+/**
+ * One child. Its weight w_k is a fraction g_k of the previous child's,
+ * w_k = g_k * w_{k-1} with w_{-1} = 1, so a listing is sorted by construction.
+ * The client sums nothing up front; what the listed children leave of 1 is
+ * the weight of the rest.
+ *
+ * @generated from message natlas.v1.Edge
+ */
+export type Edge = Message<"natlas.v1.Edge"> & {
+  /**
+   * @generated from field: uint32 label = 1;
+   */
+  label: number;
+
+  /**
+   * ln(g / (1 - g)) in steps of horizon * ln 2 / 2^31 nat. 2^31 - 1 means
+   * g = 1: a tie with the previous child or, for the first, the whole interval.
+   * Since w_k >= 2^-horizon, every value fits.
+   *
+   * A server encodes each g against the previous weight as the client decodes
+   * it, so rounding never accumulates. Nothing stops a server from listing
+   * more than the whole interval; a client may stop reading where it does.
+   *
+   * @generated from field: sfixed32 odds = 2;
+   */
+  odds: number;
+};
+
+/**
+ * Describes the message natlas.v1.Edge.
+ * Use `create(EdgeSchema)` to create a new message.
+ */
+export const EdgeSchema: GenMessage<Edge> = /*@__PURE__*/
   messageDesc(file_natlas_v1_natlas, 1);
 
 /**
- * @generated from message natlas.v1.Logs
- */
-export type Logs = Message<"natlas.v1.Logs"> & {
-  /**
-   * @generated from field: repeated sint32 values = 1;
-   */
-  values: number[];
-};
-
-/**
- * Describes the message natlas.v1.Logs.
- * Use `create(LogsSchema)` to create a new message.
- */
-export const LogsSchema: GenMessage<Logs> = /*@__PURE__*/
-  messageDesc(file_natlas_v1_natlas, 2);
-
-/**
- * @generated from message natlas.v1.ServerMessage
- */
-export type ServerMessage = Message<"natlas.v1.ServerMessage"> & {
-  /**
-   * @generated from oneof natlas.v1.ServerMessage.kind
-   */
-  kind: {
-    /**
-     * @generated from field: natlas.v1.Hello hello = 1;
-     */
-    value: Hello;
-    case: "hello";
-  } | {
-    /**
-     * @generated from field: natlas.v1.Run run = 2;
-     */
-    value: Run;
-    case: "run";
-  } | { case: undefined; value?: undefined };
-};
-
-/**
- * Describes the message natlas.v1.ServerMessage.
- * Use `create(ServerMessageSchema)` to create a new message.
- */
-export const ServerMessageSchema: GenMessage<ServerMessage> = /*@__PURE__*/
-  messageDesc(file_natlas_v1_natlas, 3);
-
-/**
- * @generated from message natlas.v1.ClientMessage
- */
-export type ClientMessage = Message<"natlas.v1.ClientMessage"> & {
-  /**
-   * @generated from oneof natlas.v1.ClientMessage.kind
-   */
-  kind: {
-    /**
-     * @generated from field: natlas.v1.Focus focus = 1;
-     */
-    value: Focus;
-    case: "focus";
-  } | { case: undefined; value?: undefined };
-};
-
-/**
- * Describes the message natlas.v1.ClientMessage.
- * Use `create(ClientMessageSchema)` to create a new message.
- */
-export const ClientMessageSchema: GenMessage<ClientMessage> = /*@__PURE__*/
-  messageDesc(file_natlas_v1_natlas, 4);
-
-/**
- * Explore from an anchor, replacing any earlier focus. The server lists
- * children best first, by path weight under measure 0 below the anchor, until
- * it has expanded `budget` nodes. Runs already sent stay valid.
- *
- * @generated from message natlas.v1.Focus
- */
-export type Focus = Message<"natlas.v1.Focus"> & {
-  /**
-   * A handle the stream has named, or the root's.
-   *
-   * @generated from field: fixed64 from = 1;
-   */
-  from: bigint;
-
-  /**
-   * Ranks from `from` down to the anchor.
-   *
-   * @generated from field: repeated uint32 path = 2;
-   */
-  path: number[];
-
-  /**
-   * @generated from field: uint32 budget = 3;
-   */
-  budget: number;
-};
-
-/**
- * Describes the message natlas.v1.Focus.
- * Use `create(FocusSchema)` to create a new message.
- */
-export const FocusSchema: GenMessage<Focus> = /*@__PURE__*/
-  messageDesc(file_natlas_v1_natlas, 5);
-
-/**
- * A recorded server stream, used for static datasets: a focus on the root.
+ * A recorded server, used for static datasets: one Expand per node.
  *
  * @generated from message natlas.v1.Snapshot
  */
 export type Snapshot = Message<"natlas.v1.Snapshot"> & {
   /**
-   * @generated from field: repeated natlas.v1.ServerMessage messages = 1;
+   * @generated from field: repeated natlas.v1.Expansion expansions = 1;
    */
-  messages: ServerMessage[];
+  expansions: Expansion[];
 };
 
 /**
@@ -223,5 +90,45 @@ export type Snapshot = Message<"natlas.v1.Snapshot"> & {
  * Use `create(SnapshotSchema)` to create a new message.
  */
 export const SnapshotSchema: GenMessage<Snapshot> = /*@__PURE__*/
-  messageDesc(file_natlas_v1_natlas, 6);
+  messageDesc(file_natlas_v1_natlas, 2);
+
+/**
+ * @generated from message natlas.v1.Expansion
+ */
+export type Expansion = Message<"natlas.v1.Expansion"> & {
+  /**
+   * @generated from field: natlas.v1.ExpandRequest request = 1;
+   */
+  request?: ExpandRequest | undefined;
+
+  /**
+   * @generated from field: repeated natlas.v1.Edge edges = 2;
+   */
+  edges: Edge[];
+};
+
+/**
+ * Describes the message natlas.v1.Expansion.
+ * Use `create(ExpansionSchema)` to create a new message.
+ */
+export const ExpansionSchema: GenMessage<Expansion> = /*@__PURE__*/
+  messageDesc(file_natlas_v1_natlas, 3);
+
+/**
+ * @generated from service natlas.v1.Natlas
+ */
+export const Natlas: GenService<{
+  /**
+   * The children of a node, heaviest first, down to 2^-horizon of its weight.
+   * The client may cancel at any point: every prefix is a valid listing.
+   *
+   * @generated from rpc natlas.v1.Natlas.Expand
+   */
+  expand: {
+    methodKind: "server_streaming";
+    input: typeof ExpandRequestSchema;
+    output: typeof EdgeSchema;
+  },
+}> = /*@__PURE__*/
+  serviceDesc(file_natlas_v1_natlas, 0);
 

@@ -24,25 +24,21 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x16natlas/v1/natlas.proto\x12\tnatlas.v1\";\n\x05Hello\x12\r\n\x05title\x18\x01 \x01(\t\x12\x10\n\x08measures\x18\x02 \x03(\t\x12\x11\n\tlog_scale\x18\x03 \x01(\r\"\x80\x01\n\x03Run\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\r\n\x05start\x18\x02 \x01(\r\x12\x0e\n\x06labels\x18\x03 \x03(\t\x12\x0c\n\x04gaps\x18\x04 \x03(\r\x12\x1f\n\x06others\x18\x05 \x03(\x0b\x32\x0f.natlas.v1.Logs\x12\x1d\n\x04rest\x18\x06 \x01(\x0b\x32\x0f.natlas.v1.Logs\"\x16\n\x04Logs\x12\x0e\n\x06values\x18\x01 \x03(\x11\"Y\n\rServerMessage\x12!\n\x05hello\x18\x01 \x01(\x0b\x32\x10.natlas.v1.HelloH\x00\x12\x1d\n\x03run\x18\x02 \x01(\x0b\x32\x0e.natlas.v1.RunH\x00\x42\x06\n\x04kind\":\n\rClientMessage\x12!\n\x05\x66ocus\x18\x01 \x01(\x0b\x32\x10.natlas.v1.FocusH\x00\x42\x06\n\x04kind\"3\n\x05\x46ocus\x12\x0c\n\x04\x66rom\x18\x01 \x01(\x06\x12\x0c\n\x04path\x18\x02 \x03(\r\x12\x0e\n\x06\x62udget\x18\x03 \x01(\r\"6\n\x08Snapshot\x12*\n\x08messages\x18\x01 \x03(\x0b\x32\x18.natlas.v1.ServerMessageb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x16natlas/v1/natlas.proto\x12\tnatlas.v1\".\n\rExpandRequest\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x0f\n\x07horizon\x18\x02 \x01(\r\"#\n\x04\x45\x64ge\x12\r\n\x05label\x18\x01 \x01(\r\x12\x0c\n\x04odds\x18\x02 \x01(\x0f\"4\n\x08Snapshot\x12(\n\nexpansions\x18\x01 \x03(\x0b\x32\x14.natlas.v1.Expansion\"V\n\tExpansion\x12)\n\x07request\x18\x01 \x01(\x0b\x32\x18.natlas.v1.ExpandRequest\x12\x1e\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x0f.natlas.v1.Edge2?\n\x06Natlas\x12\x35\n\x06\x45xpand\x12\x18.natlas.v1.ExpandRequest\x1a\x0f.natlas.v1.Edge0\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'natlas.v1.natlas_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_HELLO']._serialized_start=37
-  _globals['_HELLO']._serialized_end=96
-  _globals['_RUN']._serialized_start=99
-  _globals['_RUN']._serialized_end=227
-  _globals['_LOGS']._serialized_start=229
-  _globals['_LOGS']._serialized_end=251
-  _globals['_SERVERMESSAGE']._serialized_start=253
-  _globals['_SERVERMESSAGE']._serialized_end=342
-  _globals['_CLIENTMESSAGE']._serialized_start=344
-  _globals['_CLIENTMESSAGE']._serialized_end=402
-  _globals['_FOCUS']._serialized_start=404
-  _globals['_FOCUS']._serialized_end=455
-  _globals['_SNAPSHOT']._serialized_start=457
-  _globals['_SNAPSHOT']._serialized_end=511
+  _globals['_EXPANDREQUEST']._serialized_start=37
+  _globals['_EXPANDREQUEST']._serialized_end=83
+  _globals['_EDGE']._serialized_start=85
+  _globals['_EDGE']._serialized_end=120
+  _globals['_SNAPSHOT']._serialized_start=122
+  _globals['_SNAPSHOT']._serialized_end=174
+  _globals['_EXPANSION']._serialized_start=176
+  _globals['_EXPANSION']._serialized_end=262
+  _globals['_NATLAS']._serialized_start=264
+  _globals['_NATLAS']._serialized_end=327
 # @@protoc_insertion_point(module_scope)

@@ -2,79 +2,91 @@ syntax = "proto3";
 
 package natlas.v1;
 
-// natlas draws an append-only nested interval tree.
+// natlas draws a nested interval tree that a server explores on demand.
 //
-// Every node owns one interval. Its children are an ordered list of slots that
-// partition that interval. A slot carries one conditional weight per measure
-// (for example one next-token probability per model). The client picks one
-// measure p for slot heights and one measure q for slot widths, -ln q.
+// Every node owns one interval, partitioned by its children. The server lists
+// a node's children in runs, by decreasing weight under measure 0, and the
+// client fits them into the node's own interval. Weights are therefore only
+// relative: each one is a log measured against the node's first child under
+// the same measure, in integer units of 1/log_scale nat, and the client
+// normalizes. Nothing on the wire has to sum to anything.
 //
-// Slots are listed progressively: a node lists a prefix of its slots plus, per
-// measure, the exact aggregate weight of the unlisted remainder (its tail). A
-// slot becomes a node once the server expands it. Node ids are dense and
-// assigned in publication order with the root at 0, so a client resumes a
-// stream from its node count and replays are verified rather than repaired.
+// The weight of the children not yet listed travels as one rest per measure.
+// A run that reaches the end of a node's listing replaces its rest: the latest
+// run wins, so a server that refines a node can only cause rounding jitter.
+//
+// Nodes are named by handles derived from their path of ranks, so either side
+// can name any node without a round trip:
+//
+//   handle(root)                 = 0
+//   handle(child of h at rank r) = mix64(h + 0x9e3779b97f4a7c15 * (r + 1))
+//
+// with arithmetic mod 2^64 and mix64 the SplitMix64 finalizer:
+//
+//   z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9
+//   z = (z ^ z >> 27) * 0x94d049bb133111eb
+//   z =  z ^ z >> 31
+//
+// mix64 is a bijection, so siblings never collide; other collisions are left
+// to chance at 64 bits.
 
 // First message of every stream.
 message Hello {
   string title = 1;
-  // Measure names. Every Page carries one weight vector per measure, in order.
+  // Measure names. Measure 0 orders every node's children.
   repeated string measures = 2;
+  // Log weights count units of 1/log_scale nat.
+  uint32 log_scale = 3;
 }
 
-// Publish one node. Its slot in the parent must already be listed.
-message Node {
-  uint64 id = 1;
-  uint64 parent = 2; // ignored for the root
-  uint32 slot = 3; // ignored for the root
-  uint32 size = 4; // total slot count; 0 is a terminal node
-  Page page = 5; // first listed slots, starting at slot 0; its node is ignored
-}
-
-// List more slots of an existing node.
-message Page {
-  uint64 node = 1;
-  // At most the node's listed count. Overlapping slots must match exactly.
+// Children [start, start + len(labels)) of one node. The node itself must be
+// the root or a listed child of a node the stream already has.
+message Run {
+  fixed64 node = 1;
+  // At most the node's listed count. Overlapping children must match exactly.
   uint32 start = 2;
   repeated string labels = 3;
-  // One vector per measure, each with one weight per label.
-  repeated Weights weights = 4;
-  // Per measure: aggregate weight of slots [start + len(labels), size).
-  repeated double tail = 5;
+  // Each per-child array below has one entry per child of the run except rank
+  // 0, whose log weight is 0 by definition.
+  // Measure 0: the drop from the previous rank, ln(w[r - 1] / w[r]).
+  repeated uint32 gaps = 4;
+  // Measures 1 and up, in order: ln(w[0] / w[r]) under that measure.
+  repeated Logs others = 5;
+  // Per measure: ln(w[0] / weight of every child after this run). Absent when
+  // the run lists the node's last child; then a run with no children marks a
+  // leaf. Present only with at least one child listed.
+  Logs rest = 6;
 }
 
-message Weights {
-  repeated double values = 1;
+message Logs {
+  repeated sint32 values = 1;
 }
 
 message ServerMessage {
   oneof kind {
     Hello hello = 1;
-    Node node = 2;
-    Page page = 3;
+    Run run = 2;
   }
 }
 
 message ClientMessage {
   oneof kind {
-    Expand expand = 1;
-    List list = 2;
+    Focus focus = 1;
   }
 }
 
-// Ask the server to publish one listed slot as a node.
-message Expand {
-  uint64 node = 1;
-  uint32 slot = 2;
+// Explore from an anchor, replacing any earlier focus. The server lists
+// children best first, by path weight under measure 0 below the anchor, until
+// it has expanded `budget` nodes. Runs already sent stay valid.
+message Focus {
+  // A handle the stream has named, or the root's.
+  fixed64 from = 1;
+  // Ranks from `from` down to the anchor.
+  repeated uint32 path = 2;
+  uint32 budget = 3;
 }
 
-// Ask the server to list a node's slots up to, but excluding, stop.
-message List {
-  uint64 node = 1;
-  uint32 stop = 2;
-}
-
-// A recorded server stream, used for static datasets.
+// A recorded server stream, used for static datasets: a focus on the root.
 message Snapshot {
   repeated ServerMessage messages = 1;
 }

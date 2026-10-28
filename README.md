@@ -45,12 +45,21 @@ exact geometry 80 halvings deep.
 ## Protocol
 
 `proto/natlas/v1/natlas.proto`. A server streams `ServerMessage`s: one `Hello`
-naming the measures, then `Node`s in dense id order (root 0), each with its
-first `Page` of slots, plus later `Page`s that list more slots. An unlisted
-remainder is one tail slot with exact aggregate weight per measure. Replays are
-verified, not repaired. Clients ask for more with `Expand` and `List`.
+naming the measures and the log scale, then `Run`s, each listing some children
+of one node by decreasing weight under measure 0.
 
-A `Snapshot` is a recorded stream; that is what the client loads today.
+- Weights are only relative. Every weight is an integer log against the node's
+  first child (1/256 nat in the exporters), so measure 0 travels as unsigned
+  gaps between consecutive ranks. The client normalizes each node into its own
+  interval; nothing on the wire has to sum to 1.
+- The unlisted remainder is one rest per measure, drawn as a tail slot. The
+  latest run to reach the end of a node's listing replaces it.
+- Nodes are named by 64-bit handles hashed from their path of ranks, so client
+  and server both derive them; no ids are assigned.
+
+Clients steer with `Focus`: an anchor and a node budget, explored best first
+below the anchor. A `Snapshot` is a recorded stream for a focus on the root;
+that is what the client loads today.
 
 ## Data
 

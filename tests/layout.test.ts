@@ -11,14 +11,16 @@ describe("layout", () => {
     const tree = chainTree([0.5, 0.25, 0.25], []);
     const cam: Camera = { x: -0.1, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
     const frame = layout(tree, lens, cam, view);
+    // Weights travel as rounded logs, so they arrive within 1/LOG_SCALE nat.
+    const near = (value: number) => expect.closeTo(value, 4);
     const spans = frame.boxes.map((box) => [box.slot, box.y0, box.y1, box.x1 - box.x0]);
     expect(spans).toEqual([
-      [0, 0, 0.5, Math.log(2)],
-      [1, 0.5, 0.75, Math.log(4)],
-      [2, 0.75, 1, Math.log(4)],
+      [0, 0, near(0.5), near(Math.log(2))],
+      [1, near(0.5), near(0.75), near(Math.log(4))],
+      [2, near(0.75), near(1), near(Math.log(4))],
     ]);
     expect(frame.rootTop).toBe(0);
-    expect(frame.rootBottom).toBe(1);
+    expect(frame.rootBottom).toBeCloseTo(1, 12);
   });
 
   it("stays exact at depths beyond absolute float precision", () => {

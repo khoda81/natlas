@@ -104,7 +104,7 @@ describe("layout", () => {
     const cam: Camera = { x: Math.log(2), k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
     const frame = layout(tree, lens, cam, view);
     expect(frame.boxes.some((box) => box.node === 0 && box.slot === 0)).toBe(false);
-    expect(frame.unexpanded).toContainEqual({ node: 0, label: 0, lnMass: expect.closeTo(-Math.log(2), 9), x1: expect.closeTo(Math.log(2), 9) });
+    expect(frame.unexpanded).toContainEqual({ node: 0, label: 0, lnMass: expect.closeTo(-Math.log(2), 9), x1: expect.closeTo(Math.log(2), 9), y0: 0, y1: expect.closeTo(1, 9) });
   });
 
   it("moves the anchor up to what p lists", () => {

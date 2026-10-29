@@ -45,8 +45,11 @@ real-valued exponentiation. Query coordinates are compared as exact dyadic
 rationals.
 
 Current resource limits are 1024 prefix bytes and a log-weight range of 16384
-bits. Exceeding either returns an explicit error. Each measure keeps eight
-CDFs in LRU order. Handle identities depend on paths rather than registration
+bits. Exceeding either returns an explicit error. Each measure caches CDFs in
+LRU order under a 1 GiB estimated storage budget, including Python integer
+storage, configurable through `Service(cache_bytes=...)`. A single CDF larger
+than the budget stays cached so subsequent pages can reuse it. Handle
+identities depend on paths rather than registration
 order, avoiding accidental reuse for different paths after a restart.
 
 ## Asynchronous inference
@@ -96,6 +99,14 @@ guarantee of half-pixel error for the whole sorted silhouette. Heights and
 node statistics are marked approximate. Explicit prompt/travel IDs have their
 p mass resolved and reserved even when initial samples missed them.
 
+Fetching a child's distribution requires its parent-CDF lower mass bound to
+support at least two screen pixels of height. If the bounds straddle that
+cutoff, the scheduler spends the continuation's visible-area priority on
+refining the parent endpoints first. A coarse sample assigned a whole bin
+therefore cannot launch inference for a token that later resolves below the
+cutoff. Tokens already supported by the bounds can expand while the rest of
+the parent is still being refined.
+
 For each visible token, q endpoints are bracketed in ID order. Subtracting
 aligned BigInts gives probability bounds [L,U], hence width bounds
 [-ln U,-ln L]. At k pixels per nat, uncertainty is k ln(U/L). Each edge gets
@@ -104,8 +115,17 @@ stops sooner if the width lower bound extends past the viewport. Widths stay
 in log space, including below floating-point probability range.
 
 The scheduler alternates p geometry and q precision, fetching one new page
-per task with bounded concurrency. Replies refill fetch capacity independently
-of animation frames. Before each batch, current view geometry is recomputed
+per task with bounded concurrency. Nodes are prioritized by the sum of their
+visible box areas: probability height relative to the view times width in
+nats, clipping both dimensions to the viewport. Unfetched children use the
+visible area their continuations could occupy to the right of their own box.
+An ancestor whose boxes are offscreen remains eligible for dependency work
+with zero visible-area priority; its full projected height does not promote
+it ahead of visible refinement. Pixel precision budgets remain separate from
+this ordering.
+
+Replies refill fetch capacity independently of animation frames. Before each
+batch, current view geometry is recomputed
 using a camera copy, so new samples and q ordering affect the next requests
 without moving the displayed camera between paints. The pump yields between
 batches and retries failures after backoff, even without further input. A

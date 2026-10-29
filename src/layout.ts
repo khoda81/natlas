@@ -75,7 +75,7 @@ export interface Frame {
    * Children not expanded yet whose own children would start on screen, even
    * where their box itself ends at or left of the screen's left edge.
    */
-  unexpanded: { node: NodeId; label: Label; lnMass: number; x1: number }[];
+  unexpanded: { node: NodeId; label: Label; lnMass: number; x1: number; y0: number; y1: number }[];
   /** Slot boundaries inside the view, re-anchoring candidates. */
   boundaries: { boundary: Boundary; y: number }[];
   /** Root interval edges in view heights; bounds, once an ancestor covers the view. */
@@ -237,7 +237,7 @@ export function layout(
     boundary(node, slot, y0);
     boundary(node, slot + 1, y1);
     if (x1 >= right || !slots.widthReady) return;
-    if (kind === "leaf") unexpanded.push({ node: node.id, label: label!, lnMass: childMass, x1 });
+    if (kind === "leaf") unexpanded.push({ node: node.id, label: label!, lnMass: childMass, x1, y0, y1 });
     if (kind !== "node") return;
     if (downward) down(child!, 0, y0, scaled(pw, scale), x1, childMass);
     else up(child!, child!.slots(lens).count - 1, y1, scaled(pw, scale), x1, childMass);

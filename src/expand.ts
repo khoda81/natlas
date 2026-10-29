@@ -3,7 +3,7 @@
 // as the anchored camera pans, zooms, or changes measures.
 
 import { Code, ConnectError } from "@connectrpc/connect";
-import { Refiner, type QuantileWant } from "./refine";
+import { MIN_EXPAND_PX, Refiner, type QuantileWant } from "./refine";
 import { Decoder } from "./codec";
 import { type Camera, type Frame, logView, type Viewport } from "./layout";
 import type { Reply, Source } from "./source";
@@ -23,9 +23,6 @@ export interface Want {
   priority: number;
   quantile?: QuantileWant;
 }
-
-/** Boxes shorter than this do not ask for their children. */
-const MIN_PX = 2;
 
 /**
  * What ``frame`` needs. A node ``heightPx`` tall needs p down to one pixel,
@@ -49,7 +46,7 @@ export function wants(
   const result: Want[] = [];
   const want = (node: () => TreeNode, lnMass: number, x: number, p = true) => {
     const heightPx = Math.exp(lnMass - lambda) * view.height;
-    if (heightPx < MIN_PX || !(x < right)) return;
+    if (heightPx < MIN_EXPAND_PX || !(x < right)) return;
     const target = node();
     if (p)
       result.push({
@@ -80,19 +77,34 @@ export function wants(
   return result;
 }
 
-/** v2 fetches follow the same anchored frame, with precision set by its pixels. */
+/** v2 precision follows pixels; priority is the node's visible probability × nats. */
 function quantileWants(tree: IntervalTree, lens: Lens, cam: Camera, view: Viewport, frame: Frame): Want[] {
   const result = new Map<number, Want>();
   const right = cam.x + view.width / cam.k;
-  const add = (node: TreeNode, lnMass: number, x: number, discover = false) => {
+  // Heights are probabilities relative to the view mass. Use the anchored
+  // coordinates directly so offscreen mass never inflates the area score.
+  const area = (x0: number, x1: number, y0: number, y1: number) =>
+    Math.max(0, Math.min(1, y1) - Math.max(0, y0)) *
+    Math.max(0, Math.min(right, x1) - Math.max(cam.x, x0));
+  const visible = new Map<number, number>();
+  for (const box of frame.boxes) {
+    visible.set(box.node, (visible.get(box.node) ?? 0) + area(box.x0, box.x1, box.y0, box.y1));
+  }
+  const add = (
+    node: TreeNode,
+    lnMass: number,
+    x: number,
+    discover = false,
+    priority = visible.get(node.id) ?? 0,
+  ) => {
     const logHeight = lnMass - logView(cam) + Math.log(view.height);
-    if (logHeight < Math.log(MIN_PX) || x >= right) return;
+    if (logHeight < Math.log(MIN_EXPAND_PX) || x >= right) return;
     if (!result.has(node.id))
       result.set(node.id, {
         node,
         measure: lens.p,
         horizon: 0,
-        priority: Math.exp(Math.min(700, logHeight)),
+        priority,
         quantile: {
           node,
           lens,
@@ -103,9 +115,35 @@ function quantileWants(tree: IntervalTree, lens: Lens, cam: Camera, view: Viewpo
         },
       });
   };
-  if (!tree.root.listing(lens.p)?.radix?.ready) add(tree.root, 0, 0, true);
-  for (const entry of frame.walked) add(tree.node(entry.node), entry.lnMass, entry.x);
-  for (const entry of frame.unexpanded) add(tree.child(entry.node, entry.label), entry.lnMass, entry.x1, true);
+  if (!tree.root.listing(lens.p)?.radix?.ready) add(tree.root, 0, 0, true, right - cam.x);
+  const walked = new Map(frame.walked.map((entry) => [entry.node, entry]));
+  for (const entry of walked.values()) add(tree.node(entry.node), entry.lnMass, entry.x);
+  for (const entry of frame.unexpanded) {
+    const parent = tree.node(entry.node);
+    const parentFrame = walked.get(parent.id)!;
+    const logParentHeight = parentFrame.lnMass - logView(cam) + Math.log(view.height);
+    const bounds = parent.listing(lens.p)!.radix!.bounds(entry.label);
+    const continuationArea = area(entry.x1, right, entry.y0, entry.y1);
+    if (bounds.lower + logParentHeight < Math.log(MIN_EXPAND_PX)) {
+      if (bounds.upper + logParentHeight >= Math.log(MIN_EXPAND_PX)) {
+        // A sample bin can make a tiny token look large. Spend this area's
+        // priority on resolving the parent before admitting model work below it.
+        const owner = result.get(parent.id)!;
+        owner.priority += continuationArea;
+        const target = owner.quantile!;
+        const children = (target.children ??= new Set()) as Set<number>;
+        children.add(entry.label);
+      }
+      continue;
+    }
+    add(
+      tree.child(entry.node, entry.label),
+      entry.lnMass,
+      entry.x1,
+      true,
+      continuationArea,
+    );
+  }
   for (const box of frame.boxes) {
     const target = result.get(box.node)?.quantile;
     if (!target?.labels) continue;
@@ -116,7 +154,8 @@ function quantileWants(tree: IntervalTree, lens: Lens, cam: Camera, view: Viewpo
     }
   }
   // Even an ancestor entirely left of the view places every visible descendant.
-  // Do not lose its q request when layout stops its outward walk early.
+  // Keep that dependency eligible when layout stops its outward walk early,
+  // without assigning priority to its potentially enormous offscreen height.
   let ancestorMass = 0;
   let ancestorX = 0;
   const chain = tree.chain(cam.anchor.node);

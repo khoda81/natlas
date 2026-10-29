@@ -5,16 +5,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import sys
 from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from functools import cached_property
 
 from google.protobuf.message import DecodeError
 from natlas.v2 import natlas_pb2 as pb
 
 MAX_PREFIX = 1024
 MAX_WEIGHT_BITS = 16384
-CACHED_CDFS = 8
+CDF_CACHE_BYTES = 1024 * 1024 * 1024
 RPC = "/natlas.v2.Natlas/Quantile"
 
 
@@ -115,6 +117,11 @@ class CDF:
         threshold = numerator * self.total // denominator
         return bisect_right(self.ends, threshold)
 
+    @cached_property
+    def memory_bytes(self) -> int:
+        """Estimated retained storage, including Python's cumulative integers."""
+        return sys.getsizeof(self) + sys.getsizeof(self.ends) + sum(map(sys.getsizeof, self.ends))
+
     def page(self, prefix: bytes) -> tuple[int, list[int], bool]:
         if not self.ends:
             return 0, [], True
@@ -132,9 +139,14 @@ class Service:
         distribution: Callable[[tuple[int, ...]], Awaitable[Iterable[float]]],
         *,
         log_weights: bool = False,
+        cache_bytes: int = CDF_CACHE_BYTES,
     ):
+        if cache_bytes < 1:
+            raise ValueError("CDF cache budget must be positive")
         self.distribution = distribution
         self.log_weights = log_weights
+        self.cache_bytes = cache_bytes
+        self.cached_bytes = 0
         self.paths: dict[int, tuple[int, ...]] = {0: ()}
         self.handles: dict[tuple[int, ...], int] = {(): 0}
         self.cache: OrderedDict[tuple[int, ...], CDF] = OrderedDict()
@@ -193,10 +205,15 @@ class Service:
         weights = await self.distribution(path)
         make = CDF.from_log_weights if self.log_weights else CDF
         cdf = await asyncio.to_thread(make, weights)
+        size = await asyncio.to_thread(lambda: cdf.memory_bytes)
         self.vocabularies[path] = len(cdf.ends)
         self.cache[path] = cdf
-        if len(self.cache) > CACHED_CDFS:
-            self.cache.popitem(last=False)
+        self.cached_bytes += size
+        # Keep one oversized CDF usable for its later pages instead of
+        # rebuilding it for every prefix when it exceeds the whole budget.
+        while self.cached_bytes > self.cache_bytes and len(self.cache) > 1:
+            _, evicted = self.cache.popitem(last=False)
+            self.cached_bytes -= evicted.memory_bytes
         return cdf
 
     async def aclose(self) -> None:

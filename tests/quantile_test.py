@@ -100,6 +100,54 @@ class QuantileTests(unittest.IsolatedAsyncioTestCase):
             handles.append(found)
         self.assertEqual(handles[0], handles[1])
 
+    async def test_default_cache_keeps_a_working_set_larger_than_eight_nodes(self):
+        calls = Counter()
+
+        async def distribution(path):
+            calls[path] += 1
+            return [1.0] * 16
+
+        service = Service(distribution)
+        self.addAsyncCleanup(service.aclose)
+        for _ in range(3):
+            for label in range(16):
+                message = pb.QuantileRequest(node=pb.Branch(parent=0, branch_id=label))
+                await service.query(message.SerializeToString())
+        self.assertEqual(calls, Counter({(): 1, **{(label,): 1 for label in range(16)}}))
+
+    async def test_cache_evicts_by_storage_and_preserves_recently_used_cdfs(self):
+        calls = Counter()
+        size = CDF([1.0] * 4).memory_bytes
+
+        async def distribution(path):
+            calls[path] += 1
+            return [1.0] * 4
+
+        service = Service(distribution, cache_bytes=2 * size)
+        self.addAsyncCleanup(service.aclose)
+        for label in [0, 1, 0, 2]:
+            await service.cdf((label,))
+        self.assertEqual(set(service.cache), {(0,), (2,)})
+        self.assertLessEqual(service.cached_bytes, service.cache_bytes)
+        await service.cdf((0,))
+        self.assertEqual(calls[(0,)], 1)
+        await service.cdf((1,))
+        self.assertEqual(calls[(1,)], 2)
+
+    async def test_oversized_cdf_is_reused_for_later_pages(self):
+        calls = 0
+
+        async def distribution(path):
+            nonlocal calls
+            calls += 1
+            return [1.0] * 4
+
+        service = Service(distribution, cache_bytes=1)
+        self.addAsyncCleanup(service.aclose)
+        await service.query(b"")
+        await service.query(pb.QuantileRequest(prefix=b"\x7f").SerializeToString())
+        self.assertEqual(calls, 1)
+
 
 class ServerTests(unittest.TestCase):
     @classmethod

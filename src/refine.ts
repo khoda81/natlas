@@ -4,6 +4,9 @@ import { RadixCDF } from "./radix";
 import type { Source } from "./source";
 import type { IntervalTree, Lens, TreeNode } from "./tree";
 
+/** A child's p mass must support this screen height before fetching its subtree. */
+export const MIN_EXPAND_PX = 2;
+
 export interface QuantileWant {
   node: TreeNode;
   lens: Lens;
@@ -12,6 +15,8 @@ export interface QuantileWant {
   right: number;
   /** Undefined on first discovery; otherwise refine only visible IDs. */
   labels?: ReadonlySet<number>;
+  /** Resolve p bounds for children whose estimated height crosses the expansion cutoff. */
+  children?: ReadonlySet<number>;
 }
 
 export class Refiner {
@@ -88,12 +93,21 @@ export class Refiner {
 
   /** Select work without issuing requests or causing redraws when satisfied. */
   next(want: QuantileWant): (() => Promise<void>) | undefined {
-    const { node, lens, logHeight, k, right, labels } = want;
+    const { node, lens, logHeight, k, right, labels, children } = want;
     const p = this.state(node, lens.p);
     const q = this.state(node, lens.q);
     if (!p.ready) return () => this.page(node, lens.p, []);
     if (p.terminal) return undefined;
     if (!q.ready) return () => this.page(node, lens.q, []);
+    for (const label of children ?? []) {
+      const bounds = p.bounds(label);
+      if (
+        bounds.lower + logHeight >= Math.log(MIN_EXPAND_PX) ||
+        bounds.upper + logHeight < Math.log(MIN_EXPAND_PX)
+      ) continue;
+      const prefix = p.nextBoundary(label);
+      if (prefix) return () => this.page(node, lens.p, prefix);
+    }
     const sample = p.nextSample(logHeight, labels);
     // Alternate p geometry and q endpoints, rather than finishing either
     // distribution before showing the other measure's information.

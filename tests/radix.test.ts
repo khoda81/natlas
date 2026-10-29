@@ -48,6 +48,54 @@ function attach(tree: IntervalTree, measure: number, state: RadixCDF): void {
 }
 
 describe("radix CDF", () => {
+  it("uses normalization for exact outside boundaries and empty ranges", () => {
+    const state = new RadixCDF();
+    state.insert([], page([1n]));
+    expect(state.boundaryBounds(0)).toEqual({ lo: 0n, hi: 0n, depth: 0 });
+    expect(state.boundaryBounds(1)).toEqual({ lo: 1n, hi: 1n, depth: 0 });
+    expect(state.bounds(0)).toEqual({ lower: 0, upper: 0 });
+    expect(state.rangeBounds(0, 0)).toEqual({ lower: -Infinity, upper: -Infinity });
+    expect(state.partition().map((r) => [r.kind, r.first, r.end, r.lnMass])).toEqual([["token", 0, 1, 0]]);
+  });
+  it("does not invent individual probabilities from indistinguishable sparse pages", () => {
+    const uniform = Array<bigint>(512).fill(1n);
+    const spikes = uniform.map((_, i) => i % 2 ? 0n : 2n);
+    expect(page(uniform)).toEqual(page(spikes));
+    const state = new RadixCDF();
+    state.insert([], page(uniform));
+    const regions = state.partition();
+    expect(regions).toHaveLength(1);
+    expect(regions[0]).toMatchObject({ kind: "unresolved", first: 0, end: 512, mass: { lower: 0, upper: 0 }, lnMass: 0 });
+  });
+  it("preserves shared cumulative boundaries and monotone certificates during refinement", () => {
+    const weights = [0n, 1n, 23n, 0n, 7n, 969n];
+    const state = new RadixCDF();
+    state.insert([], page(weights));
+    for (let step = 0; step < 12; step++) {
+      const previous = weights.map((_, id) => state.bounds(id));
+      const regions = state.partition();
+      expect(regions.reduce((sum, region) => sum + Math.exp(region.lnMass), 0)).toBeCloseTo(1, 12);
+      for (let i = 0; i < regions.length; i++) {
+        const region = regions[i]!;
+        const truth = Number(weights.slice(region.first, region.end).reduce((a, b) => a + b, 0n)) / 1000;
+        expect(Math.exp(region.mass.lower)).toBeLessThanOrEqual(truth + 1e-14);
+        expect(Math.exp(region.mass.upper)).toBeGreaterThanOrEqual(truth - 1e-14);
+        if (i) expect(region.before).toEqual(regions[i - 1]!.after);
+        if (region.kind === "token") expect(region.mass.lower).toBeGreaterThan(-Infinity);
+      }
+      const prefix = state.nextBoundary(1);
+      if (!prefix) break;
+      state.insert(prefix, page(weights, prefix));
+      for (let id = 0; id < weights.length; id++) {
+        const current = state.bounds(id);
+        expect(current.lower).toBeGreaterThanOrEqual(previous[id]!.lower - 1e-12);
+        expect(current.upper).toBeLessThanOrEqual(previous[id]!.upper + 1e-12);
+      }
+    }
+    const before = state.partition();
+    state.pin(1);
+    expect(state.partition()).toEqual(before);
+  });
   it("weights unequal refinement levels by their actual probability mass", () => {
     const weights = [1n, 2n, 997n];
     const state = new RadixCDF();
@@ -66,6 +114,9 @@ describe("radix CDF", () => {
     expect(b.lower).toBeLessThanOrEqual(expected + 1e-10);
     expect(b.upper).toBeGreaterThanOrEqual(expected - 1e-10);
     expect((b.upper - b.lower) * 100).toBeLessThan(0.5);
+    const region = state.partition().find((r) => r.first === 1)!;
+    expect(region.kind).toBe("token");
+    expect(region.lnMass).toBeCloseTo(expected, 5);
   });
   it("skips zero mass IDs and handles the vocabulary-end sentinel", () => {
     const weights = [0n, 2n, 0n, 1n, 0n];

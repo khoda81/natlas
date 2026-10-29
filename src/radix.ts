@@ -12,12 +12,43 @@ export interface MassBounds {
   upper: number;
 }
 
-interface Boundary {
+export interface CDFBoundary {
+  /** Bounds on F(id), in units of 256^-depth. Keep these rational until projection. */
   lo: bigint;
   hi: bigint;
   depth: number;
+}
+
+interface Boundary extends CDFBoundary {
   /** Next page to fetch to tighten this boundary, if it is not exact. */
   next?: number[];
+}
+
+/** A disjoint range of whole IDs, with its cumulative boundaries preserved. */
+export interface CDFRegion {
+  kind: "token" | "unresolved";
+  first: number;
+  end: number;
+  before: CDFBoundary;
+  after: CDFBoundary;
+  mass: MassBounds;
+  /** A layout representative between the boundary midpoints, never a measurement. */
+  lnMass: number;
+}
+
+/** Difference of rational CDF coordinates, without cancellation near 1. */
+function logDifference(a: bigint, ad: number, b: bigint, bd: number): number {
+  const depth = Math.max(ad, bd);
+  return logInteger((b << BigInt(8 * (depth - bd))) - (a << BigInt(8 * (depth - ad)))) - depth * 8 * Math.LN2;
+}
+
+export function boundaryUncertainty(boundary: CDFBoundary): number {
+  return logInteger(boundary.hi - boundary.lo) - boundary.depth * 8 * Math.LN2;
+}
+
+function midpointMass(a: CDFBoundary, b: CDFBoundary): number {
+  // The sums are twice the midpoint; divide the difference by two in log space.
+  return logDifference(a.lo + a.hi, a.depth, b.lo + b.hi, b.depth) - Math.LN2;
 }
 
 interface Bin {
@@ -45,6 +76,7 @@ export class RadixCDF {
   private estimates: Map<number, number> | undefined;
   private readonly massBounds = new Map<number, MassBounds>();
   private leaves: Bin[] | undefined;
+  private regions: readonly CDFRegion[] | undefined;
   terminal = false;
   ready = false;
   version = 0;
@@ -91,10 +123,16 @@ export class RadixCDF {
     this.estimates = undefined;
     this.massBounds.clear();
     this.leaves = undefined;
+    this.regions = undefined;
     this.version++;
   }
 
   private boundary(target: number): Boundary {
+    const vocabulary = this.pages.get("")?.[256];
+    if (!Number.isInteger(target) || target < 0 || (vocabulary !== undefined && target > vocabulary))
+      throw new Error("Branch outside the shared vocabulary");
+    if (target === 0) return { lo: 0n, hi: 0n, depth: 0 };
+    if (target === vocabulary) return { lo: 1n, hi: 1n, depth: 0 };
     let prefix: number[] = [];
     let a = 0n;
     for (;;) {
@@ -113,22 +151,57 @@ export class RadixCDF {
     }
   }
 
+  boundaryBounds(target: number): CDFBoundary {
+    const { lo, hi, depth } = this.boundary(target);
+    return { lo, hi, depth };
+  }
+
+  rangeBounds(first: number, end: number): MassBounds {
+    if (first > end) throw new Error("Reversed ID range");
+    const a = this.boundary(first), b = this.boundary(end);
+    if (first === end) return { lower: -Infinity, upper: -Infinity };
+    return {
+      lower: logDifference(a.hi, a.depth, b.lo, b.depth),
+      upper: Math.min(0, logDifference(a.lo, a.depth, b.hi, b.depth)),
+    };
+  }
+
+  /** Known tokens and explicit unresolved ID ranges, in the protocol's order.
+   * Only tokens with a certified positive interior receive an individual region.
+   * Shared midpoint boundaries partition the interval without global renormalization.
+   */
+  partition(): readonly CDFRegion[] {
+    if (!this.ready || this.terminal) return [];
+    if (this.regions) return this.regions;
+    const vocabulary = this.pages.get("")![256]!;
+    const labels = new Set<number>(this.pins);
+    for (const ids of this.pages.values()) for (const id of ids) if (id < vocabulary) labels.add(id);
+    const regions: CDFRegion[] = [];
+    const add = (first: number, end: number, kind: CDFRegion["kind"]) => {
+      if (first === end) return;
+      const before = this.boundaryBounds(first), after = this.boundaryBounds(end);
+      const mass = this.rangeBounds(first, end);
+      if (mass.upper === -Infinity) return;
+      regions.push({ kind, first, end, before, after, mass, lnMass: midpointMass(before, after) });
+    };
+    let cursor = 0;
+    for (const label of [...labels].sort((a, b) => a - b)) {
+      if (this.bounds(label).lower === -Infinity) continue;
+      add(cursor, label, "unresolved");
+      add(label, label + 1, "token");
+      cursor = label + 1;
+    }
+    add(cursor, vocabulary, "unresolved");
+    this.regions = regions;
+    return regions;
+  }
+
   bounds(label: number): MassBounds {
     if (!this.ready) return { lower: -Infinity, upper: 0 };
     if (this.terminal || label >= this.pages.get("")![256]!) return { lower: -Infinity, upper: -Infinity };
     const cached = this.massBounds.get(label);
     if (cached) return cached;
-    const a = this.boundary(label);
-    const b = this.boundary(label + 1);
-    const depth = Math.max(a.depth, b.depth);
-    const align = (n: bigint, d: number) => n << BigInt(8 * (depth - d));
-    const lower = align(b.lo, b.depth) - align(a.hi, a.depth);
-    const upper = align(b.hi, b.depth) - align(a.lo, a.depth);
-    const scale = depth * 8 * Math.LN2;
-    const bounds = {
-      lower: logInteger(lower) - scale,
-      upper: Math.min(0, logInteger(upper) - scale),
-    };
+    const bounds = this.rangeBounds(label, label + 1);
     this.massBounds.set(label, bounds);
     return bounds;
   }
@@ -203,6 +276,7 @@ export class RadixCDF {
     }
     this.pins.add(label);
     this.estimates = undefined;
+    this.regions = undefined;
   }
 
   /** Largest unresolved p bin relevant to the visible labels, down to 0.5px. */

@@ -20,8 +20,8 @@
 The root is the empty text, the model's start-of-text token alone; every
 node below it is a text, and its children are the next tokens. Every measure
 is one Natlas service under its own path prefix, /0/ for the model itself and
-/1/, /2/, … for the --q measures, speaking the Connect protocol's server
-streaming. GET /manifest.json describes them to the client, with the prompt's
+/1/, /2/, … for the --q measures, speaking Connect's unary quantile protocol
+(and retaining the legacy streaming Expand service). GET /manifest.json describes them to the client, with the prompt's
 tokens as the place to start, and GET /labels.json holds the token bytes.
 
 A node's handle hashes its path, so handles survive a restart, but the
@@ -169,6 +169,7 @@ def _end(error: dict | None = None) -> bytes:
 
 def app(model: Model, manifest: list[dict], files: dict[str, tuple[bytes, str]]) -> Starlette:
     """The measures' services, the manifest, and ``files``: each published path's bytes and media type."""
+
     def service(measure: int):
         async def expand(request: Request) -> Response:
             if request.headers.get("content-type") != _CONTENT_TYPE:
@@ -216,10 +217,56 @@ def app(model: Model, manifest: list[dict], files: dict[str, tuple[bytes, str]])
 
         return serve
 
+    # v2 uses the same model/path semantics, with independent opaque handles.
+    from quantile import Service as QuantileService, RPC as QUANTILE_RPC
+
+    def distribution(measure, path):
+        with model.lock:
+            if model.ends(path):
+                return []
+            logs = model.measures[measure].log_probs(model.root + path).tolist()
+        return logs
+
+    quantile_services = [
+        QuantileService(lambda path, m=m: distribution(m, path), log_weights=True) for m in range(len(model.measures))
+    ]
+
+    def quantile_endpoint(index):
+        async def query(request):
+            if request.headers.get("content-type", "").split(";")[0] != "application/proto":
+                return Response(status_code=415)
+            body = await request.body()
+            if len(body) > 4096:
+                return JSONResponse({"code": "resource_exhausted", "message": "request too large"}, status_code=429)
+            try:
+                result = await anyio.to_thread.run_sync(quantile_services[index].query, body)
+                return Response(result, media_type="application/proto")
+            except lm.TooLong as error:
+                return JSONResponse({"code": "out_of_range", "message": str(error)}, status_code=400)
+            except KeyError:
+                return JSONResponse({"code": "not_found", "message": "unknown parent handle"}, status_code=404)
+            except (ValueError, OverflowError) as error:
+                exhausted = isinstance(error, OverflowError)
+                return JSONResponse(
+                    {"code": "resource_exhausted" if exhausted else "invalid_argument", "message": str(error)},
+                    status_code=429 if exhausted else 400,
+                )
+            except Exception as error:
+                traceback.print_exc()
+                return JSONResponse(
+                    {"code": "internal", "message": f"{type(error).__name__}: {error}"}, status_code=500
+                )
+
+        return query
+
     routes = [Route("/manifest.json", manifest_json)]
     routes += [Route(f"/{path}", file(*served)) for path, served in files.items()]
     routes += [
         Route(f"/{index}/natlas.v1.Natlas/Expand", service(index), methods=["POST"])
+        for index in range(len(model.measures))
+    ]
+    routes += [
+        Route(f"/{index}{QUANTILE_RPC}", quantile_endpoint(index), methods=["POST"])
         for index in range(len(model.measures))
     ]
     # Any page may read a local research server.
@@ -243,7 +290,9 @@ def main() -> None:
         default="The most interesting consequence of information theory is",
         help="where the client starts; the server serves every text alike",
     )
-    parser.add_argument("--p", default="HuggingFaceTB/SmolLM2-360M", help="the model: a Hugging Face id or a .gguf file")
+    parser.add_argument(
+        "--p", default="HuggingFaceTB/SmolLM2-360M", help="the model: a Hugging Face id or a .gguf file"
+    )
     parser.add_argument(
         "--q",
         action="append",
@@ -276,7 +325,10 @@ def main() -> None:
             "title": f"{language.name} · live",
             "labels": "labels.json",
             "start": prompt,
-            "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
+            "measures": [
+                {"name": measure.name, "url": f"{index}/", "protocol": "quantile-v2"}
+                for index, measure in enumerate(measures)
+            ],
         }
     ]
     model = Model(language.start, lambda path: bool(path) and path[-1] in language.eos, language.vocabulary, measures)

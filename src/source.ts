@@ -2,10 +2,12 @@
 // answers from memory; a live server answers over Connect.
 
 import { fromBinary } from "@bufbuild/protobuf";
-import { createClient } from "@connectrpc/connect";
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { decode, encode, type WireEdge } from "./codec";
 import { type ExpandResponse, Natlas, SnapshotSchema } from "./gen/natlas/v1/natlas_pb";
+import { Natlas as QuantileNatlas } from "./gen/natlas/v2/natlas_pb";
+import type { QuantileReply } from "./radix";
 import { TextLabels } from "./labels";
 import { type NotesFile, NoteLabels } from "./notes";
 import type { Labels } from "./reading";
@@ -29,6 +31,8 @@ export interface Reply {
 }
 
 export interface Source {
+  /** v2 measures expose byte-prefix CDF pages instead of sorted listings. */
+  quantile?(node: Child | undefined, prefix: Uint8Array): Promise<QuantileReply>;
   /** Expand ``node``, or the root when undefined. */
   expand(node: Child | undefined, horizon: number): Promise<Reply>;
 }
@@ -39,7 +43,10 @@ async function* replay(edges: WireEdge[]): AsyncIterable<WireEdge> {
 
 /** A recorded server: one Expand per node, re-encoded for each request. */
 export class SnapshotSource implements Source {
-  private readonly recorded = new Map<string, { node: Handle; horizon: number; labels: number[]; lnWeights: number[] }>();
+  private readonly recorded = new Map<
+    string,
+    { node: Handle; horizon: number; labels: number[]; lnWeights: number[] }
+  >();
   /** Given to every node not recorded: no recorded node has it, so nothing is recorded under it either. */
   private readonly unrecorded: Handle;
 
@@ -48,7 +55,12 @@ export class SnapshotSource implements Source {
     for (const { request, node, edges } of fromBinary(SnapshotSchema, bytes).expansions) {
       if (request === undefined) throw new Error("expansion without a request");
       const { labels, lnWeights } = decode(edges, request.horizon);
-      this.recorded.set(key(request.node), { node, horizon: request.horizon, labels, lnWeights });
+      this.recorded.set(key(request.node), {
+        node,
+        horizon: request.horizon,
+        labels,
+        lnWeights,
+      });
       handles.add(node);
       if (request.node !== undefined) handles.add(request.node.parent);
     }
@@ -83,8 +95,33 @@ export class ConnectSource implements Source {
   async expand(node: Child | undefined, horizon: number): Promise<Reply> {
     const stream = this.client.expand({ node, horizon })[Symbol.asyncIterator]();
     const first = await stream.next();
-    if (first.done || first.value.part.case !== "node") throw new Error("an expansion must begin with its node's handle");
-    return { node: first.value.part.value, complete: horizon, edges: edgesOf(stream) };
+    if (first.done || first.value.part.case !== "node")
+      throw new Error("an expansion must begin with its node's handle");
+    return {
+      node: first.value.part.value,
+      complete: horizon,
+      edges: edgesOf(stream),
+    };
+  }
+}
+
+/** Unary v2 service. Servers share label paths, never opaque handles. */
+export class QuantileSource implements Source {
+  private readonly client;
+
+  constructor(baseUrl: string) {
+    this.client = createClient(QuantileNatlas, createConnectTransport({ baseUrl, useBinaryFormat: true }));
+  }
+
+  quantile(node: Child | undefined, prefix: Uint8Array): Promise<QuantileReply> {
+    return this.client.quantile({
+      node: node && { parent: node.parent, branchId: node.label },
+      prefix,
+    });
+  }
+
+  async expand(): Promise<Reply> {
+    throw new ConnectError("This measure uses the quantile protocol", Code.Unimplemented);
   }
 }
 
@@ -106,7 +143,12 @@ export interface DatasetEntry {
   /** A labels file: a JSON array of label bytes in base64, indexed by label, or a notes file. */
   labels?: string;
   /** Each measure is a recorded snapshot file or a live service's base URL. */
-  measures: { name: string; file?: string; url?: string }[];
+  measures: {
+    name: string;
+    file?: string;
+    url?: string;
+    protocol?: "quantile-v2";
+  }[];
   /** What the entry's paths are relative to; the static data directory by default. */
   base?: string;
   /** Labels from the root to the node the client opens at. */
@@ -132,7 +174,10 @@ export async function manifest(server?: string): Promise<DatasetEntry[]> {
     try {
       const response = await fetch(new URL("manifest.json", base));
       if (!response.ok) return [];
-      return ((await response.json()) as DatasetEntry[]).map((entry) => ({ ...entry, base }));
+      return ((await response.json()) as DatasetEntry[]).map((entry) => ({
+        ...entry,
+        base,
+      }));
     } catch {
       return [];
     }
@@ -157,8 +202,11 @@ export async function fetchDataset(entry: DatasetEntry): Promise<Dataset> {
           return parseLabels(await (await fetchOk(url)).text(), url);
         })();
   const sources = Promise.all(
-    entry.measures.map(async ({ name, file, url }): Promise<Source> => {
-      if (url !== undefined) return new ConnectSource(new URL(url, base).href);
+    entry.measures.map(async ({ name, file, url, protocol }): Promise<Source> => {
+      if (url !== undefined) {
+        const endpoint = new URL(url, base).href;
+        return protocol === "quantile-v2" ? new QuantileSource(endpoint) : new ConnectSource(endpoint);
+      }
       if (file === undefined) throw new Error(`measure ${name} has neither a file nor a url`);
       return new SnapshotSource(new Uint8Array(await (await fetchOk(new URL(file, base))).arrayBuffer()));
     }),
@@ -180,7 +228,9 @@ export async function droppedDataset(files: File[]): Promise<Dataset> {
   return {
     title: snapshots.map((file) => file.name).join(" · "),
     measures: snapshots.map((file) => file.name.replace(/\.pb$/, "")),
-    sources: await Promise.all(snapshots.map(async (file) => new SnapshotSource(new Uint8Array(await file.arrayBuffer())))),
+    sources: await Promise.all(
+      snapshots.map(async (file) => new SnapshotSource(new Uint8Array(await file.arrayBuffer()))),
+    ),
     labels: labelFile === undefined ? TextLabels.none() : parseLabels(await labelFile.text(), null),
     start: [],
   };

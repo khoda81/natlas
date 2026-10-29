@@ -112,7 +112,9 @@ class App {
     });
     const initial = decodeURIComponent(location.hash.slice(1)) || entries[0]?.name;
     if (initial === undefined) {
-      this.setStatus("No datasets in data/manifest.json. Drop .pb snapshots, one per measure, and a labels .json here.");
+      this.setStatus(
+        "No datasets in data/manifest.json. Drop .pb snapshots, one per measure, and a labels .json here.",
+      );
       return;
     }
     select.value = initial;
@@ -237,7 +239,7 @@ class App {
     clamp(tree, this.lens, this.cam);
     const frame = layout(tree, this.lens, this.cam, this.view);
     this.frame = frame;
-    this.expander?.request(wants(tree, this.lens, this.cam, this.view, frame));
+    this.expander?.request(wants(tree, this.lens, this.cam, this.view, frame, this.dataset?.sources));
     // The anchor is fixed while focusing, so the target stays exactly addressable.
     if (!this.focus) reanchor(this.cam, frame);
     this.updateHover();
@@ -263,11 +265,17 @@ class App {
 
   private bindPointer(): void {
     const canvas = this.canvas;
-    canvas.addEventListener("wheel", (event) => this.onWheel(event), { passive: false });
+    canvas.addEventListener("wheel", (event) => this.onWheel(event), {
+      passive: false,
+    });
     canvas.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
       canvas.setPointerCapture(event.pointerId);
-      this.dragging = { id: event.pointerId, x: event.offsetX, y: event.offsetY };
+      this.dragging = {
+        id: event.pointerId,
+        x: event.offsetX,
+        y: event.offsetY,
+      };
       this.focus = null;
       canvas.classList.add("dragging");
     });
@@ -275,7 +283,13 @@ class App {
       this.pointer = { x: event.offsetX, y: event.offsetY };
       const grab = this.dragging;
       if (grab && grab.id === event.pointerId) {
-        drag(this.cam, event.offsetX - grab.x, event.offsetY - grab.y, this.view.height, event.offsetY / this.view.height);
+        drag(
+          this.cam,
+          event.offsetX - grab.x,
+          event.offsetY - grab.y,
+          this.view.height,
+          event.offsetY / this.view.height,
+        );
         grab.x = event.offsetX;
         grab.y = event.offsetY;
       }
@@ -359,21 +373,21 @@ class App {
         switch (event.key) {
           case "+":
           case "=":
-            return scale(cam, KEY_SCALE), true;
+            return (scale(cam, KEY_SCALE), true);
           case "-":
           case "_":
-            return scale(cam, 1 / KEY_SCALE), true;
+            return (scale(cam, 1 / KEY_SCALE), true);
           case "0":
           case "Home":
-            return this.reset(), true;
+            return (this.reset(), true);
           case "b":
-            return this.toggleUnits(), true;
+            return (this.toggleUnits(), true);
           case "s":
-            return this.setLens({ p: this.lens.q, q: this.lens.p }), true;
+            return (this.setLens({ p: this.lens.q, q: this.lens.p }), true);
           case "?":
-            return this.toggleHelp(), true;
+            return (this.toggleHelp(), true);
           case "Escape":
-            return (element("help").hidden = true), true;
+            return ((element("help").hidden = true), true);
           default:
             return false;
         }
@@ -405,7 +419,10 @@ class App {
 
   private startFocus(box: Box): void {
     if (this.tree === null) return;
-    this.cam.anchor = normalize(this.tree, this.lens, { node: box.node, slot: box.slot });
+    this.cam.anchor = normalize(this.tree, this.lens, {
+      node: box.node,
+      slot: box.slot,
+    });
     this.cam.a = box.y0;
     this.focus = {
       box,
@@ -494,7 +511,8 @@ class App {
       return;
     }
     const node = tree.node(box.node);
-    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : this.glyph(box.node, box.label).text;
+    const last =
+      box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : this.glyph(box.node, box.label).text;
     const chips = [chip(last)];
 
     const { p, q } = this.lens;
@@ -504,15 +522,15 @@ class App {
     const qBound = box.kind === "tail" || (box.kind !== "merged" && slots.qBound[box.slot] === true);
     const [atMost, atLeast] = qBound ? ["≤ ", "≥ "] : ["", ""];
     const rows: [string, string][] = [
-      [`p · ${names[p]}`, `${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
+      [`p · ${names[p]}`, `${slots.sampled ? "≈ " : ""}${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
     ];
     if (p !== q || box.kind === "tail") {
-      rows.push([`q · ${names[q]}`, `${atMost}${box.q.toPrecision(4)}  (${atLeast}${this.fmt(-Math.log(box.q))})`]);
+      rows.push([`q · ${names[q]}`, `${atMost}${box.q.toPrecision(4)}  (${atLeast}${this.fmt(box.x1 - box.x0)})`]);
     }
-    rows.push(["p · −log q", `${atLeast}${this.fmt(-box.p * Math.log(box.q))}`]);
+    rows.push(["p · −log q", `${slots.sampled ? "≈ " : atLeast}${this.fmt(box.p * (box.x1 - box.x0))}`]);
     rows.push(["−log P (path)", this.fmt(-box.lnMass)]);
     const stats = nodeStats(slots, this.lens);
-    const bound = slots.count > slots.listed || slots.qBound.some(Boolean) ? "≥ " : "";
+    const bound = slots.sampled ? "≈ " : slots.count > slots.listed || slots.qBound.some(Boolean) ? "≥ " : "";
     if (p === q) rows.push(["H at node", `${bound}${this.fmt(stats.entropy)}`]);
     else {
       rows.push(["H(p) at node", `${bound}${this.fmt(stats.entropy)}`]);
@@ -604,7 +622,7 @@ function chip(text: string): HTMLElement {
   return span;
 }
 
-/** Lower bounds on entropy and cross-entropy over a node's slots; the tail counts as one slot. */
+/** v1 lower bounds or v2 sample estimates of node entropy and cross-entropy. */
 function nodeStats(slots: Slots, lens: Lens): { entropy: number; cross: number } {
   let entropy = 0;
   let cross = 0;
@@ -613,7 +631,7 @@ function nodeStats(slots: Slots, lens: Lens): { entropy: number; cross: number }
     if (p === 0) continue;
     // With p = q, q bounds the tail's heaviest child, which is tighter than the tail as a whole.
     entropy -= p * Math.log(slots.isTail(slot) && lens.p === lens.q ? slots.q[slot]! : p);
-    cross -= p * Math.log(slots.q[slot]!);
+    cross += p * slots.widths[slot]!;
   }
   return { entropy, cross };
 }

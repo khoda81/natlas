@@ -21,6 +21,8 @@ export type { Lens } from "./tree";
 export interface Boundary {
   node: NodeId;
   slot: number;
+  /** Stable identity while v2 refinement reorders the slots. */
+  label?: Label;
 }
 
 /**
@@ -97,10 +99,6 @@ function scaled(weight: number, scale: number): number {
   return weight === 0 ? 0 : weight * scale;
 }
 
-function nats(weight: number): number {
-  return -Math.log(weight);
-}
-
 /** The slot of ``node`` among its parent's slots under ``lens``. */
 function slotIn(tree: IntervalTree, lens: Lens, node: TreeNode): number {
   const slot = tree.node(node.parent!).slots(lens).slotOf(node.label);
@@ -111,12 +109,15 @@ function slotIn(tree: IntervalTree, lens: Lens, node: TreeNode): number {
 /** Canonical spelling of a boundary: a node's bottom is its next sibling's top. */
 export function normalize(tree: IntervalTree, lens: Lens, boundary: Boundary): Boundary {
   let { node, slot } = boundary;
-  for (let current = tree.node(node); slot >= current.slots(lens).count && current.parent !== null; ) {
+  for (let current = tree.node(node); slot >= current.slots(lens).count && current.parent !== null;) {
     slot = slotIn(tree, lens, current) + 1;
     node = current.parent;
     current = tree.node(node);
   }
-  return node === 0 && slot >= tree.root.slots(lens).count ? { node: 0, slot: Number.MAX_SAFE_INTEGER } : { node, slot };
+  if (node === 0 && slot >= tree.root.slots(lens).count) return { node: 0, slot: Number.MAX_SAFE_INTEGER };
+  const slots = tree.node(node).slots(lens);
+  const label = slots.label(slot);
+  return slots.sampled && label !== null ? { node, slot, label } : { node, slot };
 }
 
 /**
@@ -124,6 +125,13 @@ export function normalize(tree: IntervalTree, lens: Lens, boundary: Boundary): B
  * shallower listing never leaves it unreachable.
  */
 export function repair(tree: IntervalTree, lens: Lens, cam: Camera): void {
+  if (cam.anchor.label !== undefined) {
+    const owner = tree.node(cam.anchor.node);
+    const slots = owner.slots(lens);
+    const slot = slots.slotOf(cam.anchor.label);
+    if (slot !== undefined) cam.anchor.slot = slot;
+    else if (owner.expanded(lens.p)) cam.anchor = normalize(tree, lens, { node: owner.id, slot: 0 });
+  }
   const chain = tree.chain(cam.anchor.node);
   for (let i = 1; i < chain.length; i++) {
     if (chain[i - 1]!.slots(lens).slotOf(chain[i]!.label) === undefined) {
@@ -138,11 +146,11 @@ interface Run {
   first: number;
   count: number;
   p: number;
-  q: number;
   y0: number;
   y1: number;
   x: number;
   lnMass: number;
+  weightedWidth: number;
 }
 
 export function layout(
@@ -162,7 +170,11 @@ export function layout(
   const boundaries: Frame["boundaries"] = [];
 
   const boundary = (node: TreeNode, slot: number, y: number) => {
-    if (y >= 0 && y <= 1) boundaries.push({ boundary: normalize(tree, lens, { node: node.id, slot }), y });
+    if (y >= 0 && y <= 1)
+      boundaries.push({
+        boundary: normalize(tree, lens, { node: node.id, slot }),
+        y,
+      });
   };
 
   const push = (box: Box) => {
@@ -178,10 +190,10 @@ export function layout(
       kind: "merged",
       label: null,
       p: run.p,
-      q: run.q,
+      q: Math.exp(-run.weightedWidth / run.p),
       lnMass: run.lnMass + Math.log(run.p),
       x0: run.x,
-      x1: run.x + nats(run.q),
+      x1: run.x + run.weightedWidth / run.p,
       y0: run.y0,
       y1: run.y1,
     });
@@ -202,16 +214,29 @@ export function layout(
   ) => {
     const pw = slots.p[slot]!;
     const qw = slots.q[slot]!;
-    const x1 = x + nats(qw);
+    const x1 = x + slots.widths[slot]!;
     const label = slots.label(slot);
     const id = label === null ? undefined : node.children.get(label);
     const child = id === undefined ? undefined : tree.node(id);
     const kind: BoxKind = label === null ? "tail" : child?.expanded(lens.p) ? "node" : "leaf";
     const childMass = lnMass + Math.log(pw);
-    push({ node: node.id, slot, count: 1, kind, label, p: pw, q: qw, lnMass: childMass, x0: x, x1, y0, y1 });
+    push({
+      node: node.id,
+      slot,
+      count: 1,
+      kind,
+      label,
+      p: pw,
+      q: qw,
+      lnMass: childMass,
+      x0: x,
+      x1,
+      y0,
+      y1,
+    });
     boundary(node, slot, y0);
     boundary(node, slot + 1, y1);
-    if (x1 >= right) return;
+    if (x1 >= right || !slots.widthReady) return;
     if (kind === "leaf") unexpanded.push({ node: node.id, label: label!, lnMass: childMass, x1 });
     if (kind !== "node") return;
     if (downward) down(child!, 0, y0, scaled(pw, scale), x1, childMass);
@@ -229,10 +254,20 @@ export function layout(
       const y1 = y + scaled(pw, scale);
       if (y1 > 0) {
         if (y1 - y < mergeUnits) {
-          run ??= { node, first: slot, count: 0, p: 0, q: 0, y0: y, y1: y, x, lnMass };
+          run ??= {
+            node,
+            first: slot,
+            count: 0,
+            p: 0,
+            y0: y,
+            y1: y,
+            x,
+            lnMass,
+            weightedWidth: 0,
+          };
           run.count++;
           run.p += pw;
-          run.q += slots.q[slot]!;
+          run.weightedWidth += pw * slots.widths[slot]!;
           run.y1 = y1;
           if (run.y1 - run.y0 >= mergeUnits) {
             flush(run);
@@ -260,11 +295,21 @@ export function layout(
       const y0 = y - scaled(pw, scale);
       if (y0 < 1) {
         if (y - y0 < mergeUnits) {
-          run ??= { node, first: slot, count: 0, p: 0, q: 0, y0: y, y1: y, x, lnMass };
+          run ??= {
+            node,
+            first: slot,
+            count: 0,
+            p: 0,
+            y0: y,
+            y1: y,
+            x,
+            lnMass,
+            weightedWidth: 0,
+          };
           run.first = slot;
           run.count++;
           run.p += pw;
-          run.q += slots.q[slot]!;
+          run.weightedWidth += pw * slots.widths[slot]!;
           run.y0 = y0;
           if (run.y1 - run.y0 >= mergeUnits) {
             flush(run);
@@ -285,7 +330,7 @@ export function layout(
   const depth = chain.length - 1;
   const xs = new Float64Array(chain.length);
   for (let i = 1; i <= depth; i++) {
-    xs[i] = xs[i - 1]! + nats(chain[i - 1]!.slots(lens).q[chainSlots[i]!]!);
+    xs[i] = xs[i - 1]! + chain[i - 1]!.slots(lens).widths[chainSlots[i]!]!;
   }
 
   const anchor = chain[depth]!;
@@ -329,7 +374,14 @@ export function layout(
     if (top <= 0 && bottom >= 1 && x <= cam.x) break;
   }
 
-  return { boxes, walked, unexpanded, boundaries, rootTop: top, rootBottom: bottom };
+  return {
+    boxes,
+    walked,
+    unexpanded,
+    boundaries,
+    rootTop: top,
+    rootBottom: bottom,
+  };
 }
 
 /** The anchor chain, each node's slot in its parent, and each node's ln p mass. */
@@ -352,7 +404,7 @@ export function place(tree: IntervalTree, lens: Lens, id: NodeId): { lnMass: num
     const slots = tree.node(node.parent!).slots(lens);
     const slot = slotIn(tree, lens, node);
     lnMass += Math.log(slots.p[slot]!);
-    x1 += nats(slots.q[slot]!);
+    x1 += slots.widths[slot]!;
   }
   return { lnMass, x1 };
 }

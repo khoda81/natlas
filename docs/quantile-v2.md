@@ -104,8 +104,16 @@ stops sooner if the width lower bound extends past the viewport. Widths stay
 in log space, including below floating-point probability range.
 
 The scheduler alternates p geometry and q precision, fetching one new page
-per task with bounded concurrency. It also requests ancestor q endpoints when
-those boxes lie left of the viewport, since they place visible descendants.
+per task with bounded concurrency. Replies refill fetch capacity independently
+of animation frames. Before each batch, current view geometry is recomputed
+using a camera copy, so new samples and q ordering affect the next requests
+without moving the displayed camera between paints. The pump yields between
+batches and retries failures after backoff, even without further input. A
+dataset switch retires its old scheduler. Drawing and canvas resizing stay in
+the same animation frame.
+
+The scheduler also requests ancestor q endpoints when those boxes lie left of
+the viewport, since they place visible descendants.
 Tiny adjacent boxes merge with their p-weighted mean width, preserving their
 entropy/cross-entropy area.
 

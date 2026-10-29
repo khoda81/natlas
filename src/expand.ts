@@ -141,6 +141,10 @@ export class Expander {
   private inFlight = 0;
   private readonly asked = new Map<string, number>();
   private readonly failed = new Map<string, number>();
+  private wanted: () => Want[] = () => [];
+  private wake: ReturnType<typeof setTimeout> | undefined;
+  private wakeAt = Infinity;
+  private disposed = false;
   onError: (error: unknown) => void = (error) => console.error(error);
 
   constructor(
@@ -151,13 +155,58 @@ export class Expander {
     this.refiner = new Refiner(tree, sources);
   }
 
-  /** Start fetching the wants not yet covered, most important first, up to the concurrency limit. */
-  request(wants: Want[]): void {
-    wants.sort((a, b) => b.priority - a.priority);
-    for (const { node, measure, horizon, quantile } of wants) {
+  /** Replace demand. A provider recomputes geometry after each batch of replies. */
+  request(wanted: Want[] | (() => Want[])): void {
+    if (this.disposed) return;
+    this.wanted = typeof wanted === "function" ? wanted : () => wanted;
+    this.schedule();
+  }
+
+  /** Retire a dataset's scheduler; accepted requests may finish populating its tree. */
+  dispose(): void {
+    this.disposed = true;
+    this.wanted = () => [];
+    if (this.wake !== undefined) clearTimeout(this.wake);
+    this.wake = undefined;
+    this.wakeAt = Infinity;
+  }
+
+  private schedule(delay = 0): void {
+    if (this.disposed) return;
+    const at = performance.now() + delay;
+    if (this.wake !== undefined) {
+      if (this.wakeAt <= at) return;
+      clearTimeout(this.wake);
+    }
+    this.wakeAt = at;
+    // Yield between batches, including when cached sources resolve immediately,
+    // so input and painting can run without putting fetching behind display Hz.
+    this.wake = setTimeout(() => {
+      this.wake = undefined;
+      this.wakeAt = Infinity;
+      this.pump();
+    }, delay);
+  }
+
+  private pump(): void {
+    if (this.disposed || this.inFlight >= this.limit) return;
+    let wanted: Want[];
+    try {
+      wanted = [...this.wanted()].sort((a, b) => b.priority - a.priority);
+    } catch (error) {
+      this.onError(error);
+      this.schedule(RETRY_MS);
+      return;
+    }
+    let retryAt = Infinity;
+    for (const { node, measure, horizon, quantile } of wanted) {
       if (this.inFlight >= this.limit) return;
       const key = `${node.id}:${measure}`;
-      if ((this.failed.get(key) ?? -Infinity) > performance.now() - RETRY_MS) continue;
+      const retry = (this.failed.get(key) ?? -Infinity) + RETRY_MS;
+      if (retry > performance.now()) {
+        retryAt = Math.min(retryAt, retry);
+        continue;
+      }
       if (quantile) {
         if (this.asked.has(key)) continue;
         let task: (() => Promise<void>) | undefined;
@@ -165,41 +214,38 @@ export class Expander {
           task = this.refiner.next(quantile);
         } catch (error) {
           this.failed.set(key, performance.now());
+          retryAt = Math.min(retryAt, performance.now() + RETRY_MS);
           this.onError(error);
           continue;
         }
         if (!task) continue;
-        this.asked.set(key, 0);
-        this.inFlight++;
-        task()
-          .then(() => this.failed.delete(key))
-          .catch((error: unknown) => {
-            this.failed.set(key, performance.now());
-            this.onError(error);
-          })
-          .finally(() => {
-            this.inFlight--;
-            this.asked.delete(key);
-          });
+        this.start(key, 0, task);
         continue;
       }
       const covered = Math.max(node.listing(measure)?.horizon ?? -1, this.asked.get(key) ?? -1);
       if (horizon <= covered) continue;
       const ask = Math.min(MAX_HORIZON, horizon + HEADROOM);
       if (ask <= covered) continue;
-      this.asked.set(key, ask);
-      this.inFlight++;
-      this.fetch(node, measure, ask)
-        .then(() => this.failed.delete(key))
-        .catch((error: unknown) => {
-          this.failed.set(key, performance.now());
-          this.onError(error);
-        })
-        .finally(() => {
-          this.inFlight--;
-          this.asked.delete(key);
-        });
+      this.start(key, ask, () => this.fetch(node, measure, ask));
     }
+    if (Number.isFinite(retryAt)) this.schedule(Math.max(0, retryAt - performance.now()));
+  }
+
+  private start(key: string, horizon: number, task: () => Promise<void>): void {
+    this.asked.set(key, horizon);
+    this.inFlight++;
+    task()
+      .then(() => this.failed.delete(key))
+      .catch((error: unknown) => {
+        if (this.disposed) return;
+        this.failed.set(key, performance.now());
+        this.onError(error);
+      })
+      .finally(() => {
+        this.inFlight--;
+        this.asked.delete(key);
+        this.schedule();
+      });
   }
 
   /**

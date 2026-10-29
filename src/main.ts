@@ -1,6 +1,6 @@
 import { drag, moveDepth, panVertical, scale } from "./camera";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
-import { Expander, wants } from "./expand";
+import { Expander, type Want, wants } from "./expand";
 import {
   type Box,
   type Camera,
@@ -132,6 +132,7 @@ class App {
   }
 
   private setDataset(dataset: Dataset): void {
+    this.expander?.dispose();
     const tree = new IntervalTree(dataset.measures.length);
     this.dataset = dataset;
     this.tree = tree;
@@ -144,6 +145,7 @@ class App {
       this.setStatus(String(error));
     };
     tree.subscribe(() => {
+      if (this.tree !== tree) return;
       if (failing) this.setStatus("");
       failing = false;
       this.invalidate();
@@ -227,6 +229,17 @@ class App {
     });
   }
 
+  /** Fetch against current geometry without moving the camera between paints. */
+  private fetchWants = (): Want[] => {
+    const tree = this.tree;
+    if (tree === null) return [];
+    const cam = { ...this.cam, anchor: { ...this.cam.anchor } };
+    repair(tree, this.lens, cam);
+    clamp(tree, this.lens, cam);
+    const frame = layout(tree, this.lens, cam, this.view);
+    return wants(tree, this.lens, cam, this.view, frame, this.dataset?.sources);
+  };
+
   private render(time: number): void {
     // Resize and draw in the same callback, so a cleared bitmap is never
     // presented between a hover-driven panel resize and its redraw.
@@ -239,7 +252,7 @@ class App {
     clamp(tree, this.lens, this.cam);
     const frame = layout(tree, this.lens, this.cam, this.view);
     this.frame = frame;
-    this.expander?.request(wants(tree, this.lens, this.cam, this.view, frame, this.dataset?.sources));
+    this.expander?.request(this.fetchWants);
     // The anchor is fixed while focusing, so the target stays exactly addressable.
     if (!this.focus) reanchor(this.cam, frame);
     this.updateHover();

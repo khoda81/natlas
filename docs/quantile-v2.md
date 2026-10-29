@@ -47,8 +47,41 @@ rationals.
 Current resource limits are 1024 prefix bytes and a log-weight range of 16384
 bits. Exceeding either returns an explicit error. Each measure keeps eight
 CDFs in LRU order. Handle identities depend on paths rather than registration
-order, avoiding accidental reuse for different paths after a restart. The
-existing model lock still serializes inference.
+order, avoiding accidental reuse for different paths after a restart.
+
+## Asynchronous inference
+
+`export/inference.py` separates request handling from model execution. Handles,
+CDF caches and pending CDF builds belong to the server's event loop. A cached
+page can return while another node is being inferred. CDF construction, page
+generation and legacy listing/encoding run on CPU threads independently of
+the model executor.
+
+Both v1 and v2 submit immutable `Job(measure, path)` values to one shared
+worker. Paths are relative to the server's configured model root; jobs contain
+no HTTP requests, opaque node handles, horizons or CDF prefixes. Duplicate
+outstanding jobs share a result. The default capacity is 64 distinct queued
+and running jobs; new jobs beyond it get Connect `resource_exhausted` (HTTP
+429 for v2). Cache hits and duplicate waiters do not consume another slot.
+
+The backend contract is asynchronous `evaluate(tuple[Job, ...])`, returning
+one log-weight tuple or exception per job, keyed by the original job. Results
+may arrive in a different order; missing or unexpected job keys reject the
+batch. A backend is bound to one fixed set of measures. This is the extension
+point for native batching or remote execution. The current `LocalBackend`
+owns one dedicated thread and evaluates jobs serially, preserving stateful
+model/KV-cache access. The worker defaults to batches of one; a larger
+`batch_size` drains already queued jobs without adding a batching delay.
+`app(..., backend=..., capacity=..., batch_size=...)` configures this boundary.
+
+Cancelling a worker waiter leaves other waiters intact. An abandoned queued
+job is removed; running inference finishes. V2 CDF builds deliberately keep
+their worker waiter alive after an HTTP cancellation, completing and caching
+the accepted distribution for other pages. Failed builds are removed so they
+can be retried. Starlette's lifespan starts the worker and, on shutdown,
+rejects queued inference, finishes the active batch, closes the backend and
+settles outstanding CDF and legacy listing builds. The inference queue never
+holds cache locks.
 
 ## Sampling, fetching and rasterization
 
@@ -84,9 +117,13 @@ bun run build
 python3 -m unittest discover -s tests -p '*_test.py'
 ```
 
-Python tests require numpy, protobuf, starlette and httpx. They exercise CDF
-precision, masks, generated protobuf exchange, error statuses and the real
-unary route. TypeScript tests cover weighted refinement, tiny probabilities
+Python tests require numpy, protobuf, starlette and its test-client dependency
+(httpx or httpx2, depending on the installed Starlette). They exercise CDF
+precision, masks, generated protobuf exchange, error statuses, the real unary
+route and inference-worker concurrency. Event-gated tests verify cached-page
+responses during blocked inference, duplicate sharing, bounded admission,
+cancellation, per-measure identity, batch result matching and shutdown without
+loading a model. TypeScript tests cover weighted refinement, tiny probabilities
 near CDF 1, labelled anchors, area-preserving merging, prompt IDs and handle
 recovery, alongside the existing v1 and deep camera tests.
 

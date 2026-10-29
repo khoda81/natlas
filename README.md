@@ -101,6 +101,10 @@ The server's handles hash label paths, so their identities survive a restart,
 but forgotten ancestors still need to be named again. Each v2 response carries
 a CDF page that the client caches; a cold server may need model evaluations
 while resolving that ancestry.
+Request handlers await a bounded inference worker shared by v1 and v2, so
+cached pages can return while another node is being computed. The local
+backend owns one model thread; its batch interface also supports future
+batched or remote backends. See the [worker contract](docs/quantile-v2.md#asynchronous-inference).
 Models load in float32 by default, which is both more precise and, on a GTX
 1660 Ti, about 5× faster than float16; `--dtype` trades that for memory on
 larger models.

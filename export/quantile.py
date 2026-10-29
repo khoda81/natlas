@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
-import threading
 from bisect import bisect_right
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 from google.protobuf.message import DecodeError
 from natlas.v2 import natlas_pb2 as pb
@@ -115,47 +115,73 @@ class CDF:
 
 
 class Service:
-    """Opaque path handles and a bounded cache of normalized CDFs per measure."""
+    """Event-loop-owned handles and CDFs; inference is an asynchronous provider."""
 
-    def __init__(self, distribution: Callable[[tuple[int, ...]], Iterable[float]], *, log_weights: bool = False):
+    def __init__(
+        self, distribution: Callable[[tuple[int, ...]], Awaitable[Iterable[float]]], *, log_weights: bool = False
+    ):
         self.distribution = distribution
         self.log_weights = log_weights
         self.paths: dict[int, tuple[int, ...]] = {0: ()}
         self.handles: dict[tuple[int, ...], int] = {(): 0}
         self.cache: OrderedDict[tuple[int, ...], CDF] = OrderedDict()
         self.vocabularies: dict[tuple[int, ...], int] = {}
-        self.lock = threading.Lock()
+        self.pending: dict[tuple[int, ...], asyncio.Task[CDF]] = {}
 
-    def query(self, data: bytes) -> bytes:
+    async def query(self, data: bytes) -> bytes:
         child, prefix = request(data)
-        with self.lock:
-            if child is None:
-                path: tuple[int, ...] = ()
-            else:
-                parent, label = child
-                if parent not in self.paths:
-                    raise KeyError("unknown parent handle")
-                base = self.paths[parent]
-                if base not in self.vocabularies:
-                    self.cdf(base)
-                if label >= self.vocabularies[base]:
-                    raise ValueError("invalid branch")
-                path = base + (label,)
-            if path not in self.handles:
-                encoded = b"".join(label.to_bytes(4, "big") for label in path)
-                handle = int.from_bytes(hashlib.blake2b(encoded, digest_size=8, person=b"natlas-v2").digest(), "big")
-                if handle in self.paths and self.paths[handle] != path:
-                    raise RuntimeError("node handle collision")
-                self.handles[path] = handle
-                self.paths[handle] = path
-            return response(self.handles[path], *self.cdf(path).page(prefix))
+        if child is None:
+            path: tuple[int, ...] = ()
+        else:
+            parent, label = child
+            if parent not in self.paths:
+                raise KeyError("unknown parent handle")
+            base = self.paths[parent]
+            if base not in self.vocabularies:
+                await self.cdf(base)
+            if label >= self.vocabularies[base]:
+                raise ValueError("invalid branch")
+            path = base + (label,)
+        if path not in self.handles:
+            encoded = b"".join(label.to_bytes(4, "big") for label in path)
+            handle = int.from_bytes(hashlib.blake2b(encoded, digest_size=8, person=b"natlas-v2").digest(), "big")
+            if handle in self.paths and self.paths[handle] != path:
+                raise RuntimeError("node handle collision")
+            self.handles[path] = handle
+            self.paths[handle] = path
+        cdf = await self.cdf(path)
+        # The local reference remains valid if another request evicts this CDF.
+        page = await asyncio.to_thread(cdf.page, prefix)
+        return response(self.handles[path], *page)
 
-    def cdf(self, path: tuple[int, ...]) -> CDF:
-        if path not in self.cache:
-            weights = self.distribution(path)
-            self.cache[path] = CDF.from_log_weights(weights) if self.log_weights else CDF(weights)
-            self.vocabularies[path] = len(self.cache[path].ends)
-            if len(self.cache) > CACHED_CDFS:
-                self.cache.popitem(last=False)
-        self.cache.move_to_end(path)
-        return self.cache[path]
+    async def cdf(self, path: tuple[int, ...]) -> CDF:
+        cached = self.cache.get(path)
+        if cached is not None:
+            self.cache.move_to_end(path)
+            return cached
+        task = self.pending.get(path)
+        if task is None:
+            task = asyncio.create_task(self._load(path), name="natlas-cdf")
+            self.pending[path] = task
+            task.add_done_callback(lambda done: self._finished(path, done))
+        # Accepted work warms the cache even if its HTTP caller disconnects;
+        # other callers waiting for this same CDF keep their result.
+        return await asyncio.shield(task)
+
+    def _finished(self, path: tuple[int, ...], task: asyncio.Task[CDF]) -> None:
+        self.pending.pop(path, None)
+        if not task.cancelled():
+            task.exception()
+
+    async def _load(self, path: tuple[int, ...]) -> CDF:
+        weights = await self.distribution(path)
+        make = CDF.from_log_weights if self.log_weights else CDF
+        cdf = await asyncio.to_thread(make, weights)
+        self.vocabularies[path] = len(cdf.ends)
+        self.cache[path] = cdf
+        if len(self.cache) > CACHED_CDFS:
+            self.cache.popitem(last=False)
+        return cdf
+
+    async def aclose(self) -> None:
+        await asyncio.gather(*self.pending.values(), return_exceptions=True)

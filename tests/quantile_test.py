@@ -1,9 +1,15 @@
 """Run with python -m unittest discover -s tests -p '*_test.py'."""
 
+import asyncio
+import io
 import math
+import struct
 import sys
+import threading
 import types
 import unittest
+from collections import Counter
+from contextlib import redirect_stderr
 from fractions import Fraction
 from pathlib import Path
 
@@ -12,7 +18,7 @@ from quantile import CDF, Service, request, response, MAX_PREFIX
 from natlas.v2 import natlas_pb2 as pb
 
 
-class QuantileTests(unittest.TestCase):
+class QuantileTests(unittest.IsolatedAsyncioTestCase):
     def test_uniform(self):
         first, deltas, terminal = CDF([1] * 256).page(b"")
         self.assertEqual((first, deltas, terminal), (0, [1] * 256, False))
@@ -67,22 +73,30 @@ class QuantileTests(unittest.TestCase):
         self.assertEqual(result.delta[-1], 2**32)
         self.assertEqual(result.first_branch_id, 17)
 
-    def test_service(self):
-        service = Service(lambda path: [1, 1] if not path else [])
-        result = pb.QuantileResponse.FromString(service.query(b""))
+    async def test_service(self):
+        async def distribution(path):
+            return [1, 1] if not path else []
+
+        service = Service(distribution)
+        self.addAsyncCleanup(service.aclose)
+        result = pb.QuantileResponse.FromString(await service.query(b""))
         self.assertEqual(len(result.delta), 256)
         child = pb.QuantileRequest(node=pb.Branch(parent=result.node, branch_id=0))
-        result = pb.QuantileResponse.FromString(service.query(child.SerializeToString()))
+        result = pb.QuantileResponse.FromString(await service.query(child.SerializeToString()))
         self.assertTrue(result.terminal)
 
-    def test_handle_identity_does_not_depend_on_registration_order(self):
-        services = [Service(lambda path: [1, 1, 1, 1]) for _ in range(2)]
+    async def test_handle_identity_does_not_depend_on_registration_order(self):
+        async def distribution(path):
+            return [1, 1, 1, 1]
+
+        services = [Service(distribution) for _ in range(2)]
         handles = []
         for service, order in zip(services, ([0, 1], [1, 0])):
+            self.addAsyncCleanup(service.aclose)
             found = {}
             for label in order:
                 query = pb.QuantileRequest(node=pb.Branch(parent=0, branch_id=label))
-                found[label] = pb.QuantileResponse.FromString(service.query(query.SerializeToString())).node
+                found[label] = pb.QuantileResponse.FromString(await service.query(query.SerializeToString())).node
             handles.append(found)
         self.assertEqual(handles[0], handles[1])
 
@@ -101,6 +115,11 @@ class ServerTests(unittest.TestCase):
         )
         model = serve.Model((), lambda path: len(path) > 1, 3, [measure])
         cls.client = TestClient(serve.app(model, [], {}))
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
 
     def post(self, data):
         return self.client.post(
@@ -128,6 +147,224 @@ class ServerTests(unittest.TestCase):
         )
         self.assertEqual(result.status_code, 200)
         self.assertTrue(result.content)
+
+
+class ServerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        sys.modules.setdefault("lm", types.SimpleNamespace(TooLong=type("TooLong", (Exception,), {})))
+        try:
+            import httpx2 as httpx
+        except ImportError:
+            import httpx
+        import serve
+
+        self.httpx = httpx
+        loop = asyncio.get_running_loop()
+        self.entered = asyncio.Event()
+        self.release = threading.Event()
+        self.calls = Counter()
+        self.threads = set()
+        self.fail = set()
+        self.block = {(0, (1,))}
+
+        def measure(index):
+            def log_probs(path):
+                key = index, path
+                self.calls[key] += 1
+                self.threads.add(threading.get_ident())
+                if key in self.block:
+                    loop.call_soon_threadsafe(self.entered.set)
+                    if not self.release.wait(5):
+                        raise TimeoutError("test did not release inference")
+                if key in self.fail:
+                    raise RuntimeError("fixture inference failed")
+                return types.SimpleNamespace(tolist=lambda: [-1.0, -2.0, -800.0])
+
+            return types.SimpleNamespace(log_probs=log_probs)
+
+        model = serve.Model((), lambda path: len(path) > 1, 3, [measure(0), measure(1)])
+        self.application = serve.app(model, [], {}, capacity=2)
+        self.lifespan = self.application.router.lifespan_context(self.application)
+        await self.lifespan.__aenter__()
+        self.addAsyncCleanup(self.lifespan.__aexit__, None, None, None)
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.application), base_url="http://test")
+        self.addAsyncCleanup(self.client.aclose)
+        self.addCleanup(self.release.set)
+        root = await self.post()
+        self.root = pb.QuantileResponse.FromString(root.content).node
+
+    async def post(self, label=None, prefix=b"", *, measure=0, parent=None):
+        node = None if label is None else pb.Branch(parent=self.root if parent is None else parent, branch_id=label)
+        message = pb.QuantileRequest(node=node, prefix=prefix)
+        return await self.client.post(
+            f"/{measure}/natlas.v2.Natlas/Quantile",
+            content=message.SerializeToString(),
+            headers={"content-type": "application/proto"},
+        )
+
+    async def legacy(self, label=None, *, horizon=10):
+        from natlas.v1 import natlas_pb2 as v1
+
+        node = None if label is None else v1.Child(parent=0, label=label)
+        body = v1.ExpandRequest(node=node, horizon=horizon).SerializeToString()
+        return await self.client.post(
+            "/0/natlas.v1.Natlas/Expand",
+            content=b"\0" + len(body).to_bytes(4, "big") + body,
+            headers={"content-type": "application/connect+proto"},
+        )
+
+    async def cold(self):
+        task = asyncio.create_task(self.post(1))
+        await asyncio.wait_for(self.entered.wait(), 2)
+        return task
+
+    async def test_cached_refinement_and_manifest_return_during_cold_inference(self):
+        cold = await self.cold()
+        cached = await asyncio.wait_for(self.post(prefix=b"\xff"), 2)
+        self.assertEqual(cached.status_code, 200)
+        manifest = await asyncio.wait_for(self.client.get("/manifest.json"), 2)
+        self.assertEqual(manifest.status_code, 200)
+        self.assertFalse(cold.done())
+        self.assertEqual(self.calls[(0, ())], 1)
+        self.release.set()
+        self.assertEqual((await cold).status_code, 200)
+
+    async def test_duplicate_pages_share_inference_and_survive_one_http_cancellation(self):
+        first = await self.cold()
+        second = asyncio.create_task(self.post(1, b"\xff"))
+        await asyncio.sleep(0)
+        first.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        self.release.set()
+        result = await second
+        self.assertEqual(result.status_code, 200)
+        message = pb.QuantileResponse.FromString(result.content)
+        expected = CDF.from_log_weights([-1, -2, -800]).page(b"\xff")
+        self.assertEqual((message.first_branch_id, list(message.delta), message.terminal), expected)
+        self.assertEqual((await self.post(1, b"\x00")).status_code, 200)
+        self.assertEqual(self.calls[(0, (1,))], 1)
+
+    async def test_queue_overload_returns_429_while_cache_hits_still_work(self):
+        cold = await self.cold()
+        queued = asyncio.create_task(self.post(2))
+        # Wait for admission rather than relying on a wall-clock scheduling delay.
+        for _ in range(100):
+            if len(self.application.state.inference.pending) == 2:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(len(self.application.state.inference.pending), 2)
+        overloaded = await self.post(0)
+        self.assertEqual(overloaded.status_code, 429)
+        self.assertEqual(overloaded.json()["code"], "resource_exhausted")
+        legacy = await self.legacy(0)
+        self.assertIn(b'"code": "resource_exhausted"', legacy.content)
+        self.assertEqual((await self.post(prefix=b"\x00")).status_code, 200)
+        self.assertFalse(cold.done())
+        self.release.set()
+        self.assertEqual([reply.status_code for reply in await asyncio.gather(cold, queued)], [200, 200])
+
+    async def test_legacy_cache_bypasses_busy_inference_and_protocols_share_the_worker(self):
+        self.assertEqual((await self.legacy()).status_code, 200)
+        cold = await self.cold()
+        cached = await asyncio.wait_for(self.legacy(), 2)
+        self.assertEqual(cached.status_code, 200)
+        queued = asyncio.create_task(self.legacy(0))
+        await asyncio.sleep(0)
+        self.assertFalse(cold.done())
+        self.assertFalse(queued.done())
+        self.assertEqual(self.calls[(0, (0,))], 0)
+        self.release.set()
+        self.assertEqual((await cold).status_code, 200)
+        self.assertEqual((await queued).status_code, 200)
+        self.assertEqual(len(self.threads), 1)
+        self.assertNotIn(threading.get_ident(), self.threads)
+
+    async def test_different_measures_have_independent_job_keys(self):
+        replies = await asyncio.gather(self.post(0), self.post(0, measure=1))
+        self.assertEqual([reply.status_code for reply in replies], [200, 200])
+        self.assertEqual(self.calls[(0, (0,))], 1)
+        self.assertEqual(self.calls[(1, (0,))], 1)
+        self.assertEqual(len(self.threads), 1)
+
+    async def test_failed_inference_is_retryable_and_does_not_poison_the_cdf_cache(self):
+        self.fail.add((0, (0,)))
+        with redirect_stderr(io.StringIO()):
+            failed = await self.post(0)
+        self.assertEqual(failed.status_code, 500)
+        self.assertEqual(failed.json()["code"], "internal")
+        self.fail.clear()
+        self.assertEqual((await self.post(0)).status_code, 200)
+        self.assertEqual(self.calls[(0, (0,))], 2)
+
+    async def test_terminal_node_returns_without_submitting_inference(self):
+        child = await self.post(0)
+        handle = pb.QuantileResponse.FromString(child.content).node
+        before = self.calls.copy()
+        result = await self.post(0, parent=handle)
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(pb.QuantileResponse.FromString(result.content).terminal)
+        self.assertEqual(self.calls, before)
+
+    async def test_legacy_wire_weights_are_preserved(self):
+        from natlas.v1 import natlas_pb2 as v1
+        from natlas_codec import encode
+
+        result = await self.legacy(horizon=16)
+        offset, edges, handles = 0, [], []
+        while offset < len(result.content):
+            flags, size = struct.unpack_from(">BI", result.content, offset)
+            offset += 5
+            body = result.content[offset : offset + size]
+            offset += size
+            if flags == 0:
+                message = v1.ExpandResponse.FromString(body)
+                if message.HasField("edge"):
+                    edges.append(message.edge)
+                else:
+                    handles.append(message.node)
+        self.assertEqual(handles, [0])
+        self.assertEqual(edges, encode([0, 1], [-1, -2], 16))
+
+    async def test_async_backend_can_replace_the_local_model(self):
+        import serve
+
+        class RemoteFixture:
+            def __init__(self):
+                self.jobs = []
+                self.closed = False
+
+            async def evaluate(self, jobs):
+                self.jobs.extend(jobs)
+                return {job: (-1.0, -2.0, -800.0) for job in jobs}
+
+            async def aclose(self):
+                self.closed = True
+
+        from inference import Job
+
+        backend = RemoteFixture()
+        # This measure has no local inference method at all.
+        model = serve.Model((), lambda path: False, 3, [object()])
+        application = serve.app(model, [], {}, backend=backend, batch_size=4)
+        async with application.router.lifespan_context(application):
+            async with self.httpx.AsyncClient(
+                transport=self.httpx.ASGITransport(app=application), base_url="http://test"
+            ) as client:
+                root = await client.post(
+                    "/0/natlas.v2.Natlas/Quantile", content=b"", headers={"content-type": "application/proto"}
+                )
+                self.assertEqual(root.status_code, 200)
+                handle = pb.QuantileResponse.FromString(root.content).node
+                child = pb.QuantileRequest(node=pb.Branch(parent=handle, branch_id=1))
+                reply = await client.post(
+                    "/0/natlas.v2.Natlas/Quantile",
+                    content=child.SerializeToString(),
+                    headers={"content-type": "application/proto"},
+                )
+                self.assertEqual(reply.status_code, 200)
+        self.assertEqual(backend.jobs, [Job(0, ()), Job(0, (1,))])
+        self.assertTrue(backend.closed)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ export function distributionBounds(p: RadixCDF, q: RadixCDF | undefined): { entr
     entropy.lower += Math.min(entropyMass(lower), entropyMass(upper));
     const maximum = Math.max(lower, Math.min(upper, logCount - 1));
     entropy.upper += entropyMass(maximum, logCount);
-    const qb = q?.ready && !q.terminal ? q.rangeBounds(region.first, region.end) : { lower: -Infinity, upper: 0 };
+    const qb = q?.terminal ? { lower: -Infinity, upper: -Infinity } : q?.ready ? q.rangeBounds(region.first, region.end) : { lower: -Infinity, upper: 0 };
     cross.lower += lower === -Infinity ? 0 : Math.exp(lower) * -qb.upper;
     cross.upper += upper === -Infinity ? 0 : region.kind === "unresolved" ? Infinity : Math.exp(upper) * -qb.lower;
   }

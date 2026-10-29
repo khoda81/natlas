@@ -183,6 +183,7 @@ export class RadixCDF {
 
   /** Representative derived from shared CDF midpoints, not independent token estimates. */
   estimate(first: number, end = first + 1): number {
+    if (!this.ready || this.terminal) return -Infinity;
     return midpointMass(this.boundary(first), this.boundary(end));
   }
 

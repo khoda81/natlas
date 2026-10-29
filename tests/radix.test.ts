@@ -210,6 +210,20 @@ describe("v2 anchored geometry", () => {
     }
   });
 
+  it("keeps unsupported Q continuations infinitely wide instead of inventing a midpoint", () => {
+    const tree = new IntervalTree(2), p = new RadixCDF(), q = new RadixCDF();
+    p.insert([], page([1n, 1n])); q.insert([], page([]));
+    attach(tree, 0, p); attach(tree, 1, q);
+    const lens = { p: 0, q: 1 };
+    const slots = tree.root.slots(lens);
+    expect([...slots.widths]).toEqual([Infinity, Infinity]);
+    expect([...slots.q]).toEqual([0, 0]);
+    expect(distributionBounds(p, q).cross).toEqual({ lower: Infinity, upper: Infinity });
+    const frame = layout(tree, lens, { x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 }, { width: 1000, height: 800 });
+    expect(frame.boxes).toHaveLength(2);
+    expect(frame.boxes.every((box) => box.x1 === Infinity)).toBe(true);
+  });
+
   it("keeps an unresolved range's ID boundary when its interior is discovered", () => {
     const tree = new IntervalTree(1), p = new RadixCDF();
     const weights = Array<bigint>(512).fill(1n);

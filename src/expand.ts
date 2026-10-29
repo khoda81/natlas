@@ -117,7 +117,11 @@ function quantileWants(tree: IntervalTree, lens: Lens, cam: Camera, view: Viewpo
   };
   if (!tree.root.listing(lens.p)?.radix?.ready) add(tree.root, 0, 0, true, right - cam.x);
   const walked = new Map(frame.walked.map((entry) => [entry.node, entry]));
-  for (const entry of walked.values()) add(tree.node(entry.node), entry.lnMass, entry.x);
+  for (const entry of walked.values()) {
+    add(tree.node(entry.node), entry.lnMass, entry.x);
+    const target = result.get(entry.node)?.quantile;
+    if (target && entry.at) target.window = { id: entry.at.id, y: entry.at.y * view.height, height: view.height };
+  }
   for (const entry of frame.unexpanded) {
     const parent = tree.node(entry.node);
     const parentFrame = walked.get(parent.id)!;
@@ -148,6 +152,12 @@ function quantileWants(tree: IntervalTree, lens: Lens, cam: Camera, view: Viewpo
     const target = result.get(box.node)?.quantile;
     if (!target?.labels) continue;
     const slots = tree.node(box.node).slots(lens);
+    if (slots.sampled && (box.kind === "unresolved" || box.kind === "aggregate")) {
+      const first = slots.regions[box.slot]!.first;
+      const end = slots.regions[box.slot + box.count - 1]!.end;
+      target.ranges = [...(target.ranges ?? []), { first, end }];
+      continue;
+    }
     for (let i = box.slot; i < box.slot + box.count; i++) {
       const label = slots.label(i);
       if (label !== null) (target.labels as Set<number>).add(label);
@@ -293,7 +303,10 @@ export class Expander {
    */
   async reach(node: TreeNode, measure: number, label: number): Promise<boolean> {
     if (this.sources[measure]?.quantile) return this.refiner.reach(node, measure, label);
-    const listed = () => node.listing(measure)?.labels.includes(label) === true;
+    const listed = () => {
+      const listing = node.listing(measure);
+      return listing !== undefined && !listing.radix && listing.labels.includes(label);
+    };
     for (let horizon = Math.max(16, 2 * (node.listing(measure)?.horizon ?? 0)); !listed(); horizon *= 2) {
       if (horizon > MAX_HORIZON) return false;
       await this.fetch(node, measure, horizon);

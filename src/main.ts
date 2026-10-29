@@ -19,6 +19,7 @@ import { BITS, draw, NATS, RULER_HEIGHT, screenRect, slotKey, type Units } from 
 import type { Glyph, Reading } from "./reading";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "./source";
 import { IntervalTree, type NodeId, type Slots, type TreeNode } from "./tree";
+import { distributionBounds, type Interval } from "./statistics";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
 const KEY_DEPTH_SPEED = 900;
@@ -534,7 +535,7 @@ class App {
     // A tail's q, and q of a child q has not listed, are upper bounds.
     const qBound = box.kind === "tail" || (box.kind !== "merged" && slots.qBound[box.slot] === true);
     const [atMost, atLeast] = qBound ? ["≤ ", "≥ "] : ["", ""];
-    const rows: [string, string][] = [
+    let rows: [string, string][] = [
       [`p · ${names[p]}`, `${slots.sampled ? "≈ " : ""}${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
     ];
     if (p !== q || box.kind === "tail") {
@@ -552,6 +553,34 @@ class App {
       rows.push(["KL(p ‖ q) at node", `${bound === "" ? "" : "≈ "}${this.fmt(stats.cross - stats.entropy)}`]);
     }
 
+    if (slots.sampled) {
+      const state = node.listing(p)!.radix!;
+      const first = slots.regions[box.slot]!.first;
+      const end = slots.regions[box.slot + box.count - 1]!.end;
+      const pb = state.rangeBounds(first, end);
+      const range = (b: Interval) => `${this.fmt(b.lower)} … ${this.fmt(b.upper)}`;
+      const probability = (lower: number, upper: number) => `${Math.exp(lower).toPrecision(4)} … ${Math.exp(upper).toPrecision(4)}`;
+      rows = [
+        [box.label === null ? "IDs" : "ID", box.label === null ? `${first} … ${end - 1}` : String(first)],
+        [`p · ${names[p]}`, probability(pb.lower, pb.upper)],
+      ];
+      if (box.label !== null) {
+        const qb = slots.qBounds[box.slot]!;
+        rows.push([`q · ${names[q]}`, probability(qb.lower, qb.upper)]);
+        rows.push(["width −log q", range({ lower: -qb.upper, upper: -qb.lower })]);
+      } else rows.push(["width", box.kind === "aggregate" ? "individual bars below a pixel" : "individual weights unresolved"]);
+      rows.push(["placement", "CDF midpoints · ancestors approximate"]);
+      const bounds = distributionBounds(state, node.listing(q)?.radix);
+      rows.push([p === q ? "H at node" : "H(p) at node", range(bounds.entropy)]);
+      if (p !== q) {
+        rows.push(["H(p, q) at node", range(bounds.cross)]);
+        rows.push(["KL(p ‖ q) at node", range({
+          lower: Math.max(0, bounds.cross.lower - bounds.entropy.upper),
+          upper: Math.max(0, bounds.cross.upper - bounds.entropy.lower),
+        })]);
+      }
+    }
+
     const list = document.createElement("dl");
     for (const [term, value] of rows) {
       const dt = document.createElement("dt");
@@ -565,7 +594,7 @@ class App {
     path.append(...chips);
     const kind = document.createElement("div");
     kind.className = "kind";
-    kind.textContent = `${box.kind === "node" ? "expanded" : box.kind === "leaf" ? "unexpanded" : box.kind} · ${this.units.name}`;
+    kind.textContent = `${box.kind === "node" ? "expanded" : box.kind === "leaf" ? "unexpanded" : box.kind} · ${slots.sampled ? "ID order · " : ""}${this.units.name}`;
     this.inspect.replaceChildren(path, kind, list);
     this.inspect.hidden = false;
   }
@@ -586,9 +615,16 @@ class App {
     const highText = document.createElement("span");
     highText.textContent = high;
     this.legend.append(lowText, swatch, highText);
+    const quantile = this.dataset?.sources[this.lens.p]?.quantile !== undefined;
+    if (quantile) {
+      const uncertainty = document.createElement("span");
+      uncertainty.textContent = "ID order · ▧ unresolved";
+      this.legend.append(uncertainty);
+    }
     this.legend.title = equal
       ? "Color repeats each slot's conditional probability. Area is entropy."
       : "Color is ln(p/q) per slot: red where q under-weights it. Area is cross-entropy.";
+    if (quantile) this.legend.title = "ID order. Hatched regions have unresolved weights or edges. Solid geometry uses shared CDF midpoints; ancestor placement remains approximate. Hover for probability and entropy bounds.";
   }
 
   private toggleUnits(): void {

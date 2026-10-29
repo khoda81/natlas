@@ -1,6 +1,6 @@
 /** View-directed v2 fetching; one page per task keeps refinement progressive. */
 import { Code, ConnectError } from "@connectrpc/connect";
-import { RadixCDF } from "./radix";
+import { RadixCDF, type CDFWindow, type IDRange } from "./radix";
 import type { Source } from "./source";
 import type { IntervalTree, Lens, TreeNode } from "./tree";
 
@@ -15,6 +15,9 @@ export interface QuantileWant {
   right: number;
   /** Undefined on first discovery; otherwise refine only visible IDs. */
   labels?: ReadonlySet<number>;
+  /** Visible ranges whose token ownership is unresolved or below raster resolution. */
+  ranges?: readonly IDRange[];
+  window?: CDFWindow;
   /** Resolve p bounds for children whose estimated height crosses the expansion cutoff. */
   children?: ReadonlySet<number>;
 }
@@ -40,15 +43,7 @@ export class Refiner {
   }
 
   private publish(node: TreeNode, measure: number, state: RadixCDF): void {
-    const values = [...state.weights()].filter(([, mass]) => mass > 0);
-    node.setListing(measure, {
-      labels: values.map(([label]) => label),
-      lnWeights: values.map(([, mass]) => Math.log(mass)),
-      leftover: 0,
-      complete: 0,
-      horizon: 0,
-      radix: state,
-    });
+    node.setListing(measure, { horizon: 0, radix: state });
   }
 
   private async page(node: TreeNode, measure: number, prefix: number[]): Promise<void> {
@@ -87,13 +82,13 @@ export class Refiner {
     const state = this.state(node, measure);
     state.insert(prefix, reply);
     this.publish(node, measure, state);
-    // q changes also reorder p's slots, including other active lenses.
+    // A CDF may be shared by the height and width lenses.
     this.tree.touch(node.id);
   }
 
   /** Select work without issuing requests or causing redraws when satisfied. */
   next(want: QuantileWant): (() => Promise<void>) | undefined {
-    const { node, lens, logHeight, k, right, labels, children } = want;
+    const { node, lens, logHeight, k, right, labels, ranges, window, children } = want;
     const p = this.state(node, lens.p);
     const q = this.state(node, lens.q);
     if (!p.ready) return () => this.page(node, lens.p, []);
@@ -108,14 +103,14 @@ export class Refiner {
       const prefix = p.nextBoundary(label);
       if (prefix) return () => this.page(node, lens.p, prefix);
     }
-    const sample = p.nextSample(logHeight, labels);
+    const sample = p.nextSample(logHeight, labels, ranges, window);
     // Alternate p geometry and q endpoints, rather than finishing either
     // distribution before showing the other measure's information.
     if (sample && this.turn++ % 2 === 0) return () => this.page(node, lens.p, sample);
-    const weights = p.weights();
     // The sum of these per-edge budgets is <0.5px at any path depth.
     const tolerance = 0.25 / this.tree.chain(node.id).length ** 2;
-    const targets = [...(labels ?? weights.keys())].sort((a, b) => (weights.get(b) ?? 0) - (weights.get(a) ?? 0));
+    const targets = [...(labels ?? p.partition().filter((r) => r.kind === "token").map((r) => r.first))]
+      .sort((a, b) => p.bounds(b).upper - p.bounds(a).upper);
     for (const label of targets) {
       const bounds = q.bounds(label);
       if (-bounds.upper >= right || (bounds.upper - bounds.lower) * k <= tolerance) continue;

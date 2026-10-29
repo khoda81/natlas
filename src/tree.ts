@@ -1,9 +1,8 @@
 // Client replica of a nested interval tree, fetched node by node and measure
 // by measure. Legacy v1 listings use p-rank order and a residual tail; v2
-// derives weighted samples from CDF bins and sorts the slots by q. Heights
-// are then estimates, while widths are conservative bounds in log space.
+// preserves ID order, shared CDF boundaries, and explicit unresolved ranges.
 
-import type { RadixCDF } from "./radix";
+import { boundaryUncertainty, type CDFRegion, type MassBounds, type RadixCDF } from "./radix";
 import type { Listing } from "./codec";
 
 export type NodeId = number;
@@ -19,11 +18,18 @@ export interface Lens {
 }
 
 /** A listing and the horizon it was fetched at. */
-export interface Fetched extends Listing {
+export interface RankedFetched extends Listing {
   horizon: number;
-  /** v2 geometry is derived from this progressively refined CDF. */
-  radix?: RadixCDF;
+  radix?: undefined;
 }
+
+/** CDF evidence is never passed off as a complete ranked listing. */
+export interface QuantileFetched {
+  radix: RadixCDF;
+  horizon: 0;
+}
+
+export type Fetched = RankedFetched | QuantileFetched;
 
 /** Upper bound on the weight of any child ``listing`` leaves out. */
 function unlistedBound(listing: Listing): number {
@@ -43,6 +49,9 @@ export class Slots {
   /** Conditional q weight per slot, or an upper bound where ``qBound``. */
   readonly q: Float64Array;
   readonly qBound: boolean[];
+  readonly regions: readonly CDFRegion[];
+  readonly qBounds: readonly MassBounds[];
+  private readonly slotLabels: (Label | null)[];
   readonly listed: number;
   readonly count: number;
   private readonly index = new Map<Label, number>();
@@ -52,46 +61,53 @@ export class Slots {
   constructor(p: Fetched | undefined, q: Fetched | undefined) {
     this.sampled = p?.radix !== undefined;
     this.widthReady = !this.sampled || q?.radix?.ready === true;
-    const labels = p?.labels ?? [];
-    const pIndex = new Map(labels.map((label, i) => [label, i]));
-    this.labels = this.sampled
-      ? [...labels].sort((a, b) => {
-          const qa = q?.radix?.bounds(a).upper ?? 0;
-          const qb = q?.radix?.bounds(b).upper ?? 0;
-          return qb - qa || a - b;
-        })
-      : labels;
+    this.regions = p?.radix?.partition() ?? [];
+    this.labels = p?.radix
+      ? this.regions.filter((r) => r.kind === "token").map((r) => r.first)
+      : p?.labels ?? [];
     this.listed = this.labels.length;
-    const tail = p !== undefined && p.leftover > 0;
-    this.count = this.listed + (tail ? 1 : 0);
+    const tail = p !== undefined && !p.radix && p.leftover > 0;
+    this.slotLabels = this.sampled
+      ? this.regions.map((r) => r.kind === "token" ? r.first : null)
+      : [...this.labels, ...(tail ? [null] : [])];
+    this.count = this.slotLabels.length;
     this.p = new Float64Array(this.count);
     this.q = new Float64Array(this.count);
     this.widths = new Float64Array(this.count);
     this.qBound = new Array<boolean>(this.count).fill(true);
-    this.labels.forEach((label, slot) => {
-      this.index.set(label, slot);
-      this.p[slot] = Math.exp(p!.lnWeights[pIndex.get(label)!]!);
+    this.slotLabels.forEach((label, slot) => {
+      if (label !== null) this.index.set(label, slot);
     });
-    if (tail) this.p[this.listed] = p.leftover;
+    const qBounds: MassBounds[] = [];
+    this.qBounds = qBounds;
 
-    if (this.sampled) {
-      this.labels.forEach((label, slot) => {
-        const bounds = q?.radix?.bounds(label) ?? {
+    if (p?.radix) {
+      this.regions.forEach((region, slot) => {
+        this.p[slot] = Math.exp(region.lnMass);
+        const bounds = region.kind === "unresolved" ? { lower: -Infinity, upper: 0 } : q?.radix?.bounds(region.first) ?? {
           lower: -Infinity,
           upper: 0,
         };
-        this.widths[slot] = -bounds.upper;
-        this.q[slot] = Math.exp(bounds.upper);
+        qBounds.push(bounds);
+        const midpoint = q?.radix?.ready ? q.radix.estimate(region.first, region.end) : -Infinity;
+        // One shared representative in p=q; an unresolved q endpoint stays
+        // explicitly uncertain, including when its lower mass bound is zero.
+        const estimate = Number.isFinite(midpoint) ? midpoint : bounds.upper;
+        this.widths[slot] = region.kind === "unresolved" ? Infinity : -estimate;
+        this.q[slot] = region.kind === "unresolved" ? NaN : Math.exp(estimate);
         this.qBound[slot] = bounds.lower !== bounds.upper;
       });
     } else {
+      this.labels.forEach((_, slot) => this.p[slot] = Math.exp(p!.lnWeights[slot]!));
+      if (tail) this.p[this.listed] = p!.leftover;
       // Whatever q leaves out weighs at most this; a child it lists only under
       // p's tail can be heavier.
-      const unlisted = q === undefined ? 1 : unlistedBound(q);
+      const rankedQ = q?.radix ? undefined : q;
+      const unlisted = rankedQ === undefined ? 1 : unlistedBound(rankedQ);
       this.q.fill(unlisted);
       let tailBound = unlisted;
-      q?.labels.forEach((label, rank) => {
-        const weight = Math.exp(q.lnWeights[rank]!);
+      rankedQ?.labels.forEach((label, rank) => {
+        const weight = Math.exp(rankedQ.lnWeights[rank]!);
         const slot = this.index.get(label);
         if (slot === undefined) tailBound = Math.max(tailBound, weight);
         else {
@@ -111,15 +127,31 @@ export class Slots {
   }
 
   isTail(slot: number): boolean {
-    return slot === this.listed && this.count > this.listed;
+    return !this.sampled && slot === this.listed && this.count > this.listed;
   }
 
   label(slot: number): Label | null {
-    return slot < this.listed ? this.labels[slot]! : null;
+    return this.slotLabels[slot] ?? null;
   }
 
   slotOf(label: Label): number | undefined {
     return this.index.get(label);
+  }
+
+  /** Preserve an ID boundary even while its containing unresolved range splits. */
+  slotAtID(id: Label): number | undefined {
+    if (!this.sampled) return this.slotOf(id);
+    const slot = this.regions.findIndex((region) => region.first <= id && id < region.end);
+    return slot < 0 ? undefined : slot;
+  }
+
+  /** Half-widths of the cumulative boundary brackets, in conditional p units. */
+  edgeError(slot: number): { before: number; after: number } {
+    const region = this.regions[slot];
+    return region ? {
+      before: Math.exp(boundaryUncertainty(region.before)) / 2,
+      after: Math.exp(boundaryUncertainty(region.after)) / 2,
+    } : { before: 0, after: 0 };
   }
 
   /** Σ p over slots [0, slot): accumulated forward, so free of cancellation. */
@@ -163,7 +195,7 @@ export class TreeNode {
   expanded(measure: number): boolean {
     const listing = this.listings[measure];
     return (
-      listing !== undefined && (listing.radix?.ready === true || listing.labels.length > 0 || listing.complete > 0)
+      listing !== undefined && (listing.radix ? listing.radix.ready : listing.labels.length > 0 || listing.complete > 0)
     );
   }
 

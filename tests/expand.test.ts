@@ -88,12 +88,7 @@ function sampled(tree: IntervalTree, node: TreeNode, measure: number, weights: b
 }
 
 function publish(tree: IntervalTree, node: TreeNode, measure: number, state: RadixCDF): void {
-  const values = [...state.weights()];
-  tree.setListing(node.id, measure, {
-    labels: values.map(([label]) => label),
-    lnWeights: values.map(([, mass]) => Math.log(mass)),
-    leftover: 0, complete: 0, horizon: 0, radix: state,
-  });
+  tree.setListing(node.id, measure, { horizon: 0, radix: state });
 }
 
 const quantileSource: Source = {
@@ -258,7 +253,7 @@ describe("child expansion confidence", () => {
     // Interior tokens have no positive lower mass yet. Normalization F(V)=1
     // already certifies the last token's mass, so it may expand immediately.
     expect(coarse.every((want) => want.node === tree.root || want.node.label === 255)).toBe(true);
-    expect(coarse[0]!.quantile!.children?.has(0)).toBe(true);
+    expect(coarse[0]!.quantile!.ranges).toContainEqual({ first: 0, end: 255 });
     state.insert([0], uniformPage(256, new Uint8Array([0])));
     publish(tree, tree.root, 0, state);
     const child = tree.child(0, 0);
@@ -291,7 +286,7 @@ describe("child expansion confidence", () => {
       // The coarse page made 256 tokens look 3.125px tall. Their actual height
       // is 800/1024px, so resolving them must not require any child inference.
       expect(children).toBe(0);
-      expect(Math.max(...tree.root.listing(0)!.radix!.weights().values()) * view.height).toBeLessThan(1);
+      expect(Math.max(...tree.root.listing(0)!.radix!.partition().filter((r) => r.kind === "token").map((r) => Math.exp(r.mass.upper))) * view.height).toBeLessThan(1);
     } finally {
       expander.dispose();
     }
@@ -324,7 +319,7 @@ describe("completion-driven fetching", () => {
       });
       expect(calls.length).toBeGreaterThan(1);
       expect(new Set(calls).size).toBe(calls.length);
-      expect([...tree.root.listing(0)!.radix!.weights().values()].reduce((a, b) => a + b, 0)).toBeCloseTo(1, 12);
+      expect(tree.root.listing(0)!.radix!.partition().reduce((a, r) => a + Math.exp(r.lnMass), 0)).toBeCloseTo(1, 12);
       const settled = calls.length;
       await Bun.sleep(10);
       expect(calls.length).toBe(settled);

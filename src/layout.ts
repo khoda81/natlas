@@ -21,7 +21,7 @@ export type { Lens } from "./tree";
 export interface Boundary {
   node: NodeId;
   slot: number;
-  /** Stable identity while v2 refinement reorders the slots. */
+  /** Stable ID boundary while unresolved v2 ranges split. */
   label?: Label;
 }
 
@@ -44,7 +44,7 @@ export interface Viewport {
   height: number;
 }
 
-export type BoxKind = "node" | "leaf" | "tail" | "merged";
+export type BoxKind = "node" | "leaf" | "tail" | "merged" | "unresolved" | "aggregate";
 
 export interface Box {
   node: NodeId;
@@ -65,12 +65,15 @@ export interface Box {
   /** Vertical extent in view heights from the top of the view. */
   y0: number;
   y1: number;
+  /** Local endpoint brackets, conditional on the current ancestor placement.
+   * Full path geometry remains a representative until ancestors are resolved. */
+  uncertainty?: { y0: number; y1: number; xMin: number; xMax: number };
 }
 
 export interface Frame {
   boxes: Box[];
   /** Nodes whose slots were laid out, with their ln p mass and left edge in nats. */
-  walked: { node: NodeId; lnMass: number; x: number }[];
+  walked: { node: NodeId; lnMass: number; x: number; at?: { id: number; y: number } }[];
   /**
    * Children not expanded yet whose own children would start on screen, even
    * where their box itself ends at or left of the screen's left edge.
@@ -116,7 +119,7 @@ export function normalize(tree: IntervalTree, lens: Lens, boundary: Boundary): B
   }
   if (node === 0 && slot >= tree.root.slots(lens).count) return { node: 0, slot: Number.MAX_SAFE_INTEGER };
   const slots = tree.node(node).slots(lens);
-  const label = slots.label(slot);
+  const label = slots.sampled ? slots.regions[slot]?.first ?? null : slots.label(slot);
   return slots.sampled && label !== null ? { node, slot, label } : { node, slot };
 }
 
@@ -128,7 +131,7 @@ export function repair(tree: IntervalTree, lens: Lens, cam: Camera): void {
   if (cam.anchor.label !== undefined) {
     const owner = tree.node(cam.anchor.node);
     const slots = owner.slots(lens);
-    const slot = slots.slotOf(cam.anchor.label);
+    const slot = slots.slotAtID(cam.anchor.label);
     if (slot !== undefined) cam.anchor.slot = slot;
     else if (owner.expanded(lens.p)) cam.anchor = normalize(tree, lens, { node: owner.id, slot: 0 });
   }
@@ -183,17 +186,19 @@ export function layout(
 
   const flush = (run: Run | null) => {
     if (run === null) return;
+    const sampled = run.node.slots(lens).sampled;
     push({
       node: run.node.id,
       slot: run.first,
       count: run.count,
-      kind: "merged",
+      kind: sampled ? "aggregate" : "merged",
       label: null,
       p: run.p,
-      q: Math.exp(-run.weightedWidth / run.p),
+      q: sampled ? NaN : Math.exp(-run.weightedWidth / run.p),
       lnMass: run.lnMass + Math.log(run.p),
       x0: run.x,
-      x1: run.x + run.weightedWidth / run.p,
+      // A collection of subpixel bars has no single measured width.
+      x1: sampled ? Infinity : run.x + run.weightedWidth / run.p,
       y0: run.y0,
       y1: run.y1,
     });
@@ -218,8 +223,10 @@ export function layout(
     const label = slots.label(slot);
     const id = label === null ? undefined : node.children.get(label);
     const child = id === undefined ? undefined : tree.node(id);
-    const kind: BoxKind = label === null ? "tail" : child?.expanded(lens.p) ? "node" : "leaf";
+    const kind: BoxKind = label === null ? slots.sampled ? "unresolved" : "tail" : child?.expanded(lens.p) ? "node" : "leaf";
     const childMass = lnMass + Math.log(pw);
+    const error = slots.edgeError(slot);
+    const qBounds = slots.qBounds[slot];
     push({
       node: node.id,
       slot,
@@ -233,6 +240,10 @@ export function layout(
       x1,
       y0,
       y1,
+      ...(slots.sampled ? { uncertainty: {
+        y0: scaled(error.before, scale), y1: scaled(error.after, scale),
+        xMin: x - qBounds!.upper, xMax: x - qBounds!.lower,
+      } } : {}),
     });
     boundary(node, slot, y0);
     boundary(node, slot + 1, y1);
@@ -246,8 +257,9 @@ export function layout(
   // Slots from ``start`` onward, whose top edge is at ``y``.
   const down = (node: TreeNode, start: number, y: number, scale: number, x: number, lnMass: number) => {
     if (x >= right) return;
-    walked.push({ node: node.id, lnMass, x });
     const slots = node.slots(lens);
+    const id = slots.regions[start]?.first ?? slots.regions.at(-1)?.end;
+    walked.push({ node: node.id, lnMass, x, ...(id !== undefined ? { at: { id, y } } : {}) });
     let run: Run | null = null;
     for (let slot = start; slot < slots.count && y < 1; slot++) {
       const pw = slots.p[slot]!;
@@ -267,7 +279,7 @@ export function layout(
           };
           run.count++;
           run.p += pw;
-          run.weightedWidth += pw * slots.widths[slot]!;
+          if (!slots.sampled) run.weightedWidth += pw * slots.widths[slot]!;
           run.y1 = y1;
           if (run.y1 - run.y0 >= mergeUnits) {
             flush(run);
@@ -287,8 +299,9 @@ export function layout(
   // Slots from ``start`` back to the first, whose bottom edge is at ``y``.
   const up = (node: TreeNode, start: number, y: number, scale: number, x: number, lnMass: number) => {
     if (x >= right) return;
-    walked.push({ node: node.id, lnMass, x });
     const slots = node.slots(lens);
+    const id = slots.regions[start + 1]?.first ?? slots.regions.at(-1)?.end;
+    walked.push({ node: node.id, lnMass, x, ...(id !== undefined ? { at: { id, y } } : {}) });
     let run: Run | null = null;
     for (let slot = start; slot >= 0 && y > 0; slot--) {
       const pw = slots.p[slot]!;
@@ -309,7 +322,7 @@ export function layout(
           run.first = slot;
           run.count++;
           run.p += pw;
-          run.weightedWidth += pw * slots.widths[slot]!;
+          if (!slots.sampled) run.weightedWidth += pw * slots.widths[slot]!;
           run.y0 = y0;
           if (run.y1 - run.y0 >= mergeUnits) {
             flush(run);
@@ -362,6 +375,12 @@ export function layout(
       x1: xs[i + 1]!,
       y0: top,
       y1: bottom,
+      ...(slots.sampled ? { uncertainty: {
+        y0: scaled(slots.edgeError(slot).before, scale),
+        y1: scaled(slots.edgeError(slot).after, scale),
+        xMin: x - slots.qBounds[slot]!.upper,
+        xMax: x - slots.qBounds[slot]!.lower,
+      } } : {}),
     });
     boundary(owner, slot, top);
     boundary(owner, slot + 1, bottom);

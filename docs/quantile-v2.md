@@ -9,8 +9,9 @@ node handles remain specific to each endpoint.
 Use the normal `bun run dev` and `uv run export/serve.py` commands. The same
 camera, token labels, hover/path inspector, unit switch, keyboard controls,
 and music reading/roll operate on the progressively refined scene. V2 slots
-sort by descending q, with ID ties. Anchors remember token IDs as well as
-transient slot indices, keeping the viewed edge fixed when slots reorder.
+stay in ascending token ID order, matching the wire CDF. Anchors remember ID
+boundaries as well as transient slot indices, keeping the viewed edge fixed
+when an unresolved range splits. Q refinement never reorders P's rows.
 The ancestor walk still avoids absolute root-CDF coordinates at deep zoom.
 
 ## Wire contract
@@ -89,15 +90,37 @@ holds cache locks.
 ## Sampling, fetching and rasterization
 
 A page partitions its window into 256 equal-mass bins. Matching endpoint IDs
-certify a homogeneous bin. Otherwise the left-boundary ID provisionally
-represents that bin. Refining replaces its mass by 256 smaller weighted bins.
-Unequal refinement levels always retain their actual masses.
+certify a homogeneous bin; differing endpoints leave token ownership unknown.
+The client stores bounds on shared cumulative boundaries F(id) as exact
+base-256 rationals. F(0)=0 and F(V)=1 are known from normalization. Subtracting
+aligned integers gives mass bounds for a token or an entire ID range.
 
-P refinement prioritizes unresolved bins touching visible IDs, down to half
-a screen pixel vertically per bin. This is a local refinement budget, not a
-guarantee of half-pixel error for the whole sorted silhouette. Heights and
-node statistics are marked approximate. Explicit prompt/travel IDs have their
-p mass resolved and reserved even when initial samples missed them.
+`QuantileFetched` contains CDF evidence, separate from a v1 `RankedFetched`
+listing. It does not publish guessed token weights with zero leftover.
+`RadixCDF.partition()` produces disjoint whole-ID regions. A token receives a
+named region only after some positive mass is certified; gaps remain explicit
+unresolved ranges. The shared boundary midpoints provide a representative
+partition for navigation. Pinning a travel token never renormalizes neighbors.
+
+Hatched regions show unresolved ownership or subpixel collections. Their
+horizontal span is a placeholder, not a measured surprisal or entropy area.
+Named tokens expose P and Q intervals, including in P=Q. The same CDF
+representative supplies both height and width in P=Q. Hatched edge bands show
+local cumulative-boundary and width uncertainty. Ancestor placement and scale
+still use representatives: these local bands are not a certified envelope for
+the whole nested scene, and the inspector states that limitation.
+
+Node entropy readouts bound each group's contribution between -r ln r and
+r ln(m/r), optimizing over its mass interval, where m is the number of IDs in
+the group. Cross-entropy can have an infinite upper bound while Q or ownership
+is unresolved. No uniform-within-group assumption supplies a point statistic.
+
+P refinement prioritizes unresolved bins touching visible IDs or ID ranges,
+down to half a screen pixel vertically per bin. A CDF window relative to the
+camera's local ID boundary excludes offscreen bins even inside a large unnamed
+range; rational differences avoid float cancellation near CDF 1. This is a
+local budget, not a whole-path pixel-error guarantee. Explicit prompt/travel
+IDs have their P boundaries refined even when initial pages missed them.
 
 Fetching a child's distribution requires its parent-CDF lower mass bound to
 support at least two screen pixels of height. If the bounds straddle that
@@ -126,7 +149,7 @@ this ordering.
 
 Replies refill fetch capacity independently of animation frames. Before each
 batch, current view geometry is recomputed
-using a camera copy, so new samples and q ordering affect the next requests
+using a camera copy, so new evidence affects the next requests
 without moving the displayed camera between paints. The pump yields between
 batches and retries failures after backoff, even without further input. A
 dataset switch retires its old scheduler. Drawing and canvas resizing stay in
@@ -134,10 +157,23 @@ the same animation frame.
 
 The scheduler also requests ancestor q endpoints when those boxes lie left of
 the viewport, since they place visible descendants.
-Tiny adjacent boxes merge with their p-weighted mean width, preserving their
-entropy/cross-entropy area.
+Tiny adjacent v2 boxes form a hatched aggregate without an invented average
+width. Legacy v1 retains its ranked listings and tail rendering.
 
 ## Validation
+
+For a deterministic ID-order preview with sparse ranges, peaks, P/Q reversal,
+and tiny-token travel, build into a separate directory and run:
+
+```sh
+bun build ./index.html --outdir /tmp/natlas-id-order-build
+python3 tests/id_order_fixture.py --static /tmp/natlas-id-order-build
+# Open http://127.0.0.1:8423/?server=http://127.0.0.1:8423/
+```
+
+To compare independent servers, start another instance with `--port 8424`,
+and pass `--peer http://127.0.0.1:8424/` to the first. `--delay 0.03` makes
+progressive refinement easier to observe. Neither fixture uses model inference.
 
 ```sh
 bun test
@@ -151,9 +187,10 @@ precision, masks, generated protobuf exchange, error statuses, the real unary
 route and inference-worker concurrency. Event-gated tests verify cached-page
 responses during blocked inference, duplicate sharing, bounded admission,
 cancellation, per-measure identity, batch result matching and shutdown without
-loading a model. TypeScript tests cover weighted refinement, tiny probabilities
-near CDF 1, labelled anchors, area-preserving merging, prompt IDs and handle
-recovery, alongside the existing v1 and deep camera tests.
+loading a model. TypeScript tests cover indistinguishable coarse distributions,
+shared boundary certificates, tiny probabilities near CDF 1, stable ID anchors,
+visible-window refinement, coherent P=Q geometry, entropy/cross-entropy bounds,
+prompt IDs and handle recovery, alongside the existing v1 and deep camera tests.
 
 To test the main UI with the Qwen NPZ ZIP, without model/GPU inference:
 

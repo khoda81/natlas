@@ -36,6 +36,19 @@ export interface CDFRegion {
   lnMass: number;
 }
 
+export interface IDRange {
+  first: number;
+  end: number;
+}
+
+/** A visible window relative to one CDF boundary; avoids absolute float CDFs. */
+export interface CDFWindow {
+  id: number;
+  /** The boundary midpoint's screen position in pixels. */
+  y: number;
+  height: number;
+}
+
 /** Difference of rational CDF coordinates, without cancellation near 1. */
 function logDifference(a: bigint, ad: number, b: bigint, bd: number): number {
   const depth = Math.max(ad, bd);
@@ -55,7 +68,7 @@ interface Bin {
   prefix: number[];
   first: number;
   last: number;
-  mass: number;
+  logMass: number;
 }
 
 export const MAX_PREFIX = 1024;
@@ -73,7 +86,6 @@ function pageKey(prefix: readonly number[]): string {
 export class RadixCDF {
   private readonly pages = new Map<string, readonly number[]>();
   private readonly pins = new Set<number>();
-  private estimates: Map<number, number> | undefined;
   private readonly massBounds = new Map<number, MassBounds>();
   private leaves: Bin[] | undefined;
   private regions: readonly CDFRegion[] | undefined;
@@ -120,7 +132,6 @@ export class RadixCDF {
     if (previous && previous.some((value, i) => value !== ids[i])) throw new Error("Measure changed within a session");
     this.pages.set(pageKey(prefix), ids);
     this.ready = true;
-    this.estimates = undefined;
     this.massBounds.clear();
     this.leaves = undefined;
     this.regions = undefined;
@@ -164,6 +175,11 @@ export class RadixCDF {
       lower: logDifference(a.hi, a.depth, b.lo, b.depth),
       upper: Math.min(0, logDifference(a.lo, a.depth, b.hi, b.depth)),
     };
+  }
+
+  /** Representative derived from shared CDF midpoints, not independent token estimates. */
+  estimate(first: number, end = first + 1): number {
+    return midpointMass(this.boundary(first), this.boundary(end));
   }
 
   /** Known tokens and explicit unresolved ID ranges, in the protocol's order.
@@ -217,10 +233,10 @@ export class RadixCDF {
     return next;
   }
 
-  private *bins(prefix: number[] = [], mass = 1): Generator<Bin> {
+  private *bins(prefix: number[] = [], logMass = 0): Generator<Bin> {
     const page = this.pages.get(pageKey(prefix));
     if (!page) return;
-    const step = mass / 256;
+    const step = logMass - 8 * Math.LN2;
     for (let j = 0; j < 256; j++) {
       const first = page[j]!;
       const last = page[j + 1]!;
@@ -229,44 +245,11 @@ export class RadixCDF {
         // Fine pages mostly repeat one ID. Keep certified runs compact.
         let end = j + 1;
         while (end < 256 && page[end] === first && page[end + 1] === first) end++;
-        yield { prefix: child, first, last, mass: step * (end - j) };
+        yield { prefix: child, first, last, logMass: step + Math.log(end - j) };
         j = end - 1;
       } else if (this.has(child)) yield* this.bins(child, step);
-      else yield { prefix: child, first, last, mass: step };
+      else yield { prefix: child, first, last, logMass: step };
     }
-  }
-
-  /** Each unrefined bin contributes its own mass, including between levels. */
-  weights(): ReadonlyMap<number, number> {
-    if (this.estimates) return this.estimates;
-    const values = new Map<number, number>();
-    for (const bin of (this.leaves ??= [...this.bins()]))
-      values.set(bin.first, (values.get(bin.first) ?? 0) + bin.mass);
-    // Travel can explicitly name a token smaller than any current sample bin.
-    // Reserve its resolved mass and renormalize only the sampled remainder.
-    let pinned = 0;
-    for (const label of this.pins) {
-      const bounds = this.bounds(label);
-      const mass = Math.exp((bounds.lower + bounds.upper) / 2);
-      if (mass > 0) {
-        values.set(label, mass);
-        pinned += mass;
-      }
-    }
-    if (pinned > 1) {
-      for (const label of this.pins) if (values.has(label)) values.set(label, values.get(label)! / pinned);
-      pinned = 1;
-    }
-    let rest = 0;
-    for (const [label, mass] of values) if (!this.pins.has(label)) rest += mass;
-    if (rest > 0) {
-      for (const [label, mass] of values)
-        if (!this.pins.has(label)) values.set(label, (mass * Math.max(0, 1 - pinned)) / rest);
-    } else if (pinned > 0) {
-      for (const [label, mass] of values) values.set(label, mass / pinned);
-    }
-    this.estimates = values;
-    return values;
   }
 
   pin(label: number): void {
@@ -275,18 +258,31 @@ export class RadixCDF {
       throw new Error("Token p mass cannot be represented by the camera");
     }
     this.pins.add(label);
-    this.estimates = undefined;
     this.regions = undefined;
   }
 
   /** Largest unresolved p bin relevant to the visible labels, down to 0.5px. */
-  nextSample(logHeight: number, labels?: ReadonlySet<number>): number[] | undefined {
+  nextSample(logHeight: number, labels?: ReadonlySet<number>, ranges: readonly IDRange[] = [], window?: CDFWindow): number[] | undefined {
     if (!this.ready) return [];
     if (this.terminal) return undefined;
     let best: Bin | undefined;
     const sorted = labels ? [...labels].sort((a, b) => a - b) : undefined;
+    const anchor = window ? this.boundary(window.id) : undefined;
+    const error = anchor ? Math.exp(boundaryUncertainty(anchor) + logHeight) / 2 : 0;
+    const position = (coordinate: bigint, depth: number) => {
+      const common = Math.max(depth, anchor!.depth);
+      const delta = (coordinate << BigInt(8 * (common - depth) + 1)) -
+        ((anchor!.lo + anchor!.hi) << BigInt(8 * (common - anchor!.depth)));
+      if (delta === 0n) return window!.y;
+      return window!.y + (delta < 0n ? -1 : 1) * Math.exp(logInteger(delta < 0n ? -delta : delta) - common * 8 * Math.LN2 - Math.LN2 + logHeight);
+    };
     for (const bin of (this.leaves ??= [...this.bins()])) {
-      if (bin.first === bin.last || logHeight + Math.log(bin.mass) <= Math.log(0.5)) continue;
+      if (bin.first === bin.last || logHeight + bin.logMass <= Math.log(0.5)) continue;
+      if (window) {
+        const a = bin.prefix.reduce((a, b) => a * 256n + BigInt(b), 0n);
+        if (position(a + 1n, bin.prefix.length) + error <= 0 ||
+          position(a, bin.prefix.length) - error >= window.height) continue;
+      }
       if (sorted) {
         let lo = 0,
           hi = sorted.length;
@@ -295,9 +291,10 @@ export class RadixCDF {
           if (sorted[mid]! < bin.first) lo = mid + 1;
           else hi = mid;
         }
-        if (lo === sorted.length || sorted[lo]! > bin.last) continue;
+        if ((lo === sorted.length || sorted[lo]! > bin.last) &&
+          !ranges.some((range) => range.first <= bin.last && range.end > bin.first)) continue;
       }
-      if (!best || bin.mass > best.mass) best = bin;
+      if (!best || bin.logMass > best.logMass) best = bin;
     }
     if (best && best.prefix.length > MAX_PREFIX) throw new Error("CDF precision limit reached");
     return best?.prefix;

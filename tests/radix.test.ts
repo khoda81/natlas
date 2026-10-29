@@ -6,6 +6,7 @@ import { Refiner } from "../src/refine";
 import type { Source } from "../src/source";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { distributionBounds } from "../src/statistics";
+import { GeometryEvidence } from "../src/evidence";
 
 /** Exact finite integer distribution, independent of the client's algorithms. */
 function page(weights: bigint[], prefix: readonly number[] = [], node = 7n): QuantileReply {
@@ -204,8 +205,8 @@ describe("v2 anchored geometry", () => {
       expect(box.x1 - box.x0).toBeCloseTo(-Math.log(box.p), 12);
       expect(box.uncertainty).toBeDefined();
       const exactWidth = -Math.log([3, 1, 7][box.label!]! / 11);
-      expect(box.uncertainty!.xMin).toBeLessThanOrEqual(exactWidth);
-      expect(box.uncertainty!.xMax).toBeGreaterThanOrEqual(exactWidth);
+      expect(box.uncertainty!.right.lower).toBeLessThanOrEqual(exactWidth);
+      expect(box.uncertainty!.right.upper).toBeGreaterThanOrEqual(exactWidth);
     }
   });
 
@@ -224,6 +225,58 @@ describe("v2 anchored geometry", () => {
     tree.touch();
     repair(tree, lens, cam);
     expect(layout(tree, lens, cam, { width: 1000, height: 800 }).boxes[0]!.y0).toBeCloseTo(0.2, 12);
+  });
+});
+
+describe("anchored geometry evidence", () => {
+  it("bounds distances between cousins, ancestors, and descendant boundaries", () => {
+    const tree = new IntervalTree(2);
+    const truth = new Map<number, { top: number; mass: number; x: number }>();
+    const weights = [3n, 7n, 2n], qw = [9n, 2n, 1n];
+    const build = (node: number, depth: number, top: number, mass: number, x: number) => {
+      const p = new RadixCDF(), q = new RadixCDF();
+      p.insert([], page(weights)); q.insert([], page(qw));
+      tree.setListing(node, 0, { horizon: 0, radix: p });
+      tree.setListing(node, 1, { horizon: 0, radix: q });
+      truth.set(node, { top, mass, x });
+      if (!depth) return;
+      let offset = 0;
+      for (let id = 0; id < 3; id++) {
+        build(tree.child(node, id).id, depth - 1, top + mass * offset, mass * Number(weights[id]) / 12, x - Math.log(Number(qw[id]) / 12));
+        offset += Number(weights[id]) / 12;
+      }
+    };
+    build(0, 2, 0, 1, 0);
+    const evidence = new GeometryEvidence(tree, { p: 0, q: 1 });
+    const exact = (node: number, id: number) => truth.get(node)!.top + truth.get(node)!.mass * Number(weights.slice(0, id).reduce((a, b) => a + b, 0n)) / 12;
+    for (const a of tree.nodes) for (const b of tree.nodes) for (const ai of [0, 1, 3]) for (const bi of [0, 2, 3]) {
+      const bounds = evidence.project({ node: a.id, id: ai }, { node: b.id, id: bi }, 0.37, 0);
+      const actual = 0.37 + exact(b.id, bi) - exact(a.id, ai);
+      expect(bounds.lower).toBeLessThanOrEqual(actual + 1e-12);
+      expect(bounds.upper).toBeGreaterThanOrEqual(actual - 1e-12);
+    }
+    for (const node of tree.nodes) {
+      expect(evidence.mass(node.id).lower).toBeLessThanOrEqual(Math.log(truth.get(node.id)!.mass) + 1e-12);
+      expect(evidence.mass(node.id).upper).toBeGreaterThanOrEqual(Math.log(truth.get(node.id)!.mass) - 1e-12);
+      expect(evidence.x(node.id).lower).toBeLessThanOrEqual(truth.get(node.id)!.x + 1e-12);
+      expect(evidence.x(node.id).upper).toBeGreaterThanOrEqual(truth.get(node.id)!.x - 1e-12);
+    }
+  });
+  it("keeps deep tail coordinates without subtracting absolute CDF floats", () => {
+    const tree = new IntervalTree(1), p = new RadixCDF();
+    fill(p, [1n, 1n], 0, 1e-14);
+    let node = tree.root;
+    for (let depth = 0; depth <= 80; depth++) {
+      tree.setListing(node.id, 0, { horizon: 0, radix: p });
+      if (depth < 80) node = tree.child(node.id, 1);
+    }
+    const evidence = new GeometryEvidence(tree, { p: 0, q: 0 });
+    const bounds = evidence.project({ node: node.id, id: 0 }, { node: node.id, id: 1 }, 0.2, -80 * Math.LN2);
+    expect(bounds.lower).toBeCloseTo(0.7, 10);
+    expect(bounds.upper).toBeCloseTo(0.7, 10);
+    const rootBottom = evidence.project({ node: node.id, id: 0 }, { node: 0, id: 2 }, 0.2, -80 * Math.LN2);
+    expect(rootBottom.lower).toBeCloseTo(1.2, 10);
+    expect(rootBottom.upper).toBeCloseTo(1.2, 10);
   });
 });
 

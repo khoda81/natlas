@@ -2,7 +2,7 @@
 // by measure. Legacy v1 listings use p-rank order and a residual tail; v2
 // preserves ID order, shared CDF boundaries, and explicit unresolved ranges.
 
-import { boundaryUncertainty, type CDFRegion, type MassBounds, type RadixCDF } from "./radix";
+import type { CDFRegion, MassBounds, RadixCDF } from "./radix";
 import type { Listing } from "./codec";
 
 export type NodeId = number;
@@ -143,15 +143,6 @@ export class Slots {
     if (!this.sampled) return this.slotOf(id);
     const slot = this.regions.findIndex((region) => region.first <= id && id < region.end);
     return slot < 0 ? undefined : slot;
-  }
-
-  /** Half-widths of the cumulative boundary brackets, in conditional p units. */
-  edgeError(slot: number): { before: number; after: number } {
-    const region = this.regions[slot];
-    return region ? {
-      before: Math.exp(boundaryUncertainty(region.before)) / 2,
-      after: Math.exp(boundaryUncertainty(region.after)) / 2,
-    } : { before: 0, after: 0 };
   }
 
   /** Σ p over slots [0, slot): accumulated forward, so free of cancellation. */

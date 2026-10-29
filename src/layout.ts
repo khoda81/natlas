@@ -14,6 +14,7 @@
 // the view, which re-anchoring after every frame keeps below one view height.
 
 import type { IntervalTree, Label, Lens, NodeId, Slots, TreeNode } from "./tree";
+import { GeometryEvidence, type GeometryBounds } from "./evidence";
 
 export type { Lens } from "./tree";
 
@@ -65,9 +66,8 @@ export interface Box {
   /** Vertical extent in view heights from the top of the view. */
   y0: number;
   y1: number;
-  /** Local endpoint brackets, conditional on the current ancestor placement.
-   * Full path geometry remains a representative until ancestors are resolved. */
-  uncertainty?: { y0: number; y1: number; xMin: number; xMax: number };
+  /** Bounds relative to the same anchor, including uncertain ancestor transforms. */
+  uncertainty?: GeometryBounds;
 }
 
 export interface Frame {
@@ -171,6 +171,9 @@ export function layout(
   const walked: Frame["walked"] = [];
   const unexpanded: Frame["unexpanded"] = [];
   const boundaries: Frame["boundaries"] = [];
+  const anchorCDF = tree.node(cam.anchor.node).slots(lens);
+  const anchorID = anchorCDF.regions[Math.min(cam.anchor.slot, anchorCDF.count)]?.first ?? anchorCDF.regions.at(-1)?.end;
+  const evidence = anchorID === undefined ? undefined : new GeometryEvidence(tree, lens);
 
   const boundary = (node: TreeNode, slot: number, y: number) => {
     if (y >= 0 && y <= 1)
@@ -181,7 +184,14 @@ export function layout(
   };
 
   const push = (box: Box) => {
-    if (box.x1 > cam.x && box.x0 < right && box.y1 > 0 && box.y0 < 1) boxes.push(box);
+    if (box.x1 > cam.x && box.x0 < right && box.y1 > 0 && box.y0 < 1) {
+      if (evidence) {
+        const regions = tree.node(box.node).slots(lens).regions;
+        box.uncertainty = evidence.box(box.node, regions[box.slot]!.first, regions[box.slot + box.count - 1]!.end,
+          { node: cam.anchor.node, id: anchorID! }, cam.a, lambda, box.label !== null);
+      }
+      boxes.push(box);
+    }
   };
 
   const flush = (run: Run | null) => {
@@ -225,8 +235,6 @@ export function layout(
     const child = id === undefined ? undefined : tree.node(id);
     const kind: BoxKind = label === null ? slots.sampled ? "unresolved" : "tail" : child?.expanded(lens.p) ? "node" : "leaf";
     const childMass = lnMass + Math.log(pw);
-    const error = slots.edgeError(slot);
-    const qBounds = slots.qBounds[slot];
     push({
       node: node.id,
       slot,
@@ -240,10 +248,6 @@ export function layout(
       x1,
       y0,
       y1,
-      ...(slots.sampled ? { uncertainty: {
-        y0: scaled(error.before, scale), y1: scaled(error.after, scale),
-        xMin: x - qBounds!.upper, xMax: x - qBounds!.lower,
-      } } : {}),
     });
     boundary(node, slot, y0);
     boundary(node, slot + 1, y1);
@@ -375,12 +379,6 @@ export function layout(
       x1: xs[i + 1]!,
       y0: top,
       y1: bottom,
-      ...(slots.sampled ? { uncertainty: {
-        y0: scaled(slots.edgeError(slot).before, scale),
-        y1: scaled(slots.edgeError(slot).after, scale),
-        xMin: x - slots.qBounds[slot]!.upper,
-        xMax: x - slots.qBounds[slot]!.lower,
-      } } : {}),
     });
     boundary(owner, slot, top);
     boundary(owner, slot + 1, bottom);

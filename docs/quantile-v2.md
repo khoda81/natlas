@@ -106,9 +106,18 @@ Hatched regions show unresolved ownership or subpixel collections. Their
 horizontal span is a placeholder, not a measured surprisal or entropy area.
 Named tokens expose P and Q intervals, including in P=Q. The same CDF
 representative supplies both height and width in P=Q. Hatched edge bands show
-local cumulative-boundary and width uncertainty. Ancestor placement and scale
-still use representatives: these local bands are not a certified envelope for
-the whole nested scene, and the inspector states that limitation.
+cumulative-boundary and width uncertainty, including ancestors' mass and
+surprisal bounds. `GeometryEvidence` compares a box boundary with the camera
+anchor through their common ancestor. The distance is a sum of disjoint,
+nonnegative masses: the end of the first branch, intervening IDs, and the
+beginning of the second branch. Rational differences and log sums preserve
+deep tail coordinates without subtracting absolute floating-point CDFs.
+
+These are bounds for the represented boxes relative to the same anchor.
+Navigation, viewport culling, and fetch budgets still use representative
+geometry; this is not a certificate that every possibly visible branch has
+been fetched or that the entire image is within half a pixel of convergence.
+The inspector reports full-path probability bounds as well as local weights.
 
 Node entropy readouts bound each group's contribution between -r ln r and
 r ln(m/r), optimizing over its mass interval, where m is the number of IDs in

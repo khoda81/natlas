@@ -118,7 +118,7 @@ export function draw(
     }
   }
 
-  // These bands show uncertainty in local edges, not invented extra bars.
+  // These bands include the ancestors' uncertainty, relative to the same anchor.
   // Draw after descendants so an uncertain parent edge remains visible.
   for (const box of frame.boxes) {
     const bounds = box.uncertainty;
@@ -126,11 +126,13 @@ export function draw(
     const rect = screenRect(box, cam, view);
     const clampX = (x: number) => Math.max(0, Math.min(view.width, (x - cam.x) * cam.k));
     const clampY = (y: number) => Math.max(0, Math.min(view.height, y * view.height));
-    const x0 = clampX(bounds.xMin), x1 = clampX(bounds.xMax);
-    if (x1 - x0 > 0.5) hatch(ctx, { x0, x1, y0: rect.y0, y1: rect.y1 }, scheme.inkMuted, true);
-    for (const [edge, error] of [[box.y0, bounds.y0], [box.y1, bounds.y1]]) {
-      const y0 = clampY(edge! - error!), y1 = clampY(edge! + error!);
-      if (y1 - y0 > 0.5) hatch(ctx, { x0: rect.x0, x1: Math.max(rect.x1, x1), y0, y1 }, scheme.inkMuted, true);
+    for (const edge of [bounds.left, bounds.right]) {
+      const x0 = clampX(edge.lower), x1 = clampX(edge.upper);
+      if (x1 - x0 > 0.5) hatch(ctx, { x0, x1, y0: rect.y0, y1: rect.y1 }, scheme.inkMuted, true);
+    }
+    for (const edge of [bounds.top, bounds.bottom]) {
+      const y0 = clampY(edge.lower), y1 = clampY(edge.upper);
+      if (y1 - y0 > 0.5) hatch(ctx, { x0: Math.min(rect.x0, clampX(bounds.left.lower)), x1: Math.max(rect.x1, clampX(bounds.right.upper)), y0, y1 }, scheme.inkMuted, true);
     }
   }
 

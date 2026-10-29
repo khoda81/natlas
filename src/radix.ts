@@ -93,6 +93,10 @@ export class RadixCDF {
   ready = false;
   version = 0;
 
+  get vocabulary(): number | undefined {
+    return this.terminal ? 0 : this.pages.get("")?.[256];
+  }
+
   has(prefix: readonly number[]): boolean {
     return this.pages.has(pageKey(prefix));
   }

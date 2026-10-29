@@ -568,8 +568,13 @@ class App {
         const qb = slots.qBounds[box.slot]!;
         rows.push([`q · ${names[q]}`, probability(qb.lower, qb.upper)]);
         rows.push(["width −log q", range({ lower: -qb.upper, upper: -qb.lower })]);
+        rows.push(["p · −log q", range({
+          lower: pb.lower === -Infinity ? 0 : Math.exp(pb.lower) * -qb.upper,
+          upper: pb.upper === -Infinity ? 0 : Math.exp(pb.upper) * -qb.lower,
+        })]);
       } else rows.push(["width", box.kind === "aggregate" ? "individual bars below a pixel" : "individual weights unresolved"]);
-      rows.push(["placement", "CDF midpoints · ancestors approximate"]);
+      if (box.uncertainty) rows.push(["−log P (path)", range({ lower: -box.uncertainty.mass.upper, upper: -box.uncertainty.mass.lower })]);
+      rows.push(["placement", "CDF midpoints · edges bounded"]);
       const bounds = distributionBounds(state, node.listing(q)?.radix);
       rows.push([p === q ? "H at node" : "H(p) at node", range(bounds.entropy)]);
       if (p !== q) {
@@ -624,7 +629,7 @@ class App {
     this.legend.title = equal
       ? "Color repeats each slot's conditional probability. Area is entropy."
       : "Color is ln(p/q) per slot: red where q under-weights it. Area is cross-entropy.";
-    if (quantile) this.legend.title = "ID order. Hatched regions have unresolved weights or edges. Solid geometry uses shared CDF midpoints; ancestor placement remains approximate. Hover for probability and entropy bounds.";
+    if (quantile) this.legend.title = "ID order. Hatched regions have unresolved weights or edges. Geometry uses shared CDF midpoints; edge bounds include ancestor uncertainty. Hover for probability and entropy bounds.";
   }
 
   private toggleUnits(): void {

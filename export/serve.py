@@ -44,18 +44,17 @@ from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
+import lm
 import numpy as np
 import uvicorn
+from inference import Backend, Busy, Closed, Job, LocalBackend, LogWeights, Worker
+from natlas_codec import encode, labels_json, pb
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
-
-import lm
-from inference import Backend, Busy, Closed, Job, LocalBackend, LogWeights, Worker
-from natlas_codec import encode, labels_json, pb
 
 # Connect envelopes: one flags byte, a big-endian length, the message.
 _COMPRESSED = 0x01

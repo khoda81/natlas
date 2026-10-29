@@ -25,12 +25,20 @@ def request(data: bytes) -> tuple[tuple[int, int] | None, bytes]:
         raise ValueError("malformed protobuf request") from error
     if len(message.prefix) > MAX_PREFIX:
         raise OverflowError(f"prefix exceeds {MAX_PREFIX} bytes")
-    node = (message.node.parent, message.node.branch_id) if message.HasField("node") else None
+    node = (
+        (message.node.parent, message.node.branch_id)
+        if message.HasField("node")
+        else None
+    )
     return node, message.prefix
 
 
-def response(handle: int, first: int, deltas: Sequence[int], terminal: bool = False) -> bytes:
-    return pb.QuantileResponse(node=handle, first_branch_id=first, delta=deltas, terminal=terminal).SerializeToString()
+def response(
+    handle: int, first: int, deltas: Sequence[int], terminal: bool = False
+) -> bytes:
+    return pb.QuantileResponse(
+        node=handle, first_branch_id=first, delta=deltas, terminal=terminal
+    ).SerializeToString()
 
 
 class CDF:
@@ -86,7 +94,9 @@ class CDF:
             if not math.isfinite(value) or value < -MAX_WEIGHT_BITS * math.log(2):
                 raise OverflowError(f"log weight range exceeds {MAX_WEIGHT_BITS} bits")
             exponent = math.floor(value / math.log(2))
-            numerator, denominator = math.exp(value - exponent * math.log(2)).as_integer_ratio()
+            numerator, denominator = math.exp(
+                value - exponent * math.log(2)
+            ).as_integer_ratio()
             ratios.append((numerator, exponent - (denominator.bit_length() - 1)))
         minimum = min(exponent for numerator, exponent in ratios if numerator)
         result = cls.__new__(cls)
@@ -118,7 +128,10 @@ class Service:
     """Event-loop-owned handles and CDFs; inference is an asynchronous provider."""
 
     def __init__(
-        self, distribution: Callable[[tuple[int, ...]], Awaitable[Iterable[float]]], *, log_weights: bool = False
+        self,
+        distribution: Callable[[tuple[int, ...]], Awaitable[Iterable[float]]],
+        *,
+        log_weights: bool = False,
     ):
         self.distribution = distribution
         self.log_weights = log_weights
@@ -144,7 +157,10 @@ class Service:
             path = base + (label,)
         if path not in self.handles:
             encoded = b"".join(label.to_bytes(4, "big") for label in path)
-            handle = int.from_bytes(hashlib.blake2b(encoded, digest_size=8, person=b"natlas-v2").digest(), "big")
+            handle = int.from_bytes(
+                hashlib.blake2b(encoded, digest_size=8, person=b"natlas-v2").digest(),
+                "big",
+            )
             if handle in self.paths and self.paths[handle] != path:
                 raise RuntimeError("node handle collision")
             self.handles[path] = handle

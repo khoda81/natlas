@@ -255,8 +255,9 @@ describe("child expansion confidence", () => {
     const view = { width: 1000, height: 800 };
     const demand = () => wants(tree, lens, cam, view, layout(tree, lens, cam, view), [quantileSource]);
     const coarse = demand();
-    // Each estimated token is 3.125px, but no positive lower mass is known yet.
-    expect(coarse.every((want) => want.node === tree.root)).toBe(true);
+    // Interior tokens have no positive lower mass yet. Normalization F(V)=1
+    // already certifies the last token's mass, so it may expand immediately.
+    expect(coarse.every((want) => want.node === tree.root || want.node.label === 255)).toBe(true);
     expect(coarse[0]!.quantile!.children?.has(0)).toBe(true);
     state.insert([0], uniformPage(256, new Uint8Array([0])));
     publish(tree, tree.root, 0, state);

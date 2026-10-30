@@ -1,12 +1,53 @@
 import { describe, expect, it } from "bun:test";
-import { moveDepth, scale } from "../src/camera";
-import { type Camera, clamp, layout, reanchor, repair, rootExtent } from "../src/layout";
+import { type Camera, clamp, layout, pick, reanchor, repair, rootExtent } from "../src/core/layout";
+import { moveDepth, scale } from "../src/ui/camera";
 import { chainTree, listing } from "./build";
+import { IntervalTree } from "../src/core/tree";
 
 const view = { width: 1000, height: 800 };
 const lens = { p: 0, q: 0 };
 
 describe("layout", () => {
+  it("keeps the root selectable before discovery and leaves the canvas bounds alone", () => {
+    const tree = new IntervalTree(1);
+    const cam: Camera = { x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
+    const frame = layout(tree, lens, cam, view);
+    expect(pick(frame, cam, view, 500, 400)?.box.node).toBe(tree.root);
+    expect(pick(frame, cam, view, 500, 400)?.exact).toBe(false);
+    expect(pick(frame, cam, view, -1, 400)).toBeNull();
+    expect(pick(frame, cam, view, 500, -1)).toBeNull();
+    expect(frame.cover).toEqual({ node: tree.root, y: 0 });
+  });
+
+  it("selects the containing known branch when its box is left of undiscovered space", () => {
+    const tree = chainTree([0.5, 0.5], []);
+    const cam: Camera = { x: 2, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
+    const frame = layout(tree, lens, cam, view);
+    const hit = pick(frame, cam, view, 500, 400)!;
+    expect(hit.exact).toBe(false);
+    expect(hit.box.label).toBe(0);
+  });
+
+  it("preserves area while merging and still picks the individual integer branches", () => {
+    const weights = [0.5, 0.488, 0.006, 0.004, 0.002];
+    const tree = chainTree(weights, []);
+    const cam: Camera = { x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
+    const frame = layout(tree, lens, cam, view, { mergePx: 10 });
+    const run = frame.boxes.find((box) => box.kind === "merged")!;
+    const expected = weights.slice(2).reduce((area, weight) => area - weight * Math.log(weight), 0);
+    expect(run.p * (run.x1 - run.x0)).toBeCloseTo(expected, 6);
+    const hit = pick(frame, cam, view, 100, 0.991 * view.height)!;
+    expect(hit.box.label).toBe(2);
+    expect(hit.box.kind).not.toBe("merged");
+  });
+
+  it("finds a smaller covering node even when the camera anchor is still its parent", () => {
+    const tree = chainTree([0.5, 0.5], [0, 1]);
+    const cam: Camera = { x: Math.log(4), k: 100, anchor: { node: 0, slot: 0 }, a: -1 };
+    const frame = layout(tree, lens, cam, view);
+    expect(frame.cover?.node).toBe(tree.child(tree.child(0, 0), 1));
+  });
+
   it("partitions the root interval by p and sizes widths by -ln q", () => {
     const tree = chainTree([0.5, 0.25, 0.25], []);
     const cam: Camera = { x: -0.1, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
@@ -89,6 +130,14 @@ describe("layout", () => {
     for (const box of shared) expect([box.y0, box.y1]).toEqual(rows.get(key(box))!);
   });
 
+  it("does not bound horizontal scale", () => {
+    const cam: Camera = { x: 1, k: 10, anchor: { node: 0, slot: 0 }, a: 0 };
+    scale(cam, 1e12);
+    expect(cam.k).toBe(1e13);
+    scale(cam, 1e-24);
+    expect(cam.k).toBe(1e-11);
+  });
+
   it("clamps the view inside the root interval", () => {
     const tree = chainTree([0.5, 0.5], [0]);
     const cam: Camera = { x: 0.5, k: 100, anchor: { node: 1, slot: 0 }, a: 0.4 };
@@ -109,8 +158,8 @@ describe("layout", () => {
 
   it("moves the anchor up to what p lists", () => {
     // Measure 1 lists only the root's first child, so node 2 is out of reach under it.
-    const tree = chainTree([0.5, 0.5], [1, 0]);
-    for (const node of tree.nodes) tree.setListing(node.id, 1, listing([1]));
+    const tree = chainTree([0.5, 0.5], [1, 0], 2);
+    for (const node of tree.chain(2)) tree.setListing(node, 1, listing([1]));
     const cam: Camera = { x: 1, k: 100, anchor: { node: 2, slot: 1 }, a: 0.4 };
     repair(tree, { p: 1, q: 1 }, cam);
     expect(cam.anchor).toEqual({ node: 0, slot: 0 });

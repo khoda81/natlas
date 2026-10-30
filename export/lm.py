@@ -20,6 +20,7 @@ from typing import Protocol
 
 import numpy as np
 import torch
+from errors import TooLong
 
 type LogProbs = Callable[[Sequence[int]], torch.Tensor]
 
@@ -55,10 +56,6 @@ def log_probs(model, tokens: Sequence[int], device: str, temperature: float = 1.
     with torch.inference_mode():
         logits = model(input_ids=input_ids, use_cache=False).logits[0, -1].to(torch.float64)
     return torch.log_softmax(logits / temperature, dim=-1)
-
-
-class TooLong(Exception):
-    """More tokens than the model's context holds."""
 
 
 class Language(Protocol):

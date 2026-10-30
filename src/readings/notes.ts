@@ -9,7 +9,7 @@
 import { clock, DRUM_PROGRAM, pitchName, tint } from "./music";
 import { type Glyph, type Labels, type Reading, States } from "./reading";
 import { ScorePanel } from "./roll";
-import type { IntervalTree, Label, NodeId } from "./tree";
+import type { IntervalTree, Label, NodeId } from "../core/tree";
 
 type Event = readonly [type: string, value: number];
 

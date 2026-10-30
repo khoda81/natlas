@@ -1,11 +1,13 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
+#   "natlas-core",
 #   "natwalk",
 #   "protobuf>=7.36.1",
 # ]
 #
 # [tool.uv.sources]
+# natlas-core = { path = "../core" }
 # natwalk = { path = "../../natwalk", editable = true }
 # ///
 

@@ -1,6 +1,4 @@
-import { drag, moveDepth, panVertical, scale } from "./camera";
-import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
-import { Expander, wants } from "./expand";
+import { Expander, wants } from "../data/expand";
 import {
   type Box,
   type Camera,
@@ -10,22 +8,26 @@ import {
   layout,
   logView,
   normalize,
+  pick,
   place,
   reanchor,
   repair,
+  type Selection,
   type Viewport,
-} from "./layout";
-import { BITS, draw, NATS, RULER_HEIGHT, screenRect, slotKey, type Units } from "./render";
-import type { Glyph, Reading } from "./reading";
-import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "./source";
-import { IntervalTree, type NodeId, type Slots, type TreeNode } from "./tree";
+} from "../core/layout";
+import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "../data/source";
+import { IntervalTree, isTail, type NodeId, type Slots, slotOf } from "../core/tree";
+import type { Glyph, Reading } from "../readings/reading";
+import { drag, moveDepth, panVertical, scale } from "./camera";
+import { parseView, type SavedView, viewKey } from "./view-state";
+import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
+import { BITS, draw, NATS, RULER_HEIGHT, slotKey, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
 const KEY_DEPTH_SPEED = 900;
 const KEY_PAN_SPEED = 1.2;
 /** A frame after a stall moves at most this far, so the view never jumps. */
 const MAX_FRAME_MS = 50;
-/** Held arrow keys: depth direction (+1 deeper) and pan direction (+1 content down). */
 const ARROWS: Record<string, { depth: number; pan: number }> = {
   ArrowRight: { depth: 1, pan: 0 },
   ArrowLeft: { depth: -1, pan: 0 },
@@ -34,6 +36,8 @@ const ARROWS: Record<string, { depth: number; pan: number }> = {
 };
 const KEY_SCALE = 1.25;
 const FOCUS_MS = 450;
+const SEARCH_MS = 150;
+const SAVE_MS = 200;
 const LOCAL_SERVER = "http://localhost:8421/";
 
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -46,13 +50,21 @@ interface Focus {
   fromCenter: number;
 }
 
+
 class App {
   private readonly canvas = element<HTMLCanvasElement>("canvas");
   private readonly ctx = this.canvas.getContext("2d")!;
   private readonly inspect = element<HTMLElement>("inspect");
+  private readonly details = element<HTMLElement>("inspect-details");
+  private readonly editor = element<HTMLInputElement>("inspect-editor");
   private readonly where = element<HTMLElement>("where");
-  /** The box the path panel shows, as ``node:slot``. */
+  /** The box the path panel shows, as node:slot:kind. */
   private shown = "";
+  private loading = 0;
+  private navigation = 0;
+  private restoring = false;
+  private readonly result = element<HTMLButtonElement>("search-result");
+  private pendingView: { id: string; view: SavedView } | null = null;
   private readonly readout = element<HTMLElement>("readout");
   private readonly legend = element<HTMLElement>("legend");
   private readonly status = element<HTMLElement>("status");
@@ -70,18 +82,23 @@ class App {
   private frame: Frame | null = null;
   private units: Units = NATS;
   private palette = Palette.current();
-  private hover: Box | null = null;
+  private hover: Selection | null = null;
+  /** Screen coordinates, converted against the current canvas rect every frame. */
   private pointer: { x: number; y: number } | null = null;
   private dragging: { id: number; x: number; y: number } | null = null;
   private focus: Focus | null = null;
-  /** Arrow keys held down, and the time of the last frame that moved by them. */
   private readonly held = new Set<string>();
   private heldSince: number | null = null;
   private scheduled = false;
+  private searchTimer: number | null = null;
+  private searchGeneration = 0;
+  private found: { text: string; path: number[] } | null = null;
+  private saveTimer: number | null = null;
+  private storage = true;
 
   constructor() {
-    // ResizeObserver runs after animation callbacks, before paint. Resetting
-    // the bitmap here would expose a blank canvas until the next frame.
+    // ResizeObserver runs after animation callbacks, before paint. Draw in the
+    // same animation callback as resizing so no cleared bitmap is presented.
     new ResizeObserver(() => this.invalidate()).observe(this.canvas);
     matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
       this.palette = Palette.current();
@@ -90,15 +107,18 @@ class App {
     });
     this.bindPointer();
     this.bindKeys();
+    this.bindEditor();
     this.pSelect.addEventListener("change", () => this.setLens({ ...this.lens, p: Number(this.pSelect.value) }));
     this.qSelect.addEventListener("change", () => this.setLens({ ...this.lens, q: Number(this.qSelect.value) }));
     element("swap").addEventListener("click", () => this.setLens({ p: this.lens.q, q: this.lens.p }));
     this.unitsButton.addEventListener("click", () => this.toggleUnits());
     element("help-toggle").addEventListener("click", () => this.toggleHelp());
     this.bindDrop();
+    window.addEventListener("pagehide", () => this.flushView());
   }
 
   async start(): Promise<void> {
+    this.resize();
     const select = element<HTMLSelectElement>("dataset");
     const entries = await manifest(liveServer());
     for (const entry of entries) select.add(new Option(entry.title, entry.name));
@@ -120,28 +140,36 @@ class App {
   }
 
   private async load(entry: DatasetEntry): Promise<void> {
+    const generation = ++this.loading;
     this.setStatus(`Loading ${entry.title} …`);
     try {
-      this.setDataset(await fetchDataset(entry));
+      const dataset = await fetchDataset(entry);
+      if (generation !== this.loading) return;
+      this.setDataset(dataset);
       this.setStatus("");
     } catch (error) {
-      this.setStatus(String(error));
+      if (generation === this.loading) this.setStatus(String(error));
     }
   }
 
   private setDataset(dataset: Dataset): void {
+    this.flushView();
+    this.loading++;
+    this.expander?.dispose();
+    this.cancelNavigation();
     const tree = new IntervalTree(dataset.measures.length);
     this.dataset = dataset;
     this.tree = tree;
     this.reading = dataset.labels.read(tree);
     this.expander = new Expander(tree, dataset.sources);
-    // A failed listing is asked for again; its error stays until one lands.
     let failing = false;
     this.expander.onError = (error) => {
+      if (tree !== this.tree) return;
       failing = true;
       this.setStatus(String(error));
     };
     tree.subscribe(() => {
+      if (tree !== this.tree) return;
       if (failing) this.setStatus("");
       failing = false;
       this.invalidate();
@@ -150,51 +178,109 @@ class App {
     for (const select of [this.pSelect, this.qSelect]) {
       select.replaceChildren(...dataset.measures.map((name, index) => new Option(name, String(index))));
     }
-    const multiple = dataset.measures.length > 1;
-    element("lens").hidden = !multiple;
-    this.setLens({ p: 0, q: 0 });
-    this.reset();
+    element("lens").hidden = dataset.measures.length <= 1;
+    this.editor.hidden = !dataset.searchable;
+    this.editor.value = "";
+    this.result.hidden = true;
+    this.editor.classList.remove("found");
+    this.found = null;
+    this.searchGeneration++;
+    if (this.searchTimer !== null) clearTimeout(this.searchTimer);
+    if (this.saveTimer !== null) clearTimeout(this.saveTimer);
+    this.hover = null;
+    this.pointer = null;
     this.shown = "";
     this.where.hidden = true;
-    void this.travel(dataset.start).catch((error: unknown) => this.setStatus(String(error)));
+    this.details.replaceChildren();
+    this.inspect.hidden = !dataset.searchable;
+    this.setLens({ p: 0, q: 0 });
+    this.reset();
+    const saved = this.readView(dataset);
+    if (saved !== null) void this.restore(saved);
   }
 
-  /** Fetch the way down ``path`` from the root, then stand at its end. */
-  private async travel(path: number[]): Promise<void> {
+  private cancelNavigation(): void {
+    this.navigation++;
+    this.restoring = false;
+  }
+
+  /** Fetch as much of a path as the current source knows. */
+  private async reachPath(path: readonly number[], generation: number): Promise<{ node: NodeId; complete: boolean } | null> {
     const tree = this.tree!;
     const expander = this.expander!;
+    const lens = { ...this.lens };
+    const current = () => tree === this.tree && generation === this.navigation;
     let node = tree.root;
     for (const label of path) {
-      if (!(await expander.reach(node, this.lens.p, label))) break;
-      node = tree.child(node.id, label);
+      if (!current()) return null;
+      const reached = await expander.reach(node, lens.p, label);
+      if (!current()) return null;
+      if (!reached) return { node, complete: false };
+      if (lens.q !== lens.p) await expander.reach(node, lens.q, label);
+      if (!current()) return null;
+      node = tree.child(node, label);
     }
-    // The dataset may have changed, or the view moved on, meanwhile.
-    if (tree !== this.tree || node.parent === null) return;
-    this.standAt(node);
-    this.showPath(node.parent, node.label);
+    return { node, complete: true };
   }
 
-  /** Put ``node`` where the root stands, its children filling the view, as a double-click does. */
-  private standAt(node: TreeNode): void {
+  private async restore(saved: SavedView): Promise<void> {
+    this.setLens({ p: saved.p, q: saved.q });
+    const generation = this.navigation;
+    this.restoring = true;
+    try {
+      const reached = await this.reachPath(saved.path, generation);
+      if (reached === null) return;
+      this.focus = null;
+      if (reached.complete) {
+        this.cam = { x: saved.x, k: saved.k, anchor: { node: reached.node, slot: 0 }, a: saved.a };
+      } else {
+        this.standAt(reached.node);
+        this.setStatus("The saved path is only partly available; showing its deepest known ancestor.");
+      }
+      this.invalidate();
+    } catch (error) {
+      if (generation === this.navigation) this.setStatus(String(error));
+    } finally {
+      if (generation === this.navigation) this.restoring = false;
+    }
+  }
+
+  /** Put ``node`` where the root stands, its children filling the view. */
+  private standAt(node: NodeId): void {
     const tree = this.tree!;
-    const { lnMass, x1 } = place(tree, this.lens, node.id);
-    const slot = tree.node(node.parent!).slots(this.lens).slotOf(node.label)!;
+    if (node === tree.root) {
+      this.reset();
+      this.where.hidden = true;
+      return;
+    }
+    const parent = tree.parent(node)!;
+    const label = tree.label(node);
+    const { lnMass, x1 } = place(tree, this.lens, node);
+    const slot = slotOf(tree.slots(parent, this.lens), label)!;
     this.focus = null;
-    this.cam.anchor = normalize(tree, this.lens, { node: node.parent!, slot });
+    this.cam.anchor = normalize(tree, this.lens, { node: parent, slot });
     this.cam.x = rootLike(lnMass, x1);
     this.cam.a = 0.5 - Math.exp(lnMass - logView(this.cam)) / 2;
+    this.showPath(parent, label);
     this.invalidate();
   }
 
   private setLens(lens: Lens): void {
+    this.cancelNavigation();
+    this.focus = null;
+    this.result.hidden = true;
     this.lens = lens;
     this.pSelect.value = String(lens.p);
     this.qSelect.value = String(lens.q);
+    this.found = null;
+    this.searchGeneration++;
+    this.editor.classList.remove("found");
     this.updateLegend();
     this.invalidate();
   }
 
   private reset(): void {
+    this.cancelNavigation();
     const { width, height } = this.view;
     const k = width / Math.log(Math.max(8, height / 4));
     this.cam = { x: 0, k, anchor: { node: 0, slot: 0 }, a: 0 };
@@ -205,15 +291,12 @@ class App {
   private resize(): void {
     const ratio = devicePixelRatio || 1;
     const { clientWidth: width, clientHeight: height } = this.canvas;
-    const first = this.view.width === 1;
     this.view = { width, height: Math.max(1, height - RULER_HEIGHT) };
     const pixelWidth = Math.round(width * ratio);
     const pixelHeight = Math.round(height * ratio);
-    // Even assigning the current size clears the bitmap and drawing state.
     if (this.canvas.width !== pixelWidth) this.canvas.width = pixelWidth;
     if (this.canvas.height !== pixelHeight) this.canvas.height = pixelHeight;
     this.ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    if (first && this.tree) this.reset();
   }
 
   private invalidate(): void {
@@ -226,8 +309,6 @@ class App {
   }
 
   private render(time: number): void {
-    // Resize and draw in the same callback, so a cleared bitmap is never
-    // presented between a hover-driven panel resize and its redraw.
     this.resize();
     const tree = this.tree;
     if (tree === null) return;
@@ -237,16 +318,24 @@ class App {
     clamp(tree, this.lens, this.cam);
     const frame = layout(tree, this.lens, this.cam, this.view);
     this.frame = frame;
-    this.expander?.request(wants(tree, this.lens, this.cam, this.view, frame));
-    // The anchor is fixed while focusing, so the target stays exactly addressable.
+    this.expander?.request(() => {
+      if (tree !== this.tree) return [];
+      const camera = { ...this.cam };
+      repair(tree, this.lens, camera);
+      clamp(tree, this.lens, camera);
+      const current = layout(tree, this.lens, camera, this.view);
+      return wants(tree, this.lens, camera, this.view, current);
+    });
     if (!this.focus) reanchor(this.cam, frame);
     this.updateHover();
     const ancestors = new Set<string>();
     if (this.hover) {
-      ancestors.add(slotKey(this.hover.node, this.hover.slot));
-      for (const node of tree.chain(this.hover.node).slice(1)) {
-        const slot = tree.node(node.parent!).slots(this.lens).slotOf(node.label);
-        if (slot !== undefined) ancestors.add(slotKey(node.parent!, slot));
+      const selected = this.hover.box;
+      ancestors.add(slotKey(selected.node, selected.slot));
+      for (const node of tree.chain(selected.node).slice(1)) {
+        const parent = tree.parent(node)!;
+        const slot = slotOf(tree.slots(parent, this.lens), tree.label(node));
+        if (slot !== undefined) ancestors.add(slotKey(parent, slot));
       }
     }
     draw(this.ctx, frame, this.cam, this.view, this.lens, this.palette, {
@@ -256,6 +345,7 @@ class App {
       glyph: (node, label) => this.glyph(node, label),
     });
     this.updateReadout();
+    this.saveView(frame);
     if (this.focus || this.held.size > 0) this.invalidate();
   }
 
@@ -266,13 +356,15 @@ class App {
     canvas.addEventListener("wheel", (event) => this.onWheel(event), { passive: false });
     canvas.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
+      this.cancelNavigation();
       canvas.setPointerCapture(event.pointerId);
+      this.pointer = { x: event.clientX, y: event.clientY };
       this.dragging = { id: event.pointerId, x: event.offsetX, y: event.offsetY };
       this.focus = null;
       canvas.classList.add("dragging");
     });
     canvas.addEventListener("pointermove", (event) => {
-      this.pointer = { x: event.offsetX, y: event.offsetY };
+      this.pointer = { x: event.clientX, y: event.clientY };
       const grab = this.dragging;
       if (grab && grab.id === event.pointerId) {
         drag(this.cam, event.offsetX - grab.x, event.offsetY - grab.y, this.view.height, event.offsetY / this.view.height);
@@ -284,25 +376,27 @@ class App {
     const release = (event: PointerEvent) => {
       if (this.dragging?.id !== event.pointerId) return;
       this.dragging = null;
+      this.pointer = event.type === "pointercancel" ? null : { x: event.clientX, y: event.clientY };
       canvas.classList.remove("dragging");
+      this.invalidate();
     };
     canvas.addEventListener("pointerup", release);
     canvas.addEventListener("pointercancel", release);
     canvas.addEventListener("pointerleave", () => {
-      // The path panel may fit its text again.
       this.where.style.minHeight = "";
       if (this.dragging) return;
       this.pointer = null;
       this.invalidate();
     });
     canvas.addEventListener("dblclick", (event) => {
-      const box = this.boxAt(event.offsetX, event.offsetY);
-      if (box) this.startFocus(box);
+      const selection = this.frame ? pick(this.frame, this.cam, this.view, event.offsetX, event.offsetY) : null;
+      if (selection) this.startFocus(selection.box);
     });
   }
 
   private onWheel(event: WheelEvent): void {
     event.preventDefault();
+    this.cancelNavigation();
     const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? this.view.height : 1;
     const dx = event.deltaX * unit;
     const dy = event.deltaY * unit;
@@ -314,7 +408,6 @@ class App {
     this.invalidate();
   }
 
-  /** Move by the held arrow keys for the time since the last frame, like movement in a game. */
   private stepKeys(time: number): void {
     if (this.held.size === 0) {
       this.heldSince = null;
@@ -339,11 +432,19 @@ class App {
       if (this.held.delete(event.key)) event.preventDefault();
     });
     window.addEventListener("keydown", (event) => {
-      if (event.target instanceof HTMLSelectElement || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (
+        event.target instanceof HTMLSelectElement ||
+        event.target instanceof HTMLInputElement ||
+        event.ctrlKey ||
+        event.metaKey ||
+        event.altKey
+      ) {
+        return;
+      }
       if (event.key in ARROWS) {
-        // Repeats change nothing: the key moves the view for as long as it is down.
         event.preventDefault();
         if (!this.held.has(event.key)) {
+          this.cancelNavigation();
           this.held.add(event.key);
           this.focus = null;
           this.invalidate();
@@ -391,17 +492,75 @@ class App {
       event.preventDefault();
       const files = [...(event.dataTransfer?.files ?? [])];
       if (files.length === 0) return;
+      const generation = ++this.loading;
       try {
-        this.setDataset(await droppedDataset(files));
+        const dataset = await droppedDataset(files);
+        if (generation !== this.loading) return;
+        this.setDataset(dataset);
         this.setStatus("");
       } catch (error) {
-        this.setStatus(String(error));
+        if (generation === this.loading) this.setStatus(String(error));
       }
     });
   }
 
-  // Focus animation: glide until the box stands where the root does, its
-  // children starting at the left edge and filling the view.
+  // Text search and the inspector editor.
+
+  private bindEditor(): void {
+    this.result.addEventListener("click", () => void this.search(true, ++this.searchGeneration));
+    this.editor.addEventListener("focus", () => this.held.clear());
+    this.editor.addEventListener("input", () => {
+      this.result.hidden = true;
+      this.found = null;
+      this.editor.classList.remove("found");
+      const generation = ++this.searchGeneration;
+      if (this.searchTimer !== null) clearTimeout(this.searchTimer);
+      this.searchTimer = window.setTimeout(() => void this.search(false, generation), SEARCH_MS);
+    });
+    this.editor.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      if (this.searchTimer !== null) clearTimeout(this.searchTimer);
+      void this.search(true, ++this.searchGeneration);
+    });
+    this.editor.addEventListener("blur", () => this.invalidate());
+  }
+
+  private async search(anchor: boolean, generation: number): Promise<void> {
+    const dataset = this.dataset;
+    if (dataset === null || !dataset.searchable) return;
+    const text = this.editor.value;
+    try {
+      const path = this.found?.text === text ? this.found.path : await dataset.search(text, this.lens.p);
+      if (generation !== this.searchGeneration || dataset !== this.dataset) return;
+      this.found = { text, path: [...path] };
+      this.editor.classList.add("found");
+      this.editor.title = "Select the result or press Enter to anchor here";
+      let preview = this.tree!.root;
+      for (const label of path) preview = this.tree!.child(preview, label);
+      this.result.textContent = `${this.reading?.text?.(preview, null) || "Root"} · Enter to anchor`;
+      this.result.disabled = false;
+      this.result.hidden = false;
+      if (!anchor) return;
+      this.cancelNavigation();
+      const reached = await this.reachPath(path, this.navigation);
+      if (generation !== this.searchGeneration || dataset !== this.dataset || reached === null) return;
+      this.standAt(reached.node);
+      this.result.hidden = true;
+      this.setStatus(reached.complete ? "" : "Showing the deepest recorded prefix of this sequence.");
+      this.editor.blur();
+    } catch (error) {
+      if (generation !== this.searchGeneration) return;
+      this.editor.classList.remove("found");
+      this.editor.title = String(error);
+      this.result.textContent = String(error);
+      this.result.disabled = true;
+      this.result.hidden = false;
+      if (anchor) this.setStatus(String(error));
+    }
+  }
+
+  // Focus animation.
 
   private startFocus(box: Box): void {
     if (this.tree === null) return;
@@ -428,46 +587,41 @@ class App {
     if (t === 1) this.focus = null;
   }
 
-  // Readouts.
+  // Selection and readouts.
 
-  private boxAt(x: number, y: number): Box | null {
-    if (y >= this.view.height) return null;
-    for (const box of this.frame?.boxes ?? []) {
-      const rect = screenRect(box, this.cam, this.view);
-      if (x >= rect.x0 && x < rect.x1 && y >= rect.y0 && y < rect.y1) return box;
-    }
-    return null;
+  private pointerPosition(): { x: number; y: number } | null {
+    if (this.pointer === null) return null;
+    const rect = this.canvas.getBoundingClientRect();
+    return { x: this.pointer.x - rect.left, y: this.pointer.y - rect.top };
   }
 
   private updateHover(): void {
-    const pointer = this.pointer;
-    this.hover = pointer && !this.dragging ? this.boxAt(pointer.x, pointer.y) : null;
-    // Keep the inspector clear of the pointer.
-    const covered = pointer !== null && pointer.x < this.view.width * 0.45 && pointer.y > this.view.height * 0.55;
-    this.inspect.classList.toggle("right", covered);
+    const pointer = this.pointerPosition();
+    this.hover = pointer && !this.dragging && this.frame ? pick(this.frame, this.cam, this.view, pointer.x, pointer.y) : null;
+    if (pointer !== null) {
+      const covered = pointer.x < this.view.width * 0.45 && pointer.y > this.view.height * 0.55;
+      this.inspect.classList.toggle("right", covered);
+    }
     this.updateInspect();
-    if (this.hover !== null) this.showPath(this.hover.node, this.hover.label, this.hover);
+    if (this.hover) {
+      const { box, exact } = this.hover;
+      const more = !exact || box.label === null ? " …" : undefined;
+      this.showPath(box.node, box.label, more);
+    }
   }
 
-  /**
-   * Show the path from the root down to child ``label`` of ``node``, or to
-   * ``node`` itself for a tail or merged box, until another box is hovered.
-   * While the pointer is over the canvas the panel only grows, so that a
-   * shorter text cannot shrink it, resize the canvas, and move the box under
-   * the pointer.
-   */
-  private showPath(node: NodeId, label: number | null, box?: Box): void {
-    const key = `${node}:${box?.slot ?? label}:${box?.kind ?? ""}`;
+  /** Show the selected path until another box is hovered; ``more`` marks unknown continuation. */
+  private showPath(node: NodeId, label: number | null, more?: string): void {
+    const key = `${node}:${label}:${more ?? ""}`;
     if (this.reading === null || key === this.shown) return;
     this.shown = key;
     const where = this.where;
     where.style.minHeight = this.pointer === null ? "" : `${where.offsetHeight}px`;
     where.hidden = false;
-    this.reading.show(where, node, label, box?.kind === "merged" ? ` ${box.count} children` : " …");
+    this.reading.show(where, node, label, more);
     where.scrollTop = where.scrollHeight;
   }
 
-  /** How the child with ``label`` of ``node`` reads. */
   private glyph(node: NodeId, label: number): Glyph {
     return this.reading?.glyph(node, label) ?? { text: `#${label}` };
   }
@@ -487,20 +641,32 @@ class App {
   }
 
   private updateInspect(): void {
-    const box = this.hover;
+    const selection = this.hover;
     const tree = this.tree;
-    if (box === null || tree === null) {
-      this.inspect.hidden = true;
+    const searchable = this.dataset?.searchable === true;
+    if (selection === null || tree === null) {
+      this.details.hidden = true;
+      this.inspect.hidden = !searchable && document.activeElement !== this.editor;
       return;
     }
-    const node = tree.node(box.node);
-    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : this.glyph(box.node, box.label).text;
-    const chips = [chip(last)];
+    const { box, exact } = selection;
+    if (searchable && document.activeElement !== this.editor && document.activeElement !== this.result) {
+      const text = this.reading?.text?.(box.node, box.label) ?? "";
+      if (this.editor.value !== text) {
+        this.editor.value = text;
+        this.result.hidden = true;
+        this.found = null;
+        this.searchGeneration++;
+        if (this.searchTimer !== null) clearTimeout(this.searchTimer);
+        this.editor.classList.remove("found");
+      }
+    }
 
+    const last = box.label === null ? "…" : this.glyph(box.node, box.label).text;
+    const chips = [chip(last)];
     const { p, q } = this.lens;
     const names = this.dataset?.measures ?? [];
-    const slots = node.slots(this.lens);
-    // A tail's q, and q of a child q has not listed, are upper bounds.
+    const slots = tree.slots(box.node, this.lens);
     const qBound = box.kind === "tail" || (box.kind !== "merged" && slots.qBound[box.slot] === true);
     const [atMost, atLeast] = qBound ? ["≤ ", "≥ "] : ["", ""];
     const rows: [string, string][] = [
@@ -517,7 +683,6 @@ class App {
     else {
       rows.push(["H(p) at node", `${bound}${this.fmt(stats.entropy)}`]);
       rows.push(["H(p, q) at node", `${bound}${this.fmt(stats.cross)}`]);
-      // A difference of two lower bounds bounds nothing.
       rows.push(["KL(p ‖ q) at node", `${bound === "" ? "" : "≈ "}${this.fmt(stats.cross - stats.entropy)}`]);
     }
 
@@ -534,8 +699,11 @@ class App {
     path.append(...chips);
     const kind = document.createElement("div");
     kind.className = "kind";
-    kind.textContent = `${box.kind === "node" ? "expanded" : box.kind === "leaf" ? "unexpanded" : box.kind} · ${this.units.name}`;
-    this.inspect.replaceChildren(path, kind, list);
+    kind.textContent = exact
+      ? `${box.kind === "node" ? "expanded" : box.kind === "leaf" ? "unexpanded" : box.kind} · ${this.units.name}`
+      : `known subtree · continuation unknown · ${this.units.name}`;
+    this.details.replaceChildren(path, kind, list);
+    this.details.hidden = false;
     this.inspect.hidden = false;
   }
 
@@ -560,6 +728,46 @@ class App {
       : "Color is ln(p/q) per slot: red where q under-weights it. Area is cross-entropy.";
   }
 
+  // Remember the deepest anchor that covers the screen, not a server-chosen prompt.
+
+  private readView(dataset: Dataset): SavedView | null {
+    if (!this.storage) return null;
+    try {
+      const raw = localStorage.getItem(viewKey(dataset.id));
+      return raw === null ? null : parseView(raw, dataset.measures.length);
+    } catch (error) {
+      this.storage = false;
+      console.warn("Could not read the saved natlas view", error);
+      return null;
+    }
+  }
+
+  private saveView(frame: Frame): void {
+    if (!this.storage || this.restoring || frame.cover === null || this.dataset === null || this.tree === null) return;
+    if (this.saveTimer !== null) clearTimeout(this.saveTimer);
+    const { x, k } = this.cam;
+    const { node, y } = frame.cover;
+    this.pendingView = {
+      id: this.dataset.id,
+      view: { path: this.tree.path(node), x, k, a: y, ...this.lens },
+    };
+    this.saveTimer = window.setTimeout(() => this.flushView(), SAVE_MS);
+  }
+
+  private flushView(): void {
+    if (this.saveTimer !== null) clearTimeout(this.saveTimer);
+    this.saveTimer = null;
+    const pending = this.pendingView;
+    this.pendingView = null;
+    if (!this.storage || pending === null) return;
+    try {
+      localStorage.setItem(viewKey(pending.id), JSON.stringify(pending.view));
+    } catch (error) {
+      this.storage = false;
+      console.warn("Could not save the natlas view", error);
+    }
+  }
+
   private toggleUnits(): void {
     this.units = this.units === NATS ? BITS : NATS;
     this.unitsButton.textContent = this.units.name;
@@ -577,20 +785,11 @@ class App {
   }
 }
 
-/**
- * Depth at which a box of ln p mass ``lnMass`` fills the view, since the view
- * spans e^-x of the root. With p = q that is also where its children start,
- * at ``x1``; otherwise stop there, if sooner, so they stay on screen.
- */
+/** Depth at which a box of ln p mass fills the view, or its children start, if sooner. */
 function rootLike(lnMass: number, x1: number): number {
   return Math.min(-lnMass, x1);
 }
 
-/**
- * The live server to ask for datasets: ``?server=URL``, else a local one when
- * the page itself is local, so a deployed page never probes the visitor's
- * machine.
- */
 function liveServer(): string | undefined {
   const server = new URLSearchParams(location.search).get("server");
   if (server !== null) return new URL(server.endsWith("/") ? server : `${server}/`, location.href).href;
@@ -611,11 +810,14 @@ function nodeStats(slots: Slots, lens: Lens): { entropy: number; cross: number }
   for (let slot = 0; slot < slots.count; slot++) {
     const p = slots.p[slot]!;
     if (p === 0) continue;
-    // With p = q, q bounds the tail's heaviest child, which is tighter than the tail as a whole.
-    entropy -= p * Math.log(slots.isTail(slot) && lens.p === lens.q ? slots.q[slot]! : p);
+    entropy -= p * Math.log(isTail(slots, slot) && lens.p === lens.q ? slots.q[slot]! : p);
     cross -= p * Math.log(slots.q[slot]!);
   }
   return { entropy, cross };
 }
 
-void new App().start();
+void new App().start().catch((error: unknown) => {
+  const status = element<HTMLElement>("status");
+  status.textContent = String(error);
+  status.hidden = false;
+});

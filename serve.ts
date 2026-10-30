@@ -8,7 +8,13 @@ const server = Bun.serve({
   development: true,
   routes: { "/": index },
   async fetch(request) {
-    const file = Bun.file(`public${new URL(request.url).pathname}`);
+    const { pathname } = new URL(request.url);
+    if (pathname === "/generated/natlas_core_bg.wasm") {
+      return new Response(Bun.file(`src/core/generated${pathname.slice(10)}`), {
+        headers: { "content-type": "application/wasm" },
+      });
+    }
+    const file = Bun.file(`public${pathname}`);
     return (await file.exists()) ? new Response(file) : new Response("not found", { status: 404 });
   },
 });

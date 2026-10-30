@@ -67,12 +67,12 @@ body {
   width: 100%;
   height: 100%;
   display: block;
-  cursor: grab;
+  cursor: crosshair;
   touch-action: none;
 }
 
 #canvas.dragging {
-  cursor: grabbing;
+  cursor: crosshair;
 }
 
 .bar {
@@ -133,7 +133,8 @@ body {
 }
 
 select,
-button {
+button,
+input {
   font: inherit;
   color: var(--ink);
   background: var(--plane);
@@ -148,7 +149,8 @@ button {
 }
 
 button:hover,
-select:hover {
+select:hover,
+input:hover {
   border-color: var(--ink-muted);
 }
 
@@ -168,7 +170,33 @@ select:hover {
   border: 1px solid var(--rule);
   border-radius: 8px;
   box-shadow: var(--shadow);
-  pointer-events: none;
+}
+
+.inspect-editor {
+  max-width: none;
+  width: min(520px, calc(100vw - 38px));
+  margin: 0 0 6px;
+  padding: 4px 6px;
+  color: var(--ink);
+  background: var(--plane);
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.search-result {
+  display: block;
+  max-width: 100%;
+  margin-bottom: 6px;
+  text-align: start;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.search-result[hidden] { display: none; }
+
+.inspect-editor.found {
+  border-color: var(--accent);
 }
 
 .inspect.right {

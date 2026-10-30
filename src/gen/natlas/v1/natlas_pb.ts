@@ -10,24 +10,23 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file natlas/v1/natlas.proto.
  */
 export const file_natlas_v1_natlas: GenFile = /*@__PURE__*/
-  fileDesc("ChZuYXRsYXMvdjEvbmF0bGFzLnByb3RvEgluYXRsYXMudjEiQAoNRXhwYW5kUmVxdWVzdBIeCgRub2RlGAEgASgLMhAubmF0bGFzLnYxLkNoaWxkEg8KB2hvcml6b24YAiABKA0iJgoFQ2hpbGQSDgoGcGFyZW50GAEgASgGEg0KBWxhYmVsGAIgASgNIkkKDkV4cGFuZFJlc3BvbnNlEg4KBG5vZGUYASABKAZIABIfCgRlZGdlGAIgASgLMg8ubmF0bGFzLnYxLkVkZ2VIAEIGCgRwYXJ0IiMKBEVkZ2USDQoFbGFiZWwYASABKA0SDAoEb2RkcxgCIAEoDyI0CghTbmFwc2hvdBIoCgpleHBhbnNpb25zGAEgAygLMhQubmF0bGFzLnYxLkV4cGFuc2lvbiJkCglFeHBhbnNpb24SKQoHcmVxdWVzdBgBIAEoCzIYLm5hdGxhcy52MS5FeHBhbmRSZXF1ZXN0EgwKBG5vZGUYAiABKAYSHgoFZWRnZXMYAyADKAsyDy5uYXRsYXMudjEuRWRnZTJJCgZOYXRsYXMSPwoGRXhwYW5kEhgubmF0bGFzLnYxLkV4cGFuZFJlcXVlc3QaGS5uYXRsYXMudjEuRXhwYW5kUmVzcG9uc2UwAWIGcHJvdG8z");
+  fileDesc("ChZuYXRsYXMvdjEvbmF0bGFzLnByb3RvEgluYXRsYXMudjEiLgoNRXhwYW5kUmVxdWVzdBIMCgRwYXRoGAEgAygNEg8KB2hvcml6b24YAiABKA0iHQoNU2VhcmNoUmVxdWVzdBIMCgR0ZXh0GAEgASgJIh4KDlNlYXJjaFJlc3BvbnNlEgwKBHBhdGgYASADKA0iIwoERWRnZRINCgVsYWJlbBgBIAEoDRIMCgRvZGRzGAIgASgPIkwKCFNuYXBzaG90EigKCmV4cGFuc2lvbnMYASADKAsyFC5uYXRsYXMudjEuRXhwYW5zaW9uEhYKDmZvcm1hdF92ZXJzaW9uGAIgASgNIlYKCUV4cGFuc2lvbhIpCgdyZXF1ZXN0GAEgASgLMhgubmF0bGFzLnYxLkV4cGFuZFJlcXVlc3QSHgoFZWRnZXMYAiADKAsyDy5uYXRsYXMudjEuRWRnZTJ+CgZOYXRsYXMSNQoGRXhwYW5kEhgubmF0bGFzLnYxLkV4cGFuZFJlcXVlc3QaDy5uYXRsYXMudjEuRWRnZTABEj0KBlNlYXJjaBIYLm5hdGxhcy52MS5TZWFyY2hSZXF1ZXN0GhkubmF0bGFzLnYxLlNlYXJjaFJlc3BvbnNlYgZwcm90bzM");
 
 /**
  * @generated from message natlas.v1.ExpandRequest
  */
 export type ExpandRequest = Message<"natlas.v1.ExpandRequest"> & {
   /**
-   * The root when unset.
+   * The complete label path from the root; empty for the root itself.
    *
-   * @generated from field: natlas.v1.Child node = 1;
+   * @generated from field: repeated uint32 path = 1;
    */
-  node?: Child | undefined;
+  path: number[];
 
   /**
    * In bits. The server lists every child of conditional weight at least
    * 2^-horizon and stops there, so every child it leaves out is lighter. It
-   * also sets the step of Edge.odds. At 0 the server lists nothing: the
-   * client asks only for the handle.
+   * also sets the step of Edge.odds. At 0 the server lists nothing.
    *
    * @generated from field: uint32 horizon = 2;
    */
@@ -42,58 +41,39 @@ export const ExpandRequestSchema: GenMessage<ExpandRequest> = /*@__PURE__*/
   messageDesc(file_natlas_v1_natlas, 0);
 
 /**
- * The child with `label` of the node the server gave `parent` to.
- *
- * @generated from message natlas.v1.Child
+ * @generated from message natlas.v1.SearchRequest
  */
-export type Child = Message<"natlas.v1.Child"> & {
+export type SearchRequest = Message<"natlas.v1.SearchRequest"> & {
   /**
-   * @generated from field: fixed64 parent = 1;
+   * @generated from field: string text = 1;
    */
-  parent: bigint;
-
-  /**
-   * @generated from field: uint32 label = 2;
-   */
-  label: number;
+  text: string;
 };
 
 /**
- * Describes the message natlas.v1.Child.
- * Use `create(ChildSchema)` to create a new message.
+ * Describes the message natlas.v1.SearchRequest.
+ * Use `create(SearchRequestSchema)` to create a new message.
  */
-export const ChildSchema: GenMessage<Child> = /*@__PURE__*/
+export const SearchRequestSchema: GenMessage<SearchRequest> = /*@__PURE__*/
   messageDesc(file_natlas_v1_natlas, 1);
 
 /**
- * @generated from message natlas.v1.ExpandResponse
+ * @generated from message natlas.v1.SearchResponse
  */
-export type ExpandResponse = Message<"natlas.v1.ExpandResponse"> & {
+export type SearchResponse = Message<"natlas.v1.SearchResponse"> & {
   /**
-   * @generated from oneof natlas.v1.ExpandResponse.part
+   * The complete label path from the root for the requested text.
+   *
+   * @generated from field: repeated uint32 path = 1;
    */
-  part: {
-    /**
-     * The first message, and only the first: the node's handle.
-     *
-     * @generated from field: fixed64 node = 1;
-     */
-    value: bigint;
-    case: "node";
-  } | {
-    /**
-     * @generated from field: natlas.v1.Edge edge = 2;
-     */
-    value: Edge;
-    case: "edge";
-  } | { case: undefined; value?: undefined };
+  path: number[];
 };
 
 /**
- * Describes the message natlas.v1.ExpandResponse.
- * Use `create(ExpandResponseSchema)` to create a new message.
+ * Describes the message natlas.v1.SearchResponse.
+ * Use `create(SearchResponseSchema)` to create a new message.
  */
-export const ExpandResponseSchema: GenMessage<ExpandResponse> = /*@__PURE__*/
+export const SearchResponseSchema: GenMessage<SearchResponse> = /*@__PURE__*/
   messageDesc(file_natlas_v1_natlas, 2);
 
 /**
@@ -141,6 +121,13 @@ export type Snapshot = Message<"natlas.v1.Snapshot"> & {
    * @generated from field: repeated natlas.v1.Expansion expansions = 1;
    */
   expansions: Expansion[];
+
+  /**
+   * 2 identifies path-based snapshots; handle-based recordings had no version.
+   *
+   * @generated from field: uint32 format_version = 2;
+   */
+  formatVersion: number;
 };
 
 /**
@@ -160,12 +147,7 @@ export type Expansion = Message<"natlas.v1.Expansion"> & {
   request?: ExpandRequest | undefined;
 
   /**
-   * @generated from field: fixed64 node = 2;
-   */
-  node: bigint;
-
-  /**
-   * @generated from field: repeated natlas.v1.Edge edges = 3;
+   * @generated from field: repeated natlas.v1.Edge edges = 2;
    */
   edges: Edge[];
 };
@@ -182,16 +164,25 @@ export const ExpansionSchema: GenMessage<Expansion> = /*@__PURE__*/
  */
 export const Natlas: GenService<{
   /**
-   * A node's handle, then its children, heaviest first, down to 2^-horizon of
-   * its weight. The client may cancel at any point: every prefix is a valid
-   * listing.
+   * A node's children, heaviest first, down to 2^-horizon of its weight. The
+   * client may cancel at any point: every prefix is a valid listing.
    *
    * @generated from rpc natlas.v1.Natlas.Expand
    */
   expand: {
     methodKind: "server_streaming";
     input: typeof ExpandRequestSchema;
-    output: typeof ExpandResponseSchema;
+    output: typeof EdgeSchema;
+  },
+  /**
+   * The label path for a text, under the server's text-to-label mapping.
+   *
+   * @generated from rpc natlas.v1.Natlas.Search
+   */
+  search: {
+    methodKind: "unary";
+    input: typeof SearchRequestSchema;
+    output: typeof SearchResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_natlas_v1_natlas, 0);

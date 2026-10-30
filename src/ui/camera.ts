@@ -1,10 +1,7 @@
 // Camera motions. Every motion keeps one screen point fixed; vertical zoom is
 // never set directly, it follows depth through ``logView``.
 
-import { type Camera, logView } from "./layout";
-
-export const MIN_SCALE = 1e-3;
-export const MAX_SCALE = 1e7;
+import { type Camera, logView } from "../core/layout";
 
 /**
  * Move the left edge ``dx`` nats deeper, zooming vertically about view
@@ -26,7 +23,8 @@ export function panVertical(cam: Camera, dy: number): void {
  * the depth there, so keeping it fixed is what leaves the vertical view alone.
  */
 export function scale(cam: Camera, factor: number): void {
-  cam.k = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.k * factor));
+  const k = cam.k * factor;
+  if (Number.isFinite(k) && k > 0) cam.k = k;
 }
 
 /** Drag: content follows the pointer by (dx, dy) px, zooming about its y. */

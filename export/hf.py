@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
+#   "natlas-core",
 #   "natwalk",
 #   "numpy>=1.26",
 #   "protobuf>=7.36.1",
@@ -9,6 +10,7 @@
 # ]
 #
 # [tool.uv.sources]
+# natlas-core = { path = "../core" }
 # natwalk = { path = "../../natwalk", editable = true }
 # ///
 
@@ -116,7 +118,6 @@ def main() -> None:
         language.token_bytes(),
         [measure.name for measure in measures],
         recorded,
-        start=prompt,
     )
 
 

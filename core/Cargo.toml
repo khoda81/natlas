@@ -1,0 +1,22 @@
+[package]
+name = "natlas-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared integer-sequence distribution tree and anchored geometry for natlas"
+license = "MIT"
+repository = "https://github.com/khoda81/natlas"
+
+[lib]
+name = "natlas_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["wasm"]
+wasm = ["dep:serde-wasm-bindgen", "dep:wasm-bindgen"]
+python = ["dep:pyo3"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+pyo3 = { version = "0.30", optional = true }

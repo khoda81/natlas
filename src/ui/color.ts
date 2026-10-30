@@ -12,10 +12,7 @@ export interface Scheme {
   inkOnLight: string;
   sequential: string[];
   diverging: string[];
-  merged: string;
   tail: string;
-  /** How far an unexpanded slot fades toward the surface. */
-  leafFade: number;
 }
 
 const LIGHT: Scheme = {
@@ -26,9 +23,7 @@ const LIGHT: Scheme = {
   inkOnLight: "#0b0b0b",
   sequential: ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#104281"],
   diverging: ["#1c5cab", "#5598e7", "#b7d3f6", "#f0efec", "#f6c4c1", "#e34948", "#a92b2b"],
-  merged: "#dcdbd6",
   tail: "#c9c8c1",
-  leafFade: 0.45,
 };
 
 const DARK: Scheme = {
@@ -39,9 +34,7 @@ const DARK: Scheme = {
   inkOnLight: "#0b0b0b",
   sequential: ["#0d366b", "#184f95", "#256abf", "#3987e5", "#6da7ec", "#9ec5f4"],
   diverging: ["#9ec5f4", "#5598e7", "#2f5f9e", "#383835", "#8a3535", "#e34948", "#f4a3a1"],
-  merged: "#3a3a37",
   tail: "#4a4a45",
-  leafFade: 0.45,
 };
 
 const LEVELS = 256;
@@ -67,26 +60,20 @@ function luminance([r, g, b]: Rgb): number {
   return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
 }
 
-/** Precomputed fills and matching label inks for one ramp, solid and faded. */
+/** Precomputed fills and matching label inks for one ramp. */
 class Ramp {
   readonly fill: string[] = [];
-  readonly faded: string[] = [];
   readonly ink: string[] = [];
-  readonly fadedInk: string[] = [];
 
   constructor(stops: string[], scheme: Scheme) {
     const colors = stops.map(parse);
-    const surface = parse(scheme.surface);
     const inkFor = (rgb: Rgb) => (luminance(rgb) > 0.3 ? scheme.inkOnLight : scheme.inkOnDark);
     for (let level = 0; level < LEVELS; level++) {
       const position = (level / (LEVELS - 1)) * (colors.length - 1);
       const index = Math.min(colors.length - 2, Math.floor(position));
       const rgb = mix(colors[index]!, colors[index + 1]!, position - index);
-      const faded = mix(rgb, surface, scheme.leafFade);
       this.fill.push(css(rgb));
-      this.faded.push(css(faded));
       this.ink.push(inkFor(rgb));
-      this.fadedInk.push(inkFor(faded));
     }
   }
 
@@ -98,14 +85,12 @@ class Ramp {
 export class Palette {
   readonly sequential: Ramp;
   readonly diverging: Ramp;
-  readonly mergedInk: string;
   readonly tailInk: string;
 
   constructor(readonly scheme: Scheme) {
     this.sequential = new Ramp(scheme.sequential, scheme);
     this.diverging = new Ramp(scheme.diverging, scheme);
     const ink = (hex: string) => (luminance(parse(hex)) > 0.3 ? scheme.inkOnLight : scheme.inkOnDark);
-    this.mergedInk = ink(scheme.merged);
     this.tailInk = ink(scheme.tail);
   }
 

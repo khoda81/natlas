@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { NoteLabels, type NotesFile } from "../src/notes";
+import { NoteLabels, type NotesFile } from "../src/readings/notes";
 
 // MuScriptor's vocabulary layout: special tokens, shifts, then the note events.
 const ranges: [string, number][] = [["PAD", 1], ["EOS", 1], ["UNK", 1], ["shift", 1001], ["pitch", 128], ["velocity", 2], ["tie", 1], ["program", 130], ["drum", 128]];

@@ -1,22 +1,19 @@
 import { describe, expect, it } from "bun:test";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { Code, ConnectError } from "@connectrpc/connect";
-import { encode } from "../src/codec";
-import { Expander } from "../src/expand";
+import { encode } from "../src/core/codec";
+import { Expander } from "../src/data/expand";
+import { type Reply, type Source, SnapshotSource } from "../src/data/source";
+import { IntervalTree, type NodeId } from "../src/core/tree";
 import { SnapshotSchema } from "../src/gen/natlas/v1/natlas_pb";
-import { type Child, type Reply, type Source, SnapshotSource } from "../src/source";
-import { type Handle, IntervalTree, type TreeNode } from "../src/tree";
+import { TextLabels } from "../src/readings/labels";
 
 const weights = [0.5, 0.2, 0.1, 0.05, 0.01];
-const ROOT = 7n;
-const CHILD = 8n;
 
-function snapshot(): SnapshotSource {
-  const expansions = [
-    { request: { horizon: 10 }, node: ROOT },
-    { request: { node: { parent: ROOT, label: 1 }, horizon: 10 }, node: CHILD },
-  ].map((expansion) => ({ ...expansion, edges: encode([0, 1, 2, 3, 4], weights.map(Math.log), 10) }));
-  return new SnapshotSource(toBinary(SnapshotSchema, create(SnapshotSchema, { expansions })));
+function snapshot(labels = TextLabels.none()): SnapshotSource {
+  const expansions = [{ request: { path: [], horizon: 10 } }, { request: { path: [1], horizon: 10 } }].map(
+    (expansion) => ({ ...expansion, edges: encode([0, 1, 2, 3, 4], weights.map(Math.log), 10) }),
+  );
+  return new SnapshotSource(toBinary(SnapshotSchema, create(SnapshotSchema, { expansions, formatVersion: 2 })), labels);
 }
 
 async function labels(reply: Reply): Promise<number[]> {
@@ -26,32 +23,41 @@ async function labels(reply: Reply): Promise<number[]> {
 }
 
 describe("SnapshotSource", () => {
+  it("rejects handle recordings with migration instructions", () => {
+    const bytes = toBinary(SnapshotSchema, create(SnapshotSchema));
+    expect(() => new SnapshotSource(bytes)).toThrow("migrate-snapshots.py");
+  });
   it("answers down to the requested horizon, vouching only for its own", async () => {
     const source = snapshot();
-    const shallow = await source.expand(undefined, 4);
-    expect(shallow.node).toBe(ROOT);
+    const shallow = await source.expand([], 4);
     expect(shallow.complete).toBe(4);
     expect(await labels(shallow)).toEqual([0, 1, 2]);
-    const deep = await source.expand(undefined, 20);
+    const deep = await source.expand([], 20);
     expect(deep.complete).toBe(10);
     expect(await labels(deep)).toEqual([0, 1, 2, 3, 4]);
-    expect((await source.expand({ parent: ROOT, label: 1 }, 10)).node).toBe(CHILD);
+    expect((await source.expand([1], 10)).complete).toBe(10);
   });
 
-  it("knows nothing about nodes it did not record, nor below them", async () => {
+  it("knows nothing below paths it did not record", async () => {
     const source = snapshot();
-    const reply = await source.expand({ parent: ROOT, label: 0 }, 10);
-    expect([ROOT, CHILD]).not.toContain(reply.node);
-    expect(reply.complete).toBe(0);
-    expect(await labels(reply)).toEqual([]);
-    const below = await source.expand({ parent: reply.node, label: 1 }, 10);
-    expect(below.node).toBe(reply.node);
-    expect(below.complete).toBe(0);
+    for (const path of [[0], [1, 2], [9, 9, 9]]) {
+      const reply = await source.expand(path, 10);
+      expect(reply.complete).toBe(0);
+      expect(await labels(reply)).toEqual([]);
+    }
+  });
+
+  it("searches recorded paths by their text", async () => {
+    const source = snapshot(new TextLabels([new TextEncoder().encode("x"), new TextEncoder().encode("abc")]));
+    expect(await source.search("abc")).toEqual([1]);
+    expect(await source.search("ab")).toEqual([1]);
+    expect(await source.search("abcd")).toEqual([1]);
+    expect(source.search("unrelated")).rejects.toThrow("No recorded sequence");
   });
 });
 
-/** Wait for ``measure``'s listing of ``node`` from ``expander``. */
-async function fetched(tree: IntervalTree, expander: Expander, node: TreeNode, horizon = 2): Promise<void> {
+/** Wait for measure 0's listing of ``node`` from ``expander``. */
+async function fetched(tree: IntervalTree, expander: Expander, node: NodeId, horizon = 2): Promise<void> {
   const landed = new Promise<void>((resolve) => {
     const stop = tree.subscribe(() => (stop(), resolve()));
   });
@@ -60,72 +66,93 @@ async function fetched(tree: IntervalTree, expander: Expander, node: TreeNode, h
 }
 
 describe("Expander", () => {
+  it("refills capacity using current demand without another render", async () => {
+    const tree = new IntervalTree(1);
+    const calls: number[][] = [];
+    const source: Source = {
+      async expand(path, horizon) {
+        calls.push([...path]);
+        return snapshot().expand([], horizon);
+      },
+    };
+    const child = tree.child(0, 1);
+    const expander = new Expander(tree, [source], 1);
+    expander.request(() => [{ node: tree.listing(0, 0) === undefined ? 0 : child, measure: 0, horizon: 2, priority: 1 }]);
+    try {
+      await waitUntil(() => tree.listing(child, 0) !== undefined);
+      expect(calls).toEqual([[], [1]]);
+    } finally { expander.dispose(); }
+  });
+
+  it("coalesces path search with discovery and limits simultaneous requests", async () => {
+    const tree = new IntervalTree(1);
+    let active = 0;
+    let peak = 0;
+    const calls: number[][] = [];
+    const source: Source = {
+      async expand(path, horizon) {
+        calls.push([...path]);
+        peak = Math.max(peak, ++active);
+        await Bun.sleep(5);
+        active--;
+        return snapshot().expand([], horizon);
+      },
+    };
+    const expander = new Expander(tree, [source], 1);
+    const child = tree.child(0, 1);
+    expander.request([{ node: 0, measure: 0, horizon: 2, priority: 1 }]);
+    try {
+      const reached = await Promise.all([expander.reach(0, 0, 1), expander.reach(child, 0, 1)]);
+      expect(reached).toEqual([true, true]);
+      expect(peak).toBe(1);
+      expect(calls.filter((path) => path.length === 0)).toHaveLength(1);
+    } finally { expander.dispose(); }
+  });
+
+  it("stops unreachable recorded searches and ignores responses after disposal", async () => {
+    const tree = new IntervalTree(1);
+    const expander = new Expander(tree, [snapshot()]);
+    expect(await expander.reach(0, 0, 99)).toBe(false);
+    expect(tree.listing(0, 0)?.horizon).toBe(16);
+    expander.dispose();
+    let release!: (reply: Reply) => void;
+    const pending = new Expander(new IntervalTree(1), [{ expand: () => new Promise((resolve) => { release = resolve; }) }]);
+    pending.request([{ node: 0, measure: 0, horizon: 2, priority: 1 }]);
+    pending.dispose();
+    release(await snapshot().expand([], 8));
+    await Bun.sleep(5);
+  });
   it("fetches wanted listings once, with headroom", async () => {
     const tree = new IntervalTree(1);
     const expander = new Expander(tree, [snapshot()]);
-    const want = { node: tree.root, measure: 0, horizon: 2, priority: 1 };
-    const landed = fetched(tree, expander, tree.root);
-    expander.request([want]);
-    await landed;
-    const root = tree.root.listing(0)!;
+    await fetched(tree, expander, tree.root);
+    const root = tree.listing(tree.root, 0)!;
     expect(root.horizon).toBe(6);
     expect(root.labels).toEqual([0, 1, 2, 3]);
     expect(root.leftover).toBeCloseTo(0.15, 6);
-    expect(tree.root.handle(0)).toBe(ROOT);
+  });
+
+  it("names a deep node directly by its complete integer path", async () => {
+    const calls: string[] = [];
+    const source: Source = {
+      async expand(path, horizon) {
+        calls.push(`${path.join(",")}@${horizon}`);
+        return snapshot().expand([], horizon);
+      },
+    };
+    const tree = new IntervalTree(1);
+    const expander = new Expander(tree, [source]);
+    const deep = tree.child(tree.child(tree.child(tree.root, 1), 2), 3);
+    await fetched(tree, expander, deep);
+    expect(calls).toEqual(["1,2,3@6"]);
+    expect(tree.listing(tree.root, 0)).toBeUndefined();
   });
 });
 
-/**
- * A server that, like the live one, hands out handles as nodes are expanded,
- * knows only those, and forgets them on a restart. Every node has children
- * 0 to 4.
- */
-class Forgetful implements Source {
-  known = new Set<Handle>([1n]);
-  calls: string[] = [];
-
-  async expand(node: Child | undefined, horizon: number): Promise<Reply> {
-    this.calls.push(node === undefined ? `root@${horizon}` : `${node.parent}/${node.label}@${horizon}`);
-    if (node !== undefined && !this.known.has(node.parent)) throw new ConnectError("forgotten", Code.NotFound);
-    const handle = node === undefined ? 1n : node.parent * 10n + BigInt(node.label);
-    this.known.add(handle);
-    return { ...(await snapshot().expand(undefined, horizon)), node: handle, complete: horizon };
-  }
-
-  restart(): void {
-    this.known = new Set([1n]);
-    this.calls = [];
+async function waitUntil(condition: () => boolean): Promise<void> {
+  const deadline = performance.now() + 1000;
+  while (!condition()) {
+    if (performance.now() > deadline) throw new Error("timed out waiting for the expander");
+    await Bun.sleep(1);
   }
 }
-
-describe("Expander naming nodes", () => {
-  it("names a node's unnamed ancestors from the nearest named one, asking for handles alone", async () => {
-    const tree = new IntervalTree(1);
-    const server = new Forgetful();
-    const expander = new Expander(tree, [server]);
-    const deep = tree.child(tree.child(tree.child(0, 1).id, 2).id, 3);
-    await fetched(tree, expander, deep);
-    expect(server.calls).toEqual(["root@0", "1/1@0", "11/2@0", "112/3@6"]);
-    expect(deep.handle(0)).toBe(1123n);
-    expect(tree.root.listing(0)).toBeUndefined();
-  });
-
-  it("after a restart, names forgotten ancestors again, going up only as far as needed", async () => {
-    const tree = new IntervalTree(1);
-    const server = new Forgetful();
-    const expander = new Expander(tree, [server]);
-    const child = tree.child(0, 1);
-    const grandchild = tree.child(child.id, 2);
-    await fetched(tree, expander, grandchild);
-    server.restart();
-    const leaf = tree.child(grandchild.id, 3);
-    await fetched(tree, expander, leaf, 10);
-    expect(server.calls).toEqual(["112/3@14", "11/2@0", "1/1@0", "11/2@0", "112/3@14"]);
-    expect(leaf.listing(0)?.labels).toEqual([0, 1, 2, 3, 4]);
-
-    // What the walk named, the server knows again.
-    server.calls = [];
-    await fetched(tree, expander, tree.child(grandchild.id, 4));
-    expect(server.calls).toEqual(["112/4@6"]);
-  });
-});

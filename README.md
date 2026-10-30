@@ -1,6 +1,6 @@
 # natlas
 
-A web navigator for nested interval trees, built as the visual client for
+A web navigator for distributions over integer sequences, built as the visual client for
 [natwalk](https://github.com/khoda81/natwalk). It knows nothing about tokens or
 models: a tree is nodes whose children partition their interval, with one
 weight per child under each *measure*, and children are numbered labels whose
@@ -47,7 +47,7 @@ is. Scrolling deeper is therefore also zooming in.
 
 Absolute vertical coordinates would lose precision a few dozen nats deep, so
 the camera is anchored to a nearby slot boundary instead, and every position is
-a same-sign sum of masses outward from it (see `src/layout.ts`). The tests pin
+a same-sign sum of masses outward from it (see `core/src/layout.rs`). The tests pin
 exact geometry 80 halvings deep.
 
 | input | motion |
@@ -57,61 +57,80 @@ exact geometry 80 halvings deep.
 | shift + wheel, ↑ ↓ | along the interval |
 | ctrl + wheel, pinch, + − | horizontal scale, about the left edge, leaving the vertical view alone |
 | double-click | glide until a box stands like the root, its children filling the view |
-| hover | show the text down to the box above the canvas; it stays until the next hover |
+| hover | select a branch by height, then depth; empty space keeps the deepest known subtree selected |
+| inspector editor | search text as you type; select a result or press Enter to anchor there |
 | 0 · s · b | root · swap p and q · nats/bits |
 
 ## Protocol
 
-`proto/natlas/v1/natlas.proto`. One server serves one measure through one
-call, `Expand(node, horizon)`, which streams the node's handle and then its
-children heaviest first, down to 2^−horizon of its weight, as
-`Edge { label, odds }`.
+`proto/natlas/v1/natlas.proto`. A distribution is over sequences of unsigned
+32-bit integers. The empty sequence is the root; appending one integer names
+a child. The complete sequence is its identity across the client, measures,
+server restarts and saved views. Numeric node IDs inside the core are only
+local storage indices and never go over the wire.
 
-- A child is a 32-bit label; what labels mean (a vocabulary) is agreed
-  outside the protocol. Nodes are 64-bit handles the server chooses and the
-  client only learns: a request names a node by its parent's handle and its
-  label, or names nothing for the root, and the reply starts with the node's
-  own handle. A server that has forgotten a handle answers `NOT_FOUND`, and
-  the client names that parent again the same way, going up only as far as
-  the server has forgotten. Horizon 0 asks for the handle alone.
-- Each weight is a fraction g of the previous child's, sent as the log-odds of
-  g in steps of horizon·ln 2 / 2³¹ nat. Listings are sorted by construction and
-  every prefix is valid: the client sums nothing up front, and whatever the
-  listed children leave is the rest. One horizon sets both where the server
-  stops and how precise the weights are.
-- The client asks for what the view needs: a box's children down to a pixel
-  under p and, when q differs, every child that could end short of the right
-  edge under q. Children q has not listed have an upper bound on q, so their
-  width is a lower bound; the tail is drawn the same way, at least as wide as
-  the horizon.
+Each server serves one measure through two Connect RPCs:
 
-Comparing p with q means asking two servers about the same nodes, each by
-its own handles. A `Snapshot` is a recorded server, one `Expand` per node with
-the handle it answered; the client replays it, re-encoding it for each
-request.
+- `Expand(path, horizon)` streams `Edge { label, odds }` directly, heaviest
+  first, down to conditional probability 2^−horizon. Horizon 0 lists nothing.
+  Each edge's weight is a fraction g of the previous child's, sent as the
+  log-odds of g in steps of horizon·ln 2 / 2³¹ nat. Every stream prefix is
+  valid; unlisted mass remains a tail.
+- `Search(text)` maps text to its complete integer path, using the model's
+  tokenizer. The browser searches on input and anchors only when a result
+  is selected. Music services return `unimplemented` for text search.
+
+Comparing p with q means asking both servers about the same paths. The client
+asks for enough children to resolve their height in pixels under p and their
+width under q. Missing q weights are upper bounds, so their drawn widths are
+lower bounds. Listed branches use the same colors whether their children are
+known yet. Tiny adjacent branches merge into borderless, area-preserving
+runs while selection still resolves their individual integer labels.
+
+A `Snapshot` records expansions by complete path with `format_version = 2`.
+Recorded search includes listed leaves as well as expanded nodes, and returns
+an exact match, a completion, or the deepest recorded prefix. Text with no
+recorded match shows an error. Old handle-based recordings must be converted:
+
+```bash
+uv run scripts/migrate-snapshots.py           # all public/data/*.pb
+uv run scripts/migrate-snapshots.py tree.pb   # selected files
+```
+
+The converter resolves the old parent handles without model inference and
+keeps originals in `.snapshot-backups/`. Regenerating data is also supported.
+The wire format changed; the browser and live services must be updated together.
+
+The browser saves the smallest known anchor covering the viewport, its integer
+path and camera position, horizontal scale and p/q measures to local storage.
+Keys include source URLs (or dropped file contents). Reload reconstructs the
+path on demand; if a recording no longer reaches it, the view falls back to
+its deepest available ancestor. A server does not choose the initial tree or
+send a starting prompt.
 
 ## Live
 
 ```bash
 bun run live      # SmolLM2-360M on the GPU, at http://localhost:8421
 cd export
-uv run serve.py "Once upon a time" --p HuggingFaceTB/SmolLM2-360M \
+uv run serve.py --p HuggingFaceTB/SmolLM2-360M \
   --q context:4 --q temperature:1.6
 ```
 
 `export/serve.py` loads the model and serves each measure as its own `Natlas`
 service, `/0/` for the model and `/1/`, `/2/`, … for the `--q` measures, over
-the Connect protocol. Its root is the empty text, the start-of-text token
-alone, and every text is a node like any other: the prompt is only where the
-client starts, a path of token labels in `GET /manifest.json` that the client
-fetches its way down on load. `/labels.json` holds each token's bytes. With
-`bun run dev` running, the page finds a local server on its own and lists it
-first; `?server=URL` points it elsewhere.
+the Connect protocol. The root is the empty text; the start-of-text token is
+internal to the model. `/manifest.json` describes the measures and
+`/labels.json` holds each token's bytes. With `bun run dev` running, the page
+finds a local server and lists it first; `?server=URL` points it elsewhere.
+Use the inspector editor to find text and select the result to start there.
 
-The server's handles hash label paths, so they survive a restart, but it
-cannot invert them: it remembers the parent and label of each node it has
-expanded. After a restart the client names the forgotten ancestors again,
-asking for handles alone, which costs round trips but no forward passes.
+`export/service.py` owns the model-independent RPC handlers and the bounded
+LRU policy for complete model distributions. Both language and music servers
+store those distributions in the native Rust tree and encode responses with
+the same Rust codec as the browser. The model runs on worker threads with a
+lock protecting inference and cache updates.
+
 Models load in float32 by default, which is both more precise and, on a GTX
 1660 Ti, about 5× faster than float16; `--dtype` trades that for memory on
 larger models.
@@ -123,7 +142,7 @@ request that shares a prefix with the previous one reuses its KV cache, so
 walking down a path costs one token per step.
 
 ```bash
-uv run serve.py "Once upon a time" \
+uv run serve.py \
   --p ~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-GGUF/snapshots/*/Qwen3-4B-Q6_K.gguf \
   --q temperature:1.6
 ```
@@ -187,22 +206,50 @@ uv run hf.py --p HuggingFaceTB/SmolLM2-360M --tokenizer HuggingFaceTB/SmolLM2-36
 Both use natwalk's own search to discover the tree, then evaluate the other
 measures on the same paths, each listed in its own order down to the bit
 below its coverage. `hf.py` roots the tree at the empty text too: it records
-the path down to the prompt, where natwalk's search begins, and the page opens
-there. A q measure is another model with the same
+the path down to the prompt where natwalk's discovery begins. The browser
+chooses its own anchor through text search or its saved view. A q measure is another model with the same
 tokenizer, `context:N` (p seeing only its last N tokens) or `temperature:T`.
 
 ## Development
 
-[Bun](https://bun.sh) runs everything: install, the dev server (`serve.ts`,
-which bundles the page and serves `public/`), tests and the static build.
+The source is split by responsibility:
+
+- `core/`: Rust tree, cached listings and derived slots, shared wire codec,
+  anchored geometry, best-effort picking and covering-anchor queries.
+- `src/core/`: thin TypeScript adapters to that core, compiled to WebAssembly.
+- `src/data/`: live/recorded sources, dataset loading and completion-driven
+  expansion scheduling.
+- `src/readings/`: text and music interpretations of integer labels.
+- `src/ui/`: canvas drawing, camera controls, inspector/search and saved views.
+- `export/`: Python model adapters, Connect service and snapshot exporters.
+
+Install [Bun](https://bun.sh), [Rust](https://www.rust-lang.org/tools/install),
+[wasm-pack](https://wasm-bindgen.github.io/wasm-pack/installer/) and
+[uv](https://docs.astral.sh/uv/). Rust builds to WebAssembly for the browser and
+to a native Python module through PyO3/maturin. The Python scripts declare the
+local `core/` dependency, so uv builds it automatically. Generated WebAssembly
+files and Python wheels are build outputs, kept out of version control.
 
 ```bash
 bun install
-bun run dev     # http://localhost:5173, PORT to change
-bun test
-bun run build   # static site in dist/, datasets included
-bun run proto   # after editing the .proto; needs protoc
+bun run dev       # builds the core, then serves http://localhost:5173
+bun run test      # browser adapters + native Rust + Python/Connect tests
+bun run typecheck
+bun run build     # static site in dist/, including the .wasm and datasets
+bun run proto     # regenerate TypeScript/Python bindings; needs protoc
 ```
+
+For faster targeted checks after the core has been built:
+
+```bash
+bun test
+cargo test --manifest-path core/Cargo.toml
+uv run tests/server_test.py   # native cache, codec, transport and migration
+```
+
+The Python tests use deterministic distributions and load no model. For manual
+browser checks, `PORT=8427 uv run tests/server_test.py --serve` starts the same
+fixture, usable through `?server=http://127.0.0.1:8427/`.
 
 The exporters (`export/hf.py`, `export/synthetic.py`) use a
 [natwalk](https://github.com/khoda81/natwalk) checkout beside this one;

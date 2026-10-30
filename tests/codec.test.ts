@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { decode, encode, SATURATED, step } from "../src/codec";
+import { decode, encode, SATURATED } from "../src/core/codec";
 
 const ln = (weights: number[]) => weights.map(Math.log);
+const step = (horizon: number) => (horizon * Math.LN2) / 2 ** 31;
 
 describe("encode", () => {
   it("matches the exporter's edges", () => {

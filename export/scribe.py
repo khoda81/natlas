@@ -1,12 +1,16 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
+#   "natlas-core",
 #   "muscriptor==0.3.0",
 #   "numpy>=1.26",
 #   "protobuf>=7.36.1",
 #   "starlette>=0.40",
 #   "uvicorn>=0.30",
 # ]
+#
+# [tool.uv.sources]
+# natlas-core = { path = "../core" }
 # ///
 
 """Serve MuScriptor's tree of transcriptions of a recording to natlas, live.
@@ -58,8 +62,11 @@ import uvicorn
 from muscriptor import TranscriptionModel
 from muscriptor.events import ChunkBoundary, OpenNoteTracker
 from muscriptor.modules.streaming import increment_steps, init_states
-from muscriptor.tokenizer.mt3 import instrument_group_from_names, resolve_instrument_names
-from serve import Model, _slug, app
+from muscriptor.tokenizer.mt3 import (
+    instrument_group_from_names,
+    resolve_instrument_names,
+)
+from service import Model, _slug, app
 
 SAMPLE_RATE = 16_000
 WINDOW_SECONDS = 5
@@ -387,7 +394,6 @@ def main() -> None:
             "name": f"scribe-{_slug(args.audio.stem)}-{args.at:g}",
             "title": f"{args.audio.stem} · {args.at:g}–{args.at + seconds:.0f} s · live",
             "labels": "labels.json",
-            "start": [],
             "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
         }
     ]

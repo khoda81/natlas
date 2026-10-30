@@ -2,53 +2,39 @@ syntax = "proto3";
 
 package natlas.v1;
 
-// natlas draws a nested interval tree that a server measures on demand. One
-// server serves one measure; comparing two measures means asking two servers
-// about the same nodes.
+// natlas draws an integer-sequence distribution as a nested interval tree that
+// a server measures on demand. One server serves one measure; comparing two
+// measures means asking two servers about the same paths.
 //
-// Every node owns one interval, partitioned by its children. A child is named
-// by a 32-bit label whose meaning (a vocabulary, for a language model) is
-// agreed outside this protocol; siblings have distinct labels.
-//
-// Nodes are named by 64-bit handles that the server chooses and the client
-// only learns: a request names a node by its parent's handle and its own
-// label, and the response begins with the node's handle, by which the client
-// names its children in turn. The root needs no name. A handle means
-// something only to the server that gave it.
-//
-// A server that has forgotten a handle, as after a restart, answers
-// NOT_FOUND. The client then names that parent afresh by its own parent,
-// going up only as far as the server still knows.
+// Every node is identified globally by its complete path of 32-bit labels from
+// the root; the root is the empty path. A label's meaning (a vocabulary, for a
+// language model) is agreed outside this protocol, and siblings have distinct
+// labels. Every node owns one interval, partitioned by its children.
 
 service Natlas {
-  // A node's handle, then its children, heaviest first, down to 2^-horizon of
-  // its weight. The client may cancel at any point: every prefix is a valid
-  // listing.
-  rpc Expand(ExpandRequest) returns (stream ExpandResponse);
+  // A node's children, heaviest first, down to 2^-horizon of its weight. The
+  // client may cancel at any point: every prefix is a valid listing.
+  rpc Expand(ExpandRequest) returns (stream Edge);
+  // The label path for a text, under the server's text-to-label mapping.
+  rpc Search(SearchRequest) returns (SearchResponse);
 }
 
 message ExpandRequest {
-  // The root when unset.
-  Child node = 1;
+  // The complete label path from the root; empty for the root itself.
+  repeated uint32 path = 1;
   // In bits. The server lists every child of conditional weight at least
   // 2^-horizon and stops there, so every child it leaves out is lighter. It
-  // also sets the step of Edge.odds. At 0 the server lists nothing: the
-  // client asks only for the handle.
+  // also sets the step of Edge.odds. At 0 the server lists nothing.
   uint32 horizon = 2;
 }
 
-// The child with `label` of the node the server gave `parent` to.
-message Child {
-  fixed64 parent = 1;
-  uint32 label = 2;
+message SearchRequest {
+  string text = 1;
 }
 
-message ExpandResponse {
-  oneof part {
-    // The first message, and only the first: the node's handle.
-    fixed64 node = 1;
-    Edge edge = 2;
-  }
+message SearchResponse {
+  // The complete label path from the root for the requested text.
+  repeated uint32 path = 1;
 }
 
 // One child. Its weight w_k is a fraction g_k of the previous child's,
@@ -70,10 +56,11 @@ message Edge {
 // A recorded server, used for static datasets: one Expand per node.
 message Snapshot {
   repeated Expansion expansions = 1;
+  // 2 identifies path-based snapshots; handle-based recordings had no version.
+  uint32 format_version = 2;
 }
 
 message Expansion {
   ExpandRequest request = 1;
-  fixed64 node = 2;
-  repeated Edge edges = 3;
+  repeated Edge edges = 2;
 }

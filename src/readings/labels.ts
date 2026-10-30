@@ -5,7 +5,7 @@
 // array of base64 strings, indexed by label, as proto3 JSON writes bytes.
 
 import { type Glyph, type Labels, type Reading, States } from "./reading";
-import type { IntervalTree, Label, NodeId } from "./tree";
+import type { IntervalTree, Label, NodeId } from "../core/tree";
 
 /** The bytes a decoder holds back after ``bytes``: an unfinished UTF-8 character, at most 3 bytes. */
 function unfinished(bytes: Uint8Array): Uint8Array {
@@ -35,6 +35,10 @@ export class TextLabels implements Labels {
 
   constructor(private readonly bytes: readonly Uint8Array[]) {}
 
+  get searchable(): boolean {
+    return this.bytes.length > 0;
+  }
+
   /** Labels from a labels file's array of base64 strings. */
   static fromJson(encoded: string[]): TextLabels {
     return new TextLabels(encoded.map((text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0))));
@@ -53,11 +57,17 @@ export class TextLabels implements Labels {
     const unfinished = new States<Uint8Array>(tree, new Uint8Array(), (before, label) => this.after(before, label).unfinished);
     return {
       glyph: (node: NodeId, label: Label): Glyph => ({ text: visible(this.shown(unfinished.at(node), label)) }),
-      show: (panel: HTMLElement, node: NodeId, label: Label | null, more: string) => {
+      show: (panel: HTMLElement, node: NodeId, label: Label | null, more?: string) => {
         const tokens = this.along(tree.path(node)).map((text) => token(text));
-        tokens.push(label === null ? token(more, "more") : token(this.shown(unfinished.at(node), label), "current"));
+        if (label !== null) tokens.push(token(this.shown(unfinished.at(node), label), "current"));
+        if (more !== undefined) tokens.push(token(more, "more"));
         panel.dataset.kind = "text";
         panel.replaceChildren(...tokens);
+      },
+      text: (node: NodeId, label: Label | null): string => {
+        const path = tree.path(node);
+        if (label !== null) path.push(label);
+        return this.along(path).join("");
       },
     };
   }
@@ -86,6 +96,36 @@ export class TextLabels implements Labels {
     return own !== undefined && /^\uFFFD*$/.test(text) ? hex(own) : text;
   }
 
+  /** Find an exact recorded text, then a completion, then its deepest known prefix. */
+  search(paths: Iterable<readonly Label[]>, text: string): Label[] {
+    if (text === "") return [];
+    const query = new TextEncoder().encode(text);
+    let prefix: { path: readonly Label[]; depth: number } | undefined;
+    let completion: { path: readonly Label[]; length: number } | undefined;
+    for (const path of paths) {
+      const bytes = this.bytesAlong(path);
+      if (bytes === null) continue;
+      if (equal(bytes, query)) return [...path];
+      if (startsWith(query, bytes) && path.length > (prefix?.depth ?? -1)) prefix = { path, depth: path.length };
+      if (startsWith(bytes, query) && bytes.length < (completion?.length ?? Infinity)) {
+        completion = { path, length: bytes.length };
+      }
+    }
+    const match = completion?.path ?? prefix?.path;
+    if (match === undefined || match.length === 0) throw new Error("No recorded sequence matches this text");
+    return [...match];
+  }
+
+  private bytesAlong(path: readonly Label[]): Uint8Array | null {
+    let bytes: Uint8Array<ArrayBufferLike> = new Uint8Array();
+    for (const label of path) {
+      const own = this.bytes[label];
+      if (own === undefined) return null;
+      bytes = concat(bytes, own);
+    }
+    return bytes;
+  }
+
   /** The text of each label along ``path``, each read after the ones before it. */
   along(path: readonly Label[]): string[] {
     let before: Uint8Array = new Uint8Array();
@@ -95,6 +135,14 @@ export class TextLabels implements Labels {
       return read.text;
     });
   }
+}
+
+function startsWith(bytes: Uint8Array, prefix: Uint8Array): boolean {
+  return prefix.length <= bytes.length && prefix.every((byte, index) => bytes[index] === byte);
+}
+
+function equal(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && startsWith(a, b);
 }
 
 /** Whitespace made visible, for a label shown on its own. */

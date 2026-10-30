@@ -1,9 +1,9 @@
 // Canvas 2D drawing of one laid-out frame.
 
 import { type Palette, rampPosition } from "./color";
-import type { Box, Camera, Frame, Lens, Viewport } from "./layout";
-import type { Glyph, Mark } from "./reading";
-import type { NodeId } from "./tree";
+import type { Box, Camera, Frame, Lens, Selection, Viewport } from "../core/layout";
+import type { NodeId } from "../core/tree";
+import type { Glyph, Mark } from "../readings/reading";
 
 export interface Units {
   name: string;
@@ -15,7 +15,7 @@ export const NATS: Units = { name: "nats", nats: 1 };
 export const BITS: Units = { name: "bits", nats: Math.LN2 };
 
 export interface DrawState {
-  hover: Box | null;
+  hover: Selection | null;
   /** ``node:slot`` keys of the hovered box's ancestor slots. */
   ancestors: Set<string>;
   units: Units;
@@ -82,32 +82,31 @@ export function draw(
   ctx.textBaseline = "middle";
 
   const labels: { box: Box; rect: ScreenRect; glyph: Glyph; ink: string; grows: boolean }[] = [];
+  let visible = false;
   for (const box of frame.boxes) {
     const rect = screenRect(box, cam, view);
     const width = rect.x1 - rect.x0;
     const height = rect.y1 - rect.y0;
     if (width <= 0 || height <= 0) continue;
+    visible = true;
 
     let fill: string;
     let ink: string;
-    if (box.kind === "merged") {
-      fill = scheme.merged;
-      ink = palette.mergedInk;
-    } else if (box.kind === "tail") {
+    if (box.kind === "tail") {
       fill = scheme.tail;
       ink = palette.tailInk;
     } else {
       const level = ramp.level(rampPosition(box.p, box.q, equal));
-      const leaf = box.kind === "leaf";
-      fill = (leaf ? ramp.faded : ramp.fill)[level]!;
-      ink = (leaf ? ramp.fadedInk : ramp.ink)[level]!;
+      fill = ramp.fill[level]!;
+      ink = ramp.ink[level]!;
     }
     ctx.fillStyle = fill;
+    const bordered = box.kind !== "merged" && box.kind !== "tail" && width >= GAP_MIN && height >= GAP_MIN;
     ctx.fillRect(
       rect.x0,
       rect.y0,
-      width >= GAP_MIN ? width - 1 : width,
-      height >= GAP_MIN ? height - 1 : height,
+      bordered && width >= GAP_MIN ? width - 1 : width,
+      bordered && height >= GAP_MIN ? height - 1 : height,
     );
 
     if (box.kind !== "merged" && height >= LABEL_MIN_HEIGHT && width >= LABEL_MIN_WIDTH) {
@@ -146,10 +145,10 @@ export function draw(
     ctx.restore();
   }
 
-  if (frame.boxes.length === 0) {
+  if (!visible) {
     ctx.fillStyle = scheme.inkMuted;
     ctx.textAlign = "center";
-    ctx.fillText("Nothing discovered here · press 0 for the root", view.width / 2, view.height / 2);
+    ctx.fillText("No continuation discovered here · press 0 for the root", view.width / 2, view.height / 2);
     ctx.textAlign = "left";
   }
 
@@ -235,8 +234,10 @@ function outline(
   }
   ctx.globalAlpha = 1;
   ctx.lineWidth = 2;
-  const rect = screenRect(state.hover, cam, view);
+  if (!state.hover.exact) ctx.setLineDash([5, 3]);
+  const rect = screenRect(state.hover.box, cam, view);
   ctx.strokeRect(rect.x0 + 1, rect.y0 + 1, Math.max(0, rect.x1 - rect.x0 - 3), Math.max(0, rect.y1 - rect.y0 - 3));
+  ctx.setLineDash([]);
 }
 
 /** ``value`` moved into [low, high]; ``low`` wins when the range is empty. */
@@ -252,6 +253,7 @@ function niceStep(raw: number): number {
 
 function format(value: number, step: number): string {
   const decimals = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
+  if (decimals > 12 || Math.abs(value) >= 1e12) return value.toExponential(3);
   return value.toFixed(decimals);
 }
 
@@ -271,7 +273,11 @@ function ruler(ctx: CanvasRenderingContext2D, cam: Camera, view: Viewport, units
   const first = Math.ceil(cam.x / units.nats / step);
   const last = Math.floor((cam.x + view.width / cam.k) / units.nats / step);
   ctx.beginPath();
-  for (let i = first; i <= last; i++) {
+  // A bounded tick count also works when adjacent integer indices are no
+  // longer distinguishable at an extreme, but finite, horizontal scale.
+  for (let tick = 0; tick <= Math.ceil(view.width / 80) + 1; tick++) {
+    const i = first + tick;
+    if (!Number.isFinite(i) || i > last || !Number.isFinite(step) || step <= 0) break;
     const value = i * step;
     const x = Math.round((value * units.nats - cam.x) * cam.k) + 0.5;
     const text = format(value, step);

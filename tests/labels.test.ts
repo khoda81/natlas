@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { TextLabels } from "../src/labels";
+import { TextLabels } from "../src/readings/labels";
 
 const utf8 = (text: string) => new TextEncoder().encode(text);
 // 🦢 is F0 9F A6 A2 and چ is DA 86, each split over byte-level tokens as SmolLM2 splits them.

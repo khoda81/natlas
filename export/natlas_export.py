@@ -63,32 +63,25 @@ def snapshots(
     child: natwalk's discovered children always fit, and so does every child
     at least that heavy, as Expand requires.
 
-    natwalk's root sits at ``start``, a path of labels from the tree's root;
-    ``ancestry`` gives every measure's weights, natwalk's own first, at each
-    node on that path, whose listing then reaches at least the next label.
+    natwalk's root sits at ``start``, a structural path of labels from the
+    global root; ``ancestry`` gives every measure's weights, natwalk's own
+    first, at each node on that path, whose listing then reaches at least the
+    next label. Every recorded request contains its complete path from the
+    global root.
     """
     if start and len(ancestry) != 1 + len(extra):
         raise ValueError("a start path needs the weights along it under every measure")
-    # Handles are the recording's own: the nodes on the start path by depth,
-    # then natwalk's nodes by id after them, natwalk's root last on the path.
-    def along(depth: int) -> pb.Child | None:
-        return None if depth == 0 else pb.Child(parent=depth - 1, label=start[depth - 1])
 
-    def handle(node_id: NodeId) -> int:
-        return len(start) + node_id
-
-    def named(node_id: NodeId) -> tuple[pb.Child | None, int]:
-        parent = tree[node_id].parent
-        request = along(len(start)) if parent is None else pb.Child(parent=handle(parent), label=tree.token(node_id))
-        return request, handle(node_id)
+    def path(node_id: NodeId) -> tuple[int, ...]:
+        return tuple(start) + tuple(tree.path(node_id))
 
     def along_start(measure: int) -> list[pb.Expansion]:
         return [
-            _expansion_of((along(depth), depth), ancestry[measure](start[:depth]), min_list, max_list, coverage, label)
+            _expansion_of(start[:depth], ancestry[measure](start[:depth]), min_list, max_list, coverage, label)
             for depth, label in enumerate(start)
         ]
 
-    own = pb.Snapshot(expansions=along_start(0) if start else [])
+    own = pb.Snapshot(format_version=2, expansions=along_start(0) if start else [])
     for node_id, node in enumerate(tree.nodes):
         distribution = node.distribution
         count = listed_count(tree, node_id, min_list=min_list, max_list=max_list, coverage=coverage)
@@ -101,7 +94,7 @@ def snapshots(
             listed.append(len(listed))
         own.expansions.append(
             _expansion(
-                named(node_id),
+                path(node_id),
                 horizon,
                 [distribution.token(rank) for rank in listed],
                 [-distribution.nats(rank) for rank in listed],
@@ -110,17 +103,17 @@ def snapshots(
 
     recorded = [own]
     for index, measure in enumerate(extra, start=1):
-        snapshot = pb.Snapshot(expansions=along_start(index) if start else [])
+        snapshot = pb.Snapshot(format_version=2, expansions=along_start(index) if start else [])
         for node_id in range(len(tree.nodes)):
             # A sequence natwalk has ended has no continuation under any measure.
             weights = measure(node_id) if len(tree[node_id].distribution) else []
-            snapshot.expansions.append(_expansion_of(named(node_id), weights, min_list, max_list, coverage))
+            snapshot.expansions.append(_expansion_of(path(node_id), weights, min_list, max_list, coverage))
         recorded.append(snapshot)
     return recorded
 
 
 def _expansion_of(
-    named: tuple[pb.Child | None, int],
+    path: Sequence[int],
     weights: Sequence[float],
     min_list: int,
     max_list: int,
@@ -132,7 +125,7 @@ def _expansion_of(
     top = heapq.nlargest(max_list, range(len(weights)), key=weights.__getitem__)
     count = _coverage_count([weights[label] for label in top], min_list, max_list, coverage)
     if not count:
-        return _expansion(named, _LEAF_HORIZON, [], [])
+        return _expansion(path, _LEAF_HORIZON, [], [])
     horizon = _horizon(_ln(weights[top[count - 1]]))
     if include is not None:
         horizon = max(horizon, _horizon(_ln(weights[include])))
@@ -140,16 +133,14 @@ def _expansion_of(
     threshold = math.exp(-horizon * math.log(2))
     heavy = [label for label, weight in enumerate(weights) if weight >= threshold]
     listed = sorted(heavy, key=lambda label: (-weights[label], label))
-    return _expansion(named, horizon, listed, [_ln(weights[label]) for label in listed])
+    return _expansion(path, horizon, listed, [_ln(weights[label]) for label in listed])
 
 
 def _expansion(
-    named: tuple[pb.Child | None, int], horizon: int, labels: Sequence[int], ln_weights: Sequence[float]
+    path: Sequence[int], horizon: int, labels: Sequence[int], ln_weights: Sequence[float]
 ) -> pb.Expansion:
-    """``named`` is how a request names the node, and the handle the recording gives it."""
-    child, node = named
-    request = pb.ExpandRequest(node=child, horizon=horizon)
-    return pb.Expansion(request=request, node=node, edges=encode(labels, ln_weights, horizon))
+    request = pb.ExpandRequest(path=path, horizon=horizon)
+    return pb.Expansion(request=request, edges=encode(labels, ln_weights, horizon))
 
 
 def _coverage_count(weights: Sequence[float], min_list: int, max_list: int, coverage: float) -> int:
@@ -181,10 +172,8 @@ def write(
     labels: Sequence[bytes],
     measures: Sequence[str],
     recorded: Sequence[pb.Snapshot],
-    start: Sequence[int] = (),
 ) -> list[Path]:
-    """Write one snapshot per measure and the label texts, and register them in
-    the manifest, with ``start`` as the path the client opens at."""
+    """Write one snapshot per measure and the label texts, and register them in the manifest."""
     if len(measures) != len(recorded):
         raise ValueError("one measure name per snapshot")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -202,10 +191,10 @@ def write(
 
     manifest_path = DATA_DIR / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
+    for entry in manifest:
+        entry.pop("start", None)
     manifest = [entry for entry in manifest if "name" in entry and entry["name"] != name]
     entry = {"name": name, "title": title, "labels": label_file, "measures": entries}
-    if start:
-        entry["start"] = list(start)
     manifest.append(entry)
     manifest.sort(key=lambda entry: entry["name"])
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")

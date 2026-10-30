@@ -56,8 +56,11 @@ class App {
   private readonly ctx = this.canvas.getContext("2d")!;
   private readonly inspect = element<HTMLElement>("inspect");
   private readonly details = element<HTMLElement>("inspect-details");
-  private readonly editor = element<HTMLInputElement>("inspect-editor");
   private readonly where = element<HTMLElement>("where");
+  private readonly pathPanel = element<HTMLElement>("path-panel");
+  private editing = false;
+  private shownText = "";
+  private shownPath: { node: NodeId; label: number | null; more?: string } | null = null;
   /** The box the path panel shows, as node:slot:kind. */
   private shown = "";
   private loading = 0;
@@ -179,10 +182,27 @@ class App {
       select.replaceChildren(...dataset.measures.map((name, index) => new Option(name, String(index))));
     }
     element("lens").hidden = dataset.measures.length <= 1;
-    this.editor.hidden = !dataset.searchable;
-    this.editor.value = "";
+    this.editing = false;
+    this.shownText = "";
+    this.shownPath = null;
+    this.where.replaceChildren();
+    this.where.style.minHeight = "";
+    this.where.contentEditable = dataset.searchable ? "plaintext-only" : "false";
+    this.where.tabIndex = dataset.searchable ? 0 : -1;
+    this.where.setAttribute("aria-label", dataset.searchable ? "find text in the sequence distribution" : "text down to the hovered box");
+    if (dataset.searchable) {
+      this.where.dataset.kind = "text";
+      this.where.dataset.placeholder = "Find text…";
+      this.where.setAttribute("role", "textbox");
+      this.where.setAttribute("aria-multiline", "true");
+      this.where.setAttribute("aria-controls", "search-result");
+    } else {
+      this.where.removeAttribute("role");
+      this.where.removeAttribute("aria-multiline");
+      this.where.removeAttribute("aria-controls");
+    }
     this.result.hidden = true;
-    this.editor.classList.remove("found");
+    this.where.classList.remove("found");
     this.found = null;
     this.searchGeneration++;
     if (this.searchTimer !== null) clearTimeout(this.searchTimer);
@@ -190,9 +210,9 @@ class App {
     this.hover = null;
     this.pointer = null;
     this.shown = "";
-    this.where.hidden = true;
+    this.pathPanel.hidden = this.where.hidden = !dataset.searchable;
     this.details.replaceChildren();
-    this.inspect.hidden = !dataset.searchable;
+    this.inspect.hidden = true;
     this.setLens({ p: 0, q: 0 });
     this.reset();
     const saved = this.readView(dataset);
@@ -250,7 +270,8 @@ class App {
     const tree = this.tree!;
     if (node === tree.root) {
       this.reset();
-      this.where.hidden = true;
+      if (this.dataset?.searchable) this.showPath(tree.root, null);
+      else this.pathPanel.hidden = true;
       return;
     }
     const parent = tree.parent(node)!;
@@ -274,7 +295,7 @@ class App {
     this.qSelect.value = String(lens.q);
     this.found = null;
     this.searchGeneration++;
-    this.editor.classList.remove("found");
+    this.where.classList.remove("found");
     this.updateLegend();
     this.invalidate();
   }
@@ -435,6 +456,7 @@ class App {
       if (
         event.target instanceof HTMLSelectElement ||
         event.target instanceof HTMLInputElement ||
+        (event.target instanceof HTMLElement && event.target.isContentEditable) ||
         event.ctrlKey ||
         event.metaKey ||
         event.altKey
@@ -504,38 +526,71 @@ class App {
     });
   }
 
-  // Text search and the inspector editor.
+  // The top path inspector doubles as the text editor.
 
   private bindEditor(): void {
     this.result.addEventListener("click", () => void this.search(true, ++this.searchGeneration));
-    this.editor.addEventListener("focus", () => this.held.clear());
-    this.editor.addEventListener("input", () => {
+    this.where.addEventListener("focus", () => {
+      if (!this.dataset?.searchable || this.editing) return;
+      this.held.clear();
+      this.editing = true;
+      this.where.textContent = this.shownText;
+      this.invalidate();
+    });
+    this.where.addEventListener("input", () => {
+      if (!this.dataset?.searchable) return;
       this.result.hidden = true;
       this.found = null;
-      this.editor.classList.remove("found");
+      this.where.classList.remove("found");
       const generation = ++this.searchGeneration;
       if (this.searchTimer !== null) clearTimeout(this.searchTimer);
       this.searchTimer = window.setTimeout(() => void this.search(false, generation), SEARCH_MS);
     });
-    this.editor.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter") return;
+    this.where.addEventListener("keydown", (event) => {
+      if (!this.dataset?.searchable || event.isComposing) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.where.blur();
+        return;
+      }
+      if (event.key !== "Enter" || event.shiftKey) return;
       event.preventDefault();
       if (this.searchTimer !== null) clearTimeout(this.searchTimer);
       void this.search(true, ++this.searchGeneration);
     });
-    this.editor.addEventListener("blur", () => this.invalidate());
+    this.where.addEventListener("blur", (event) => {
+      if (event.relatedTarget !== this.result) this.finishEditing();
+    });
+    this.result.addEventListener("blur", (event) => {
+      if (event.relatedTarget !== this.where) this.finishEditing();
+    });
+  }
+
+  private finishEditing(): void {
+    if (!this.editing) return;
+    this.editing = false;
+    this.found = null;
+    this.searchGeneration++;
+    if (this.searchTimer !== null) clearTimeout(this.searchTimer);
+    this.result.hidden = true;
+    this.where.classList.remove("found");
+    this.shown = "";
+    const path = this.shownPath;
+    if (path === null) this.where.replaceChildren();
+    else this.showPath(path.node, path.label, path.more);
+    this.invalidate();
   }
 
   private async search(anchor: boolean, generation: number): Promise<void> {
     const dataset = this.dataset;
     if (dataset === null || !dataset.searchable) return;
-    const text = this.editor.value;
+    const text = this.where.innerText;
     try {
       const path = this.found?.text === text ? this.found.path : await dataset.search(text, this.lens.p);
       if (generation !== this.searchGeneration || dataset !== this.dataset) return;
       this.found = { text, path: [...path] };
-      this.editor.classList.add("found");
-      this.editor.title = "Select the result or press Enter to anchor here";
+      this.where.classList.add("found");
+      this.where.title = "Select the result or press Enter to anchor here";
       let preview = this.tree!.root;
       for (const label of path) preview = this.tree!.child(preview, label);
       this.result.textContent = `${this.reading?.text?.(preview, null) || "Root"} · Enter to anchor`;
@@ -545,14 +600,16 @@ class App {
       this.cancelNavigation();
       const reached = await this.reachPath(path, this.navigation);
       if (generation !== this.searchGeneration || dataset !== this.dataset || reached === null) return;
+      this.editing = false;
+      this.shown = "";
       this.standAt(reached.node);
       this.result.hidden = true;
       this.setStatus(reached.complete ? "" : "Showing the deepest recorded prefix of this sequence.");
-      this.editor.blur();
+      this.where.blur();
     } catch (error) {
       if (generation !== this.searchGeneration) return;
-      this.editor.classList.remove("found");
-      this.editor.title = String(error);
+      this.where.classList.remove("found");
+      this.where.title = String(error);
       this.result.textContent = String(error);
       this.result.disabled = true;
       this.result.hidden = false;
@@ -613,11 +670,18 @@ class App {
   /** Show the selected path until another box is hovered; ``more`` marks unknown continuation. */
   private showPath(node: NodeId, label: number | null, more?: string): void {
     const key = `${node}:${label}:${more ?? ""}`;
-    if (this.reading === null || key === this.shown) return;
+    if (this.reading === null || this.editing || key === this.shown) return;
     this.shown = key;
+    this.shownPath = { node, label, more };
+    this.shownText = this.reading.text?.(node, label) ?? "";
+    this.found = null;
+    this.searchGeneration++;
+    if (this.searchTimer !== null) clearTimeout(this.searchTimer);
+    this.result.hidden = true;
+    this.where.classList.remove("found");
     const where = this.where;
     where.style.minHeight = this.pointer === null ? "" : `${where.offsetHeight}px`;
-    where.hidden = false;
+    this.pathPanel.hidden = where.hidden = false;
     this.reading.show(where, node, label, more);
     where.scrollTop = where.scrollHeight;
   }
@@ -643,24 +707,12 @@ class App {
   private updateInspect(): void {
     const selection = this.hover;
     const tree = this.tree;
-    const searchable = this.dataset?.searchable === true;
     if (selection === null || tree === null) {
       this.details.hidden = true;
-      this.inspect.hidden = !searchable && document.activeElement !== this.editor;
+      this.inspect.hidden = true;
       return;
     }
     const { box, exact } = selection;
-    if (searchable && document.activeElement !== this.editor && document.activeElement !== this.result) {
-      const text = this.reading?.text?.(box.node, box.label) ?? "";
-      if (this.editor.value !== text) {
-        this.editor.value = text;
-        this.result.hidden = true;
-        this.found = null;
-        this.searchGeneration++;
-        if (this.searchTimer !== null) clearTimeout(this.searchTimer);
-        this.editor.classList.remove("found");
-      }
-    }
 
     const last = box.label === null ? "…" : this.glyph(box.node, box.label).text;
     const chips = [chip(last)];

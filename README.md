@@ -58,7 +58,7 @@ exact geometry 80 halvings deep.
 | ctrl + wheel, pinch, + − | horizontal scale, about the left edge, leaving the vertical view alone |
 | double-click | glide until a box stands like the root, its children filling the view |
 | hover | select a branch by height, then depth; empty space keeps the deepest known subtree selected |
-| inspector editor | search text as you type; select a result or press Enter to anchor there |
+| top path inspector | click the displayed text to edit and search; select a result or press Enter to anchor there |
 | 0 · s · b | root · swap p and q · nats/bits |
 
 ## Protocol
@@ -123,7 +123,7 @@ the Connect protocol. The root is the empty text; the start-of-text token is
 internal to the model. `/manifest.json` describes the measures and
 `/labels.json` holds each token's bytes. With `bun run dev` running, the page
 finds a local server and lists it first; `?server=URL` points it elsewhere.
-Use the inspector editor to find text and select the result to start there.
+Edit the text in the top path inspector and select a result to start there.
 
 `export/service.py` owns the model-independent RPC handlers and the bounded
 LRU policy for complete model distributions. Both language and music servers
@@ -220,7 +220,7 @@ The source is split by responsibility:
 - `src/data/`: live/recorded sources, dataset loading and completion-driven
   expansion scheduling.
 - `src/readings/`: text and music interpretations of integer labels.
-- `src/ui/`: canvas drawing, camera controls, inspector/search and saved views.
+- `src/ui/`: canvas drawing, camera controls, the top path editor, branch details and saved views.
 - `export/`: Python model adapters, Connect service and snapshot exporters.
 
 Install [Bun](https://bun.sh), [Rust](https://www.rust-lang.org/tools/install),

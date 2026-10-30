@@ -23,13 +23,14 @@
       <button id="help-toggle" type="button" title="controls (?)">?</button>
     </header>
 
-    <section id="where" class="where" hidden aria-label="text down to the hovered box"></section>
+    <section id="path-panel" class="path-panel" hidden aria-label="selected sequence">
+      <div id="where" class="where" hidden aria-label="text down to the hovered box"></div>
+      <button id="search-result" class="search-result" type="button" hidden></button>
+    </section>
 
     <main class="stage"><canvas id="canvas"></canvas></main>
 
     <aside id="inspect" class="inspect" hidden>
-      <input id="inspect-editor" class="inspect-editor" type="search" placeholder="Find text…" aria-label="find text in the sequence distribution" hidden />
-      <button id="search-result" class="search-result" type="button" hidden></button>
       <div id="inspect-details"></div>
     </aside>
     <div id="status" class="status" hidden></div>
@@ -54,8 +55,8 @@
         <dd>horizontal scale, the base of the log, about the left edge</dd>
         <dt>hover</dt>
         <dd>select a box; in empty space, select the deepest known branch at that height</dd>
-        <dt>inspector editor</dt>
-        <dd>search text as you type; Enter stands at the resulting sequence</dd>
+        <dt>top path inspector</dt>
+        <dd>edit the text to search; Enter stands at the resulting sequence, Shift + Enter adds a line</dd>
         <dt>double-click</dt>
         <dd>glide until a box stands like the root, its children filling the view</dd>
         <dt>0</dt>

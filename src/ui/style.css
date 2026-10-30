@@ -172,18 +172,6 @@ input:hover {
   box-shadow: var(--shadow);
 }
 
-.inspect-editor {
-  max-width: none;
-  width: min(520px, calc(100vw - 38px));
-  margin: 0 0 6px;
-  padding: 4px 6px;
-  color: var(--ink);
-  background: var(--plane);
-  border: 1px solid var(--rule);
-  border-radius: 5px;
-  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
 .search-result {
   display: block;
   max-width: 100%;
@@ -195,7 +183,7 @@ input:hover {
 
 .search-result[hidden] { display: none; }
 
-.inspect-editor.found {
+.where.found {
   border-color: var(--accent);
 }
 
@@ -225,18 +213,36 @@ input:hover {
 }
 
 /* The text down to the last hovered box: grows with it, then scrolls. */
-.where {
+.path-panel {
   margin: 0 8px 8px;
+  flex: none;
+}
+
+.path-panel[hidden] {
+  display: none;
+}
+
+.where {
+  min-height: 34px;
   padding: 6px 10px;
   max-height: 30vh;
   overflow-y: auto;
-  flex: none;
   background: var(--plane);
   border: 1px solid var(--rule);
   border-radius: 8px;
   font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.where[contenteditable="plaintext-only"] {
+  cursor: text;
+}
+
+.where[contenteditable="plaintext-only"]:empty::before {
+  content: attr(data-placeholder);
+  color: var(--ink-muted);
+  pointer-events: none;
 }
 
 .where[hidden] {

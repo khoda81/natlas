@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package natlas;
+
+// natlas draws a distribution over sequences of 32-bit integers as a nested
+// interval tree that a server measures on demand. One server serves one
+// measure; comparing two measures means asking two servers about the same
+// nodes.
+//
+// A node is a sequence, and its children are its 2^32 one-integer
+// extensions: its branches. Every branch exists; one a server never lists has
+// weight zero. What a branch denotes is agreed outside this protocol.
+//
+// Nodes are named by ids hashed from their branches, so the client and every
+// server name a node alike without exchanging the sequence:
+//
+//   id(root)                       = 0
+//   id(child of h along branch b)  = mix64(h + 0x9e3779b97f4a7c15 * (b + 1))
+//
+// with arithmetic mod 2^64 and mix64 the SplitMix64 finalizer:
+//
+//   z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9
+//   z = (z ^ z >> 27) * 0x94d049bb133111eb
+//   z =  z ^ z >> 31
+//
+// mix64 is a bijection, so siblings never collide; other collisions are left
+// to chance at 64 bits.
+
+service Natlas {
+  // A node's children, heaviest first, down to 2^-horizon of its weight.
+  // Every prefix of the stream is a valid listing; the client may stop
+  // reading. A server answers NOT_FOUND when it has not learned the id the
+  // request starts from, and the client names the node from the root.
+  rpc Expand(ExpandRequest) returns (stream Listing);
+  // The sequence for a text, under the server's text mapping. The server
+  // learns the ids along it, so expanding them needs no path.
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+message ExpandRequest {
+  // The node `path` below the node with id `node`: usually a parent's id and
+  // one branch, so a request stays small however deep the node is.
+  fixed64 node = 1;
+  repeated uint32 path = 2;
+  // In bits. Every child of conditional weight at least 2^-horizon is
+  // listed, so every child left out is lighter. At 0 nothing is listed.
+  uint32 horizon = 3;
+}
+
+message Listing {
+  // Parallel, heaviest first; each weight is a natural log probability
+  // conditional on the node.
+  repeated uint32 branches = 1;
+  repeated double ln_weights = 2;
+  // ln of the weight of every child after these, summed from the light end:
+  // -inf once the children listed so far cover the node, as for a node with
+  // no children at all.
+  double ln_leftover = 3;
+}
+
+message SearchRequest {
+  string text = 1;
+}
+
+message SearchResponse {
+  // Branches from the root.
+  repeated uint32 path = 1;
+}
+
+// A recorded server, used for static datasets: one listing per node.
+message Snapshot {
+  repeated Expansion expansions = 1;
+}
+
+message Expansion {
+  // Branches from the root.
+  repeated uint32 path = 1;
+  // The horizon recorded; the recording vouches for nothing deeper.
+  uint32 horizon = 2;
+  Listing listing = 3;
+}

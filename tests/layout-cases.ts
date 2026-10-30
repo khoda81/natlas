@@ -1,19 +1,22 @@
 // Deterministic camera/distribution cases used to freeze the pre-optimization
 // geometry, discovery demand, and exact/best-effort selection semantics.
 import type { Camera, Lens, Viewport } from "../src/core/layout";
-import type { Fetched } from "../src/core/tree";
+import type { Listing } from "../src/core/tree";
 
 interface FixtureTree {
-  child(parent: number, label: number): number;
-  setListing(node: number, measure: number, value: Fetched): void;
+  child(parent: number, branch: number): number;
+  setListing(node: number, measure: number, value: Listing): void;
 }
 
 export function layoutCases<T extends FixtureTree>(Tree: new (measures: number) => T) {
   let seed = 8161;
   const random = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32);
-  const listing = (weights: number[], labels = weights.map((_, i) => i), tail = 0): Fetched => ({
-    labels, lnWeights: weights.map(Math.log), leftover: tail, horizon: 24, complete: 24,
-  });
+  // Listings come heaviest first; each weight keeps its branch.
+  const listing = (weights: number[], branches = weights.map((_, i) => i), tail = 0): Listing => {
+    const order = weights.map((_, i) => i).sort((a, b) => weights[b]! - weights[a]!);
+    return { branches: order.map(i => branches[i]!), lnWeights: order.map(i => Math.log(weights[i]!)),
+      leftover: tail, horizon: 24, complete: 24 };
+  };
   const cases: { name: string; tree: T; lens: Lens; cam: Camera; view: Viewport; mergePx: number }[] = [];
   for (const count of [0, 3, 73, 2048]) {
     const tree = new Tree(2);
@@ -30,14 +33,14 @@ export function layoutCases<T extends FixtureTree>(Tree: new (measures: number) 
     }
     for (let i = 0; i < 9; i++) {
       cases.push({ name: `${count}/${i}`, tree, lens: { p: i % 2, q: Math.floor(i / 3) % 2 },
-        cam: { x: i * 0.7, k: [13, 140, 1000][i % 3]!, a: i % 3 === 0 ? -0.2 : 0, anchor: { node: 0, slot: i % Math.max(1, count) } },
+        cam: { origin: 0, x: i * 0.7, k: [13, 140, 1000][i % 3]!, a: i % 3 === 0 ? -0.2 : 0, anchor: { node: 0, slot: i % Math.max(1, count) } },
         view: { width: 1234, height: 789 }, mergePx: i % 3 === 0 ? 10 : 1 });
     }
   }
   const vocabulary = new Tree(1);
   vocabulary.setListing(0, 0, listing(Array(150000).fill(1 / 150000)));
   cases.push({ name: "vocabulary/150000", tree: vocabulary, lens: { p: 0, q: 0 },
-    cam: { x: 0.2, k: 100, anchor: { node: 0, slot: 74999 }, a: 0.5 },
+    cam: { origin: 0, x: 0.2, k: 100, anchor: { node: 0, slot: 74999 }, a: 0.5 },
     view: { width: 1234, height: 789 }, mergePx: 1 });
   const deep = new Tree(1);
   let node = 0;
@@ -46,7 +49,7 @@ export function layoutCases<T extends FixtureTree>(Tree: new (measures: number) 
     if (depth < 80) node = deep.child(node, depth % 3);
     if ([1, 7, 30, 79].includes(depth)) for (const a of [-0.5, 0.4, 1.1]) {
       cases.push({ name: `deep/${depth}/${a}`, tree: deep, lens: { p: 0, q: 0 },
-        cam: { x: depth * 1.1, k: 170, anchor: { node, slot: 1 }, a },
+        cam: { origin: 0, x: depth * 1.1, k: 170, anchor: { node, slot: 1 }, a },
         view: { width: 1234, height: 789 }, mergePx: 1 });
     }
   }

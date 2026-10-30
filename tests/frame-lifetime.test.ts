@@ -3,9 +3,9 @@ import { IntervalTree } from "../src/core/tree";
 import { layout, pick } from "../src/core/layout";
 
 const lens = { p: 0, q: 0 };
-const cam = { x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
+const cam = { origin: 0, x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
 const view = { width: 1234, height: 789 };
-const distribution = (count: number) => ({ labels: Array.from({ length: count }, (_, i) => i),
+const distribution = (count: number) => ({ branches: Array.from({ length: count }, (_, i) => i),
   lnWeights: Array(count).fill(-Math.log(count)), horizon: 40, complete: 40, leftover: 0 });
 
 it("keeps retained subpixel selection stable while discovery replaces listings", () => {
@@ -15,7 +15,7 @@ it("keeps retained subpixel selection stable while discovery replaces listings",
   const before = layout(tree, lens, cam, view);
   const y = (17.5 / 2000) * view.height;
   const selected = pick(before, cam, view, 100, y)!;
-  expect(selected.box.label).toBe(17);
+  expect(selected.box.branch).toBe(17);
   expect(selected.box.kind).toBe("leaf");
   tree.setListing(child, 0, distribution(2));
   const after = layout(tree, lens, cam, view);

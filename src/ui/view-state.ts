@@ -1,5 +1,9 @@
-/** A portable camera position, expressed relative to a complete integer path. */
+/** A portable camera position: the origin and the covering node as branches
+ * from the root, the covering node's position in view heights, and x from
+ * the origin. */
 export interface SavedView {
+  origin: number[];
+  /** Extends `origin`. */
   path: number[];
   x: number;
   k: number;
@@ -8,13 +12,16 @@ export interface SavedView {
   q: number;
 }
 
+const isPath = (path: unknown): path is number[] =>
+  Array.isArray(path) && path.every((branch) => Number.isInteger(branch) && branch >= 0 && branch <= 0xffffffff);
+
 export function parseView(raw: string, measures: number): SavedView | null {
   try {
     const value = JSON.parse(raw) as Partial<SavedView> | null;
     if (
       value === null ||
-      !Array.isArray(value.path) ||
-      !value.path.every((label) => Number.isInteger(label) && label >= 0 && label <= 0xffffffff) ||
+      !isPath(value.origin) || !isPath(value.path) ||
+      value.origin.length > value.path.length || !value.origin.every((branch, i) => branch === value.path![i]) ||
       typeof value.x !== "number" || !Number.isFinite(value.x) || value.x < 0 ||
       typeof value.k !== "number" || !Number.isFinite(value.k) || value.k <= 0 ||
       typeof value.a !== "number" || !Number.isFinite(value.a) ||
@@ -28,5 +35,5 @@ export function parseView(raw: string, measures: number): SavedView | null {
 }
 
 export function viewKey(dataset: string): string {
-  return `natlas.view:2:${encodeURIComponent(dataset)}`;
+  return `natlas.view:3:${encodeURIComponent(dataset)}`;
 }

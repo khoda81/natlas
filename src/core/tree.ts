@@ -2,24 +2,32 @@
 // nodes, listings, derived slot caches, paths, and all geometry queries; this
 // wrapper only adds change notifications for the fetch/render loop.
 
-import type { Listing } from "./codec";
 import { Tree } from "./wasm";
 
 export type NodeId = number;
-/** The integer identifying one branch among its siblings. */
-export type Label = number;
+/** One of a node's 2^32 branches. What it denotes is up to a reading. */
+export type Branch = number;
 
 export interface Lens {
   p: number;
   q: number;
 }
 
-export interface Fetched extends Listing {
+/** What a measure said about a node's children: the heaviest, in order. */
+export interface Listing {
+  branches: ArrayLike<Branch>;
+  /** Natural log of each listed child's conditional weight. */
+  lnWeights: ArrayLike<number>;
+  /** Weight of every child not listed. */
+  leftover: number;
+  /** The horizon asked for, in bits. */
   horizon: number;
+  /** The horizon the source vouches for; a recording can vouch for less. */
+  complete: number;
 }
 
 export interface Slots {
-  readonly labels: Label[];
+  readonly branches: Branch[];
   readonly p: number[];
   readonly q: number[];
   readonly qBound: boolean[];
@@ -27,8 +35,8 @@ export interface Slots {
   readonly count: number;
 }
 
-export function slotOf(slots: Slots, label: Label): number | undefined {
-  const slot = slots.labels.indexOf(label);
+export function slotOf(slots: Slots, branch: Branch): number | undefined {
+  const slot = slots.branches.indexOf(branch);
   return slot < 0 ? undefined : slot;
 }
 
@@ -44,19 +52,29 @@ export class IntervalTree {
   private readonly listeners = new Set<() => void>();
   private readonly revisions = new Map<NodeId, number>();
   private readonly parents = new Map<NodeId, NodeId | null>([[0, null]]);
-  private readonly labels = new Map<NodeId, Label>([[0, -1]]);
-  private readonly paths = new Map<NodeId, Label[]>();
+  private readonly branches = new Map<NodeId, Branch>([[0, -1]]);
+  private readonly paths = new Map<NodeId, Branch[]>();
 
   constructor(readonly measures: number) {
     this.raw = new Tree(measures);
     this.root = this.raw.root();
   }
 
-  child(parent: NodeId, label: Label): NodeId {
-    const id = this.raw.child(parent, label);
+  child(parent: NodeId, branch: Branch): NodeId {
+    const id = this.raw.child(parent, branch);
     this.parents.set(id, parent);
-    this.labels.set(id, label);
+    this.branches.set(id, branch);
     return id;
+  }
+
+  /** The node `path` below `node`, creating only what is missing. */
+  descend(node: NodeId, path: readonly Branch[]): NodeId {
+    return this.raw.descend(node, Uint32Array.from(path));
+  }
+
+  /** The node's id on the wire, shared with every server. */
+  hash(id: NodeId): bigint {
+    return this.raw.hash(id);
   }
 
   parent(id: NodeId): NodeId | null {
@@ -66,27 +84,35 @@ export class IntervalTree {
     return parent;
   }
 
-  /** Edge label into this node, or -1 at the root. */
-  label(id: NodeId): Label {
-    const cached = this.labels.get(id);
+  /** Branch into this node, or -1 at the root. */
+  branch(id: NodeId): Branch {
+    const cached = this.branches.get(id);
     if (cached !== undefined) return cached;
-    const label = this.raw.label(id);
-    this.labels.set(id, label);
-    return label;
+    const branch = this.raw.branch(id);
+    this.branches.set(id, branch);
+    return branch;
   }
 
-  path(id: NodeId): Label[] {
+  /** Branches from the root. */
+  path(id: NodeId): Branch[] {
     let path = this.paths.get(id);
     if (path === undefined) this.paths.set(id, path = [...this.raw.path(id)]);
     return [...path];
   }
 
-  chain(id: NodeId): NodeId[] {
-    return this.raw.chain(id) as NodeId[];
+  /** Nodes from `origin` down to `id`, inclusive. */
+  chain(origin: NodeId, id: NodeId): NodeId[] {
+    return this.raw.chain(origin, id) as NodeId[];
   }
 
-  listing(id: NodeId, measure: number): Fetched | undefined {
-    return (this.raw.listing(id, measure) as Fetched | null) ?? undefined;
+  listing(id: NodeId, measure: number): Listing | undefined {
+    return (this.raw.listing(id, measure) as Listing | null) ?? undefined;
+  }
+
+  /** The listing cut at `horizon` bits, with the ln weight of the rest. */
+  cut(id: NodeId, measure: number, horizon: number): { branches: Branch[]; lnWeights: number[]; lnLeftover: number } {
+    const [branches, lnWeights, lnLeftover] = this.raw.cut(id, measure, horizon) as [Branch[], number[], number];
+    return { branches, lnWeights, lnLeftover };
   }
 
   expanded(id: NodeId, measure: number): boolean {
@@ -105,8 +131,8 @@ export class IntervalTree {
     return this.raw.complete(id, measure);
   }
 
-  slotOf(id: NodeId, lens: Lens, label: Label): number | undefined {
-    const slot = this.raw.slotOf(id, lens.p, lens.q, label);
+  slotOf(id: NodeId, lens: Lens, branch: Branch): number | undefined {
+    const slot = this.raw.slotOf(id, lens.p, lens.q, branch);
     return slot < 0 ? undefined : slot;
   }
 
@@ -124,8 +150,8 @@ export class IntervalTree {
     return this.raw.slots(id, lens.p, lens.q) as Slots;
   }
 
-  setListing(id: NodeId, measure: number, listing: Fetched): void {
-    this.raw.setListing(id, measure, listing);
+  setListing(id: NodeId, measure: number, { branches, lnWeights, leftover, horizon, complete }: Listing): void {
+    this.raw.setListing(id, measure, Uint32Array.from(branches), Float64Array.from(lnWeights), leftover, horizon, complete);
     this.revision++;
     this.revisions.set(id, this.revision);
     for (const listener of this.listeners) listener();

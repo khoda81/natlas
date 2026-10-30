@@ -7,10 +7,10 @@ import {
   normalizeBoundary,
   place as placeNode,
   repairBoundary,
-  rootExtent as measureRootExtent,
+  extent as measureExtent,
   type LayoutFrame,
 } from "./wasm";
-import type { IntervalTree, Label, Lens, NodeId } from "./tree";
+import type { Branch, IntervalTree, Lens, NodeId } from "./tree";
 
 export type { Lens } from "./tree";
 
@@ -20,6 +20,10 @@ export interface Boundary {
 }
 
 export interface Camera {
+  /** The node the view is measured from, standing as the root does: x is
+   * q-surprisal from its children's left edge, and the view spans e^-x of its
+   * interval. It bounds the view; nothing above it is needed. */
+  origin: NodeId;
   x: number;
   k: number;
   anchor: Boundary;
@@ -38,7 +42,7 @@ export interface Box {
   slot: number;
   count: number;
   kind: BoxKind;
-  label: Label | null;
+  branch: Branch | null;
   p: number;
   q: number;
   lnMass: number;
@@ -56,17 +60,17 @@ export class Frame {
   readonly boxes: Box[];
   readonly cover: { node: NodeId; y: number } | null;
   private walkedCache?: { node: NodeId; lnMass: number; x: number }[];
-  private unexpandedCache?: { node: NodeId; label: Label; lnMass: number; x1: number }[];
+  private unexpandedCache?: { node: NodeId; branch: Branch; lnMass: number; x1: number }[];
   private disposed = false;
 
   constructor(readonly raw: LayoutFrame) {
     const packed = raw.boxes();
     this.boxes = boxBuffers.pop() ?? [];
     for (let i = 0, box = 0; i < packed.length; i += 12, box++) {
-      const b = this.boxes[box] ??= { node: 0, slot: 0, count: 0, kind: "node", label: null,
+      const b = this.boxes[box] ??= { node: 0, slot: 0, count: 0, kind: "node", branch: null,
         p: 0, q: 0, lnMass: 0, x0: 0, x1: 0, y0: 0, y1: 0 };
       b.node = packed[i]!; b.slot = packed[i + 1]!; b.count = packed[i + 2]!;
-      b.kind = KINDS[packed[i + 3]!]!; b.label = packed[i + 4] === -1 ? null : packed[i + 4]!;
+      b.kind = KINDS[packed[i + 3]!]!; b.branch = packed[i + 4] === -1 ? null : packed[i + 4]!;
       b.p = packed[i + 5]!; b.q = packed[i + 6]!; b.lnMass = packed[i + 7]!;
       b.x0 = packed[i + 8]!; b.x1 = packed[i + 9]!; b.y0 = packed[i + 10]!; b.y1 = packed[i + 11]!;
     }
@@ -78,7 +82,7 @@ export class Frame {
     return this.walkedCache ??= this.raw.walked();
   }
 
-  get unexpanded(): { node: NodeId; label: Label; lnMass: number; x1: number }[] {
+  get unexpanded(): { node: NodeId; branch: Branch; lnMass: number; x1: number }[] {
     return this.unexpandedCache ??= this.raw.unexpanded();
   }
 
@@ -86,12 +90,12 @@ export class Frame {
   // entries to paint, hit-test, reanchor, or calculate discovery demand.
   get known(): Box[] { return this.raw.known(); }
   get boundaries(): { boundary: Boundary; y: number }[] { return this.raw.boundaries(); }
-  get rootTop(): number { return this.raw.rootTop(); }
-  get rootBottom(): number { return this.raw.rootBottom(); }
+  get originTop(): number { return this.raw.originTop(); }
+  get originBottom(): number { return this.raw.originBottom(); }
 
   toJSON() {
     return { boxes: this.boxes, known: this.known, walked: this.walked, unexpanded: this.unexpanded,
-      boundaries: this.boundaries, rootTop: this.rootTop, rootBottom: this.rootBottom, cover: this.cover };
+      boundaries: this.boundaries, originTop: this.originTop, originBottom: this.originBottom, cover: this.cover };
   }
 
   /** All frame views are invalid after disposal; buffers may be reused. */
@@ -127,20 +131,22 @@ export function layout(
   return new Frame(layoutFrame(tree.raw, lens.p, lens.q, cam, view, options.mergePx ?? 1));
 }
 
-export function normalize(tree: IntervalTree, lens: Lens, boundary: Boundary): Boundary {
-  return normalizeBoundary(tree.raw, lens.p, lens.q, boundary) as Boundary;
+export function normalize(tree: IntervalTree, lens: Lens, origin: NodeId, boundary: Boundary): Boundary {
+  return normalizeBoundary(tree.raw, lens.p, lens.q, origin, boundary) as Boundary;
 }
 
 export function repair(tree: IntervalTree, lens: Lens, cam: Camera): void {
   cam.anchor = repairBoundary(tree.raw, lens.p, lens.q, cam) as Boundary;
 }
 
-export function place(tree: IntervalTree, lens: Lens, id: NodeId): { lnMass: number; x1: number } {
-  return placeNode(tree.raw, lens.p, lens.q, id) as { lnMass: number; x1: number };
+/** `id`'s ln p mass and right edge in nats below `origin`. */
+export function place(tree: IntervalTree, lens: Lens, origin: NodeId, id: NodeId): { lnMass: number; x1: number } {
+  return placeNode(tree.raw, lens.p, lens.q, origin, id) as { lnMass: number; x1: number };
 }
 
-export function rootExtent(tree: IntervalTree, lens: Lens, cam: Camera): { top: number; bottom: number } {
-  return measureRootExtent(tree.raw, lens.p, lens.q, cam) as { top: number; bottom: number };
+/** The origin's interval edges in view heights. */
+export function extent(tree: IntervalTree, lens: Lens, cam: Camera): { top: number; bottom: number } {
+  return measureExtent(tree.raw, lens.p, lens.q, cam) as { top: number; bottom: number };
 }
 
 export function reanchor(cam: Camera, frame: Frame): void {

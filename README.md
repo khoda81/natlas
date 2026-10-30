@@ -3,8 +3,8 @@
 A web navigator for distributions over integer sequences, built as the visual client for
 [natwalk](https://github.com/khoda81/natwalk). It knows nothing about tokens or
 models: a tree is nodes whose children partition their interval, with one
-weight per child under each *measure*, and children are numbered labels whose
-meaning comes separately.
+weight per child under each *measure*. A node's children are its 2^32
+numbered branches, and what a branch means (a token, a note) comes separately.
 
 ![SmolLM2-360M continuing "The most interesting consequence of information theory is"](docs/text.png)
 
@@ -40,10 +40,14 @@ slot otherwise, red where q under-weights it.
 ## The canvas
 
 Depth is unbounded, horizontal scale is unbounded (it is the base of the log),
-and vertically the view never leaves the root interval. The view height is
-coupled to depth: with the left edge at x nats the view spans e^−x of the
-root, so a node at the left edge keeps the same screen height however deep it
-is. Scrolling deeper is therefore also zooming in.
+and vertically the view never leaves its **origin**'s interval. The origin is
+the root unless you open a text, which makes its node the origin: it stands as
+the root does, and nothing above it is fetched, so opening is immediate however
+long the text. The view height is coupled to depth below the origin: with the
+left edge at x nats the view spans e^−x of the origin, so a node at the left
+edge keeps the same screen height however deep it is. Scrolling deeper is
+therefore also zooming in. With p ≠ q the picture depends on the origin, since
+x counts q-surprisal while the height follows p.
 
 Absolute vertical coordinates would lose precision a few dozen nats deep, so
 the camera is anchored to a nearby slot boundary instead, and every position is
@@ -58,55 +62,67 @@ exact geometry 80 halvings deep.
 | ctrl + wheel, pinch, + − | horizontal scale, about the left edge, leaving the vertical view alone |
 | double-click | glide until a box stands like the root, its children filling the view |
 | hover | select a branch by height, then depth; empty space keeps the deepest known subtree selected |
-| top path inspector | click the displayed text to edit and search; select a result or press Enter to anchor there |
-| 0 · s · b | root · swap p and q · nats/bits |
+| top path inspector | click the displayed text to edit and search; select a result or press Enter to open it as the origin |
+| 0 · s · b | back to the root as origin · swap p and q · nats/bits |
 
 ## Protocol
 
-`proto/natlas/v1/natlas.proto`. A distribution is over sequences of unsigned
-32-bit integers. The empty sequence is the root; appending one integer names
-a child. The complete sequence is its identity across the client, measures,
-server restarts and saved views. Numeric node IDs inside the core are only
-local storage indices and never go over the wire.
+`proto/natlas/natlas.proto`, one version: the browser and the servers live in
+this repository and change together. A distribution is over sequences of
+unsigned 32-bit integers. The empty sequence is the root, and a node's children
+are its one-integer extensions, its branches. All 2^32 branches exist; one a
+server never lists has weight zero.
+
+Nodes are named on the wire by 64-bit ids hashed from their branches (SplitMix64
+over the parent's id and the branch), so the client and every server name a node
+alike without exchanging the sequence. A request names a node by a known id and
+the branches below it: normally the parent's id and one branch, so it stays
+small however deep the node is. A server that has not learned that id (it
+restarted, or never saw the parent) answers `not_found`, and the client names
+the node once more from the root with its whole path. Numeric node indices
+inside the core are local and never go over the wire.
 
 Each server serves one measure through two Connect RPCs:
 
-- `Expand(path, horizon)` streams `Edge { label, odds }` directly, heaviest
-  first, down to conditional probability 2^−horizon. Horizon 0 lists nothing.
-  Each edge's weight is a fraction g of the previous child's, sent as the
-  log-odds of g in steps of horizon·ln 2 / 2³¹ nat. Every stream prefix is
-  valid; unlisted mass remains a tail.
-- `Search(text)` maps text to its complete integer path, using the model's
-  tokenizer. The browser searches on input and anchors only when a result
-  is selected. Music services return `unimplemented` for text search.
+- `Expand(node, path, horizon)` streams `Listing { branches, ln_weights,
+  ln_leftover }` batches, heaviest first, down to conditional probability
+  2^−horizon. Weights are exact natural log probabilities, the same at every
+  horizon; `ln_leftover` is the log weight of everything after the batch,
+  summed from the light end so tiny remainders survive, and −∞ once the listing
+  covers the node, as for a node with no children. Every stream prefix is a
+  valid listing. Horizon 0 lists nothing.
+- `Search(text)` maps text to its complete path, using the model's tokenizer,
+  and teaches the server the ids along it. The browser searches on input and
+  opens the result only when it is selected. Music services return
+  `unimplemented` for text search.
 
-Comparing p with q means asking both servers about the same paths. The client
+Comparing p with q means asking both servers about the same nodes. The client
 asks for enough children to resolve their height in pixels under p and their
 width under q. Missing q weights are upper bounds, so their drawn widths are
 lower bounds. Listed branches use the same colors whether their children are
 known yet. Tiny adjacent branches merge into borderless, area-preserving
-runs while selection still resolves their individual integer labels.
+runs while selection still resolves their individual branches.
 
-A `Snapshot` records expansions by complete path with `format_version = 2`.
-Recorded search includes listed leaves as well as expanded nodes, and returns
-an exact match, a completion, or the deepest recorded prefix. Text with no
-recorded match shows an error. Old handle-based recordings must be converted:
+A `Snapshot` records one `Listing` per node with its complete path and the
+horizon it vouches for. Recorded search includes listed leaves as well as
+expanded nodes, and returns an exact match, a completion, or the deepest
+recorded prefix. Text with no recorded match shows an error. Recordings from
+the odds-coded format convert once, without model inference:
 
 ```bash
 uv run scripts/migrate-snapshots.py           # all public/data/*.pb
 uv run scripts/migrate-snapshots.py tree.pb   # selected files
 ```
 
-The converter resolves the old parent handles without model inference and
-keeps originals in `.snapshot-backups/`. Regenerating data is also supported.
-The wire format changed; the browser and live services must be updated together.
+The converter keeps originals in `public/data/.snapshot-backups/`.
+Regenerating data is also supported.
 
-The browser saves the smallest known anchor covering the viewport, its integer
-path and camera position, horizontal scale and p/q measures to local storage.
-Keys include source URLs (or dropped file contents). Reload reconstructs the
-path on demand; if a recording no longer reaches it, the view falls back to
-its deepest available ancestor. A server does not choose the initial tree or
-send a starting prompt.
+The browser saves the origin, the smallest known node covering the viewport and
+the camera position below it, horizontal scale and p/q measures to local
+storage. Keys include source URLs (or dropped file contents). Reload opens the
+origin at once and reaches the covering node on demand; if a recording no
+longer reaches it, the view stands at its deepest available ancestor. A server
+does not choose the initial tree or send a starting prompt.
 
 ## Live
 
@@ -189,7 +205,7 @@ over the recording (`/audio.wav`).
 ## Data
 
 Datasets live in `public/data/` (git-ignored) with a `manifest.json`: per
-dataset, one `.pb` snapshot per measure and a `.labels.json` of label bytes,
+dataset, one `.pb` snapshot per measure and a `.labels.json` of each branch's bytes,
 base64 in a JSON array. A token can hold part of a character, so the client
 decodes a path's bytes together and shows each box as the characters its
 token finishes after its ancestors, or as hex where it finishes none.
@@ -219,7 +235,7 @@ The source is split by responsibility:
 - `src/core/`: thin TypeScript adapters to that core, compiled to WebAssembly.
 - `src/data/`: live/recorded sources, dataset loading and completion-driven
   expansion scheduling.
-- `src/readings/`: text and music interpretations of integer labels.
+- `src/readings/`: text and music readings of branches.
 - `src/ui/`: canvas drawing, camera controls, the top path editor, branch details and saved views.
 - `export/`: Python model adapters, Connect service and snapshot exporters.
 

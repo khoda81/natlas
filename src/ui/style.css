@@ -183,6 +183,23 @@ input:hover {
 
 .search-result[hidden] { display: none; }
 
+.search-result.busy::before {
+  content: "";
+  display: inline-block;
+  width: 0.65em;
+  height: 0.65em;
+  margin-right: 0.5em;
+  border: 1px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: searching 0.8s linear infinite;
+}
+
+@keyframes searching { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .search-result.busy::before { animation: none; }
+}
+
 .where.found {
   border-color: var(--accent);
 }

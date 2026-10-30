@@ -1,7 +1,7 @@
 // Dataset-specific readings of integer labels. Readers never touch weights or
 // distribution geometry: text renders token bytes, music renders event paths.
 
-import type { IntervalTree, Label, NodeId } from "../core/tree";
+import type { IntervalTree, Branch, NodeId } from "../core/tree";
 
 export type Mark = "onset" | "offset" | "tie" | "hit" | "time" | "instrument" | "end";
 
@@ -16,11 +16,11 @@ export interface Labels {
 }
 
 export interface Reading {
-  glyph(node: NodeId, label: Label): Glyph;
-  /** Show the path to ``node``/``label``, with an optional unknown continuation. */
-  show(panel: HTMLElement, node: NodeId, label: Label | null, more?: string): void;
+  glyph(node: NodeId, branch: Branch): Glyph;
+  /** Show the path to ``node``/``branch``, with an optional unknown continuation. */
+  show(panel: HTMLElement, node: NodeId, branch: Branch | null, more?: string): void;
   /** Plain text for editing/searching, for readers whose labels represent text. */
-  text?(node: NodeId, label: Label | null): string;
+  text?(node: NodeId, branch: Branch | null): string;
   key?(event: KeyboardEvent): boolean;
 }
 
@@ -31,11 +31,11 @@ export class States<S> {
   constructor(
     private readonly tree: IntervalTree,
     private readonly root: S,
-    private readonly after: (state: S, label: Label) => S,
+    private readonly after: (state: S, branch: Branch) => S,
   ) {}
 
   at(id: NodeId): S {
-    const pending: Label[] = [];
+    const pending: Branch[] = [];
     const ids: NodeId[] = [];
     let state = this.root;
     for (let node = id; this.tree.parent(node) !== null; node = this.tree.parent(node)!) {
@@ -44,7 +44,7 @@ export class States<S> {
         state = known;
         break;
       }
-      pending.push(this.tree.label(node));
+      pending.push(this.tree.branch(node));
       ids.push(node);
     }
     for (let index = pending.length - 1; index >= 0; index--) {

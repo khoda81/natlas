@@ -1,84 +1,72 @@
-// Integer-sequence sources: one per measure, each expanding complete label
-// paths. A recorded snapshot answers from memory; a live server uses Connect.
+// Integer-sequence sources: one per measure. Nodes are named by their shared
+// hashed ids. A recorded snapshot answers from memory; a live server uses Connect.
 
 import { fromBinary } from "@bufbuild/protobuf";
-import { createClient } from "@connectrpc/connect";
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
-import { decode, encode, type WireEdge } from "../core/codec";
-import { Natlas, SnapshotSchema } from "../gen/natlas/v1/natlas_pb";
+import { type ExpandRequest, Natlas, SnapshotSchema } from "../gen/natlas/natlas_pb";
 import { TextLabels } from "../readings/labels";
 import { type NotesFile, NoteLabels } from "../readings/notes";
 import type { Labels } from "../readings/reading";
-import type { Label } from "../core/tree";
+import { type Branch, IntervalTree, type Listing, type NodeId } from "../core/tree";
 
-export interface Reply {
-  /** A recording can only vouch for its own horizon; a live server honors the request. */
-  complete: number;
-  edges: AsyncIterable<WireEdge>;
-}
+/** A node's children as a source lists them; `complete` is what it vouches for. */
+export type Reply = Omit<Listing, "horizon">;
 
 export interface Source {
-  expand(path: readonly Label[], horizon: number, signal?: AbortSignal): Promise<Reply>;
-  /** Map text to a complete label path, when this source has a text mapping. */
-  search?(text: string): Promise<Label[]>;
+  /** The children of `node` in `tree`, down to 2^-horizon. */
+  expand(tree: IntervalTree, node: NodeId, horizon: number, signal?: AbortSignal): Promise<Reply>;
+  /** Map text to branches from the root, when this source has a text mapping. */
+  search?(text: string, signal?: AbortSignal): Promise<Branch[]>;
 }
 
-async function* replay(edges: WireEdge[]): AsyncIterable<WireEdge> {
-  yield* edges;
-}
-
-interface Recorded {
-  path: Label[];
-  horizon: number;
-  labels: Label[];
-  lnWeights: number[];
-}
-
-/** A recorded server: one Expand per label path, re-encoded for each request. */
+/** A recorded server. Its own tree learns the recorded nodes' ids. */
 export class SnapshotSource implements Source {
-  private readonly recorded = new Map<string, Recorded>();
-  private readonly paths: Label[][] = [];
+  private readonly recorded = new IntervalTree(1);
+  private readonly paths: Branch[][] = [];
 
   constructor(
     bytes: Uint8Array,
     private readonly textLabels = TextLabels.none(),
   ) {
     const snapshot = fromBinary(SnapshotSchema, bytes);
-    if (snapshot.formatVersion !== 2) {
-      throw new Error("This snapshot uses the old handle format. Run uv run scripts/migrate-snapshots.py to convert recordings to integer paths.");
-    }
-    for (const { request, edges } of snapshot.expansions) {
-      if (request === undefined) throw new Error("expansion without a request");
-      const { labels, lnWeights } = decode(edges, request.horizon);
-      this.recorded.set(key(request.path), { path: request.path, horizon: request.horizon, labels, lnWeights });
-    }
-    const paths = new Map<string, Label[]>();
-    for (const { path, labels } of this.recorded.values()) {
-      paths.set(key(path), path);
-      for (const label of labels) {
-        const child = [...path, label];
-        paths.set(key(child), child);
+    const paths = new Map<string, Branch[]>();
+    for (const { path, horizon, listing } of snapshot.expansions) {
+      if (listing === undefined) throw new Error("a recorded expansion has no listing");
+      const node = this.recorded.descend(this.recorded.root, path);
+      this.recorded.setListing(node, 0, {
+        branches: listing.branches,
+        lnWeights: listing.lnWeights,
+        leftover: Math.exp(listing.lnLeftover),
+        horizon,
+        complete: horizon,
+      });
+      paths.set(path.join(","), path);
+      for (const branch of listing.branches) {
+        const child = [...path, branch];
+        paths.set(child.join(","), child);
       }
     }
     this.paths = [...paths.values()];
   }
 
-  async expand(path: readonly Label[], horizon: number): Promise<Reply> {
-    const recorded = this.recorded.get(key(path));
-    if (recorded === undefined) return { complete: 0, edges: replay([]) };
+  async expand(tree: IntervalTree, node: NodeId, horizon: number): Promise<Reply> {
+    const recorded = this.recorded.raw.find(tree.hash(node));
+    if (recorded === undefined || !this.recorded.hasListing(recorded, 0)) {
+      return { branches: [], lnWeights: [], leftover: 1, complete: 0 };
+    }
+    const { branches, lnWeights, lnLeftover } = this.recorded.cut(recorded, 0, horizon);
     return {
-      complete: Math.min(horizon, recorded.horizon),
-      edges: replay(horizon === 0 ? [] : encode(recorded.labels, recorded.lnWeights, horizon)),
+      branches,
+      lnWeights,
+      leftover: Math.exp(lnLeftover),
+      complete: Math.min(horizon, this.recorded.complete(recorded, 0)),
     };
   }
 
-  async search(text: string): Promise<Label[]> {
+  async search(text: string): Promise<Branch[]> {
     return this.textLabels.search(this.paths, text);
   }
-}
-
-function key(path: readonly Label[]): string {
-  return path.join(",");
 }
 
 /** A live server: every expansion honors the requested horizon. */
@@ -89,32 +77,44 @@ export class ConnectSource implements Source {
     this.client = createClient(Natlas, createConnectTransport({ baseUrl, useBinaryFormat: true }));
   }
 
-  async expand(path: readonly Label[], horizon: number, signal?: AbortSignal): Promise<Reply> {
-    const stream = this.client.expand({ path: [...path], horizon }, { signal });
-    return { complete: horizon, edges: edgesOf(stream) };
+  /** Name the node by its parent's id, and from the root when the server has
+   * not learned that id (it restarted, or never saw the parent). */
+  async expand(tree: IntervalTree, node: NodeId, horizon: number, signal?: AbortSignal): Promise<Reply> {
+    const parent = tree.parent(node);
+    if (parent === null) return this.listing({ node: 0n, path: [], horizon }, signal);
+    try {
+      return await this.listing({ node: tree.hash(parent), path: [tree.branch(node)], horizon }, signal);
+    } catch (error) {
+      if (ConnectError.from(error).code !== Code.NotFound) throw error;
+      return this.listing({ node: 0n, path: tree.path(node), horizon }, signal);
+    }
   }
 
-  async search(text: string): Promise<Label[]> {
-    return (await this.client.search({ text })).path;
+  private async listing(request: Omit<ExpandRequest, "$typeName">, signal?: AbortSignal): Promise<Reply> {
+    const branches: Branch[] = [];
+    const lnWeights: number[] = [];
+    let lnLeftover = 0;
+    for await (const batch of this.client.expand(request, { signal })) {
+      for (const branch of batch.branches) branches.push(branch);
+      for (const weight of batch.lnWeights) lnWeights.push(weight);
+      lnLeftover = batch.lnLeftover;
+    }
+    return { branches, lnWeights, leftover: Math.exp(lnLeftover), complete: request.horizon };
   }
-}
 
-async function* edgesOf(stream: AsyncIterable<WireEdge>): AsyncIterable<WireEdge> {
-  const iterator = stream[Symbol.asyncIterator]();
-  try {
-    for (let next = await iterator.next(); !next.done; next = await iterator.next()) yield next.value;
-  } finally {
-    await iterator.return?.();
+  async search(text: string, signal?: AbortSignal): Promise<Branch[]> {
+    return (await this.client.search({ text }, { signal })).path;
   }
 }
 
 export interface DatasetEntry {
   name: string;
   title: string;
-  /** A JSON array of label bytes in base64, indexed by label, or a notes file. */
+  /** A JSON array of label bytes in base64, indexed by branch, or a notes file. */
   labels?: string;
   /** Each measure is a recorded snapshot file or a live service's base URL. */
   measures: { name: string; file?: string; url?: string }[];
+  /** What the entry's paths are relative to; the static data directory by default. */
   /** What the entry's paths are relative to; the static data directory by default. */
   base?: string;
 }
@@ -128,7 +128,7 @@ export interface Dataset {
   sources: Source[];
   labels: Labels;
   searchable: boolean;
-  search(text: string, measure?: number): Promise<Label[]>;
+  search(text: string, measure: number, signal?: AbortSignal): Promise<Branch[]>;
 }
 
 /** The static data directory, beside the page. */
@@ -174,11 +174,12 @@ function dataset(
     sources,
     labels,
     searchable,
-    async search(text, measure = 0) {
+    async search(text, measure, signal) {
+      // A recording finds the sequences recorded under the measure in view.
       const source = sources[measure];
       const search = source?.search;
       if (search === undefined) throw new Error("this dataset has no text search");
-      return search.call(source, text);
+      return search.call(source, text, signal);
     },
   };
 }

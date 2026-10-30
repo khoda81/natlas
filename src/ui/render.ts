@@ -19,8 +19,11 @@ export interface DrawState {
   /** ``node:slot`` keys of the hovered box's ancestor slots. */
   ancestors: Set<string>;
   units: Units;
-  /** How the child with ``label`` of node ``node`` reads. */
-  glyph: (node: NodeId, label: number) => Glyph;
+  /** How the child along ``branch`` of node ``node`` reads. */
+  glyph: (node: NodeId, branch: number) => Glyph;
+  /** Why the origin shows no children, if it does not; ``sweep`` animates
+   * a faint band behind the text while they load. */
+  note: { text: string; sweep: number | null } | null;
 }
 
 const FAMILY = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
@@ -38,6 +41,8 @@ const MARK_WIDTH = 0.8;
 const MARK_GAP = 0.3;
 const MORE: Glyph = { text: "…" };
 export const RULER_HEIGHT = 22;
+/** One sweep of the loading band across the view. */
+const SWEEP_MS = 1400;
 // Canvas coordinates far outside the view lose precision and can stall rasterizing.
 const OVERSCAN = 64;
 const textWidths = new WeakMap<CanvasRenderingContext2D, { scale: number; widths: Map<string, number> }>();
@@ -124,7 +129,7 @@ export function draw(
     );
 
     if (box.kind !== "merged" && height >= LABEL_MIN_HEIGHT && width >= LABEL_MIN_WIDTH) {
-      labels.push({ box, rect, glyph: box.label === null ? MORE : state.glyph(box.node, box.label), ink, grows: box.label !== null });
+      labels.push({ box, rect, glyph: box.branch === null ? MORE : state.glyph(box.node, box.branch), ink, grows: box.branch !== null });
     }
   }
 
@@ -159,12 +164,8 @@ export function draw(
     ctx.restore();
   }
 
-  if (!visible) {
-    ctx.fillStyle = scheme.inkMuted;
-    ctx.textAlign = "center";
-    ctx.fillText("No continuation discovered here · press 0 for the root", view.width / 2, view.height / 2);
-    ctx.textAlign = "left";
-  }
+  const note = state.note ?? (visible ? null : { text: "No continuation discovered here · press 0 for the root", sweep: null });
+  if (note !== null) drawNote(ctx, view, palette, note.text, note.sweep);
 
   outline(ctx, frame, cam, view, state, scheme.ink);
   ruler(ctx, cam, view, state.units, palette);
@@ -269,6 +270,28 @@ function format(value: number, step: number): string {
   const decimals = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
   if (decimals > 12 || Math.abs(value) >= 1e12) return value.toExponential(3);
   return value.toFixed(decimals);
+}
+
+/** A message across the view; while ``time`` is given, a band sweeps behind it. */
+function drawNote(ctx: CanvasRenderingContext2D, view: Viewport, palette: Palette, text: string, time: number | null): void {
+  const { scheme } = palette;
+  ctx.save();
+  if (time !== null) {
+    const band = view.width * 0.4;
+    const x = ((time % SWEEP_MS) / SWEEP_MS) * (view.width + band) - band;
+    const gradient = ctx.createLinearGradient(x, 0, x + band, 0);
+    gradient.addColorStop(0, `${scheme.inkMuted}00`);
+    gradient.addColorStop(0.5, `${scheme.inkMuted}1f`);
+    gradient.addColorStop(1, `${scheme.inkMuted}00`);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, view.width, view.height);
+  }
+  ctx.font = FONT;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = scheme.inkMuted;
+  ctx.fillText(text, view.width / 2, view.height / 2);
+  ctx.restore();
 }
 
 function ruler(ctx: CanvasRenderingContext2D, cam: Camera, view: Viewport, units: Units, palette: Palette): void {

@@ -7,7 +7,7 @@ describe("Slots", () => {
     const tree = new IntervalTree(1);
     tree.setListing(tree.root, 0, listing([0.5, 0.3], [10, 20], 2));
     const slots = tree.slots(tree.root, { p: 0, q: 0 });
-    expect(slots.labels).toEqual([10, 20]);
+    expect(slots.branches).toEqual([10, 20]);
     expect(slots.count).toBe(3);
     expect(isTail(slots, 2)).toBe(true);
     expect(slots.p[2]).toBeCloseTo(0.2, 9);
@@ -31,15 +31,19 @@ describe("Slots", () => {
 });
 
 describe("IntervalTree", () => {
-  it("uses the integer label path as node identity", () => {
+  it("names nodes by their branches from the root", () => {
     const tree = new IntervalTree(2);
     const child = tree.child(tree.root, 5);
     const grandchild = tree.child(child, 2);
     expect(tree.child(tree.root, 5)).toBe(child);
     expect(tree.parent(grandchild)).toBe(child);
-    expect(tree.label(grandchild)).toBe(2);
+    expect(tree.branch(grandchild)).toBe(2);
     expect(tree.path(grandchild)).toEqual([5, 2]);
-    expect(tree.chain(grandchild)).toEqual([tree.root, child, grandchild]);
+    expect(tree.chain(tree.root, grandchild)).toEqual([tree.root, child, grandchild]);
+    expect(tree.chain(child, grandchild)).toEqual([child, grandchild]);
+    expect(tree.descend(tree.root, [5, 2])).toBe(grandchild);
+    const other = new IntervalTree(1);
+    expect(other.hash(other.descend(other.root, [5, 2]))).toBe(tree.hash(grandchild));
   });
 
   it("tells an unexpanded node from one with nothing within the horizon", () => {

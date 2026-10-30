@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Regenerate the TypeScript client and Python exporter bindings from proto/.
+# Regenerate the TypeScript client and Python server bindings from proto/.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -9,4 +9,4 @@ protoc \
   --es_out=src/gen \
   --es_opt=target=ts \
   --python_out=export \
-  natlas/v1/natlas.proto
+  natlas/natlas.proto

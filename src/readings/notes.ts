@@ -9,7 +9,7 @@
 import { clock, DRUM_PROGRAM, pitchName, tint } from "./music";
 import { type Glyph, type Labels, type Reading, States } from "./reading";
 import { ScorePanel } from "./roll";
-import type { IntervalTree, Label, NodeId } from "../core/tree";
+import type { IntervalTree, Branch, NodeId } from "../core/tree";
 
 type Event = readonly [type: string, value: number];
 
@@ -94,14 +94,14 @@ export class NoteLabels implements Labels {
     this.span = file.window * file.frameRate;
   }
 
-  event(label: Label): Event {
-    return this.file.events[label] ?? ["UNK", label];
+  event(branch: Branch): Event {
+    return this.file.events[branch] ?? ["UNK", branch];
   }
 
-  /** The decoder's state after ``label``. */
-  after(score: Score, label: Label): Score {
+  /** The decoder's state after ``branch``. */
+  after(score: Score, branch: Branch): Score {
     if (score.ended) return score;
-    const [type, value] = this.event(label);
+    const [type, value] = this.event(branch);
     if (type === "EOS") {
       if (score.window + 1 >= this.file.windows) return { ...score, ended: true };
       return { ...START, window: score.window + 1 };
@@ -132,9 +132,9 @@ export class NoteLabels implements Labels {
     return (this.file.at ?? 0) + tick / this.file.frameRate;
   }
 
-  /** ``label`` read in ``score``, the state after its parent's path. */
-  glyph(score: Score, label: Label): Glyph {
-    const [type, value] = this.event(label);
+  /** ``branch`` read in ``score``, the state after its parent's path. */
+  glyph(score: Score, branch: Branch): Glyph {
+    const [type, value] = this.event(branch);
     switch (type) {
       case "EOS":
         if (score.ended || score.window + 1 >= this.file.windows) return { text: "end", mark: "end" };
@@ -162,7 +162,7 @@ export class NoteLabels implements Labels {
   }
 
   /** The notes a path writes, as MuScriptor's own decoder reads its windows in turn. */
-  transcribe(path: readonly Label[]): Transcript {
+  transcribe(path: readonly Branch[]): Transcript {
     let score = START;
     const open = new Map<string, Note>();
     const notes: Note[] = [];
@@ -178,9 +178,9 @@ export class NoteLabels implements Labels {
       }
       open.clear();
     };
-    for (const label of path) {
+    for (const branch of path) {
       if (score.ended) break;
-      const [type, value] = this.event(label);
+      const [type, value] = this.event(branch);
       touched = new Set();
       const last = score.window + 1 >= this.file.windows;
       if (type === "EOS") {
@@ -233,7 +233,7 @@ export class NoteLabels implements Labels {
           }
         }
       }
-      score = this.after(score, label);
+      score = this.after(score, branch);
     }
     const now = score.ended ? this.file.windows * this.span : score.window * this.span + Math.min(score.tick, this.span);
     // A note ended where it started, as a spoiled prologue leaves its guesses, sounds nowhere.
@@ -241,13 +241,13 @@ export class NoteLabels implements Labels {
   }
 
   read(tree: IntervalTree): Reading {
-    const scores = new States<Score>(tree, START, (score, label) => this.after(score, label));
+    const scores = new States<Score>(tree, START, (score, branch) => this.after(score, branch));
     const panel = new ScorePanel(this);
     return {
-      glyph: (node: NodeId, label: Label) => this.glyph(scores.at(node), label),
-      show: (element: HTMLElement, node: NodeId, label: Label | null) => {
+      glyph: (node: NodeId, branch: Branch) => this.glyph(scores.at(node), branch),
+      show: (element: HTMLElement, node: NodeId, branch: Branch | null) => {
         const path = tree.path(node);
-        if (label !== null) path.push(label);
+        if (branch !== null) path.push(branch);
         panel.show(element, this.transcribe(path));
       },
       key: (event: KeyboardEvent) => {

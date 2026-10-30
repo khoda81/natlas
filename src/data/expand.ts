@@ -1,10 +1,8 @@
-// Fetch the listings a frame needs. Nodes are named by their complete integer
-// paths, so expansion has no handle exchange or restart-recovery path.
+// Fetch the listings a frame needs, the view's origin first: it fills the view.
 
-import { decode } from "../core/codec";
 import { type Camera, type Frame, logView, type Viewport } from "../core/layout";
 import type { Source } from "./source";
-import type { IntervalTree, Label, Lens, NodeId } from "../core/tree";
+import type { Branch, IntervalTree, Lens, NodeId } from "../core/tree";
 
 const HEADROOM = 4;
 const MAX_HORIZON = 4096;
@@ -33,11 +31,11 @@ export function wants(tree: IntervalTree, lens: Lens, cam: Camera, view: Viewpor
     }
   };
 
-  if (!tree.hasListing(tree.root, lens.p) || !tree.hasListing(tree.root, lens.q)) {
-    want(() => tree.root, 0, 0);
+  if (!tree.hasListing(cam.origin, lens.p) || !tree.hasListing(cam.origin, lens.q)) {
+    want(() => cam.origin, 0, 0);
   }
-  for (const { node, label, lnMass, x1 } of frame.unexpanded) {
-    want(() => tree.child(node, label), lnMass, x1);
+  for (const { node, branch, lnMass, x1 } of frame.unexpanded) {
+    want(() => tree.child(node, branch), lnMass, x1);
   }
   for (const box of frame.boxes) {
     if (box.kind === "tail") want(() => box.node, box.lnMass - Math.log(box.p), box.x0);
@@ -54,7 +52,8 @@ export class Expander {
   private demand: () => Want[] = () => [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
-  private readonly abort = new AbortController();
+  /** Aborts the work in flight for the current view. */
+  private abort = new AbortController();
   private active = 0;
   private readonly waiting: (() => void)[] = [];
   onError: (error: unknown) => void = (error) => console.error(error);
@@ -68,6 +67,17 @@ export class Expander {
   request(demand: Want[] | (() => Want[])): void {
     this.demand = typeof demand === "function" ? demand : () => demand;
     this.pump();
+  }
+
+  /**
+   * Abandon the work in flight: the view moved elsewhere. A server runs one
+   * forward pass at a time, so what the old view wanted would otherwise run
+   * first. The next demand asks again for whatever it still needs.
+   */
+  cancel(): void {
+    this.abort.abort();
+    this.abort = new AbortController();
+    this.pending.clear();
   }
 
   dispose(): void {
@@ -101,8 +111,9 @@ export class Expander {
         retry = Math.min(retry, after);
         continue;
       }
+      const { signal } = this.abort;
       void this.fetch(node, measure, ask).catch((error: unknown) => {
-        if (!this.disposed) {
+        if (!signal.aborted) {
           this.failed.set(key, performance.now());
           this.onError(error);
         }
@@ -111,9 +122,9 @@ export class Expander {
     if (retry < Infinity) this.schedule(retry);
   }
 
-  /** Expand until the label is listed, coalescing with visible discovery. */
-  async reach(node: NodeId, measure: number, label: Label): Promise<boolean> {
-    const listed = () => this.tree.slotOf(node, { p: measure, q: measure }, label) !== undefined;
+  /** Expand until the branch is listed, coalescing with visible discovery. */
+  async reach(node: NodeId, measure: number, branch: Branch): Promise<boolean> {
+    const listed = () => this.tree.slotOf(node, { p: measure, q: measure }, branch) !== undefined;
     while (!listed()) {
       if (this.disposed) throw new Error("dataset changed while finding a path");
       const pending = this.pending.get(`${node}:${measure}`);
@@ -134,16 +145,16 @@ export class Expander {
     const key = `${node}:${measure}`;
     const pending = this.pending.get(key);
     if (pending !== undefined) return pending;
+    const { signal } = this.abort;
     const work = (async () => {
       if (this.active >= this.limit) await new Promise<void>((resolve) => this.waiting.push(resolve));
       else this.active++;
       try {
-        if (this.disposed) return;
-        const reply = await this.sources[measure]!.expand(this.tree.path(node), horizon, this.abort.signal);
-        const edges = [];
-        for await (const edge of reply.edges) edges.push(edge);
-        if (this.disposed || horizon < this.tree.horizon(node, measure)) return;
-        this.tree.setListing(node, measure, { ...decode(edges, horizon, reply.complete), horizon });
+        signal.throwIfAborted();
+        const reply = await this.sources[measure]!.expand(this.tree, node, horizon, signal);
+        signal.throwIfAborted();
+        if (horizon < this.tree.horizon(node, measure)) return;
+        this.tree.setListing(node, measure, { ...reply, horizon });
         this.failed.delete(key);
       } finally {
         const next = this.waiting.shift();
@@ -153,7 +164,7 @@ export class Expander {
     })();
     this.pending.set(key, work);
     const finish = () => {
-      this.pending.delete(key);
+      if (this.pending.get(key) === work) this.pending.delete(key);
       this.schedule();
     };
     void work.then(finish, finish);

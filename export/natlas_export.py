@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from natlas.v1 import natlas_pb2 as pb  # noqa: E402
-from natlas_codec import encode, labels_json  # noqa: E402
+from natlas import natlas_pb2 as pb  # noqa: E402
+from natlas_codec import labels_json  # noqa: E402
 from natwalk import Tree  # noqa: E402
 from natwalk.tree import NodeId  # noqa: E402
 
@@ -21,9 +21,9 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "public" / "data"
 # A node without children lists nothing at any horizon.
 _LEAF_HORIZON = (1 << 32) - 1
 
-# The weight of every label at one node under one further measure, indexed by label.
+# The weight of every branch at one node under one further measure, indexed by branch.
 type Measure = Callable[[NodeId], Sequence[float]]
-# The same for a path of labels from the root.
+# The same for a path of branches from the root.
 type Ancestry = Callable[[Sequence[int]], Sequence[float]]
 
 
@@ -63,10 +63,10 @@ def snapshots(
     child: natwalk's discovered children always fit, and so does every child
     at least that heavy, as Expand requires.
 
-    natwalk's root sits at ``start``, a structural path of labels from the
+    natwalk's root sits at ``start``, a structural path of branches from the
     global root; ``ancestry`` gives every measure's weights, natwalk's own
     first, at each node on that path, whose listing then reaches at least the
-    next label. Every recorded request contains its complete path from the
+    next branch. Every recorded expansion holds its complete path from the
     global root.
     """
     if start and len(ancestry) != 1 + len(extra):
@@ -77,11 +77,11 @@ def snapshots(
 
     def along_start(measure: int) -> list[pb.Expansion]:
         return [
-            _expansion_of(start[:depth], ancestry[measure](start[:depth]), min_list, max_list, coverage, label)
-            for depth, label in enumerate(start)
+            _expansion_of(start[:depth], ancestry[measure](start[:depth]), min_list, max_list, coverage, branch)
+            for depth, branch in enumerate(start)
         ]
 
-    own = pb.Snapshot(format_version=2, expansions=along_start(0) if start else [])
+    own = pb.Snapshot(expansions=along_start(0) if start else [])
     for node_id, node in enumerate(tree.nodes):
         distribution = node.distribution
         count = listed_count(tree, node_id, min_list=min_list, max_list=max_list, coverage=coverage)
@@ -98,12 +98,13 @@ def snapshots(
                 horizon,
                 [distribution.token(rank) for rank in listed],
                 [-distribution.nats(rank) for rank in listed],
+                distribution.mass(len(listed), len(distribution)),
             )
         )
 
     recorded = [own]
     for index, measure in enumerate(extra, start=1):
-        snapshot = pb.Snapshot(format_version=2, expansions=along_start(index) if start else [])
+        snapshot = pb.Snapshot(expansions=along_start(index) if start else [])
         for node_id in range(len(tree.nodes)):
             # A sequence natwalk has ended has no continuation under any measure.
             weights = measure(node_id) if len(tree[node_id].distribution) else []
@@ -120,27 +121,32 @@ def _expansion_of(
     coverage: float,
     include: int | None = None,
 ) -> pb.Expansion:
-    """A node's listing from the weight of every label, down to the bit below
-    ``coverage``, and at least down to label ``include``."""
+    """A node's listing from the weight of every branch, down to the bit below
+    ``coverage``, and at least down to branch ``include``."""
     top = heapq.nlargest(max_list, range(len(weights)), key=weights.__getitem__)
-    count = _coverage_count([weights[label] for label in top], min_list, max_list, coverage)
+    count = _coverage_count([weights[branch] for branch in top], min_list, max_list, coverage)
     if not count:
-        return _expansion(path, _LEAF_HORIZON, [], [])
+        return _expansion(path, _LEAF_HORIZON, [], [], 0.0)
     horizon = _horizon(_ln(weights[top[count - 1]]))
     if include is not None:
         horizon = max(horizon, _horizon(_ln(weights[include])))
     # Ties within the last bit can reach past the first max_list.
     threshold = math.exp(-horizon * math.log(2))
-    heavy = [label for label, weight in enumerate(weights) if weight >= threshold]
-    listed = sorted(heavy, key=lambda label: (-weights[label], label))
-    return _expansion(path, horizon, listed, [_ln(weights[label]) for label in listed])
+    heavy = [branch for branch, weight in enumerate(weights) if weight >= threshold]
+    listed = sorted(heavy, key=lambda branch: (-weights[branch], branch))
+    rest = math.fsum(weight for weight in weights if weight < threshold)
+    return _expansion(path, horizon, listed, [_ln(weights[branch]) for branch in listed], rest)
 
 
 def _expansion(
-    path: Sequence[int], horizon: int, labels: Sequence[int], ln_weights: Sequence[float]
+    path: Sequence[int],
+    horizon: int,
+    branches: Sequence[int],
+    ln_weights: Sequence[float],
+    rest: float,
 ) -> pb.Expansion:
-    request = pb.ExpandRequest(path=path, horizon=horizon)
-    return pb.Expansion(request=request, edges=encode(labels, ln_weights, horizon))
+    listing = pb.Listing(branches=branches, ln_weights=ln_weights, ln_leftover=_ln(rest))
+    return pb.Expansion(path=path, horizon=horizon, listing=listing)
 
 
 def _coverage_count(weights: Sequence[float], min_list: int, max_list: int, coverage: float) -> int:

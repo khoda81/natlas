@@ -5,7 +5,7 @@ import { type Camera, logView } from "../core/layout";
 
 /**
  * Move the left edge ``dx`` nats deeper, zooming vertically about view
- * fraction ``fy``. It stops at the root's left edge, depth 0.
+ * fraction ``fy``. It stops at the origin's left edge, depth 0.
  */
 export function moveDepth(cam: Camera, dx: number, fy: number): void {
   const before = logView(cam);

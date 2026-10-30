@@ -1,14 +1,12 @@
 // One explicit initialization for both the browser bundle and Bun's test runner.
 import init, {
   clampPosition,
-  decodeListing,
-  encodeListing,
+  extent,
   layout,
   LayoutFrame,
   normalizeBoundary,
   place,
   repairBoundary,
-  rootExtent,
   Tree,
 } from "./generated/natlas_core";
 
@@ -19,13 +17,11 @@ await init({ module_or_path: wasm });
 
 export {
   clampPosition,
-  decodeListing,
-  encodeListing,
+  extent,
   layout,
   LayoutFrame,
   normalizeBoundary,
   place,
   repairBoundary,
-  rootExtent,
   Tree,
 };

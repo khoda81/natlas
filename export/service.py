@@ -1,12 +1,13 @@
 """Model-independent integer-sequence cache and Connect RPC transport.
 
 Language and music adapters supply the measures; the Rust core owns their
-cached distributions, path identity and wire encoding.
+cached distributions and the hashed node ids shared with every client.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 import struct
 import sys
@@ -20,7 +21,7 @@ from typing import Any, Protocol
 import anyio.to_thread
 from errors import TooLong
 from google.protobuf.message import DecodeError
-from natlas_codec import pb
+from natlas import natlas_pb2 as pb
 from natlas_core import Tree
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -41,14 +42,10 @@ _COMPRESSED = 0x01
 _END_STREAM = 0x02
 _CONTENT_TYPE = "application/connect+proto"
 _PROTO_CONTENT_TYPE = "application/proto"
-# Edges per write; a listing can run to the whole vocabulary.
-_CHUNK = 1024
+# Branches per message; a listing can run to the whole vocabulary.
+_CHUNK = 4096
 # Sorted listings kept per measure, about 12 bytes per vocabulary entry each.
 _CACHED = 64
-
-
-class BadLabel(Exception):
-    pass
 
 
 class Model:
@@ -58,69 +55,83 @@ class Model:
         self,
         root: tuple[int, ...],
         ends: Callable[[tuple[int, ...]], bool],
-        labels: int,
+        vocabulary: int,
         measures: list[Measure],
     ):
         # What the model reads before the root's children: a start-of-text token.
         self.root = root
         # Whether a path is finished, with no children.
         self.ends = ends
-        self.labels = labels
+        # Branches the model has; every other branch has weight zero.
+        self.vocabulary = vocabulary
         self.measures = measures
         self.tree = Tree(len(measures))
-        # LRU policy belongs to the server; cached distributions and path identity
+        # LRU policy belongs to the server; cached distributions and node ids
         # belong to the same core the browser uses.
-        self.cache: list[OrderedDict[tuple[int, ...], int]] = [
-            OrderedDict() for _ in measures
-        ]
-        # Requests run on worker threads; one at a time keeps the cache whole
-        # and the device to one forward pass.
+        self.cache: list[OrderedDict[int, None]] = [OrderedDict() for _ in measures]
+        # Requests run on worker threads. One forward pass at a time keeps the
+        # device busy once and the cache whole; ``names`` guards the tree for
+        # the moments it is read or written, so naming a node never waits on
+        # inference. It is taken inside ``lock``, never the other way round.
         self.lock = threading.Lock()
+        self.names = threading.Lock()
 
-    def expand(self, measure: int, path: Sequence[int], horizon: int) -> list[pb.Edge]:
-        """The listing at ``path`` down to 2^-horizon."""
+    def learn(self, path: Sequence[int]) -> None:
+        """Learn the ids along ``path``, so requests can name them alone."""
+        with self.names:
+            self.tree.node(0, list(path))
+
+    def expand(
+        self, measure: int, node: int, path: Sequence[int], horizon: int
+    ) -> list[pb.Listing]:
+        """The listing of the node ``path`` below ``node`` down to 2^-horizon.
+
+        Raises KeyError when this server has not learned ``node``.
+        """
+        started = time.perf_counter()
+        with self.names:
+            node = self.tree.node(node, list(path))
+            path = tuple(self.tree.path(node))
+        # A branch past the vocabulary has weight zero: nothing follows it.
+        if self.ends(path) or any(branch >= self.vocabulary for branch in path):
+            return [pb.Listing(ln_leftover=-math.inf)]
+        if horizon == 0:
+            return [pb.Listing(ln_leftover=0.0)]
         with self.lock:
-            started = time.perf_counter()
-            path = tuple(path)
-            for label in path:
-                if not 0 <= label < self.labels:
-                    raise BadLabel(
-                        f"label {label} is past the vocabulary's {self.labels}"
-                    )
-            if horizon == 0 or self.ends(path):
-                return []
-            cached = path in self.cache[measure]
-            node = self.listing(measure, path)
-            edges = [
-                pb.Edge(label=label, odds=odds)
-                for label, odds in self.tree.expand(node, measure, horizon)
+            cached = node in self.cache[measure]
+            self.listing(measure, node, path)
+            with self.names:
+                batches = self.tree.batches(node, measure, horizon, _CHUNK)
+            listings = [
+                pb.Listing(branches=branches, ln_weights=ln_weights, ln_leftover=rest)
+                for branches, ln_weights, rest in batches
             ]
             elapsed = (time.perf_counter() - started) * 1000
             source = "cached" if cached else "computed"
+            count = sum(len(listing.branches) for listing in listings)
             print(
-                f"expand m{measure} depth {len(path)} horizon {horizon}: {len(edges)} edges, {source}, {elapsed:.0f} ms",
+                f"expand m{measure} depth {len(path)} horizon {horizon}: {count} branches, {source}, {elapsed:.0f} ms",
                 file=sys.stderr,
             )
-            return edges
+            return listings
 
-    def listing(self, measure: int, path: tuple[int, ...]) -> int:
-        """Cache the complete distribution in Rust and return its path's node."""
+    def listing(self, measure: int, node: int, path: tuple[int, ...]) -> None:
+        """Cache ``node``'s complete distribution in Rust, heaviest first."""
         cache = self.cache[measure]
-        cached = cache.get(path)
-        if cached is not None:
-            cache.move_to_end(path)
-            return cached
+        if node in cache:
+            cache.move_to_end(node)
+            return
         log_probs = self.measures[measure].log_probs(self.root + path)
-        values, order = log_probs.sort(descending=True)
-        node = self.tree.node(path)
-        self.tree.set_distribution(
-            node, measure, order.cpu().tolist(), values.cpu().tolist()
-        )
-        cache[path] = node
-        if len(cache) > _CACHED:
-            _, evicted = cache.popitem(last=False)
-            self.tree.clear_listing(evicted, measure)
-        return node
+        # Stable, so equal weights keep increasing branch order.
+        values, order = log_probs.sort(descending=True, stable=True)
+        # Normalizing in float32 can leave a certain branch a hair above ln 1.
+        ln_weights = [min(value, 0.0) for value in values.cpu().tolist()]
+        cache[node] = None
+        evicted = cache.popitem(last=False)[0] if len(cache) > _CACHED else None
+        with self.names:
+            self.tree.set_distribution(node, measure, order.cpu().tolist(), ln_weights)
+            if evicted is not None:
+                self.tree.clear_listing(evicted, measure)
 
 
 def _envelope(flags: int, payload: bytes) -> bytes:
@@ -139,7 +150,7 @@ def app(
     files: dict[str, tuple[bytes, str]],
     search: Callable[[str], Sequence[int]] | None = None,
 ) -> Starlette:
-    """The measures' services, manifest, files, and optional text-to-label-path search."""
+    """The measures' services, manifest, files, and optional text-to-path search."""
 
     def service(measure: int):
         async def expand(request: Request) -> Response:
@@ -178,10 +189,16 @@ def app(
                 )
             try:
                 request_message = pb.ExpandRequest.FromString(body[5:])
-                edges = await anyio.to_thread.run_sync(
-                    model.expand, measure, request_message.path, request_message.horizon
+                listings = await anyio.to_thread.run_sync(
+                    model.expand,
+                    measure,
+                    request_message.node,
+                    request_message.path,
+                    request_message.horizon,
                 )
-            except (BadLabel, DecodeError) as error:
+            except KeyError as error:
+                return _stream([_end({"code": "not_found", "message": error.args[0]})])
+            except DecodeError as error:
                 return _stream(
                     [_end({"code": "invalid_argument", "message": str(error)})]
                 )
@@ -202,11 +219,8 @@ def app(
                 )
 
             def chunks():
-                for start in range(0, len(edges), _CHUNK):
-                    yield b"".join(
-                        _envelope(0, edge.SerializeToString())
-                        for edge in edges[start : start + _CHUNK]
-                    )
+                for listing in listings:
+                    yield _envelope(0, listing.SerializeToString())
                 yield _end()
 
             return _stream(chunks())
@@ -228,6 +242,7 @@ def app(
         try:
             request_message = pb.SearchRequest.FromString(await request.body())
             path = await anyio.to_thread.run_sync(search, request_message.text)
+            await anyio.to_thread.run_sync(model.learn, path)
             response = pb.SearchResponse(path=path)
         except DecodeError as error:
             return JSONResponse(
@@ -253,11 +268,11 @@ def app(
     routes = [Route("/manifest.json", manifest_json)]
     routes += [Route(f"/{path}", file(*served)) for path, served in files.items()]
     routes += [
-        Route(f"/{index}/natlas.v1.Natlas/Expand", service(index), methods=["POST"])
+        Route(f"/{index}/natlas.Natlas/Expand", service(index), methods=["POST"])
         for index in range(len(model.measures))
     ]
     routes += [
-        Route(f"/{index}/natlas.v1.Natlas/Search", search_rpc, methods=["POST"])
+        Route(f"/{index}/natlas.Natlas/Search", search_rpc, methods=["POST"])
         for index in range(len(model.measures))
     ]
     # Any page may read a local research server.

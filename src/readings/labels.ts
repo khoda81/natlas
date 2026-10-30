@@ -5,7 +5,7 @@
 // array of base64 strings, indexed by label, as proto3 JSON writes bytes.
 
 import { type Glyph, type Labels, type Reading, States } from "./reading";
-import type { IntervalTree, Label, NodeId } from "../core/tree";
+import type { IntervalTree, Branch, NodeId } from "../core/tree";
 
 /** The bytes a decoder holds back after ``bytes``: an unfinished UTF-8 character, at most 3 bytes. */
 function unfinished(bytes: Uint8Array): Uint8Array {
@@ -54,7 +54,7 @@ export class TextLabels implements Labels {
 
   read(tree: IntervalTree): Reading {
     // Per node, the unfinished character its path's bytes end in.
-    const unfinished = new States<Uint8Array>(tree, new Uint8Array(), (before, label) => this.after(before, label).unfinished);
+    const unfinished = new States<Uint8Array>(tree, new Uint8Array(), (before, branch) => this.after(before, branch).unfinished);
     const paths = new Map<NodeId, { tokens: string[]; text: string }>();
     const along = (node: NodeId) => {
       let texts = paths.get(node);
@@ -65,41 +65,47 @@ export class TextLabels implements Labels {
       return texts;
     };
     return {
-      glyph: (node: NodeId, label: Label): Glyph => ({ text: visible(this.shown(unfinished.at(node), label)) }),
-      show: (panel: HTMLElement, node: NodeId, label: Label | null, more?: string) => {
+      glyph: (node: NodeId, branch: Branch): Glyph => ({ text: visible(this.shown(unfinished.at(node), branch)) }),
+      show: (panel: HTMLElement, node: NodeId, branch: Branch | null, more?: string) => {
         const tokens = along(node).tokens;
-        const current = label === null ? null : this.shown(unfinished.at(node), label);
+        const current = branch === null ? null : this.shown(unfinished.at(node), branch);
         const count = tokens.length + Number(current !== null) + Number(more !== undefined);
         panel.dataset.kind = "text";
         // Most pointer moves change only the final token. Preserve the exact
         // span markup while avoiding reconstruction/layout of the whole path.
+        // Walk siblings, not a repeatedly invalidated live childNodes index;
+        // append new spans together so long paths incur one DOM insertion.
+        let child = panel.firstChild;
+        const added = document.createDocumentFragment();
         for (let i = 0; i < count; i++) {
+          const next = child?.nextSibling ?? null;
           const kind = i < tokens.length ? "" : i === tokens.length && current !== null ? "current" : "more";
           const text = kind === "" ? tokens[i]! : kind === "current" ? current! : more!;
           const className = kind === "" ? "token" : `token ${kind}`;
-          const child = panel.childNodes[i];
           if (!(child instanceof HTMLElement) || child.tagName !== "SPAN" || child.className !== className) {
             const span = token(text, kind || undefined);
-            if (child === undefined) panel.append(span);
+            if (child === null) added.append(span);
             else panel.replaceChild(span, child);
           } else if (child.textContent !== text) child.textContent = text;
+          child = next;
         }
-        while (panel.childNodes.length > count) panel.lastChild!.remove();
+        while (child) { const next = child.nextSibling; child.remove(); child = next; }
+        if (added.hasChildNodes()) panel.append(added);
       },
-      text: (node: NodeId, label: Label | null): string => {
-        return along(node).text + (label === null ? "" : this.after(unfinished.at(node), label).text);
+      text: (node: NodeId, branch: Branch | null): string => {
+        return along(node).text + (branch === null ? "" : this.after(unfinished.at(node), branch).text);
       },
     };
   }
 
   /**
-   * What ``label`` reads as after bytes ending in ``before``, an unfinished
+   * What ``branch`` reads as after bytes ending in ``before``, an unfinished
    * character or nothing, and what it leaves unfinished in turn: empty where
    * it finishes no character.
    */
-  after(before: Uint8Array, label: Label): { text: string; unfinished: Uint8Array } {
-    const own = this.bytes[label];
-    if (own === undefined) return { text: `#${label}`, unfinished: new Uint8Array() };
+  after(before: Uint8Array, branch: Branch): { text: string; unfinished: Uint8Array } {
+    const own = this.bytes[branch];
+    if (own === undefined) return { text: `#${branch}`, unfinished: new Uint8Array() };
     const bytes = concat(before, own);
     const text = this.decoder.decode(bytes, { stream: true });
     this.decoder.decode();
@@ -107,21 +113,21 @@ export class TextLabels implements Labels {
   }
 
   /**
-   * ``label`` on its own, after ``before``: its bytes in hex where it finishes
+   * ``branch`` on its own, after ``before``: its bytes in hex where it finishes
    * no character, or holds only bytes that cannot be one.
    */
-  shown(before: Uint8Array, label: Label): string {
-    const { text } = this.after(before, label);
-    const own = this.bytes[label];
+  shown(before: Uint8Array, branch: Branch): string {
+    const { text } = this.after(before, branch);
+    const own = this.bytes[branch];
     return own !== undefined && /^\uFFFD*$/.test(text) ? hex(own) : text;
   }
 
   /** Find an exact recorded text, then a completion, then its deepest known prefix. */
-  search(paths: Iterable<readonly Label[]>, text: string): Label[] {
+  search(paths: Iterable<readonly Branch[]>, text: string): Branch[] {
     if (text === "") return [];
     const query = new TextEncoder().encode(text);
-    let prefix: { path: readonly Label[]; depth: number } | undefined;
-    let completion: { path: readonly Label[]; length: number } | undefined;
+    let prefix: { path: readonly Branch[]; depth: number } | undefined;
+    let completion: { path: readonly Branch[]; length: number } | undefined;
     for (const path of paths) {
       const bytes = this.bytesAlong(path);
       if (bytes === null) continue;
@@ -136,10 +142,10 @@ export class TextLabels implements Labels {
     return [...match];
   }
 
-  private bytesAlong(path: readonly Label[]): Uint8Array | null {
+  private bytesAlong(path: readonly Branch[]): Uint8Array | null {
     let bytes: Uint8Array<ArrayBufferLike> = new Uint8Array();
-    for (const label of path) {
-      const own = this.bytes[label];
+    for (const branch of path) {
+      const own = this.bytes[branch];
       if (own === undefined) return null;
       bytes = concat(bytes, own);
     }
@@ -147,10 +153,10 @@ export class TextLabels implements Labels {
   }
 
   /** The text of each label along ``path``, each read after the ones before it. */
-  along(path: readonly Label[]): string[] {
+  along(path: readonly Branch[]): string[] {
     let before: Uint8Array = new Uint8Array();
-    return path.map((label) => {
-      const read = this.after(before, label);
+    return path.map((branch) => {
+      const read = this.after(before, branch);
       before = read.unfinished;
       return read.text;
     });

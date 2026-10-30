@@ -4,9 +4,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
-use crate::codec;
 use crate::layout::{self, Boundary, Camera, Frame, Viewport};
-use crate::tree::{Lens, Tree as NativeTree};
+use crate::tree::{Lens, Listing, Tree as NativeTree};
 
 fn js_error(error: impl std::fmt::Display) -> JsError {
     JsError::new(&error.to_string())
@@ -43,43 +42,97 @@ impl Tree {
     }
 
     /// Get or create a child, returning its stable numeric node id.
-    pub fn child(&mut self, parent: u32, label: u32) -> std::result::Result<u32, JsError> {
-        self.inner.child(parent, label).map_err(js_error)
+    pub fn child(&mut self, parent: u32, branch: u32) -> std::result::Result<u32, JsError> {
+        self.inner.child(parent, branch).map_err(js_error)
+    }
+
+    pub fn descend(&mut self, node: u32, path: &[u32]) -> std::result::Result<u32, JsError> {
+        self.inner.descend(node, path).map_err(js_error)
+    }
+
+    /// The node's id on the wire, shared with every server.
+    pub fn hash(&self, id: u32) -> std::result::Result<u64, JsError> {
+        self.inner.hash(id).map_err(js_error)
+    }
+
+    pub fn find(&self, hash: u64) -> Option<u32> {
+        self.inner.find(hash)
     }
 
     pub fn parent(&self, id: u32) -> std::result::Result<JsValue, JsError> {
         to_js(&self.inner.parent(id).map_err(js_error)?)
     }
 
-    /// Child edge label, or -1 for the root. A number safely represents every u32 label.
-    pub fn label(&self, id: u32) -> std::result::Result<f64, JsError> {
+    /// Branch from the parent, or -1 for the root. A number safely represents every u32 branch.
+    pub fn branch(&self, id: u32) -> std::result::Result<f64, JsError> {
         Ok(self
             .inner
-            .label(id)
+            .branch(id)
             .map_err(js_error)?
             .map_or(-1.0, f64::from))
     }
 
-    /// Edge labels from the root to `id`, as a Uint32Array.
+    /// Branches from the root to `id`, as a Uint32Array.
     pub fn path(&self, id: u32) -> std::result::Result<Vec<u32>, JsError> {
         self.inner.path(id).map_err(js_error)
     }
 
-    /// Node ids from the root through `id`, as a plain number array.
-    pub fn chain(&self, id: u32) -> std::result::Result<JsValue, JsError> {
-        to_js(&self.inner.chain(id).map_err(js_error)?)
+    /// Node ids from `origin` through `id`, as a plain number array.
+    pub fn chain(&self, origin: u32, id: u32) -> std::result::Result<JsValue, JsError> {
+        to_js(&self.inner.chain(origin, id).map_err(js_error)?)
     }
 
+    /// Typed arrays cross into Wasm as copies of their memory, so a listing
+    /// of a whole vocabulary never becomes JavaScript objects.
+    #[allow(clippy::too_many_arguments)]
     #[wasm_bindgen(js_name = setListing)]
     pub fn set_listing(
         &mut self,
         id: u32,
         measure: usize,
-        listing: JsValue,
+        branches: Vec<u32>,
+        ln_weights: Vec<f64>,
+        leftover: f64,
+        horizon: f64,
+        complete: f64,
     ) -> std::result::Result<(), JsError> {
         self.inner
-            .set_listing(id, measure, from_js(listing)?)
+            .set_listing(
+                id,
+                measure,
+                Listing {
+                    horizon,
+                    branches,
+                    ln_weights,
+                    leftover,
+                    complete,
+                },
+            )
             .map_err(js_error)
+    }
+
+    /// The listing cut at `horizon`, as a recording replays it: branches,
+    /// ln weights and the ln weight of the rest.
+    pub fn cut(
+        &self,
+        id: u32,
+        measure: usize,
+        horizon: u32,
+    ) -> std::result::Result<JsValue, JsError> {
+        let listing = self
+            .inner
+            .listing(id, measure)
+            .map_err(js_error)?
+            .ok_or_else(|| JsError::new("node has no listing"))?;
+        let (range, ln_remaining) = listing
+            .batches(horizon, usize::MAX)
+            .pop()
+            .expect("a cut has one batch");
+        to_js(&(
+            &listing.branches[range.clone()],
+            &listing.ln_weights[range],
+            ln_remaining,
+        ))
     }
 
     pub fn listing(&self, id: u32, measure: usize) -> std::result::Result<JsValue, JsError> {
@@ -121,13 +174,13 @@ impl Tree {
         id: u32,
         p: usize,
         q: usize,
-        label: u32,
+        branch: u32,
     ) -> std::result::Result<f64, JsError> {
         Ok(self
             .inner
             .slots(id, Lens { p, q })
             .map_err(js_error)?
-            .slot_of(label)
+            .slot_of(branch)
             .map_or(-1.0, |v| v as f64))
     }
 
@@ -160,30 +213,6 @@ impl Tree {
         let slots = self.inner.slots(id, Lens { p, q }).map_err(js_error)?;
         to_js(&slots.view())
     }
-}
-
-#[wasm_bindgen(js_name = decodeListing)]
-pub fn decode_listing(
-    horizon: f64,
-    complete: f64,
-    edges: JsValue,
-) -> std::result::Result<JsValue, JsError> {
-    let edges: Vec<codec::WireEdge> = from_js(edges)?;
-    to_js(&codec::decode(&edges, horizon, complete))
-}
-
-#[wasm_bindgen(js_name = encodeListing)]
-pub fn encode_listing(
-    labels: Vec<u32>,
-    ln_weights: Vec<f64>,
-    horizon: f64,
-) -> std::result::Result<JsValue, JsError> {
-    if labels.len() != ln_weights.len() {
-        return Err(JsError::new(
-            "labels and lnWeights must have the same length",
-        ));
-    }
-    to_js(&codec::encode(&labels, &ln_weights, horizon))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,7 +270,7 @@ impl LayoutFrame {
                     layout::BoxKind::Tail => 2.0,
                     layout::BoxKind::Merged => 3.0,
                 },
-                b.label.map_or(-1.0, f64::from),
+                b.branch.map_or(-1.0, f64::from),
                 b.p,
                 b.q,
                 b.ln_mass,
@@ -266,13 +295,13 @@ impl LayoutFrame {
     pub fn boundaries(&self) -> std::result::Result<JsValue, JsError> {
         to_js(&self.inner.boundaries)
     }
-    #[wasm_bindgen(js_name = rootTop)]
-    pub fn root_top(&self) -> f64 {
-        self.inner.root_top
+    #[wasm_bindgen(js_name = originTop)]
+    pub fn origin_top(&self) -> f64 {
+        self.inner.origin_top
     }
-    #[wasm_bindgen(js_name = rootBottom)]
-    pub fn root_bottom(&self) -> f64 {
-        self.inner.root_bottom
+    #[wasm_bindgen(js_name = originBottom)]
+    pub fn origin_bottom(&self) -> f64 {
+        self.inner.origin_bottom
     }
     pub fn cover(&self) -> std::result::Result<JsValue, JsError> {
         to_js(&self.inner.cover)
@@ -290,15 +319,10 @@ impl LayoutFrame {
         x_px: f64,
         y_px: f64,
     ) -> std::result::Result<JsValue, JsError> {
-        let cam = Camera {
-            x,
-            k,
-            anchor: Boundary { node: 0, slot: 0 },
-            a: 0.0,
-        };
         to_js(&layout::pick(
             &self.inner,
-            cam,
+            x,
+            k,
             Viewport { width, height },
             x_px,
             y_px,
@@ -311,10 +335,11 @@ pub fn normalize_boundary(
     tree: &Tree,
     p: usize,
     q: usize,
+    origin: u32,
     boundary: JsValue,
 ) -> std::result::Result<JsValue, JsError> {
     let boundary: Boundary = from_js(boundary)?;
-    to_js(&layout::normalize(&tree.inner, Lens { p, q }, boundary).map_err(js_error)?)
+    to_js(&layout::normalize(&tree.inner, Lens { p, q }, origin, boundary).map_err(js_error)?)
 }
 
 /// Return a reachable anchor without mutating the supplied camera.
@@ -326,7 +351,10 @@ pub fn repair_boundary(
     camera: JsValue,
 ) -> std::result::Result<JsValue, JsError> {
     let camera: Camera = from_js(camera)?;
-    to_js(&layout::repair(&tree.inner, Lens { p, q }, camera.anchor).map_err(js_error)?)
+    to_js(
+        &layout::repair(&tree.inner, Lens { p, q }, camera.origin, camera.anchor)
+            .map_err(js_error)?,
+    )
 }
 
 #[wasm_bindgen(js_name = place)]
@@ -334,20 +362,21 @@ pub fn place_node(
     tree: &Tree,
     p: usize,
     q: usize,
+    origin: u32,
     id: u32,
 ) -> std::result::Result<JsValue, JsError> {
-    to_js(&layout::place(&tree.inner, Lens { p, q }, id).map_err(js_error)?)
+    to_js(&layout::place(&tree.inner, Lens { p, q }, origin, id).map_err(js_error)?)
 }
 
-#[wasm_bindgen(js_name = rootExtent)]
-pub fn root_extent(
+#[wasm_bindgen]
+pub fn extent(
     tree: &Tree,
     p: usize,
     q: usize,
     camera: JsValue,
 ) -> std::result::Result<JsValue, JsError> {
     let camera: Camera = from_js(camera)?;
-    to_js(&layout::root_extent(&tree.inner, Lens { p, q }, camera).map_err(js_error)?)
+    to_js(&layout::extent(&tree.inner, Lens { p, q }, camera).map_err(js_error)?)
 }
 
 /// Return the clamped camera `a`; the input camera is not mutated.

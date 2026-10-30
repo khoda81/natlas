@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::tree::{Label, Lens, NodeId, Slots, Tree};
+use crate::tree::{Branch, Lens, NodeId, Slots, Tree};
 use crate::Result;
 
 pub const MAX_SAFE_SLOT: u64 = 9_007_199_254_740_991;
@@ -16,6 +16,10 @@ pub struct Boundary {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Camera {
+    /// The node the view is measured from, standing as the root does: x is
+    /// q-surprisal from its children's left edge and the view spans e^-x of
+    /// its interval. It bounds the view; nothing above it is needed.
+    pub origin: NodeId,
     pub x: f64,
     pub k: f64,
     pub anchor: Boundary,
@@ -46,8 +50,8 @@ pub struct LayoutBox {
     pub slot: u64,
     pub count: u64,
     pub kind: BoxKind,
-    /// The child's label; null for a tail or a merged run.
-    pub label: Option<Label>,
+    /// The child's branch; null for a tail or a merged run.
+    pub branch: Option<Branch>,
     pub p: f64,
     pub q: f64,
     pub ln_mass: f64,
@@ -69,7 +73,7 @@ pub struct Walked {
 #[serde(rename_all = "camelCase")]
 pub struct Unexpanded {
     pub node: NodeId,
-    pub label: Label,
+    pub branch: Branch,
     pub ln_mass: f64,
     pub x1: f64,
 }
@@ -94,8 +98,8 @@ pub struct Frame {
     pub walked: Vec<Walked>,
     pub unexpanded: Vec<Unexpanded>,
     pub boundaries: Vec<BoundaryPosition>,
-    pub root_top: f64,
-    pub root_bottom: f64,
+    pub origin_top: f64,
+    pub origin_bottom: f64,
     /// Deepest anchor-chain node covering the view and starting at or left of it.
     pub cover: Option<Cover>,
 }
@@ -107,7 +111,7 @@ pub struct Frame {
 struct ThinBranches {
     node: NodeId,
     slots: Arc<Slots>,
-    expanded: Arc<HashSet<Label>>,
+    expanded: Arc<HashSet<Branch>>,
     first: usize,
     downward: bool,
     ys: Vec<f64>,
@@ -126,17 +130,17 @@ impl ThinBranches {
 
     fn get(&self, index: usize) -> LayoutBox {
         let slot = self.slot(index);
-        let label = self.slots.label(slot);
+        let branch = self.slots.branch(slot);
         LayoutBox {
             node: self.node,
             slot: slot as u64,
             count: 1,
-            kind: match label {
+            kind: match branch {
                 None => BoxKind::Tail,
-                Some(label) if self.expanded.contains(&label) => BoxKind::Node,
+                Some(branch) if self.expanded.contains(&branch) => BoxKind::Node,
                 _ => BoxKind::Leaf,
             },
-            label,
+            branch,
             p: self.slots.p(slot),
             q: self.slots.q(slot),
             ln_mass: self.ln_mass + self.slots.ln_p(slot),
@@ -237,8 +241,8 @@ impl Frame {
         self.unexpanded.clear();
         self.boundaries.clear();
         self.cover = None;
-        self.root_top = 0.0;
-        self.root_bottom = 0.0;
+        self.origin_top = 0.0;
+        self.origin_bottom = 0.0;
     }
 }
 
@@ -250,7 +254,7 @@ pub struct Placement {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-pub struct RootExtent {
+pub struct Extent {
     pub top: f64,
     pub bottom: f64,
 }
@@ -285,44 +289,41 @@ fn slot_in(tree: &Tree, lens: Lens, node: NodeId) -> Result<usize> {
     let parent = tree
         .parent(node)?
         .ok_or_else(|| "the root has no parent slot".to_string())?;
-    let label = tree
-        .label(node)?
-        .ok_or_else(|| format!("non-root node {node} has no label"))?;
+    let branch = tree
+        .branch(node)?
+        .ok_or_else(|| format!("non-root node {node} has no branch"))?;
     tree.slots(parent, lens)?
-        .slot_of(label)
+        .slot_of(branch)
         .ok_or_else(|| format!("node {node} is not listed under measure {}", lens.p))
 }
 
-/// Canonical spelling of a boundary: a node's bottom is its next sibling's top.
-pub fn normalize(tree: &Tree, lens: Lens, boundary: Boundary) -> Result<Boundary> {
+/// Canonical spelling of a boundary: a node's bottom is its next sibling's
+/// top, up to the origin, whose bottom is its last slot.
+pub fn normalize(tree: &Tree, lens: Lens, origin: NodeId, boundary: Boundary) -> Result<Boundary> {
     let Boundary { mut node, mut slot } = boundary;
-    loop {
-        let count = tree.slots(node, lens)?.count() as u64;
-        if slot < count {
-            break;
-        }
-        let Some(parent) = tree.parent(node)? else {
-            break;
-        };
+    while node != origin && slot >= tree.slots(node, lens)?.count() as u64 {
         slot = slot_in(tree, lens, node)? as u64 + 1;
-        node = parent;
+        node = tree
+            .parent(node)?
+            .expect("a node below the origin has a parent");
     }
-    if node == tree.root() && slot >= tree.slots(node, lens)?.count() as u64 {
+    if node == origin && slot >= tree.slots(node, lens)?.count() as u64 {
         slot = MAX_SAFE_SLOT;
     }
     Ok(Boundary { node, slot })
 }
 
-/// Move the anchor up to its deepest ancestor that p lists, without mutation.
-pub fn repair(tree: &Tree, lens: Lens, boundary: Boundary) -> Result<Boundary> {
-    let chain = tree.chain(boundary.node)?;
+/// Move the anchor up to its deepest ancestor that p lists below the origin,
+/// without mutation.
+pub fn repair(tree: &Tree, lens: Lens, origin: NodeId, boundary: Boundary) -> Result<Boundary> {
+    let chain = tree.chain(origin, boundary.node)?;
     for pair in chain.windows(2) {
         let parent = pair[0];
         let child = pair[1];
-        let label = tree
-            .label(child)?
-            .ok_or_else(|| format!("non-root node {child} has no label"))?;
-        let listed = tree.slots(parent, lens)?.slot_of(label).is_some();
+        let branch = tree
+            .branch(child)?
+            .ok_or_else(|| format!("non-root node {child} has no branch"))?;
+        let listed = tree.slots(parent, lens)?.slot_of(branch).is_some();
         if !listed {
             return Ok(Boundary {
                 node: parent,
@@ -339,9 +340,10 @@ struct Walk {
     ln_masses: Vec<f64>,
 }
 
-/// The anchor chain, each node's slot in its parent, and each node's ln p mass.
+/// The chain from the origin to the anchor, each node's slot in its parent,
+/// and each node's ln p mass below the origin.
 fn walk(tree: &Tree, lens: Lens, cam: Camera) -> Result<Walk> {
-    let chain = tree.chain(cam.anchor.node)?;
+    let chain = tree.chain(cam.origin, cam.anchor.node)?;
     let mut slots = vec![0; chain.len()];
     let mut ln_masses = vec![0.0; chain.len()];
     for i in 1..chain.len() {
@@ -382,7 +384,7 @@ struct Layout<'a> {
 impl Layout<'_> {
     fn consider_cover(&mut self, node: NodeId, y0: f64, y1: f64, x: f64) -> Result<()> {
         if y0 <= 1e-12 && y1 >= 1.0 - 1e-12 && x <= self.cam.x + 1e-12 {
-            let depth = self.tree.chain(node)?.len();
+            let depth = self.tree.depth(node)? + 1;
             if depth > self.cover_depth {
                 self.cover_depth = depth;
                 self.frame.cover = Some(Cover {
@@ -396,7 +398,12 @@ impl Layout<'_> {
 
     fn boundary(&mut self, node: NodeId, slot: u64, y: f64) -> Result<()> {
         if (0.0..=1.0).contains(&y) {
-            let boundary = normalize(self.tree, self.lens, Boundary { node, slot })?;
+            let boundary = normalize(
+                self.tree,
+                self.lens,
+                self.cam.origin,
+                Boundary { node, slot },
+            )?;
             self.frame.boundaries.push(BoundaryPosition { boundary, y });
         }
         Ok(())
@@ -419,7 +426,7 @@ impl Layout<'_> {
             slot: run.first as u64,
             count: run.count,
             kind: BoxKind::Merged,
-            label: None,
+            branch: None,
             p: run.p,
             // Effective q keeps the run's area equal to Σ p_i (-ln q_i).
             q: (-run.cross / run.p).exp(),
@@ -448,12 +455,12 @@ impl Layout<'_> {
         let pw = slots.p(slot);
         let qw = slots.q(slot);
         let x1 = x + slots.nats_q(slot);
-        let label = slots.label(slot);
-        let child = match label {
-            Some(label) => self.tree.child_id(node, label)?,
+        let branch = slots.branch(slot);
+        let child = match branch {
+            Some(branch) => self.tree.child_id(node, branch)?,
             None => None,
         };
-        let kind = match (label, child) {
+        let kind = match (branch, child) {
             (None, _) => BoxKind::Tail,
             (Some(_), Some(id)) if self.tree.expanded(id, self.lens.p)? => BoxKind::Node,
             _ => BoxKind::Leaf,
@@ -467,7 +474,7 @@ impl Layout<'_> {
             slot: slot as u64,
             count: 1,
             kind,
-            label,
+            branch,
             p: pw,
             q: qw,
             ln_mass: child_mass,
@@ -486,7 +493,7 @@ impl Layout<'_> {
         if kind == BoxKind::Leaf {
             self.frame.unexpanded.push(Unexpanded {
                 node,
-                label: label.expect("a leaf slot has a label"),
+                branch: branch.expect("a leaf slot has a branch"),
                 ln_mass: child_mass,
                 x1,
             });
@@ -527,7 +534,7 @@ impl Layout<'_> {
         self.frame.walked.push(Walked { node, ln_mass, x });
         let slots = self.tree.slots(node, self.lens)?;
         let mut thin: Option<ThinBranches> = None;
-        let expanded = Arc::new(self.tree.expanded_labels(node, self.lens.p)?);
+        let expanded = Arc::new(self.tree.expanded_branches(node, self.lens.p)?);
         let mut run: Option<Run> = None;
         let mut slot = start;
         while slot < slots.count() && y < 1.0 {
@@ -602,7 +609,7 @@ impl Layout<'_> {
         self.frame.walked.push(Walked { node, ln_mass, x });
         let slots = self.tree.slots(node, self.lens)?;
         let mut thin: Option<ThinBranches> = None;
-        let expanded = Arc::new(self.tree.expanded_labels(node, self.lens.p)?);
+        let expanded = Arc::new(self.tree.expanded_branches(node, self.lens.p)?);
         let mut run: Option<Run> = None;
         let mut slot = start;
         while slot >= 0 && y > 0.0 {
@@ -746,7 +753,7 @@ pub(crate) fn layout_into(
             slot: slot as u64,
             count: 1,
             kind: BoxKind::Node,
-            label: tree.label(chain[i + 1])?,
+            branch: tree.branch(chain[i + 1])?,
             p: slots.p(slot),
             q: slots.q(slot),
             ln_mass: ln_masses[i + 1],
@@ -772,17 +779,17 @@ pub(crate) fn layout_into(
         }
     }
 
-    context.frame.root_top = top;
-    context.frame.root_bottom = bottom;
-    // The root remains selectable before any expansion has arrived.
+    context.frame.origin_top = top;
+    context.frame.origin_bottom = bottom;
+    // The origin remains selectable before any expansion has arrived.
     context.frame.known.insert(
         0,
         LayoutBox {
-            node: tree.root(),
+            node: cam.origin,
             slot: 0,
             count: 0,
             kind: BoxKind::Node,
-            label: None,
+            branch: None,
             p: 1.0,
             q: 1.0,
             ln_mass: 0.0,
@@ -795,14 +802,16 @@ pub(crate) fn layout_into(
     Ok(context.frame)
 }
 
-/// `id`'s ln p mass and right edge in nats, -Σ ln q along its path.
-pub fn place(tree: &Tree, lens: Lens, id: NodeId) -> Result<Placement> {
+/// `id`'s ln p mass and right edge in nats below `origin`, -Σ ln q along the way.
+pub fn place(tree: &Tree, lens: Lens, origin: NodeId, id: NodeId) -> Result<Placement> {
     let mut placement = Placement {
         ln_mass: 0.0,
         x1: 0.0,
     };
-    for node in tree.chain(id)?.into_iter().skip(1) {
-        let parent = tree.parent(node)?.expect("a non-root node has a parent");
+    for node in tree.chain(origin, id)?.into_iter().skip(1) {
+        let parent = tree
+            .parent(node)?
+            .expect("a node below the origin has a parent");
         let slots = tree.slots(parent, lens)?;
         let slot = slot_in(tree, lens, node)?;
         placement.ln_mass += slots.ln_p(slot);
@@ -811,8 +820,8 @@ pub fn place(tree: &Tree, lens: Lens, id: NodeId) -> Result<Placement> {
     Ok(placement)
 }
 
-/// Root interval edges in view heights, walking the whole anchor chain.
-pub fn root_extent(tree: &Tree, lens: Lens, cam: Camera) -> Result<RootExtent> {
+/// The origin's interval edges in view heights, walking the whole anchor chain.
+pub fn extent(tree: &Tree, lens: Lens, cam: Camera) -> Result<Extent> {
     let lambda = log_view(cam);
     let Walk {
         chain,
@@ -840,7 +849,7 @@ pub fn root_extent(tree: &Tree, lens: Lens, cam: Camera) -> Result<RootExtent> {
         top -= scaled(owner.prefix(slot), scale);
         bottom += scaled(owner.suffix(slot + 1), scale);
     }
-    Ok(RootExtent { top, bottom })
+    Ok(Extent { top, bottom })
 }
 
 /// Re-anchor at the in-view boundary nearest the view's center.
@@ -857,9 +866,9 @@ pub fn reanchor(frame: &Frame) -> Option<AnchorPosition> {
     })
 }
 
-/// Keep the view inside the root interval, returning only the new anchor offset.
+/// Keep the view inside the origin's interval, returning only the new anchor offset.
 pub fn clamp_position(tree: &Tree, lens: Lens, cam: Camera) -> Result<f64> {
-    let RootExtent { top, bottom } = root_extent(tree, lens, cam)?;
+    let Extent { top, bottom } = extent(tree, lens, cam)?;
     if top > 0.0 {
         Ok(cam.a - top)
     } else if bottom < 1.0 {
@@ -878,11 +887,11 @@ struct ScreenRect {
     y1: f64,
 }
 
-fn screen_rect(layout_box: &LayoutBox, cam: Camera, view: Viewport) -> ScreenRect {
+fn screen_rect(layout_box: &LayoutBox, x: f64, k: f64, view: Viewport) -> ScreenRect {
     let clamp = |value: f64, extent: f64| value.max(-OVERSCAN).min(extent + OVERSCAN);
     ScreenRect {
-        x0: clamp((layout_box.x0 - cam.x) * cam.k, view.width),
-        x1: clamp((layout_box.x1 - cam.x) * cam.k, view.width),
+        x0: clamp((layout_box.x0 - x) * k, view.width),
+        x1: clamp((layout_box.x1 - x) * k, view.width),
         y0: clamp(layout_box.y0 * view.height, view.height),
         y1: clamp(layout_box.y1 * view.height, view.height),
     }
@@ -908,9 +917,12 @@ fn horizontal_distance(layout_box: &LayoutBox, x: f64) -> f64 {
     }
 }
 
+/// The box under a screen point, for a frame drawn with left edge `left` nats
+/// and scale `k` pixels per nat.
 pub fn pick(
     frame: &Frame,
-    cam: Camera,
+    left: f64,
+    k: f64,
     view: Viewport,
     x_px: f64,
     y_px: f64,
@@ -924,26 +936,26 @@ pub fn pick(
         if layout_box.kind == BoxKind::Merged {
             continue;
         }
-        let rect = screen_rect(layout_box, cam, view);
+        let rect = screen_rect(layout_box, left, k, view);
         if x_px >= rect.x0 && x_px < rect.x1 && y_px >= rect.y0 && y_px < rect.y1 {
             return Some(PickResult {
                 r#box: layout_box.clone(),
-                exact: layout_box.label.is_some(),
+                exact: layout_box.branch.is_some(),
             });
         }
     }
 
     for layout_box in frame.known.at_y(y_px, view.height) {
-        let rect = screen_rect(&layout_box, cam, view);
+        let rect = screen_rect(&layout_box, left, k, view);
         if x_px >= rect.x0 && x_px < rect.x1 && y_px >= rect.y0 && y_px < rect.y1 {
             return Some(PickResult {
                 r#box: layout_box.clone(),
-                exact: layout_box.label.is_some(),
+                exact: layout_box.branch.is_some(),
             });
         }
     }
 
-    let x = cam.x + x_px / cam.k;
+    let x = left + x_px / k;
     let y = y_px / view.height;
     let candidates = || {
         frame
@@ -1006,7 +1018,7 @@ mod tests {
     fn listing(weights: &[f64]) -> Listing {
         Listing {
             horizon: 40.0,
-            labels: (0..weights.len() as u32).collect(),
+            branches: (0..weights.len() as u32).collect(),
             ln_weights: weights.iter().map(|weight| weight.ln()).collect(),
             leftover: 1.0 - weights.iter().sum::<f64>(),
             complete: 40.0,
@@ -1018,8 +1030,8 @@ mod tests {
         let children = listing(weights);
         tree.set_listing(0, 0, children.clone()).unwrap();
         let mut node = 0;
-        for &label in path {
-            node = tree.child(node, label).unwrap();
+        for &branch in path {
+            node = tree.child(node, branch).unwrap();
             tree.set_listing(node, 0, children.clone()).unwrap();
         }
         tree
@@ -1036,6 +1048,7 @@ mod tests {
     fn layout_partitions_by_p_sizes_by_q_and_merges_thin_runs() {
         let tree = chain_tree(&[0.5, 0.25, 0.25], &[]);
         let cam = Camera {
+            origin: 0,
             x: -0.1,
             k: 100.0,
             anchor: Boundary { node: 0, slot: 0 },
@@ -1058,8 +1071,8 @@ mod tests {
             near(actual.2, expected.2);
             near(actual.3, expected.3);
         }
-        near(frame.root_top, 0.0);
-        near(frame.root_bottom, 1.0);
+        near(frame.origin_top, 0.0);
+        near(frame.origin_bottom, 1.0);
         assert_eq!(frame.cover, None);
 
         let mut thin_listing = listing(&[0.5, 0.488, 0.004, 0.004, 0.004]);
@@ -1076,7 +1089,7 @@ mod tests {
         near(run.p, 0.012);
         near(run.y0, 0.988);
         near(run.y1, 1.0);
-        assert_eq!(run.label, None);
+        assert_eq!(run.branch, None);
     }
 
     #[test]
@@ -1084,6 +1097,7 @@ mod tests {
         let path = (0..80).map(|i| i % 2).collect::<Vec<_>>();
         let tree = chain_tree(&[0.5, 0.5], &path);
         let cam = Camera {
+            origin: 0,
             x: 80.0 * std::f64::consts::LN_2,
             k: 100.0,
             anchor: Boundary { node: 80, slot: 1 },
@@ -1113,6 +1127,7 @@ mod tests {
 
         let shallow_tree = chain_tree(&[0.5, 0.5], &[0]);
         let shallow_cam = Camera {
+            origin: 0,
             x: std::f64::consts::LN_2,
             anchor: Boundary { node: 1, slot: 0 },
             a: 0.0,
@@ -1124,6 +1139,7 @@ mod tests {
             &shallow_tree,
             LENS,
             Camera {
+                origin: 0,
                 x: 0.0,
                 anchor: Boundary { node: 0, slot: 0 },
                 a: 0.0,
@@ -1152,6 +1168,7 @@ mod tests {
             repair(
                 &tree,
                 Lens { p: 1, q: 1 },
+                0,
                 Boundary {
                     node: second,
                     slot: 1
@@ -1164,6 +1181,7 @@ mod tests {
             normalize(
                 &tree,
                 LENS,
+                0,
                 Boundary {
                     node: first,
                     slot: 2
@@ -1175,12 +1193,13 @@ mod tests {
                 slot: MAX_SAFE_SLOT,
             }
         );
-        let placed = place(&tree, LENS, second).unwrap();
+        let placed = place(&tree, LENS, 0, second).unwrap();
         near(placed.ln_mass, -2.0 * std::f64::consts::LN_2);
         near(placed.x1, 2.0 * std::f64::consts::LN_2);
 
         let clamp_tree = chain_tree(&[0.5, 0.5], &[0]);
         let cam = Camera {
+            origin: 0,
             x: 0.5,
             k: 100.0,
             anchor: Boundary { node: 1, slot: 0 },
@@ -1189,9 +1208,7 @@ mod tests {
         let a = clamp_position(&clamp_tree, LENS, cam).unwrap();
         near(a, 0.0);
         near(
-            root_extent(&clamp_tree, LENS, Camera { a, ..cam })
-                .unwrap()
-                .top,
+            extent(&clamp_tree, LENS, Camera { a, ..cam }).unwrap().top,
             0.0,
         );
 
@@ -1218,9 +1235,71 @@ mod tests {
     }
 
     #[test]
+    fn an_origin_stands_as_the_root_without_any_ancestor_listing() {
+        let mut tree = Tree::new(1);
+        let origin = tree.descend(0, &[7; 3000]).unwrap();
+        tree.set_listing(origin, 0, listing(&[0.5, 0.5])).unwrap();
+        let first = tree.child(origin, 0).unwrap();
+        tree.set_listing(first, 0, listing(&[0.5, 0.5])).unwrap();
+        let cam = Camera {
+            origin,
+            x: 0.0,
+            k: 100.0,
+            anchor: Boundary {
+                node: first,
+                slot: 0,
+            },
+            a: 0.3,
+        };
+        let a = clamp_position(&tree, LENS, cam).unwrap();
+        near(a, 0.0);
+        let cam = Camera { a, ..cam };
+        let frame = layout(&tree, LENS, cam, VIEW, 1.0).unwrap();
+        near(frame.origin_top, 0.0);
+        near(frame.origin_bottom, 1.0);
+        assert_eq!(frame.cover.unwrap().node, origin);
+        assert_eq!(frame.known.materialize()[0].node, origin);
+        let placed = place(&tree, LENS, origin, first).unwrap();
+        near(placed.ln_mass, -std::f64::consts::LN_2);
+        assert_eq!(
+            normalize(
+                &tree,
+                LENS,
+                origin,
+                Boundary {
+                    node: first,
+                    slot: 2
+                }
+            )
+            .unwrap(),
+            Boundary {
+                node: origin,
+                slot: 1
+            }
+        );
+        assert_eq!(
+            repair(
+                &tree,
+                LENS,
+                origin,
+                Boundary {
+                    node: first,
+                    slot: 1
+                }
+            )
+            .unwrap(),
+            Boundary {
+                node: first,
+                slot: 1
+            }
+        );
+    }
+
+    #[test]
     fn offscreen_leaf_still_requests_its_unexpanded_children() {
         let tree = chain_tree(&[0.5, 0.5], &[]);
         let cam = Camera {
+            origin: 0,
             x: std::f64::consts::LN_2,
             k: 100.0,
             anchor: Boundary { node: 0, slot: 0 },
@@ -1230,7 +1309,7 @@ mod tests {
         assert!(!frame.boxes.iter().any(|b| b.node == 0 && b.slot == 0));
         assert!(frame.unexpanded.iter().any(|child| {
             child.node == 0
-                && child.label == 0
+                && child.branch == 0
                 && (child.ln_mass + std::f64::consts::LN_2).abs() < 1e-12
                 && (child.x1 - std::f64::consts::LN_2).abs() < 1e-12
         }));
@@ -1242,7 +1321,7 @@ mod tests {
             slot: 0,
             count: 1,
             kind: BoxKind::Leaf,
-            label: Some(node),
+            branch: Some(node),
             p: 1.0,
             q: 1.0,
             ln_mass: 0.0,
@@ -1264,12 +1343,6 @@ mod tests {
         width: 100.0,
         height: 100.0,
     };
-    const PICK_CAM: Camera = Camera {
-        x: 0.0,
-        k: 100.0,
-        anchor: Boundary { node: 0, slot: 0 },
-        a: 0.0,
-    };
 
     #[test]
     fn picking_uses_first_exact_box_in_frame_order() {
@@ -1277,10 +1350,10 @@ mod tests {
             picking_box(1, 0.0, 1.0, 0.0, 1.0),
             picking_box(2, 0.0, 1.0, 0.0, 1.0),
         ]);
-        let hit = pick(&frame, PICK_CAM, PICK_VIEW, 20.0, 20.0).unwrap();
+        let hit = pick(&frame, 0.0, 100.0, PICK_VIEW, 20.0, 20.0).unwrap();
         assert!(hit.exact);
         assert_eq!(hit.r#box.node, 1);
-        assert!(pick(&frame, PICK_CAM, PICK_VIEW, 20.0, 100.0).is_none());
+        assert!(pick(&frame, 0.0, 100.0, PICK_VIEW, 20.0, 100.0).is_none());
     }
 
     #[test]
@@ -1292,7 +1365,7 @@ mod tests {
             // Deepest known branch at the cursor's y: greatest x0 <= 0.3.
             picking_box(3, 0.2, 0.25, 0.4, 0.6),
         ]);
-        let hit = pick(&frame, PICK_CAM, PICK_VIEW, 30.0, 50.0).unwrap();
+        let hit = pick(&frame, 0.0, 100.0, PICK_VIEW, 30.0, 50.0).unwrap();
         assert!(!hit.exact);
         assert_eq!(hit.r#box.node, 3);
 
@@ -1300,7 +1373,7 @@ mod tests {
             picking_box(4, 0.4, 0.45, 0.4, 0.6),
             picking_box(5, 0.6, 0.65, 0.4, 0.6),
         ]);
-        let hit = pick(&all_right, PICK_CAM, PICK_VIEW, 30.0, 50.0).unwrap();
+        let hit = pick(&all_right, 0.0, 100.0, PICK_VIEW, 30.0, 50.0).unwrap();
         assert!(!hit.exact);
         assert_eq!(hit.r#box.node, 4);
     }
@@ -1311,7 +1384,7 @@ mod tests {
             picking_box(1, 0.0, 0.1, 0.2, 0.3),
             picking_box(2, 0.29, 0.31, 0.7, 0.8),
         ]);
-        let hit = pick(&frame, PICK_CAM, PICK_VIEW, 30.0, 50.0).unwrap();
+        let hit = pick(&frame, 0.0, 100.0, PICK_VIEW, 30.0, 50.0).unwrap();
         assert!(!hit.exact);
         assert_eq!(hit.r#box.node, 2);
     }

@@ -21,9 +21,9 @@ same: replacing it with prefix-sum subtraction changes rounding at depth and at
 merge boundaries. Expanded-child exceptions are snapshotted, so later discovery
 cannot mutate an existing frame's selections.
 
-Slots cache log weights, entropy, cross-entropy, and label lookup alongside the
+Slots cache log weights, entropy, cross-entropy, and branch lookup alongside the
 existing probability sums. Compact integer vocabularies use direct lookup;
-sparse labels still support the entire unsigned 32-bit range. Scalar coverage,
+sparse branches still support the entire unsigned 32-bit range. Scalar coverage,
 membership, and statistics queries avoid exporting full listings just to read a
 field or update the inspector.
 
@@ -87,12 +87,14 @@ and current measurements sequential to avoid CPU contention.
 
 An optional `NATLAS_PERF_FIXTURE` JSON file containing `{listing, labels}` enables
 `?live=1&frames=300&label=model`, which replays the captured root distribution
-and label bytes without contacting its model. `listing` uses the decoded
-`Fetched` shape, including its horizon; `labels` is the usual labels JSON array.
+and label bytes without contacting its model. `listing` uses the core's
+`Listing` shape (`branches`, `lnWeights`, `leftover`, `horizon`, `complete`);
+`labels` is the usual labels JSON array.
 
 ## Behavior checks
 
-`bun run test` includes 49 fixtures frozen from commit `c03ef09c`, covering empty
+`bun run test` includes 49 fixtures, frozen at `c03ef09c` and refrozen after the
+move to branch ids and view origins once they matched `06660bea` to 3e-15, covering empty
 trees, distinct measures, partial tails, merging, 150,000 branches, and an
 80-level anchor. Hashes cover every geometry field and its order, sampled
 cursor selections, reanchoring, and discovery demand. Separate tests retain old

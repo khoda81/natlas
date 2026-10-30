@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Partition playground · Natlas</title>
+  <link rel="stylesheet" href="./src/playground/style.css" />
+</head>
+<body>
+  <main>
+    <header><a class="brand" href="/">natlas<span> / partition lab</span></a><span class="badge">Single categorical distribution</span></header>
+    <section class="intro"><div><h1>How much distribution fits in a budget?</h1><p>Two independent endpoints. Shared ID filters. A silhouette bounded by what has arrived.</p></div><button id="export" disabled>Export replay ↗</button></section>
+    <div class="prompt"><span>PROMPT</span><q id="prompt">Loading Qwen capture…</q><span id="vocabulary"></span></div>
+    <section class="toolbar" aria-label="Experiment settings">
+      <label>P · height<select id="p-model" aria-label="P measure" disabled></select></label>
+      <button id="swap" aria-label="Swap P and Q" title="Swap P and Q" disabled>⇄</button>
+      <label>Q · width<select id="q-model" aria-label="Q measure" disabled></select></label>
+      <button id="same" disabled>P = Q</button>
+      <label>Partition bits<select id="order"><option value="high">High bits first</option><option value="low">Low bits first</option></select></label>
+      <label>Children per request<select id="fanout"><option value="1">2 children</option><option value="2">4 children</option><option value="4" selected>16 children</option></select></label>
+    </section>
+    <div class="workspace">
+      <section class="plot-panel">
+        <div class="plot-heading"><div><h2>Sorted silhouette</h2><p>Increasing −ln Q · vertical extent measured by P</p></div><div class="plot-settings"><label>Mass window<select id="window"><option value="0">All mass</option><option value="0.9">Last 10%</option><option value="0.99">Last 1%</option><option value="0.999">Last 0.1%</option></select></label><label>Width<select id="clip"><option value="8">8 nats</option><option value="12" selected>12 nats</option><option value="24">24 nats</option><option value="48">48 nats</option></select></label></div></div>
+        <div class="canvas-wrap"><canvas id="plot" tabindex="0" role="img" aria-label="Bounds on the Q-sorted probability silhouette. Teal is certain filled area; amber is unresolved; the white line is the full-data reference."></canvas><div id="tooltip" hidden></div></div>
+        <div class="legend"><span><i class="certain"></i>Certain area</span><span><i class="uncertain"></i>Unresolved envelope</span><label><input id="reference" type="checkbox" checked /><i class="exact"></i>Exact reference</label></div>
+        <div class="metrics" aria-live="polite"><div><span>Cross-entropy bound</span><strong id="cross">—</strong><small>nats · H(P,Q)</small></div><div><span>Unresolved area</span><strong id="gap">—</strong><small>whole distribution · clipped at view width</small></div><div><span>Individual P masses known</span><strong id="resolved">—</strong><small>mass in singleton ID filters</small></div></div>
+        <div class="reference-readout" id="reference-readout">Full-data reference loading…</div>
+      </section>
+      <aside class="budget-panel">
+        <div class="budget-heading"><h2>Transfer budgets</h2><label>Limit by<select id="unit"><option value="bytes">Protobuf bytes</option><option value="requests">Requests</option></select></label></div>
+        <div class="budget-card p-card"><div class="budget-title"><span class="channel">P</span><div><h3>Probability mass</h3><small>Independent endpoint</small></div></div>
+          <label class="cap-label" for="p-cap">Budget cap <span><input id="p-cap" type="number" min="0" value="65536" aria-label="P budget value" /><b class="budget-unit">bytes</b></span></label>
+          <input id="p-slider" class="budget-slider" type="range" min="0" max="240" step="1" aria-label="P transfer budget" />
+          <div class="range-ends"><span>0</span><span class="range-max">16 MiB</span></div>
+          <strong id="p-used">—</strong><div class="direction" id="p-direction">↑ request · ↓ reply</div><progress id="p-progress" max="1" value="0" aria-label="P budget consumed"></progress><p id="p-state">Waiting for capture</p>
+        </div>
+        <div class="budget-card q-card"><div class="budget-title"><span class="channel">Q</span><div><h3>Surprisal bounds</h3><small>Independent endpoint</small></div></div>
+          <label class="cap-label" for="q-cap">Budget cap <span><input id="q-cap" type="number" min="0" value="65536" aria-label="Q budget value" /><b class="budget-unit">bytes</b></span></label>
+          <input id="q-slider" class="budget-slider" type="range" min="0" max="240" step="1" aria-label="Q transfer budget" />
+          <div class="range-ends"><span>0</span><span class="range-max">16 MiB</span></div>
+          <strong id="q-used">—</strong><div class="direction" id="q-direction">↑ request · ↓ reply</div><progress id="q-progress" max="1" value="0" aria-label="Q budget consumed"></progress><p id="q-state">Waiting for capture</p>
+        </div>
+        <div class="budget-actions"><button id="zero">No data</button><button id="example">Example budgets</button></div>
+        <p class="budget-note">Counts actual serialized request + reply payloads. Complete exchanges only. HTTP, compression and fixture downloads are excluded.</p><p class="baseline" id="baseline"></p>
+      </aside>
+    </div>
+    <div id="status" role="status">Loading two recorded Qwen distributions…</div>
+    <div class="details-grid">
+      <details><summary>Received filters <span id="group-count"></span></summary><p>Largest P groups. Q ranges are inherited from its nearest observed ancestor when its budget is smaller.</p><div class="table-scroll"><table><thead><tr><th>Mask / value</th><th>IDs</th><th>P mass</th><th>−ln Q range</th></tr></thead><tbody id="groups"></tbody></table></div></details>
+      <details><summary>Protocol &amp; byte ledger</summary><p><code>(id &amp; mask) == value</code>. Split up to four unfixed bits; return mass bounds and optional individual log-probability extrema. <a href="/partition.proto" target="_blank">Read the .proto ↗</a></p><p id="chain"></p><div class="table-scroll"><table><thead><tr><th>Endpoint</th><th>Mask / value</th><th>↑ bytes</th><th>↓ bytes</th></tr></thead><tbody id="ledger"></tbody></table></div></details>
+    </div>
+    <footer><p><strong>Recorded Qwen3-4B, real weight quantizations.</strong> Q4_K_M was re-quantized from Q6_K, not FP16. Same prompt, tokenizer, CPU backend and temperature 1.</p><details><summary>Data provenance &amp; interpretation</summary><p id="provenance"></p><p>This is an in-browser transport simulation. The mock endpoints own the full captures; the estimator receives only admitted protobuf replies. The white reference uses the full data and never drives refinement. The aggregate shape can resolve before token identities and ranks do.</p><p>P prioritizes measured mass × log ID count. Q follows P’s partition and prioritizes mass × clipped width spread; it can stop below its cap when further Q alone cannot improve the current P groups. Decreasing a budget discards client knowledge and replays from zero.</p></details></footer>
+  </main>
+  <script type="module" src="./src/playground/main.ts"></script>
+</body>
+</html>

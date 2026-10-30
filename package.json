@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun --hot serve.ts",
-    "build": "tsc --noEmit && rm -rf dist && bun build ./index.html --outdir dist --minify && cp -r public/. dist/",
+    "build": "tsc --noEmit && rm -rf dist && bun build ./index.html ./playground.html --outdir dist --minify && bun build ./src/playground/worker.ts --outfile dist/playground-worker.js --target browser --minify && cp -r public/. dist/ && cp proto/natlas/partition/v1/partition.proto dist/partition.proto",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "proto": "scripts/gen-proto.sh",

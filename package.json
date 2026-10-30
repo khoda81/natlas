@@ -13,6 +13,8 @@
     "test": "bun test && cargo test --manifest-path core/Cargo.toml && uv run tests/server_test.py",
     "pretypecheck": "bun run core",
     "typecheck": "tsc --noEmit",
+    "prebench": "bun run core",
+    "bench": "bun scripts/bench-frames.ts",
     "proto": "scripts/gen-proto.sh",
     "data": "cd export && uv run synthetic.py",
     "live": "cd export && uv run serve.py",

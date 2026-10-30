@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,53 @@ fn unlisted_bound(listing: &Listing) -> f64 {
     listing.leftover.min(last).min(2f64.powf(-listing.complete))
 }
 
+/// Direct lookup for compact vocabularies, with sparse integer labels supported.
+#[derive(Debug)]
+enum LabelIndex {
+    Dense { slots: Vec<usize>, count: usize },
+    Sparse(HashMap<Label, usize>),
+}
+
+impl LabelIndex {
+    fn new(labels: &[Label]) -> Self {
+        let length = labels.iter().max().map_or(0, |&label| u64::from(label) + 1);
+        if length <= 1_048_576 && length <= (labels.len() as u64).saturating_mul(4) {
+            let mut slots = vec![usize::MAX; length as usize];
+            let mut count = 0;
+            for (slot, &label) in labels.iter().enumerate() {
+                count += usize::from(slots[label as usize] == usize::MAX);
+                slots[label as usize] = slot;
+            }
+            Self::Dense { slots, count }
+        } else {
+            Self::Sparse(
+                labels
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &label)| (label, slot))
+                    .collect(),
+            )
+        }
+    }
+
+    fn get(&self, label: Label) -> Option<usize> {
+        match self {
+            Self::Dense { slots, .. } => slots
+                .get(label as usize)
+                .copied()
+                .filter(|&slot| slot != usize::MAX),
+            Self::Sparse(slots) => slots.get(&label).copied(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense { count, .. } => *count,
+            Self::Sparse(slots) => slots.len(),
+        }
+    }
+}
+
 /// A node's slots under one lens.
 #[derive(Debug)]
 pub struct Slots {
@@ -52,10 +99,16 @@ pub struct Slots {
     p: Vec<f64>,
     /// Conditional q weight per slot, or an upper bound where `q_bound`.
     q: Vec<f64>,
+    ln_p: Vec<f64>,
+    nats_q: Vec<f64>,
     q_bound: Vec<bool>,
-    index: HashMap<Label, usize>,
+    index: LabelIndex,
     prefixes: Vec<f64>,
     suffixes: Vec<f64>,
+    entropy: f64,
+    equal_entropy: f64,
+    cross: f64,
+    bounded: bool,
 }
 
 impl Slots {
@@ -72,14 +125,11 @@ impl Slots {
         let tail = p.is_some_and(|listing| listing.leftover > 0.0);
         let count = listed + usize::from(tail);
         let mut p_weights = vec![0.0; count];
-        let mut q_weights;
-        let mut q_bound = vec![true; count];
-        let mut index = HashMap::with_capacity(listed);
+        let index = LabelIndex::new(&labels);
 
         if let Some(listing) = p {
-            for (slot, &label) in labels.iter().enumerate() {
-                index.insert(label, slot);
-                p_weights[slot] = listing.ln_weights[slot].exp();
+            for (weight, ln_weight) in p_weights.iter_mut().zip(&listing.ln_weights) {
+                *weight = ln_weight.exp();
             }
             if tail {
                 p_weights[listed] = listing.leftover;
@@ -89,12 +139,19 @@ impl Slots {
         // Whatever q leaves out weighs at most this; a child it lists only under
         // p's tail can be heavier.
         let unlisted = q.map_or(1.0, unlisted_bound);
-        q_weights = vec![unlisted; count];
         let mut tail_bound = unlisted;
-        if let Some(listing) = q {
+        let equal =
+            matches!((p, q), (Some(p), Some(q)) if std::ptr::eq(p, q)) && index.len() == listed;
+        let mut q_weights = if equal {
+            p_weights.clone()
+        } else {
+            vec![unlisted; count]
+        };
+        let mut q_bound = vec![!equal; count];
+        if let Some(listing) = q.filter(|_| !equal) {
             for (rank, &label) in listing.labels.iter().enumerate() {
                 let weight = listing.ln_weights[rank].exp();
-                match index.get(&label).copied() {
+                match index.get(label) {
                     None => tail_bound = tail_bound.max(weight),
                     Some(slot) => {
                         q_weights[slot] = weight;
@@ -105,6 +162,7 @@ impl Slots {
         }
         if tail {
             q_weights[listed] = tail_bound;
+            q_bound[listed] = true;
         }
 
         // Forward and backward sums avoid cancellation at slot boundaries.
@@ -117,14 +175,49 @@ impl Slots {
             suffixes[slot] = suffixes[slot + 1] + p_weights[slot];
         }
 
+        // Inspector statistics depend on the listing, not the current frame
+        // or pointer. Accumulate in the same order as the original UI loop.
+        let ln_p: Vec<_> = p_weights.iter().map(|p| p.ln()).collect();
+        let mut nats_q: Vec<_> = if equal {
+            ln_p.iter().map(|ln| -ln).collect()
+        } else {
+            q_weights.iter().map(|q| -q.ln()).collect()
+        };
+        if equal && tail {
+            nats_q[listed] = -q_weights[listed].ln();
+        }
+        let mut entropy = 0.0;
+        let mut equal_entropy = 0.0;
+        let mut cross = 0.0;
+        for slot in 0..count {
+            let p = p_weights[slot];
+            if p == 0.0 {
+                continue;
+            }
+            entropy -= p * ln_p[slot];
+            equal_entropy -= p * if slot == listed {
+                -nats_q[slot]
+            } else {
+                ln_p[slot]
+            };
+            cross += p * nats_q[slot];
+        }
+        let bounded = tail || q_bound.iter().any(|&bound| bound);
+
         Ok(Self {
             labels,
             p: p_weights,
             q: q_weights,
+            ln_p,
+            nats_q,
             q_bound,
             index,
             prefixes,
             suffixes,
+            entropy,
+            equal_entropy,
+            cross,
+            bounded,
         })
     }
 
@@ -144,12 +237,35 @@ impl Slots {
         self.q[slot]
     }
 
+    pub fn ln_p(&self, slot: usize) -> f64 {
+        self.ln_p[slot]
+    }
+    pub fn nats_q(&self, slot: usize) -> f64 {
+        self.nats_q[slot]
+    }
+
     pub fn label(&self, slot: usize) -> Option<Label> {
         (slot < self.listed()).then(|| self.labels[slot])
     }
 
     pub fn slot_of(&self, label: Label) -> Option<usize> {
-        self.index.get(&label).copied()
+        self.index.get(label)
+    }
+
+    pub fn statistics(&self, equal: bool) -> SlotStatistics {
+        SlotStatistics {
+            entropy: if equal {
+                self.equal_entropy
+            } else {
+                self.entropy
+            },
+            cross: self.cross,
+            bounded: self.bounded,
+        }
+    }
+
+    pub fn q_bound(&self, slot: usize) -> bool {
+        self.q_bound.get(slot).copied().unwrap_or(false)
     }
 
     /// Σ p over slots [0, slot): accumulated forward, so free of cancellation.
@@ -172,6 +288,13 @@ impl Slots {
             count: self.count(),
         }
     }
+}
+
+#[derive(Serialize)]
+pub struct SlotStatistics {
+    pub entropy: f64,
+    pub cross: f64,
+    pub bounded: bool,
 }
 
 #[derive(Serialize)]
@@ -251,6 +374,20 @@ impl Tree {
 
     pub(crate) fn child_id(&self, parent: NodeId, label: Label) -> Result<Option<NodeId>> {
         Ok(self.node(parent)?.children.get(&label).copied())
+    }
+
+    /// A frame only needs the expanded exceptions, not a kind record for each
+    /// of the hundred thousand unexpanded vocabulary entries.
+    pub(crate) fn expanded_labels(&self, id: NodeId, measure: usize) -> Result<HashSet<Label>> {
+        self.node(id)?
+            .children
+            .iter()
+            .filter_map(|(&label, &child)| match self.expanded(child, measure) {
+                Ok(true) => Some(Ok(label)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
     }
 
     pub fn parent(&self, id: NodeId) -> Result<Option<NodeId>> {
@@ -396,6 +533,21 @@ mod tests {
         };
         let deep = Slots::new(Some(&deep_p), Some(&deep_p)).unwrap();
         assert_eq!(deep.q(2), 2f64.powi(-4));
+    }
+
+    #[test]
+    fn compact_and_sparse_labels_keep_last_duplicate_lookup() {
+        for labels in [[0, 2, 0], [0, u32::MAX, 0]] {
+            let p = listing(&[0.5, 0.3, 0.2], &labels, 40.0);
+            let slots = Slots::new(Some(&p), Some(&p)).unwrap();
+            assert_eq!(slots.slot_of(0), Some(2));
+            assert_eq!(slots.slot_of(labels[1]), Some(1));
+            assert_eq!(slots.slot_of(1), None);
+            assert_eq!(slots.q(0), 0.0);
+            assert_eq!(slots.q(1), slots.p(1));
+            assert_eq!(slots.q(2), slots.p(2));
+            assert_eq!(slots.q_bound, [true, false, false]);
+        }
     }
 
     #[test]

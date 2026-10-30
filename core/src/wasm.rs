@@ -1,5 +1,7 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::cell::RefCell;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 use crate::codec;
@@ -23,6 +25,7 @@ fn to_js<T: Serialize + ?Sized>(value: &T) -> std::result::Result<JsValue, JsErr
 #[wasm_bindgen]
 pub struct Tree {
     pub(crate) inner: NativeTree,
+    frames: Rc<RefCell<Vec<Frame>>>,
 }
 
 #[wasm_bindgen]
@@ -31,6 +34,7 @@ impl Tree {
     pub fn new(measures: usize) -> Self {
         Self {
             inner: NativeTree::new(measures),
+            frames: Rc::default(),
         }
     }
 
@@ -89,6 +93,69 @@ impl Tree {
         self.inner.expanded(id, measure).map_err(js_error)
     }
 
+    #[wasm_bindgen(js_name = hasListing)]
+    pub fn has_listing(&self, id: u32, measure: usize) -> std::result::Result<bool, JsError> {
+        Ok(self.inner.listing(id, measure).map_err(js_error)?.is_some())
+    }
+
+    /// Scalar queries never copy a model's vocabulary into JavaScript.
+    pub fn horizon(&self, id: u32, measure: usize) -> std::result::Result<f64, JsError> {
+        Ok(self
+            .inner
+            .listing(id, measure)
+            .map_err(js_error)?
+            .map_or(-1.0, |v| v.horizon))
+    }
+
+    pub fn complete(&self, id: u32, measure: usize) -> std::result::Result<f64, JsError> {
+        Ok(self
+            .inner
+            .listing(id, measure)
+            .map_err(js_error)?
+            .map_or(f64::INFINITY, |v| v.complete))
+    }
+
+    #[wasm_bindgen(js_name = slotOf)]
+    pub fn slot_of(
+        &self,
+        id: u32,
+        p: usize,
+        q: usize,
+        label: u32,
+    ) -> std::result::Result<f64, JsError> {
+        Ok(self
+            .inner
+            .slots(id, Lens { p, q })
+            .map_err(js_error)?
+            .slot_of(label)
+            .map_or(-1.0, |v| v as f64))
+    }
+
+    pub fn statistics(&self, id: u32, p: usize, q: usize) -> std::result::Result<JsValue, JsError> {
+        to_js(
+            &self
+                .inner
+                .slots(id, Lens { p, q })
+                .map_err(js_error)?
+                .statistics(p == q),
+        )
+    }
+
+    #[wasm_bindgen(js_name = qBound)]
+    pub fn q_bound(
+        &self,
+        id: u32,
+        p: usize,
+        q: usize,
+        slot: usize,
+    ) -> std::result::Result<bool, JsError> {
+        Ok(self
+            .inner
+            .slots(id, Lens { p, q })
+            .map_err(js_error)?
+            .q_bound(slot))
+    }
+
     pub fn slots(&self, id: u32, p: usize, q: usize) -> std::result::Result<JsValue, JsError> {
         let slots = self.inner.slots(id, Lens { p, q }).map_err(js_error)?;
         to_js(&slots.view())
@@ -128,10 +195,115 @@ pub fn layout_frame(
     camera: JsValue,
     view: JsValue,
     merge_px: f64,
-) -> std::result::Result<JsValue, JsError> {
+) -> std::result::Result<LayoutFrame, JsError> {
     let camera: Camera = from_js(camera)?;
     let view: Viewport = from_js(view)?;
-    to_js(&layout::layout(&tree.inner, Lens { p, q }, camera, view, merge_px).map_err(js_error)?)
+    let frame = tree.frames.borrow_mut().pop().unwrap_or_default();
+    Ok(LayoutFrame {
+        inner: layout::layout_into(&tree.inner, Lens { p, q }, camera, view, merge_px, frame)
+            .map_err(js_error)?,
+        pool: Rc::clone(&tree.frames),
+    })
+}
+
+/// A frame stays in Wasm. Picking and reanchoring borrow it instead of
+/// round-tripping every known (usually subpixel) branch through JS objects.
+#[wasm_bindgen]
+pub struct LayoutFrame {
+    inner: Frame,
+    pool: Rc<RefCell<Vec<Frame>>>,
+}
+
+impl Drop for LayoutFrame {
+    fn drop(&mut self) {
+        let mut frame = std::mem::take(&mut self.inner);
+        frame.clear();
+        let mut pool = self.pool.borrow_mut();
+        if pool.len() < 2 {
+            pool.push(frame);
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl LayoutFrame {
+    /// Twelve f64s per visible box; numeric ids and integer slots remain exact.
+    pub fn boxes(&self) -> Vec<f64> {
+        let mut packed = Vec::with_capacity(self.inner.boxes.len() * 12);
+        for b in &self.inner.boxes {
+            packed.extend_from_slice(&[
+                f64::from(b.node),
+                b.slot as f64,
+                b.count as f64,
+                match b.kind {
+                    layout::BoxKind::Node => 0.0,
+                    layout::BoxKind::Leaf => 1.0,
+                    layout::BoxKind::Tail => 2.0,
+                    layout::BoxKind::Merged => 3.0,
+                },
+                b.label.map_or(-1.0, f64::from),
+                b.p,
+                b.q,
+                b.ln_mass,
+                b.x0,
+                b.x1,
+                b.y0,
+                b.y1,
+            ]);
+        }
+        packed
+    }
+
+    pub fn known(&self) -> std::result::Result<JsValue, JsError> {
+        to_js(&self.inner.known.materialize())
+    }
+    pub fn walked(&self) -> std::result::Result<JsValue, JsError> {
+        to_js(&self.inner.walked)
+    }
+    pub fn unexpanded(&self) -> std::result::Result<JsValue, JsError> {
+        to_js(&self.inner.unexpanded)
+    }
+    pub fn boundaries(&self) -> std::result::Result<JsValue, JsError> {
+        to_js(&self.inner.boundaries)
+    }
+    #[wasm_bindgen(js_name = rootTop)]
+    pub fn root_top(&self) -> f64 {
+        self.inner.root_top
+    }
+    #[wasm_bindgen(js_name = rootBottom)]
+    pub fn root_bottom(&self) -> f64 {
+        self.inner.root_bottom
+    }
+    pub fn cover(&self) -> std::result::Result<JsValue, JsError> {
+        to_js(&self.inner.cover)
+    }
+    pub fn reanchor(&self) -> std::result::Result<JsValue, JsError> {
+        to_js(&layout::reanchor(&self.inner))
+    }
+
+    pub fn pick(
+        &self,
+        x: f64,
+        k: f64,
+        width: f64,
+        height: f64,
+        x_px: f64,
+        y_px: f64,
+    ) -> std::result::Result<JsValue, JsError> {
+        let cam = Camera {
+            x,
+            k,
+            anchor: Boundary { node: 0, slot: 0 },
+            a: 0.0,
+        };
+        to_js(&layout::pick(
+            &self.inner,
+            cam,
+            Viewport { width, height },
+            x_px,
+            y_px,
+        ))
+    }
 }
 
 #[wasm_bindgen(js_name = normalizeBoundary)]
@@ -178,16 +350,6 @@ pub fn root_extent(
     to_js(&layout::root_extent(&tree.inner, Lens { p, q }, camera).map_err(js_error)?)
 }
 
-/// Return the new anchor and offset, or null when the frame has no candidate.
-#[wasm_bindgen(js_name = reanchor)]
-pub fn reanchor_camera(_camera: JsValue, frame: JsValue) -> std::result::Result<JsValue, JsError> {
-    let frame: Frame = from_js(frame)?;
-    match layout::reanchor(&frame) {
-        Some(position) => to_js(&position),
-        None => Ok(JsValue::NULL),
-    }
-}
-
 /// Return the clamped camera `a`; the input camera is not mutated.
 #[wasm_bindgen(js_name = clampPosition)]
 pub fn clamp_position(
@@ -198,21 +360,4 @@ pub fn clamp_position(
 ) -> std::result::Result<f64, JsError> {
     let camera: Camera = from_js(camera)?;
     layout::clamp_position(&tree.inner, Lens { p, q }, camera).map_err(js_error)
-}
-
-#[wasm_bindgen(js_name = pick)]
-pub fn pick_box(
-    frame: JsValue,
-    camera: JsValue,
-    view: JsValue,
-    x_px: f64,
-    y_px: f64,
-) -> std::result::Result<JsValue, JsError> {
-    let frame: Frame = from_js(frame)?;
-    let camera: Camera = from_js(camera)?;
-    let view: Viewport = from_js(view)?;
-    match layout::pick(&frame, camera, view, x_px, y_px) {
-        Some(hit) => to_js(&hit),
-        None => Ok(JsValue::NULL),
-    }
 }

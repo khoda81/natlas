@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::tree::{Label, Lens, NodeId, Slots, Tree};
 use crate::Result;
@@ -84,12 +86,11 @@ pub struct Cover {
     pub y: f64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Default)]
 pub struct Frame {
     pub boxes: Vec<LayoutBox>,
     /// Known individual branches, including offscreen boxes and merged slots.
-    pub known: Vec<LayoutBox>,
+    pub known: KnownBranches,
     pub walked: Vec<Walked>,
     pub unexpanded: Vec<Unexpanded>,
     pub boundaries: Vec<BoundaryPosition>,
@@ -97,6 +98,148 @@ pub struct Frame {
     pub root_bottom: f64,
     /// Deepest anchor-chain node covering the view and starting at or left of it.
     pub cover: Option<Cover>,
+}
+
+/// Subpixel branches share their immutable slot view and node metadata. Keep
+/// the successive accumulated edges: recomputing these from prefix
+/// sums would change rounding, grouping boundaries, and precision at depth.
+#[derive(Debug)]
+struct ThinBranches {
+    node: NodeId,
+    slots: Arc<Slots>,
+    expanded: Arc<HashSet<Label>>,
+    first: usize,
+    downward: bool,
+    ys: Vec<f64>,
+    x: f64,
+    ln_mass: f64,
+}
+
+impl ThinBranches {
+    fn slot(&self, index: usize) -> usize {
+        if self.downward {
+            self.first + index
+        } else {
+            self.first - index
+        }
+    }
+
+    fn get(&self, index: usize) -> LayoutBox {
+        let slot = self.slot(index);
+        let label = self.slots.label(slot);
+        LayoutBox {
+            node: self.node,
+            slot: slot as u64,
+            count: 1,
+            kind: match label {
+                None => BoxKind::Tail,
+                Some(label) if self.expanded.contains(&label) => BoxKind::Node,
+                _ => BoxKind::Leaf,
+            },
+            label,
+            p: self.slots.p(slot),
+            q: self.slots.q(slot),
+            ln_mass: self.ln_mass + self.slots.ln_p(slot),
+            x0: self.x,
+            x1: self.x + self.slots.nats_q(slot),
+            y0: self.ys[index + usize::from(!self.downward)],
+            y1: self.ys[index + usize::from(self.downward)],
+        }
+    }
+
+    fn at_y(&self, y: f64, height: f64) -> Option<LayoutBox> {
+        // Match the original multiply-then-compare pixel test exactly. The
+        // world-coordinate fallback calls this with height=1 instead.
+        let starts = if self.downward {
+            &self.ys[..self.ys.len() - 1]
+        } else {
+            &self.ys[1..]
+        };
+        let index = if self.downward {
+            starts
+                .partition_point(|&y0| y0 * height <= y)
+                .checked_sub(1)?
+        } else {
+            starts.partition_point(|&y0| y0 * height > y)
+        };
+        let &y0 = starts.get(index)?;
+        let y1 = self.ys[index + usize::from(self.downward)];
+        (y0 * height <= y && y < y1 * height).then(|| self.get(index))
+    }
+}
+
+#[derive(Debug)]
+enum KnownEntry {
+    Box(LayoutBox),
+    Thin(ThinBranches),
+}
+
+#[derive(Debug, Default)]
+pub struct KnownBranches {
+    entries: Vec<KnownEntry>,
+    spare_ys: Vec<Vec<f64>>,
+}
+
+impl KnownBranches {
+    fn clear(&mut self) {
+        self.spare_ys.clear();
+        for entry in self.entries.drain(..) {
+            if let KnownEntry::Thin(mut run) = entry {
+                run.ys.clear();
+                self.spare_ys.push(run.ys);
+            }
+        }
+    }
+
+    fn positions(&mut self, remaining: usize) -> Vec<f64> {
+        self.spare_ys
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(remaining.min(4096) + 1))
+    }
+    fn push(&mut self, b: LayoutBox) {
+        self.entries.push(KnownEntry::Box(b));
+    }
+    fn insert(&mut self, index: usize, b: LayoutBox) {
+        self.entries.insert(index, KnownEntry::Box(b));
+    }
+
+    fn flush(&mut self, run: Option<ThinBranches>) {
+        if let Some(run) = run {
+            self.entries.push(KnownEntry::Thin(run));
+        }
+    }
+
+    /// Materialization is a diagnostic operation, never part of a frame.
+    pub fn materialize(&self) -> Vec<LayoutBox> {
+        self.entries
+            .iter()
+            .flat_map(|entry| match entry {
+                KnownEntry::Box(b) => vec![b.clone()],
+                KnownEntry::Thin(run) => (0..run.ys.len() - 1).map(|i| run.get(i)).collect(),
+            })
+            .collect()
+    }
+
+    fn at_y(&self, y: f64, height: f64) -> impl Iterator<Item = LayoutBox> + '_ {
+        self.entries.iter().filter_map(move |entry| match entry {
+            KnownEntry::Box(b) => Some(b.clone()),
+            KnownEntry::Thin(run) => run.at_y(y, height),
+        })
+    }
+}
+
+impl Frame {
+    /// Release listing snapshots but keep the allocation for the next view.
+    pub(crate) fn clear(&mut self) {
+        self.boxes.clear();
+        self.known.clear();
+        self.walked.clear();
+        self.unexpanded.clear();
+        self.boundaries.clear();
+        self.cover = None;
+        self.root_top = 0.0;
+        self.root_bottom = 0.0;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -135,10 +278,6 @@ fn scaled(weight: f64, scale: f64) -> f64 {
     } else {
         weight * scale
     }
-}
-
-fn nats(weight: f64) -> f64 {
-    -weight.ln()
 }
 
 /// The slot of `node` among its parent's slots under `lens`.
@@ -207,8 +346,8 @@ fn walk(tree: &Tree, lens: Lens, cam: Camera) -> Result<Walk> {
     let mut ln_masses = vec![0.0; chain.len()];
     for i in 1..chain.len() {
         slots[i] = slot_in(tree, lens, chain[i])?;
-        let weight = tree.slots(chain[i - 1], lens)?.p(slots[i]);
-        ln_masses[i] = ln_masses[i - 1] + weight.ln();
+        let weights = tree.slots(chain[i - 1], lens)?;
+        ln_masses[i] = ln_masses[i - 1] + weights.ln_p(slots[i]);
     }
     Ok(Walk {
         chain,
@@ -223,7 +362,6 @@ struct Run {
     first: usize,
     count: u64,
     p: f64,
-    q: f64,
     cross: f64,
     y0: f64,
     y1: f64,
@@ -293,41 +431,6 @@ impl Layout<'_> {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn known_box(
-        &mut self,
-        node: NodeId,
-        slots: &Slots,
-        slot: usize,
-        y0: f64,
-        y1: f64,
-        x: f64,
-        ln_mass: f64,
-    ) -> Result<()> {
-        let kind = match slots.label(slot) {
-            None => BoxKind::Tail,
-            Some(label) => match self.tree.child_id(node, label)? {
-                Some(child) if self.tree.expanded(child, self.lens.p)? => BoxKind::Node,
-                _ => BoxKind::Leaf,
-            },
-        };
-        self.frame.known.push(LayoutBox {
-            node,
-            slot: slot as u64,
-            count: 1,
-            kind,
-            label: slots.label(slot),
-            p: slots.p(slot),
-            q: slots.q(slot),
-            ln_mass: ln_mass + slots.p(slot).ln(),
-            x0: x,
-            x1: x + nats(slots.q(slot)),
-            y0,
-            y1,
-        });
-        Ok(())
-    }
-
     /// Lay out one visible slot and recurse from its edge nearest the origin.
     #[allow(clippy::too_many_arguments)]
     fn slot_box(
@@ -344,7 +447,7 @@ impl Layout<'_> {
     ) -> Result<()> {
         let pw = slots.p(slot);
         let qw = slots.q(slot);
-        let x1 = x + nats(qw);
+        let x1 = x + slots.nats_q(slot);
         let label = slots.label(slot);
         let child = match label {
             Some(label) => self.tree.child_id(node, label)?,
@@ -355,12 +458,11 @@ impl Layout<'_> {
             (Some(_), Some(id)) if self.tree.expanded(id, self.lens.p)? => BoxKind::Node,
             _ => BoxKind::Leaf,
         };
-        let child_mass = ln_mass + pw.ln();
-        self.known_box(node, slots, slot, y0, y1, x, ln_mass)?;
+        let child_mass = ln_mass + slots.ln_p(slot);
         if let Some(child) = child {
             self.consider_cover(child, y0, y1, x1)?;
         }
-        self.push(LayoutBox {
+        let b = LayoutBox {
             node,
             slot: slot as u64,
             count: 1,
@@ -373,7 +475,9 @@ impl Layout<'_> {
             x1,
             y0,
             y1,
-        });
+        };
+        self.frame.known.push(b.clone());
+        self.push(b);
         self.boundary(node, slot as u64, y0)?;
         self.boundary(node, slot as u64 + 1, y1)?;
         if x1 >= self.right {
@@ -422,6 +526,8 @@ impl Layout<'_> {
         }
         self.frame.walked.push(Walked { node, ln_mass, x });
         let slots = self.tree.slots(node, self.lens)?;
+        let mut thin: Option<ThinBranches> = None;
+        let expanded = Arc::new(self.tree.expanded_labels(node, self.lens.p)?);
         let mut run: Option<Run> = None;
         let mut slot = start;
         while slot < slots.count() && y < 1.0 {
@@ -429,13 +535,28 @@ impl Layout<'_> {
             let y1 = y + scaled(pw, scale);
             if y1 > 0.0 {
                 if y1 - y < self.merge_units {
-                    self.known_box(node, &slots, slot, y, y1, x, ln_mass)?;
+                    if thin.is_none() {
+                        thin = Some(ThinBranches {
+                            node,
+                            slots: Arc::clone(&slots),
+                            expanded: Arc::clone(&expanded),
+                            first: slot,
+                            downward: true,
+                            ys: {
+                                let mut ys = self.frame.known.positions(slots.count() - slot);
+                                ys.push(y);
+                                ys
+                            },
+                            x,
+                            ln_mass,
+                        });
+                    }
+                    thin.as_mut().expect("thin run initialized").ys.push(y1);
                     let current = run.get_or_insert(Run {
                         node,
                         first: slot,
                         count: 0,
                         p: 0.0,
-                        q: 0.0,
                         cross: 0.0,
                         y0: y,
                         y1: y,
@@ -444,9 +565,8 @@ impl Layout<'_> {
                     });
                     current.count += 1;
                     current.p += pw;
-                    current.q += slots.q(slot);
                     if pw > 0.0 {
-                        current.cross += pw * nats(slots.q(slot));
+                        current.cross += pw * slots.nats_q(slot);
                     }
                     current.y1 = y1;
                     if current.y1 - current.y0 >= self.merge_units {
@@ -454,6 +574,7 @@ impl Layout<'_> {
                     }
                 } else {
                     self.flush(run.take());
+                    self.frame.known.flush(thin.take());
                     self.slot_box(node, &slots, slot, y, y1, scale, x, ln_mass, true)?;
                 }
             }
@@ -461,6 +582,7 @@ impl Layout<'_> {
             slot += 1;
         }
         self.flush(run.take());
+        self.frame.known.flush(thin.take());
         Ok(())
     }
 
@@ -479,6 +601,8 @@ impl Layout<'_> {
         }
         self.frame.walked.push(Walked { node, ln_mass, x });
         let slots = self.tree.slots(node, self.lens)?;
+        let mut thin: Option<ThinBranches> = None;
+        let expanded = Arc::new(self.tree.expanded_labels(node, self.lens.p)?);
         let mut run: Option<Run> = None;
         let mut slot = start;
         while slot >= 0 && y > 0.0 {
@@ -487,13 +611,28 @@ impl Layout<'_> {
             let y0 = y - scaled(pw, scale);
             if y0 < 1.0 {
                 if y - y0 < self.merge_units {
-                    self.known_box(node, &slots, index, y0, y, x, ln_mass)?;
+                    if thin.is_none() {
+                        thin = Some(ThinBranches {
+                            node,
+                            slots: Arc::clone(&slots),
+                            expanded: Arc::clone(&expanded),
+                            first: index,
+                            downward: false,
+                            ys: {
+                                let mut ys = self.frame.known.positions(index + 1);
+                                ys.push(y);
+                                ys
+                            },
+                            x,
+                            ln_mass,
+                        });
+                    }
+                    thin.as_mut().expect("thin run initialized").ys.push(y0);
                     let current = run.get_or_insert(Run {
                         node,
                         first: index,
                         count: 0,
                         p: 0.0,
-                        q: 0.0,
                         cross: 0.0,
                         y0: y,
                         y1: y,
@@ -503,9 +642,8 @@ impl Layout<'_> {
                     current.first = index;
                     current.count += 1;
                     current.p += pw;
-                    current.q += slots.q(index);
                     if pw > 0.0 {
-                        current.cross += pw * nats(slots.q(index));
+                        current.cross += pw * slots.nats_q(index);
                     }
                     current.y0 = y0;
                     if current.y1 - current.y0 >= self.merge_units {
@@ -513,6 +651,7 @@ impl Layout<'_> {
                     }
                 } else {
                     self.flush(run.take());
+                    self.frame.known.flush(thin.take());
                     self.slot_box(node, &slots, index, y0, y, scale, x, ln_mass, false)?;
                 }
             }
@@ -520,6 +659,7 @@ impl Layout<'_> {
             slot -= 1;
         }
         self.flush(run.take());
+        self.frame.known.flush(thin.take());
         Ok(())
     }
 }
@@ -531,6 +671,17 @@ pub fn layout(
     view: Viewport,
     merge_px: f64,
 ) -> Result<Frame> {
+    layout_into(tree, lens, cam, view, merge_px, Frame::default())
+}
+
+pub(crate) fn layout_into(
+    tree: &Tree,
+    lens: Lens,
+    cam: Camera,
+    view: Viewport,
+    merge_px: f64,
+    frame: Frame,
+) -> Result<Frame> {
     let lambda = log_view(cam);
     let mut context = Layout {
         tree,
@@ -538,7 +689,7 @@ pub fn layout(
         cam,
         right: cam.x + view.width / cam.k,
         merge_units: merge_px / view.height,
-        frame: Frame::default(),
+        frame,
         cover_depth: 0,
     };
 
@@ -551,7 +702,7 @@ pub fn layout(
     let mut xs = vec![0.0; chain.len()];
     for i in 1..=depth {
         let slots = tree.slots(chain[i - 1], lens)?;
-        xs[i] = xs[i - 1] + nats(slots.q(chain_slots[i]));
+        xs[i] = xs[i - 1] + slots.nats_q(chain_slots[i]);
     }
 
     let anchor = chain[depth];
@@ -654,8 +805,8 @@ pub fn place(tree: &Tree, lens: Lens, id: NodeId) -> Result<Placement> {
         let parent = tree.parent(node)?.expect("a non-root node has a parent");
         let slots = tree.slots(parent, lens)?;
         let slot = slot_in(tree, lens, node)?;
-        placement.ln_mass += slots.p(slot).ln();
-        placement.x1 += nats(slots.q(slot));
+        placement.ln_mass += slots.ln_p(slot);
+        placement.x1 += slots.nats_q(slot);
     }
     Ok(placement)
 }
@@ -782,8 +933,8 @@ pub fn pick(
         }
     }
 
-    for layout_box in &frame.known {
-        let rect = screen_rect(layout_box, cam, view);
+    for layout_box in frame.known.at_y(y_px, view.height) {
+        let rect = screen_rect(&layout_box, cam, view);
         if x_px >= rect.x0 && x_px < rect.x1 && y_px >= rect.y0 && y_px < rect.y1 {
             return Some(PickResult {
                 r#box: layout_box.clone(),
@@ -794,46 +945,49 @@ pub fn pick(
 
     let x = cam.x + x_px / cam.k;
     let y = y_px / view.height;
-    let candidates = frame
-        .boxes
-        .iter()
-        .filter(|b| b.kind != BoxKind::Merged)
-        .chain(frame.known.iter())
-        .collect::<Vec<_>>();
-    let mut left: Option<(usize, f64)> = None;
-    let mut right: Option<(usize, f64)> = None;
-    for (index, layout_box) in candidates.iter().enumerate() {
-        if !(layout_box.y0 <= y && y < layout_box.y1) {
+    let candidates = || {
+        frame
+            .boxes
+            .iter()
+            .filter(|b| b.kind != BoxKind::Merged)
+            .cloned()
+            .chain(frame.known.at_y(y, 1.0))
+    };
+    let mut left: Option<LayoutBox> = None;
+    let mut right: Option<LayoutBox> = None;
+    for b in candidates() {
+        if !(b.y0 <= y && y < b.y1) {
             continue;
         }
-        if layout_box.x0 <= x {
-            if left.is_none_or(|(_, best_x)| layout_box.x0 >= best_x) {
-                left = Some((index, layout_box.x0));
+        if b.x0 <= x {
+            if left.as_ref().is_none_or(|best| b.x0 >= best.x0) {
+                left = Some(b);
             }
-        } else if right.is_none_or(|(_, best_x)| layout_box.x0 < best_x) {
-            right = Some((index, layout_box.x0));
+        } else if right.as_ref().is_none_or(|best| b.x0 < best.x0) {
+            right = Some(b);
         }
     }
-    if let Some((index, _)) = left.or(right) {
+    if let Some(b) = left.or(right) {
         return Some(PickResult {
-            r#box: candidates[index].clone(),
+            r#box: b,
             exact: false,
         });
     }
 
     // Best effort: vertical distance first, horizontal distance only breaks ties.
-    let mut best: Option<(usize, f64, f64)> = None;
-    for (index, layout_box) in candidates.iter().enumerate() {
-        let vertical = vertical_distance(layout_box, y);
-        let horizontal = horizontal_distance(layout_box, x);
-        if best.is_none_or(|(_, best_vertical, best_horizontal)| {
-            vertical < best_vertical || (vertical == best_vertical && horizontal < best_horizontal)
-        }) {
-            best = Some((index, vertical, horizontal));
+    let mut best: Option<(LayoutBox, f64, f64)> = None;
+    for b in candidates() {
+        let vertical = vertical_distance(&b, y);
+        let horizontal = horizontal_distance(&b, x);
+        if best
+            .as_ref()
+            .is_none_or(|(_, bv, bh)| vertical < *bv || (vertical == *bv && horizontal < *bh))
+        {
+            best = Some((b, vertical, horizontal));
         }
     }
-    best.map(|(index, _, _)| PickResult {
-        r#box: candidates[index].clone(),
+    best.map(|(b, _, _)| PickResult {
+        r#box: b,
         exact: false,
     })
 }

@@ -236,6 +236,7 @@ bun run dev       # builds the core, then serves http://localhost:5173
 bun run test      # browser adapters + native Rust + Python/Connect tests
 bun run typecheck
 bun run build     # static site in dist/, including the .wasm and datasets
+bun run bench     # browser frame timings and canvas/inspector parity snapshots
 bun run proto     # regenerate TypeScript/Python bindings; needs protoc
 ```
 
@@ -250,6 +251,9 @@ uv run tests/server_test.py   # native cache, codec, transport and migration
 The Python tests use deterministic distributions and load no model. For manual
 browser checks, `PORT=8427 uv run tests/server_test.py --serve` starts the same
 fixture, usable through `?server=http://127.0.0.1:8427/`.
+
+See [Rendering performance](docs/performance.md) for the frame ownership model,
+benchmark procedure, behavior checks, and the remaining 2 ms budget gap.
 
 The exporters (`export/hf.py`, `export/synthetic.py`) use a
 [natwalk](https://github.com/khoda81/natwalk) checkout beside this one;

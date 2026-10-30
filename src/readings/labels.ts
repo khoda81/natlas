@@ -55,19 +55,39 @@ export class TextLabels implements Labels {
   read(tree: IntervalTree): Reading {
     // Per node, the unfinished character its path's bytes end in.
     const unfinished = new States<Uint8Array>(tree, new Uint8Array(), (before, label) => this.after(before, label).unfinished);
+    const paths = new Map<NodeId, { tokens: string[]; text: string }>();
+    const along = (node: NodeId) => {
+      let texts = paths.get(node);
+      if (texts === undefined) {
+        const tokens = this.along(tree.path(node));
+        paths.set(node, texts = { tokens, text: tokens.join("") });
+      }
+      return texts;
+    };
     return {
       glyph: (node: NodeId, label: Label): Glyph => ({ text: visible(this.shown(unfinished.at(node), label)) }),
       show: (panel: HTMLElement, node: NodeId, label: Label | null, more?: string) => {
-        const tokens = this.along(tree.path(node)).map((text) => token(text));
-        if (label !== null) tokens.push(token(this.shown(unfinished.at(node), label), "current"));
-        if (more !== undefined) tokens.push(token(more, "more"));
+        const tokens = along(node).tokens;
+        const current = label === null ? null : this.shown(unfinished.at(node), label);
+        const count = tokens.length + Number(current !== null) + Number(more !== undefined);
         panel.dataset.kind = "text";
-        panel.replaceChildren(...tokens);
+        // Most pointer moves change only the final token. Preserve the exact
+        // span markup while avoiding reconstruction/layout of the whole path.
+        for (let i = 0; i < count; i++) {
+          const kind = i < tokens.length ? "" : i === tokens.length && current !== null ? "current" : "more";
+          const text = kind === "" ? tokens[i]! : kind === "current" ? current! : more!;
+          const className = kind === "" ? "token" : `token ${kind}`;
+          const child = panel.childNodes[i];
+          if (!(child instanceof HTMLElement) || child.tagName !== "SPAN" || child.className !== className) {
+            const span = token(text, kind || undefined);
+            if (child === undefined) panel.append(span);
+            else panel.replaceChild(span, child);
+          } else if (child.textContent !== text) child.textContent = text;
+        }
+        while (panel.childNodes.length > count) panel.lastChild!.remove();
       },
       text: (node: NodeId, label: Label | null): string => {
-        const path = tree.path(node);
-        if (label !== null) path.push(label);
-        return this.along(path).join("");
+        return along(node).text + (label === null ? "" : this.after(unfinished.at(node), label).text);
       },
     };
   }

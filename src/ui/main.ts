@@ -16,7 +16,7 @@ import {
   type Viewport,
 } from "../core/layout";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "../data/source";
-import { IntervalTree, isTail, type NodeId, type Slots, slotOf } from "../core/tree";
+import { IntervalTree, type NodeId } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
 import { drag, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, viewKey } from "./view-state";
@@ -51,7 +51,7 @@ interface Focus {
 }
 
 
-class App {
+export class App {
   private readonly canvas = element<HTMLCanvasElement>("canvas");
   private readonly ctx = this.canvas.getContext("2d")!;
   private readonly inspect = element<HTMLElement>("inspect");
@@ -63,6 +63,12 @@ class App {
   private shownPath: { node: NodeId; label: number | null; more?: string } | null = null;
   /** The box the path panel shows, as node:slot:kind. */
   private shown = "";
+  private whereHeight: number | null = null;
+  private windowHeight = window.innerHeight;
+  private inspected = "";
+  private readoutText = "";
+  private inspector: { chip: HTMLElement; kind: HTMLElement; rows: [HTMLElement, HTMLElement][] } | null = null;
+  private readonly glyphs = new Map<string, Glyph>();
   private loading = 0;
   private navigation = 0;
   private restoring = false;
@@ -83,9 +89,11 @@ class App {
   private cam: Camera = { x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
   private view: Viewport = { width: 1, height: 1 };
   private frame: Frame | null = null;
+  private geometry: { frame: Frame; key: string } | null = null;
   private units: Units = NATS;
   private palette = Palette.current();
   private hover: Selection | null = null;
+  private lastPick: { frame: Frame; x: number; y: number; selection: Selection | null } | null = null;
   /** Screen coordinates, converted against the current canvas rect every frame. */
   private pointer: { x: number; y: number } | null = null;
   private dragging: { id: number; x: number; y: number } | null = null;
@@ -159,6 +167,14 @@ class App {
     this.flushView();
     this.loading++;
     this.expander?.dispose();
+    if (this.geometry?.frame !== this.frame) this.geometry?.frame.dispose();
+    this.frame?.dispose();
+    this.frame = null;
+    this.lastPick = null;
+    this.geometry = null;
+    this.inspected = "";
+    this.inspector = null;
+    this.glyphs.clear();
     this.cancelNavigation();
     const tree = new IntervalTree(dataset.measures.length);
     this.dataset = dataset;
@@ -186,6 +202,7 @@ class App {
     this.shownText = "";
     this.shownPath = null;
     this.where.replaceChildren();
+    this.whereHeight = null;
     this.where.style.minHeight = "";
     this.where.contentEditable = dataset.searchable ? "plaintext-only" : "false";
     this.where.tabIndex = dataset.searchable ? 0 : -1;
@@ -277,7 +294,7 @@ class App {
     const parent = tree.parent(node)!;
     const label = tree.label(node);
     const { lnMass, x1 } = place(tree, this.lens, node);
-    const slot = slotOf(tree.slots(parent, this.lens), label)!;
+    const slot = tree.slotOf(parent, this.lens, label)!;
     this.focus = null;
     this.cam.anchor = normalize(tree, this.lens, { node: parent, slot });
     this.cam.x = rootLike(lnMass, x1);
@@ -312,6 +329,8 @@ class App {
   private resize(): void {
     const ratio = devicePixelRatio || 1;
     const { clientWidth: width, clientHeight: height } = this.canvas;
+    if (width !== this.view.width || Math.max(1, height - RULER_HEIGHT) !== this.view.height || this.windowHeight !== window.innerHeight) this.whereHeight = null;
+    this.windowHeight = window.innerHeight;
     this.view = { width, height: Math.max(1, height - RULER_HEIGHT) };
     const pixelWidth = Math.round(width * ratio);
     const pixelHeight = Math.round(height * ratio);
@@ -335,19 +354,18 @@ class App {
     if (tree === null) return;
     if (this.focus) this.stepFocus(time);
     this.stepKeys(time);
-    repair(tree, this.lens, this.cam);
-    clamp(tree, this.lens, this.cam);
-    const frame = layout(tree, this.lens, this.cam, this.view);
+    const previous = this.frame;
+    const frame = this.currentFrame();
     this.frame = frame;
+    if (previous !== null && previous !== frame) previous.dispose();
     this.expander?.request(() => {
       if (tree !== this.tree) return [];
       const camera = { ...this.cam };
-      repair(tree, this.lens, camera);
-      clamp(tree, this.lens, camera);
-      const current = layout(tree, this.lens, camera, this.view);
-      return wants(tree, this.lens, camera, this.view, current);
+      return wants(tree, this.lens, camera, this.view, this.currentFrame(camera));
     });
     if (!this.focus) reanchor(this.cam, frame);
+    // Keep the input key after reanchoring. An equivalent anchor can still
+    // change floating-point rounding on the next layout and its edge pixels.
     this.updateHover();
     const ancestors = new Set<string>();
     if (this.hover) {
@@ -355,7 +373,7 @@ class App {
       ancestors.add(slotKey(selected.node, selected.slot));
       for (const node of tree.chain(selected.node).slice(1)) {
         const parent = tree.parent(node)!;
-        const slot = slotOf(tree.slots(parent, this.lens), tree.label(node));
+        const slot = tree.slotOf(parent, this.lens, tree.label(node));
         if (slot !== undefined) ancestors.add(slotKey(parent, slot));
       }
     }
@@ -368,6 +386,25 @@ class App {
     this.updateReadout();
     this.saveView(frame);
     if (this.focus || this.held.size > 0) this.invalidate();
+  }
+
+  private geometryKey(camera = this.cam): string {
+    const { x, k, a, anchor } = camera;
+    return `${this.tree!.revision}:${this.lens.p}:${this.lens.q}:${x}:${k}:${anchor.node}:${anchor.slot}:${a}:${this.view.width}:${this.view.height}`;
+  }
+
+  /** Also shared with the completion-driven fetch pump between paint frames. */
+  private currentFrame(camera = this.cam): Frame {
+    const key = this.geometryKey(camera);
+    if (this.geometry?.key === key) return this.geometry.frame;
+    repair(this.tree!, this.lens, camera);
+    clamp(this.tree!, this.lens, camera);
+    const repaired = this.geometryKey(camera);
+    if (this.geometry?.key === repaired) return this.geometry.frame;
+    const frame = layout(this.tree!, this.lens, camera, this.view);
+    if (this.geometry?.frame !== this.frame) this.geometry?.frame.dispose();
+    this.geometry = { frame, key: repaired };
+    return frame;
   }
 
   // Pointer and wheel.
@@ -405,6 +442,7 @@ class App {
     canvas.addEventListener("pointercancel", release);
     canvas.addEventListener("pointerleave", () => {
       this.where.style.minHeight = "";
+      this.whereHeight = null;
       if (this.dragging) return;
       this.pointer = null;
       this.invalidate();
@@ -535,10 +573,12 @@ class App {
       this.held.clear();
       this.editing = true;
       this.where.textContent = this.shownText;
+      this.whereHeight = null;
       this.invalidate();
     });
     this.where.addEventListener("input", () => {
       if (!this.dataset?.searchable) return;
+      this.whereHeight = null;
       this.result.hidden = true;
       this.found = null;
       this.where.classList.remove("found");
@@ -654,7 +694,12 @@ class App {
 
   private updateHover(): void {
     const pointer = this.pointerPosition();
-    this.hover = pointer && !this.dragging && this.frame ? pick(this.frame, this.cam, this.view, pointer.x, pointer.y) : null;
+    if (pointer && !this.dragging && this.frame) {
+      if (this.lastPick?.frame !== this.frame || this.lastPick.x !== pointer.x || this.lastPick.y !== pointer.y) {
+        this.lastPick = { frame: this.frame, x: pointer.x, y: pointer.y, selection: pick(this.frame, this.cam, this.view, pointer.x, pointer.y) };
+      }
+      this.hover = this.lastPick.selection;
+    } else this.hover = null;
     if (pointer !== null) {
       const covered = pointer.x < this.view.width * 0.45 && pointer.y > this.view.height * 0.55;
       this.inspect.classList.toggle("right", covered);
@@ -680,14 +725,24 @@ class App {
     this.result.hidden = true;
     this.where.classList.remove("found");
     const where = this.where;
-    where.style.minHeight = this.pointer === null ? "" : `${where.offsetHeight}px`;
+    const height = this.pathPanel.hidden || where.hidden ? 0 : this.whereHeight ?? where.offsetHeight;
+    where.style.minHeight = this.pointer === null ? "" : `${height}px`;
     this.pathPanel.hidden = where.hidden = false;
     this.reading.show(where, node, label, more);
-    where.scrollTop = where.scrollHeight;
+    where.scrollTop = Number.MAX_SAFE_INTEGER;
+    // The scroll setter has laid out the new path. Reuse this height on the
+    // next selection instead of forcing layout after inspector writes, too.
+    this.whereHeight = where.offsetHeight;
   }
 
   private glyph(node: NodeId, label: number): Glyph {
-    return this.reading?.glyph(node, label) ?? { text: `#${label}` };
+    const key = `${node}:${label}`;
+    let glyph = this.glyphs.get(key);
+    if (glyph === undefined) {
+      glyph = this.reading?.glyph(node, label) ?? { text: `#${label}` };
+      this.glyphs.set(key, glyph);
+    }
+    return glyph;
   }
 
   private fmt(nats: number): string {
@@ -699,27 +754,31 @@ class App {
   private updateReadout(): void {
     const unit = this.units.name;
     const view = -Math.min(0, -this.cam.x);
-    this.readout.textContent =
+    const text =
       `depth ${this.fmt(this.cam.x)} · view −log v ${this.fmt(view)} · ` +
       `${(this.cam.k * this.units.nats).toPrecision(3)} px/${unit.slice(0, -1)}`;
+    if (text !== this.readoutText) this.readout.textContent = this.readoutText = text;
   }
 
   private updateInspect(): void {
     const selection = this.hover;
     const tree = this.tree;
     if (selection === null || tree === null) {
+      this.inspected = "";
       this.details.hidden = true;
       this.inspect.hidden = true;
       return;
     }
     const { box, exact } = selection;
 
+    const key = `${box.node}:${box.slot}:${box.kind}:${box.label}:${box.p}:${box.q}:${box.lnMass}:${exact}:${this.lens.p}:${this.lens.q}:${this.units.name}:${tree.revisionOf(box.node)}`;
+    if (this.inspected === key) return;
+    this.inspected = key;
+
     const last = box.label === null ? "…" : this.glyph(box.node, box.label).text;
-    const chips = [chip(last)];
     const { p, q } = this.lens;
     const names = this.dataset?.measures ?? [];
-    const slots = tree.slots(box.node, this.lens);
-    const qBound = box.kind === "tail" || (box.kind !== "merged" && slots.qBound[box.slot] === true);
+    const qBound = box.kind === "tail" || (box.kind !== "merged" && tree.qBound(box.node, this.lens, box.slot));
     const [atMost, atLeast] = qBound ? ["≤ ", "≥ "] : ["", ""];
     const rows: [string, string][] = [
       [`p · ${names[p]}`, `${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
@@ -729,8 +788,8 @@ class App {
     }
     rows.push(["p · −log q", `${atLeast}${this.fmt(-box.p * Math.log(box.q))}`]);
     rows.push(["−log P (path)", this.fmt(-box.lnMass)]);
-    const stats = nodeStats(slots, this.lens);
-    const bound = slots.count > slots.listed || slots.qBound.some(Boolean) ? "≥ " : "";
+    const stats = tree.statistics(box.node, this.lens);
+    const bound = stats.bounded ? "≥ " : "";
     if (p === q) rows.push(["H at node", `${bound}${this.fmt(stats.entropy)}`]);
     else {
       rows.push(["H(p) at node", `${bound}${this.fmt(stats.entropy)}`]);
@@ -738,23 +797,27 @@ class App {
       rows.push(["KL(p ‖ q) at node", `${bound === "" ? "" : "≈ "}${this.fmt(stats.cross - stats.entropy)}`]);
     }
 
-    const list = document.createElement("dl");
-    for (const [term, value] of rows) {
-      const dt = document.createElement("dt");
-      dt.textContent = term;
-      const dd = document.createElement("dd");
-      dd.textContent = value;
-      list.append(dt, dd);
+    if (this.inspector === null || this.inspector.rows.length !== rows.length) {
+      const list = document.createElement("dl");
+      const cells = rows.map(() => [document.createElement("dt"), document.createElement("dd")] as [HTMLElement, HTMLElement]);
+      for (const pair of cells) list.append(...pair);
+      const path = document.createElement("div");
+      path.className = "path";
+      const token = chip(last);
+      path.append(token);
+      const kind = document.createElement("div");
+      kind.className = "kind";
+      this.details.replaceChildren(path, kind, list);
+      this.inspector = { chip: token, kind, rows: cells };
     }
-    const path = document.createElement("div");
-    path.className = "path";
-    path.append(...chips);
-    const kind = document.createElement("div");
-    kind.className = "kind";
-    kind.textContent = exact
+    setText(this.inspector.chip, last);
+    for (let i = 0; i < rows.length; i++) {
+      setText(this.inspector.rows[i]![0], rows[i]![0]);
+      setText(this.inspector.rows[i]![1], rows[i]![1]);
+    }
+    setText(this.inspector.kind, exact
       ? `${box.kind === "node" ? "expanded" : box.kind === "leaf" ? "unexpanded" : box.kind} · ${this.units.name}`
-      : `known subtree · continuation unknown · ${this.units.name}`;
-    this.details.replaceChildren(path, kind, list);
+      : `known subtree · continuation unknown · ${this.units.name}`);
     this.details.hidden = false;
     this.inspect.hidden = false;
   }
@@ -855,21 +918,6 @@ function chip(text: string): HTMLElement {
   return span;
 }
 
-/** Lower bounds on entropy and cross-entropy over a node's slots; the tail counts as one slot. */
-function nodeStats(slots: Slots, lens: Lens): { entropy: number; cross: number } {
-  let entropy = 0;
-  let cross = 0;
-  for (let slot = 0; slot < slots.count; slot++) {
-    const p = slots.p[slot]!;
-    if (p === 0) continue;
-    entropy -= p * Math.log(isTail(slots, slot) && lens.p === lens.q ? slots.q[slot]! : p);
-    cross -= p * Math.log(slots.q[slot]!);
-  }
-  return { entropy, cross };
+function setText(element: HTMLElement, text: string): void {
+  if (element.textContent !== text) element.textContent = text;
 }
-
-void new App().start().catch((error: unknown) => {
-  const status = element<HTMLElement>("status");
-  status.textContent = String(error);
-  status.hidden = false;
-});

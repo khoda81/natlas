@@ -33,7 +33,7 @@ export function wants(tree: IntervalTree, lens: Lens, cam: Camera, view: Viewpor
     }
   };
 
-  if (tree.listing(tree.root, lens.p) === undefined || tree.listing(tree.root, lens.q) === undefined) {
+  if (!tree.hasListing(tree.root, lens.p) || !tree.hasListing(tree.root, lens.q)) {
     want(() => tree.root, 0, 0);
   }
   for (const { node, label, lnMass, x1 } of frame.unexpanded) {
@@ -87,13 +87,13 @@ export class Expander {
   }
 
   private pump(): void {
-    if (this.disposed) return;
+    if (this.disposed || this.pending.size >= this.limit) return;
     let retry = Infinity;
     for (const { node, measure, horizon } of this.demand().sort((a, b) => b.priority - a.priority)) {
       if (this.pending.size >= this.limit) break;
       const key = `${node}:${measure}`;
       if (this.pending.has(key)) continue;
-      const covered = this.tree.listing(node, measure)?.horizon ?? -1;
+      const covered = this.tree.horizon(node, measure);
       const ask = Math.min(MAX_HORIZON, horizon + HEADROOM);
       if (horizon <= covered || ask <= covered) continue;
       const after = (this.failed.get(key) ?? -Infinity) + RETRY_MS - performance.now();
@@ -113,7 +113,7 @@ export class Expander {
 
   /** Expand until the label is listed, coalescing with visible discovery. */
   async reach(node: NodeId, measure: number, label: Label): Promise<boolean> {
-    const listed = () => this.tree.listing(node, measure)?.labels.includes(label) === true;
+    const listed = () => this.tree.slotOf(node, { p: measure, q: measure }, label) !== undefined;
     while (!listed()) {
       if (this.disposed) throw new Error("dataset changed while finding a path");
       const pending = this.pending.get(`${node}:${measure}`);
@@ -121,10 +121,10 @@ export class Expander {
         await pending;
         continue;
       }
-      const previous = this.tree.listing(node, measure);
-      if (previous !== undefined && previous.complete < previous.horizon) return false;
-      if ((previous?.horizon ?? 0) >= MAX_HORIZON) return false;
-      const horizon = Math.min(MAX_HORIZON, Math.max(16, 2 * (previous?.horizon ?? 0)));
+      const covered = this.tree.horizon(node, measure);
+      if (this.tree.complete(node, measure) < covered) return false;
+      if (covered >= MAX_HORIZON) return false;
+      const horizon = Math.min(MAX_HORIZON, Math.max(16, 2 * Math.max(0, covered)));
       await this.fetch(node, measure, horizon);
     }
     return true;
@@ -142,7 +142,7 @@ export class Expander {
         const reply = await this.sources[measure]!.expand(this.tree.path(node), horizon, this.abort.signal);
         const edges = [];
         for await (const edge of reply.edges) edges.push(edge);
-        if (this.disposed || horizon < (this.tree.listing(node, measure)?.horizon ?? -1)) return;
+        if (this.disposed || horizon < this.tree.horizon(node, measure)) return;
         this.tree.setListing(node, measure, { ...decode(edges, horizon, reply.complete), horizon });
         this.failed.delete(key);
       } finally {

@@ -40,6 +40,18 @@ const MORE: Glyph = { text: "…" };
 export const RULER_HEIGHT = 22;
 // Canvas coordinates far outside the view lose precision and can stall rasterizing.
 const OVERSCAN = 64;
+const textWidths = new WeakMap<CanvasRenderingContext2D, { scale: number; widths: Map<string, number> }>();
+
+function measure(ctx: CanvasRenderingContext2D, text: string): number {
+  const widths = textWidths.get(ctx)!.widths;
+  let width = widths.get(text);
+  if (width === undefined) {
+    // Ruler values keep changing during navigation; bound their memoization.
+    if (widths.size >= 8192) widths.clear();
+    widths.set(text, width = ctx.measureText(text).width);
+  }
+  return width;
+}
 
 export function slotKey(node: number, slot: number): string {
   return `${node}:${slot}`;
@@ -72,6 +84,8 @@ export function draw(
   palette: Palette,
   state: DrawState,
 ): void {
+  const scale = ctx.getTransform().a;
+  if (textWidths.get(ctx)?.scale !== scale) textWidths.set(ctx, { scale, widths: new Map() });
   const { scheme } = palette;
   const equal = lens.p === lens.q;
   const ramp = equal ? palette.sequential : palette.diverging;
@@ -125,7 +139,7 @@ export function draw(
     const top = box.y0 * view.height;
     const bottom = box.y1 * view.height;
     const marked = glyph.mark === undefined ? 0 : MARK_WIDTH + (glyph.text === "" ? 0 : MARK_GAP);
-    const textWidth = ctx.measureText(glyph.text).width / BASE_SIZE + marked;
+    const textWidth = measure(ctx, glyph.text) / BASE_SIZE + marked;
     // At size s the text spans textWidth·s, plus s/4 of padding on each side.
     const fit = Math.min((bottom - top) * LABEL_HEIGHT_FILL, width / (textWidth + 0.5));
     const size = grows ? Math.min(LABEL_MAX_SIZE, fit) : BASE_SIZE;
@@ -269,7 +283,7 @@ function ruler(ctx: CanvasRenderingContext2D, cam: Camera, view: Viewport, units
   ctx.lineWidth = 1;
   ctx.textBaseline = "middle";
   const caption = `−log q · ${units.name}`;
-  const captionLeft = view.width - 8 - ctx.measureText(caption).width;
+  const captionLeft = view.width - 8 - measure(ctx, caption);
   const first = Math.ceil(cam.x / units.nats / step);
   const last = Math.floor((cam.x + view.width / cam.k) / units.nats / step);
   ctx.beginPath();
@@ -281,7 +295,7 @@ function ruler(ctx: CanvasRenderingContext2D, cam: Camera, view: Viewport, units
     const value = i * step;
     const x = Math.round((value * units.nats - cam.x) * cam.k) + 0.5;
     const text = format(value, step);
-    if (x + 3 + ctx.measureText(text).width > captionLeft - 12) break;
+    if (x + 3 + measure(ctx, text) > captionLeft - 12) break;
     ctx.moveTo(x, top);
     ctx.lineTo(x, top + 5);
     ctx.fillText(text, x + 3, top + 12);

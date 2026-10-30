@@ -1,0 +1,42 @@
+{
+  "title": "Qwen3-4B \u00b7 Q6_K / Q4_K_M",
+  "prompt": "A person that is hired to handle onboarding and hiring is",
+  "tokens": [
+    151643,
+    32,
+    1697,
+    429,
+    374,
+    21446,
+    311,
+    3705,
+    389,
+    37569,
+    323,
+    23134,
+    374
+  ],
+  "vocabulary": 151936,
+  "vocabulary_sha256": "52d0887da06c70bca7a06f902e2b4601b10d6aa8a05671ddc1313a900102dcc6",
+  "labels": "labels.json.gz",
+  "measures": [
+    {
+      "name": "Qwen3-4B Q6_K",
+      "file": "0.f64.gz",
+      "sha256": "6bb7ad4befb84b883496a3c85a881b48508a042dcd4fe3d3119b39b32bef0925",
+      "model_sha256": "8a08533841623c2a689763b9318d8e27b3e052ad5b38015d4be4c04fa96f68a3",
+      "capture_seconds": 4.777
+    },
+    {
+      "name": "Qwen3-4B Q4_K_M \u00b7 from Q6_K",
+      "file": "1.f64.gz",
+      "sha256": "c12a665065318cb5222312960cef9d1f4493b51730c58305e3dbfd91c67ebe42",
+      "model_sha256": "b66f011240a0a7a7ce64fe2fb599acb96cfc120bfc1a54bdbb0cc06ecea15ab7",
+      "capture_seconds": 4.663
+    }
+  ],
+  "source": "Qwen/Qwen3-4B-GGUF",
+  "source_revision": "bc640142c66e1fdd12af0bd68f40445458f3869b",
+  "note": "Q4_K_M was re-quantized from the cached Q6_K GGUF, not from FP16. Both captures use the same prompt, tokenizer, CPU backend, batch, and temperature 1. These are model-weight quantizations, not rounded output probabilities.",
+  "format": "gzip-compressed little-endian float64 normalized log probabilities in token-ID order"
+}

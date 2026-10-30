@@ -6,11 +6,12 @@ These are design proposals only; neither feature is implemented by this change.
 
 ### Problem
 
-A distribution can assign almost all probability to one branch. Its surprisal
-is then close to zero, so every alternative becomes extremely narrow in the
-current `-log q` geometry. Horizontal scaling alone does not solve this well:
-the interesting alternatives can remain impractically thin, and the dominant
-branch can occupy nearly the entire view.
+A measure q can assign almost all probability to one branch. Its own width,
+`-log q`, is then close to zero, making that branch difficult to see or select.
+For example, q = 0.999999 gives a width of about 0.000001 nats. Low-probability
+alternatives have larger surprisal widths; when p is also concentrated, their
+heights can instead be tiny. Unbounded horizontal scaling helps, but a useful
+view may still need to regroup around the near-certain sequence.
 
 ### Proposal
 
@@ -40,7 +41,8 @@ measure semantics must remain explicit.
 
 ### Acceptance criteria
 
-- Alternatives beside a near-certain sequence remain visible and selectable.
+- The near-certain sequence remains visible and selectable despite its tiny
+  ordinary surprisal width, and its alternatives remain inspectable.
 - Expanding a complementary branch reveals its original child paths.
 - Switching the transform off restores exactly the previous geometry.
 - Deep paths retain the core's anchored-coordinate precision guarantees.

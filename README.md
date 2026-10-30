@@ -62,33 +62,22 @@ exact geometry 80 halvings deep.
 
 ## Protocol
 
-`proto/natlas/v1/natlas.proto`. One server serves one measure through one
-call, `Expand(node, horizon)`, which streams the node's handle and then its
-children heaviest first, down to 2^−horizon of its weight, as
-`Edge { label, odds }`.
+Live text and music servers use [v2 quantile pages](docs/quantile-v2.md).
+One unary `Quantile(node, prefix)` call returns a radix-256 CDF window as a
+first token ID and 256 packed varint ID differences. Prefix bytes select
+successively finer CDF windows, so the client chooses precision from the view.
+Servers share token IDs and paths; each owns its node handles.
 
-- A child is a 32-bit label; what labels mean (a vocabulary) is agreed
-  outside the protocol. Nodes are 64-bit handles the server chooses and the
-  client only learns: a request names a node by its parent's handle and its
-  label, or names nothing for the root, and the reply starts with the node's
-  own handle. A server that has forgotten a handle answers `NOT_FOUND`, and
-  the client names that parent again the same way, going up only as far as
-  the server has forgotten. Horizon 0 asks for the handle alone.
-- Each weight is a fraction g of the previous child's, sent as the log-odds of
-  g in steps of horizon·ln 2 / 2³¹ nat. Listings are sorted by construction and
-  every prefix is valid: the client sums nothing up front, and whatever the
-  listed children leave is the rest. One horizon sets both where the server
-  stops and how precise the weights are.
-- The client asks for what the view needs: a box's children down to a pixel
-  under p and, when q differs, every child that could end short of the right
-  edge under q. Children q has not listed have an upper bound on q, so their
-  width is a lower bound; the tail is drawn the same way, at least as wide as
-  the horizon.
+The main camera progressively estimates p heights from weighted bins, sorts
+slots by q, and brackets q probabilities until widths meet the screen's pixel
+budget or extend beyond its right edge. Node statistics are marked as
+approximate while heights are sampled. Labelled anchors preserve the viewed
+edge as refinement changes slot order. Tiny-box merging preserves entropy
+area. See the [implementation and precision notes](docs/quantile-v2.md).
 
-Comparing p with q means asking two servers about the same nodes, each by
-its own handles. A `Snapshot` is a recorded server, one `Expand` per node with
-the handle it answered; the client replays it, re-encoding it for each
-request.
+The v1 `Expand(node, horizon)` service and `.pb` snapshots remain supported.
+Old manifests select that client; live v2 measures explicitly advertise
+`"protocol": "quantile-v2"`. The v1 wire schema remains unchanged.
 
 ## Live
 
@@ -108,10 +97,14 @@ fetches its way down on load. `/labels.json` holds each token's bytes. With
 `bun run dev` running, the page finds a local server on its own and lists it
 first; `?server=URL` points it elsewhere.
 
-The server's handles hash label paths, so they survive a restart, but it
-cannot invert them: it remembers the parent and label of each node it has
-expanded. After a restart the client names the forgotten ancestors again,
-asking for handles alone, which costs round trips but no forward passes.
+The server's handles hash label paths, so their identities survive a restart,
+but forgotten ancestors still need to be named again. Each v2 response carries
+a CDF page that the client caches; a cold server may need model evaluations
+while resolving that ancestry.
+Request handlers await a bounded inference worker shared by v1 and v2, so
+cached pages can return while another node is being computed. The local
+backend owns one model thread; its batch interface also supports future
+batched or remote backends. See the [worker contract](docs/quantile-v2.md#asynchronous-inference).
 Models load in float32 by default, which is both more precise and, on a GTX
 1660 Ti, about 5× faster than float16; `--dtype` trades that for memory on
 larger models.

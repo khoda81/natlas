@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package natlas.v2;
+
+// One endpoint measures one fixed labelled tree. Servers agree on labels and
+// paths; their opaque node handles are independent. Changing model settings
+// or the underlying data requires a new client session.
+service Natlas {
+  rpc Quantile(QuantileRequest) returns (QuantileResponse);
+}
+
+message Branch {
+  fixed64 parent = 1;
+  fixed32 branch_id = 2;
+}
+
+message QuantileRequest {
+  // Unset means root. The branch need not have appeared in a previous reply.
+  Branch node = 1;
+  // Big-endian base-256 digits. Leading zero bytes are significant.
+  // For d bytes representing A, select [A/256^d, (A+1)/256^d).
+  // Empty selects [0,1). This refines the original CDF, without conditioning
+  // or descending into a different node. Implementations may cap precision
+  // with RESOURCE_EXHAUSTED; they must never silently round the prefix.
+  bytes prefix = 2;
+}
+
+message QuantileResponse {
+  // Requested node's handle, meaningful only at this endpoint.
+  fixed64 node = 1;
+  fixed32 first_branch_id = 2;
+  // Exactly 256 differences between successive inverse-CDF boundary IDs.
+  // Boundary j is u_j = (256*A+j)/256^(d+1), for j=0,...,256.
+  // Children are ordered by increasing ID. G(u) is the first ID i for which
+  // sum_{k<=i} weight(k)>u; at u=1 use vocabulary size as a virtual ID.
+  // first_branch_id=G(u_0), delta[j]=G(u_{j+1})-G(u_j).
+  // uint64 accommodates the sentinel 2^32 for a full uint32 ID space.
+  // Zero-probability IDs never appear as G(u), but deltas count ID positions,
+  // including gaps. Every reply must agree with all earlier ancestor pages.
+  repeated uint64 delta = 3 [packed = true];
+  // No outgoing distribution: delta is empty and first_branch_id is unused.
+  bool terminal = 4;
+}

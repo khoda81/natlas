@@ -68,6 +68,7 @@ describe("Expander", () => {
     expander.request([want]);
     await landed;
     const root = tree.root.listing(0)!;
+    if (root.radix) throw Error("Expected ranked listing");
     expect(root.horizon).toBe(6);
     expect(root.labels).toEqual([0, 1, 2, 3]);
     expect(root.leftover).toBeCloseTo(0.15, 6);
@@ -121,7 +122,7 @@ describe("Expander naming nodes", () => {
     const leaf = tree.child(grandchild.id, 3);
     await fetched(tree, expander, leaf, 10);
     expect(server.calls).toEqual(["112/3@14", "11/2@0", "1/1@0", "11/2@0", "112/3@14"]);
-    expect(leaf.listing(0)?.labels).toEqual([0, 1, 2, 3, 4]);
+    expect(leaf.slots({ p: 0, q: 0 }).labels).toEqual([0, 1, 2, 3, 4]);
 
     // What the walk named, the server knows again.
     server.calls = [];

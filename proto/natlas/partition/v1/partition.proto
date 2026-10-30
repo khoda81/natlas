@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package natlas.partition.v1;
+
+// Experimental single-categorical service. An endpoint is one immutable,
+// normalized measure over the agreed vocabulary [0, vocabulary_size).
+// P and Q have separate endpoints and the same vocabulary identity. A filter
+// describes token IDs, never a rank or a longer sequence prefix.
+service Partition {
+  rpc Summarize(SummarizeRequest) returns (SummarizeResponse);
+}
+
+message SummarizeRequest {
+  // Select IDs satisfying (id & mask) == value. value & ~mask must be zero.
+  fixed32 mask = 1;
+  fixed32 value = 2;
+  // Previously unfixed bits. At most four, producing up to sixteen children.
+  // Zero requests just the parent summary. Children partition the parent.
+  fixed32 split_mask = 3;
+  // P needs masses; Q also supplies individual-probability extrema. These
+  // fields are optional so omitting them saves actual serialized bytes.
+  bool extrema = 4;
+}
+
+message Summary {
+  fixed32 mask = 1;
+  fixed32 value = 2;
+  uint32 count = 3;
+  // Bounds on mass under the original normalized measure, not conditional
+  // mass inside this filter. Empty groups are omitted from children.
+  double mass_lower = 4;
+  double mass_upper = 5;
+  // Extrema of individual normalized log probabilities, including zero
+  // probabilities as -infinity. These are NOT logs of the group mass.
+  // Min is rounded down, max up. Present iff extrema was requested.
+  optional double log_min_probability = 6;
+  optional double log_max_probability = 7;
+}
+
+message SummarizeResponse {
+  Summary parent = 1;
+  repeated Summary children = 2;
+}

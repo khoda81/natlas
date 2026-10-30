@@ -90,10 +90,10 @@ export function draw(
 
     let fill: string;
     let ink: string;
-    if (box.kind === "merged") {
+    if (box.kind === "merged" || box.kind === "aggregate") {
       fill = scheme.merged;
       ink = palette.mergedInk;
-    } else if (box.kind === "tail") {
+    } else if (box.kind === "tail" || box.kind === "unresolved") {
       fill = scheme.tail;
       ink = palette.tailInk;
     } else {
@@ -110,8 +110,29 @@ export function draw(
       height >= GAP_MIN ? height - 1 : height,
     );
 
-    if (box.kind !== "merged" && height >= LABEL_MIN_HEIGHT && width >= LABEL_MIN_WIDTH) {
-      labels.push({ box, rect, glyph: box.label === null ? MORE : state.glyph(box.node, box.label), ink, grows: box.label !== null });
+    if (box.kind === "unresolved" || box.kind === "aggregate") hatch(ctx, rect, scheme.inkMuted);
+
+    if (box.kind !== "merged" && box.kind !== "aggregate" && height >= LABEL_MIN_HEIGHT && width >= LABEL_MIN_WIDTH) {
+      const glyph = box.kind === "unresolved" ? { text: "unresolved IDs" } : box.label === null ? MORE : state.glyph(box.node, box.label);
+      labels.push({ box, rect, glyph, ink, grows: box.label !== null });
+    }
+  }
+
+  // These bands include the ancestors' uncertainty, relative to the same anchor.
+  // Draw after descendants so an uncertain parent edge remains visible.
+  for (const box of frame.boxes) {
+    const bounds = box.uncertainty;
+    if (!bounds || box.label === null) continue;
+    const rect = screenRect(box, cam, view);
+    const clampX = (x: number) => Math.max(0, Math.min(view.width, (x - cam.x) * cam.k));
+    const clampY = (y: number) => Math.max(0, Math.min(view.height, y * view.height));
+    for (const edge of [bounds.left, bounds.right]) {
+      const x0 = clampX(edge.lower), x1 = clampX(edge.upper);
+      if (x1 - x0 > 0.5) hatch(ctx, { x0, x1, y0: rect.y0, y1: rect.y1 }, scheme.inkMuted, true);
+    }
+    for (const edge of [bounds.top, bounds.bottom]) {
+      const y0 = clampY(edge.lower), y1 = clampY(edge.upper);
+      if (y1 - y0 > 0.5) hatch(ctx, { x0: Math.min(rect.x0, clampX(bounds.left.lower)), x1: Math.max(rect.x1, clampX(bounds.right.upper)), y0, y1 }, scheme.inkMuted, true);
     }
   }
 
@@ -155,6 +176,29 @@ export function draw(
 
   outline(ctx, frame, cam, view, state, scheme.ink);
   ruler(ctx, cam, view, state.units, palette);
+}
+
+function hatch(ctx: CanvasRenderingContext2D, rect: ScreenRect, ink: string, shade = false): void {
+  const { x0, x1, y0, y1 } = rect;
+  if (x1 <= x0 || y1 <= y0) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x0, y0, x1 - x0, y1 - y0);
+  ctx.clip();
+  ctx.strokeStyle = ctx.fillStyle = ink;
+  if (shade) {
+    ctx.globalAlpha = 0.12;
+    ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+  }
+  ctx.globalAlpha = 0.35;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let diagonal = Math.floor((x0 + y0) / 8) * 8; diagonal < x1 + y1; diagonal += 8) {
+    ctx.moveTo(diagonal - y0, y0);
+    ctx.lineTo(diagonal - y1, y1);
+  }
+  ctx.stroke();
+  ctx.restore();
 }
 
 /** ``kind`` drawn ``size`` tall from ``x``, centered on ``y``: filled with ``tint``, edged in ``ink``. */

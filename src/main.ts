@@ -1,6 +1,6 @@
 import { drag, moveDepth, panVertical, scale } from "./camera";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
-import { Expander, wants } from "./expand";
+import { Expander, type Want, wants } from "./expand";
 import {
   type Box,
   type Camera,
@@ -19,6 +19,7 @@ import { BITS, draw, NATS, RULER_HEIGHT, screenRect, slotKey, type Units } from 
 import type { Glyph, Reading } from "./reading";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "./source";
 import { IntervalTree, type NodeId, type Slots, type TreeNode } from "./tree";
+import { distributionBounds, type Interval } from "./statistics";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
 const KEY_DEPTH_SPEED = 900;
@@ -112,7 +113,9 @@ class App {
     });
     const initial = decodeURIComponent(location.hash.slice(1)) || entries[0]?.name;
     if (initial === undefined) {
-      this.setStatus("No datasets in data/manifest.json. Drop .pb snapshots, one per measure, and a labels .json here.");
+      this.setStatus(
+        "No datasets in data/manifest.json. Drop .pb snapshots, one per measure, and a labels .json here.",
+      );
       return;
     }
     select.value = initial;
@@ -130,6 +133,7 @@ class App {
   }
 
   private setDataset(dataset: Dataset): void {
+    this.expander?.dispose();
     const tree = new IntervalTree(dataset.measures.length);
     this.dataset = dataset;
     this.tree = tree;
@@ -142,6 +146,7 @@ class App {
       this.setStatus(String(error));
     };
     tree.subscribe(() => {
+      if (this.tree !== tree) return;
       if (failing) this.setStatus("");
       failing = false;
       this.invalidate();
@@ -225,6 +230,17 @@ class App {
     });
   }
 
+  /** Fetch against current geometry without moving the camera between paints. */
+  private fetchWants = (): Want[] => {
+    const tree = this.tree;
+    if (tree === null) return [];
+    const cam = { ...this.cam, anchor: { ...this.cam.anchor } };
+    repair(tree, this.lens, cam);
+    clamp(tree, this.lens, cam);
+    const frame = layout(tree, this.lens, cam, this.view);
+    return wants(tree, this.lens, cam, this.view, frame, this.dataset?.sources);
+  };
+
   private render(time: number): void {
     // Resize and draw in the same callback, so a cleared bitmap is never
     // presented between a hover-driven panel resize and its redraw.
@@ -237,7 +253,7 @@ class App {
     clamp(tree, this.lens, this.cam);
     const frame = layout(tree, this.lens, this.cam, this.view);
     this.frame = frame;
-    this.expander?.request(wants(tree, this.lens, this.cam, this.view, frame));
+    this.expander?.request(this.fetchWants);
     // The anchor is fixed while focusing, so the target stays exactly addressable.
     if (!this.focus) reanchor(this.cam, frame);
     this.updateHover();
@@ -263,11 +279,17 @@ class App {
 
   private bindPointer(): void {
     const canvas = this.canvas;
-    canvas.addEventListener("wheel", (event) => this.onWheel(event), { passive: false });
+    canvas.addEventListener("wheel", (event) => this.onWheel(event), {
+      passive: false,
+    });
     canvas.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
       canvas.setPointerCapture(event.pointerId);
-      this.dragging = { id: event.pointerId, x: event.offsetX, y: event.offsetY };
+      this.dragging = {
+        id: event.pointerId,
+        x: event.offsetX,
+        y: event.offsetY,
+      };
       this.focus = null;
       canvas.classList.add("dragging");
     });
@@ -275,7 +297,13 @@ class App {
       this.pointer = { x: event.offsetX, y: event.offsetY };
       const grab = this.dragging;
       if (grab && grab.id === event.pointerId) {
-        drag(this.cam, event.offsetX - grab.x, event.offsetY - grab.y, this.view.height, event.offsetY / this.view.height);
+        drag(
+          this.cam,
+          event.offsetX - grab.x,
+          event.offsetY - grab.y,
+          this.view.height,
+          event.offsetY / this.view.height,
+        );
         grab.x = event.offsetX;
         grab.y = event.offsetY;
       }
@@ -359,21 +387,21 @@ class App {
         switch (event.key) {
           case "+":
           case "=":
-            return scale(cam, KEY_SCALE), true;
+            return (scale(cam, KEY_SCALE), true);
           case "-":
           case "_":
-            return scale(cam, 1 / KEY_SCALE), true;
+            return (scale(cam, 1 / KEY_SCALE), true);
           case "0":
           case "Home":
-            return this.reset(), true;
+            return (this.reset(), true);
           case "b":
-            return this.toggleUnits(), true;
+            return (this.toggleUnits(), true);
           case "s":
-            return this.setLens({ p: this.lens.q, q: this.lens.p }), true;
+            return (this.setLens({ p: this.lens.q, q: this.lens.p }), true);
           case "?":
-            return this.toggleHelp(), true;
+            return (this.toggleHelp(), true);
           case "Escape":
-            return (element("help").hidden = true), true;
+            return ((element("help").hidden = true), true);
           default:
             return false;
         }
@@ -405,7 +433,10 @@ class App {
 
   private startFocus(box: Box): void {
     if (this.tree === null) return;
-    this.cam.anchor = normalize(this.tree, this.lens, { node: box.node, slot: box.slot });
+    this.cam.anchor = normalize(this.tree, this.lens, {
+      node: box.node,
+      slot: box.slot,
+    });
     this.cam.a = box.y0;
     this.focus = {
       box,
@@ -494,7 +525,8 @@ class App {
       return;
     }
     const node = tree.node(box.node);
-    const last = box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : this.glyph(box.node, box.label).text;
+    const last =
+      box.kind === "merged" ? `${box.count} slots` : box.label === null ? "…" : this.glyph(box.node, box.label).text;
     const chips = [chip(last)];
 
     const { p, q } = this.lens;
@@ -503,22 +535,55 @@ class App {
     // A tail's q, and q of a child q has not listed, are upper bounds.
     const qBound = box.kind === "tail" || (box.kind !== "merged" && slots.qBound[box.slot] === true);
     const [atMost, atLeast] = qBound ? ["≤ ", "≥ "] : ["", ""];
-    const rows: [string, string][] = [
-      [`p · ${names[p]}`, `${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
+    let rows: [string, string][] = [
+      [`p · ${names[p]}`, `${slots.sampled ? "≈ " : ""}${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
     ];
     if (p !== q || box.kind === "tail") {
-      rows.push([`q · ${names[q]}`, `${atMost}${box.q.toPrecision(4)}  (${atLeast}${this.fmt(-Math.log(box.q))})`]);
+      rows.push([`q · ${names[q]}`, `${atMost}${box.q.toPrecision(4)}  (${atLeast}${this.fmt(box.x1 - box.x0)})`]);
     }
-    rows.push(["p · −log q", `${atLeast}${this.fmt(-box.p * Math.log(box.q))}`]);
+    rows.push(["p · −log q", `${slots.sampled ? "≈ " : atLeast}${this.fmt(box.p * (box.x1 - box.x0))}`]);
     rows.push(["−log P (path)", this.fmt(-box.lnMass)]);
     const stats = nodeStats(slots, this.lens);
-    const bound = slots.count > slots.listed || slots.qBound.some(Boolean) ? "≥ " : "";
+    const bound = slots.sampled ? "≈ " : slots.count > slots.listed || slots.qBound.some(Boolean) ? "≥ " : "";
     if (p === q) rows.push(["H at node", `${bound}${this.fmt(stats.entropy)}`]);
     else {
       rows.push(["H(p) at node", `${bound}${this.fmt(stats.entropy)}`]);
       rows.push(["H(p, q) at node", `${bound}${this.fmt(stats.cross)}`]);
       // A difference of two lower bounds bounds nothing.
       rows.push(["KL(p ‖ q) at node", `${bound === "" ? "" : "≈ "}${this.fmt(stats.cross - stats.entropy)}`]);
+    }
+
+    if (slots.sampled) {
+      const state = node.listing(p)!.radix!;
+      const first = slots.regions[box.slot]!.first;
+      const end = slots.regions[box.slot + box.count - 1]!.end;
+      const pb = state.rangeBounds(first, end);
+      const range = (b: Interval) => `${this.fmt(b.lower)} … ${this.fmt(b.upper)}`;
+      const probability = (lower: number, upper: number) => `${Math.exp(lower).toPrecision(4)} … ${Math.exp(upper).toPrecision(4)}`;
+      rows = [
+        [box.label === null ? "IDs" : "ID", box.label === null ? `${first} … ${end - 1}` : String(first)],
+        [`p · ${names[p]}`, probability(pb.lower, pb.upper)],
+      ];
+      if (box.label !== null) {
+        const qb = slots.qBounds[box.slot]!;
+        rows.push([`q · ${names[q]}`, probability(qb.lower, qb.upper)]);
+        rows.push(["width −log q", range({ lower: -qb.upper, upper: -qb.lower })]);
+        rows.push(["p · −log q", range({
+          lower: pb.lower === -Infinity ? 0 : Math.exp(pb.lower) * -qb.upper,
+          upper: pb.upper === -Infinity ? 0 : Math.exp(pb.upper) * -qb.lower,
+        })]);
+      } else rows.push(["width", box.kind === "aggregate" ? "individual bars below a pixel" : "individual weights unresolved"]);
+      if (box.uncertainty) rows.push(["−log P (path)", range({ lower: -box.uncertainty.mass.upper, upper: -box.uncertainty.mass.lower })]);
+      rows.push(["placement", "CDF midpoints · edges bounded"]);
+      const bounds = distributionBounds(state, node.listing(q)?.radix);
+      rows.push([p === q ? "H at node" : "H(p) at node", range(bounds.entropy)]);
+      if (p !== q) {
+        rows.push(["H(p, q) at node", range(bounds.cross)]);
+        rows.push(["KL(p ‖ q) at node", range({
+          lower: Math.max(0, bounds.cross.lower - bounds.entropy.upper),
+          upper: Math.max(0, bounds.cross.upper - bounds.entropy.lower),
+        })]);
+      }
     }
 
     const list = document.createElement("dl");
@@ -534,7 +599,7 @@ class App {
     path.append(...chips);
     const kind = document.createElement("div");
     kind.className = "kind";
-    kind.textContent = `${box.kind === "node" ? "expanded" : box.kind === "leaf" ? "unexpanded" : box.kind} · ${this.units.name}`;
+    kind.textContent = `${box.kind === "node" ? "expanded" : box.kind === "leaf" ? "unexpanded" : box.kind} · ${slots.sampled ? "ID order · " : ""}${this.units.name}`;
     this.inspect.replaceChildren(path, kind, list);
     this.inspect.hidden = false;
   }
@@ -555,9 +620,16 @@ class App {
     const highText = document.createElement("span");
     highText.textContent = high;
     this.legend.append(lowText, swatch, highText);
+    const quantile = this.dataset?.sources[this.lens.p]?.quantile !== undefined;
+    if (quantile) {
+      const uncertainty = document.createElement("span");
+      uncertainty.textContent = "ID order · ▧ unresolved";
+      this.legend.append(uncertainty);
+    }
     this.legend.title = equal
       ? "Color repeats each slot's conditional probability. Area is entropy."
       : "Color is ln(p/q) per slot: red where q under-weights it. Area is cross-entropy.";
+    if (quantile) this.legend.title = "ID order. Hatched regions have unresolved weights or edges. Geometry uses shared CDF midpoints; edge bounds include ancestor uncertainty. Hover for probability and entropy bounds.";
   }
 
   private toggleUnits(): void {
@@ -604,7 +676,7 @@ function chip(text: string): HTMLElement {
   return span;
 }
 
-/** Lower bounds on entropy and cross-entropy over a node's slots; the tail counts as one slot. */
+/** v1 lower bounds or v2 sample estimates of node entropy and cross-entropy. */
 function nodeStats(slots: Slots, lens: Lens): { entropy: number; cross: number } {
   let entropy = 0;
   let cross = 0;
@@ -613,7 +685,7 @@ function nodeStats(slots: Slots, lens: Lens): { entropy: number; cross: number }
     if (p === 0) continue;
     // With p = q, q bounds the tail's heaviest child, which is tighter than the tail as a whole.
     entropy -= p * Math.log(slots.isTail(slot) && lens.p === lens.q ? slots.q[slot]! : p);
-    cross -= p * Math.log(slots.q[slot]!);
+    cross += p * slots.widths[slot]!;
   }
   return { entropy, cross };
 }

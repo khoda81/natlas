@@ -388,7 +388,7 @@ def main() -> None:
             "title": f"{args.audio.stem} · {args.at:g}–{args.at + seconds:.0f} s · live",
             "labels": "labels.json",
             "start": [],
-            "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
+            "measures": [{"name": measure.name, "url": f"{index}/", "protocol": "quantile-v2"} for index, measure in enumerate(measures)],
         }
     ]
     model = Model(own.start, windows.ends, own.vocabulary, measures)

@@ -223,6 +223,16 @@ uv run serve.py \
   --q temperature:1.6
 ```
 
+`--q control:FILE` is the same weights steered by a llama.cpp control vector,
+read through a context of its own. `steer.py` writes one from MLP neurons, a
+dose each times the layer's median residual norm along the neuron's
+`W_down` column:
+
+```bash
+uv run steer.py Qwen/Qwen3.5-4B L14N8949+1 L13N7956-1 --out evil.gguf
+uv run serve.py --p Qwen_Qwen3.5-4B-IQ4_NL.gguf --q control:evil.gguf --n-ctx 4096
+```
+
 ### Music
 
 ```bash

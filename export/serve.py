@@ -2,7 +2,8 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "natlas-core",
-#   "llama-cpp-python>=0.3.16",
+#   "gguf>=0.17",
+#   "llama-cpp-python>=0.3.36",
 #   "numpy>=1.26",
 #   "protobuf>=7.36.1",
 #   "starlette>=0.40",
@@ -48,7 +49,7 @@ def main() -> None:
         "--q",
         action="append",
         default=[],
-        help="further measure, repeatable: a model id sharing p's tokenizer, context:N, or temperature:T",
+        help="further measure, repeatable: a model id sharing p's tokenizer, context:N, temperature:T, or control:FILE",
     )
     parser.add_argument("--tokenizer", help="default: p's own")
     parser.add_argument("--device", default=lm.default_device())

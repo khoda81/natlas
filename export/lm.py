@@ -4,7 +4,9 @@ A measure is a model's next-token log-probabilities over the whole
 vocabulary, given the tokens so far, as a float64 numpy array; walking a path
 gives them after every prefix in turn. Besides the model itself, a measure spec
 names another model sharing its tokenizer, ``context:N`` for the model seeing
-only the last N tokens, or ``temperature:T`` for the model at temperature T.
+only the last N tokens, ``temperature:T`` for the model at temperature T, or
+``control:FILE`` for a .gguf model steered by a llama.cpp control vector (see
+steer.py).
 
 A model is a Hugging Face id, run by transformers, or a .gguf file, run by
 llama.cpp.
@@ -12,6 +14,8 @@ llama.cpp.
 
 from __future__ import annotations
 
+import copy
+import ctypes
 import json
 import re
 from collections.abc import Callable, Iterator, Sequence
@@ -155,7 +159,7 @@ class Transformers:
 class LlamaCpp:
     """A GGUF model run by llama.cpp, its layers on the GPU as far as ``gpu_layers``
     says (-1 for all). Requests that share a prefix with the last one reuse
-    its KV cache, so walking down a path costs a token per step. Every token
+    its cache, so walking down a path costs a token per step. Every token
     is evaluated alone, so a node's log-probabilities depend on its path only."""
 
     def __init__(self, path: Path, context: int = 8192, gpu_layers: int = -1):
@@ -163,6 +167,7 @@ class LlamaCpp:
 
         self.name = path.stem
         try:
+            # The model, and the context and batch its unsteered reader uses.
             self.llm = Llama(
                 str(path),
                 n_ctx=context,
@@ -179,50 +184,105 @@ class LlamaCpp:
                 "Fewer --gpu-layers or a smaller --n-ctx need less of it."
             ) from error
         self.vocabulary = self.llm.n_vocab()
-        bos, eos = self.llm.token_bos(), self.llm.token_eos()
+        # llama.cpp names a BPE vocabulary's token 11 its BOS even where none
+        # is added, as in Qwen's: there the model reads EOS before a text.
+        bos = self.llm.token_bos() if self.llm._model.add_bos_token() else -1  # noqa: SLF001
+        eos = self.llm.token_eos()
         if bos < 0 and eos < 0:
             raise ValueError(f"{path} has no start- or end-of-text token to begin a text with")
         self.start = (bos if bos >= 0 else eos,)
         self.eos = frozenset({eos} if eos >= 0 else ())
+        self.reader = _Reader(self.llm._ctx, self.llm._batch, self.vocabulary)  # noqa: SLF001
+
+    def controlled(self, vector: Path) -> LlamaCpp:
+        """The same weights read through a context of its own, with the control
+        vector in ``vector`` added to the residual stream after its layers."""
+        import llama_cpp
+        from llama_cpp._internals import LlamaBatch, LlamaContext
+
+        llm = self.llm
+        layers, width = llama_cpp.llama_model_n_layer(llm._model.model), llm._model.n_embd()  # noqa: SLF001
+        directions = control_vector(vector, layers, width)
+        context = LlamaContext(model=llm._model, params=llm.context_params, verbose=False)  # noqa: SLF001
+        data = directions.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        if llama_cpp.llama_set_adapter_cvec(context.ctx, data, directions.size, width, 1, layers - 1):
+            raise RuntimeError(f"llama.cpp refused the control vector in {vector}")
+        steered = copy.copy(self)
+        steered.name = f"{self.name} · {vector.stem}"
+        steered.reader = _Reader(context, LlamaBatch(n_tokens=1, embd=0, n_seq_max=1, verbose=False), self.vocabulary)
+        return steered
 
     def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor:
-        tokens = [int(token) for token in tokens]
-        if len(tokens) > self.llm.n_ctx():
-            raise TooLong(f"{len(tokens)} tokens, but the context holds {self.llm.n_ctx()}")
-        # input_ids is the whole context buffer: past n_tokens it holds tokens
-        # already dropped from the KV cache.
-        cached = self.llm.input_ids[: self.llm.n_tokens]
-        shared = len(tokens)
-        for index, (have, want) in enumerate(zip(cached, tokens)):
-            if have != want:
-                shared = index
-                break
-        else:
-            shared = min(len(cached), len(tokens))
-        # The logits on hand are the last evaluated position's.
-        if not shared == len(tokens) == len(cached):
-            self.llm.n_tokens = min(shared, len(tokens) - 1)
-            try:
-                # One token at a time: llama.cpp's kernels round a batch
-                # differently, so a node's numbers would hang on what was
-                # asked before it.
-                for token in tokens[self.llm.n_tokens :]:
-                    self.llm.eval([token])
-            except Exception:
-                # What a failed batch left in the cache is unknown.
-                self.llm.reset()
-                raise
-        logits = np.ctypeslib.as_array(self.llm._ctx.get_logits(), shape=(self.vocabulary,))  # noqa: SLF001
+        logits = self.reader.logits([int(token) for token in tokens])
         return torch.log_softmax(torch.from_numpy(logits.astype(np.float64)) / temperature, dim=-1)
 
     def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]:
         return stepwise(self.log_probs, tokens, start, temperature)
 
     def encode(self, text: str) -> list[int]:
-        return self.llm.tokenize(text.encode(), add_bos=False, special=False)
+        # Special tokens in the text are themselves, as transformers reads them.
+        return self.llm.tokenize(text.encode(), add_bos=False, special=True)
 
     def token_bytes(self) -> list[bytes]:
         return [self.llm.detokenize([token], special=True) for token in range(self.vocabulary)]
+
+
+class _Reader:
+    """A llama.cpp context and the tokens its memory holds."""
+
+    def __init__(self, context, batch, vocabulary: int):
+        self.context = context
+        self.batch = batch
+        self.vocabulary = vocabulary
+        self.fed: list[int] = []
+
+    def logits(self, tokens: list[int]) -> np.ndarray:
+        """The logits after ``tokens``, which the context then holds."""
+        import llama_cpp
+
+        if self.context.n_ctx() < len(tokens):
+            raise TooLong(f"{len(tokens)} tokens, but the context holds {self.context.n_ctx()}")
+        shared = 0
+        for have, want in zip(self.fed, tokens):
+            if have != want:
+                break
+            shared += 1
+        # The logits on hand are the last fed position's.
+        if not shared == len(tokens) == len(self.fed):
+            keep = min(shared, len(tokens) - 1)
+            if not llama_cpp.llama_memory_seq_rm(self.context.memory, 0, keep, -1):
+                # A recurrent layer's state cannot be cut back to a prefix.
+                self.context.kv_cache_clear()
+                keep = 0
+            self.fed = tokens[:keep]
+            try:
+                # One token at a time: llama.cpp's kernels round a batch
+                # differently, so a node's numbers would hang on what was
+                # asked before it.
+                for token in tokens[keep:]:
+                    self.batch.set_batch([token], n_past=len(self.fed), logits_all=False)
+                    self.context.decode(self.batch)
+                    self.fed.append(token)
+            except Exception:
+                # What a failed batch left in the memory is unknown.
+                self.context.kv_cache_clear()
+                self.fed = []
+                raise
+        return np.ctypeslib.as_array(self.context.get_logits(), shape=(self.vocabulary,))
+
+
+def control_vector(path: Path, layers: int, width: int) -> np.ndarray:
+    """A llama.cpp control vector file's directions for layers 1 through
+    ``layers`` - 1, the rows llama.cpp reads; layers it leaves out are zero."""
+    import gguf
+
+    directions = np.zeros((layers - 1, width), np.float32)
+    for tensor in gguf.GGUFReader(path).tensors:
+        layer = int(tensor.name.removeprefix("direction."))
+        if not 1 <= layer < layers or tensor.data.shape != (width,):
+            raise ValueError(f"{path}: {tensor.name} of shape {tensor.data.shape} fits no layer of {layers} × {width}")
+        directions[layer - 1] = tensor.data
+    return directions
 
 
 def open_language(spec: str, device: str, dtype: str = "float32", tokenizer: str | None = None, **llama) -> Language:
@@ -254,6 +314,11 @@ def measures(own: Language, specs: Sequence[str], other: Callable[[str], Languag
         if kind == "temperature":
             t = float(value)
             return of(own, f"{own.name} · T={t:g}", t)
+        if kind == "control":
+            if not isinstance(own, LlamaCpp):
+                raise ValueError("control vectors need a .gguf model")
+            steered = own.controlled(Path(value).expanduser())
+            return of(steered, steered.name)
         language = other(spec)
         return of(language, language.name)
 

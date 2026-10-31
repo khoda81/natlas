@@ -22,8 +22,8 @@ import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
 import { BITS, draw, NATS, RULER_HEIGHT, childKey, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
-const KEY_DEPTH_SPEED = 900;
-const KEY_PAN_SPEED = 1.2;
+const KEY_DEPTH_SPEED = 300;
+const KEY_PAN_SPEED = 0.9;
 /** A frame after a stall moves at most this far, so the view never jumps. */
 const MAX_FRAME_MS = 50;
 const ARROWS: Record<string, { depth: number; pan: number }> = {

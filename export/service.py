@@ -51,7 +51,7 @@ _PROTO_CONTENT_TYPE = "application/proto"
 # Distributions kept per measure. The core keeps each sorted, about 24 bytes
 # per vocabulary entry. A walk leaves the deepest nodes along it, the ones in
 # view.
-_CACHED = 32
+_CACHED = 128
 
 
 class Model:

@@ -265,7 +265,10 @@ fn item_box(
             };
             (kind, Some(branch), tree.nats_q(node, lens, branch, ln_p)?)
         }
-        Item::Gap { .. } => (BoxKind::Gap, None, f64::INFINITY),
+        Item::Gap { before } => {
+            let nats = gap_nats(tree, lens, node, d, before, ln_p, rank, d.item_end(item))?;
+            (BoxKind::Gap, None, nats)
+        }
     };
     Ok(LayoutBox {
         node,
@@ -284,6 +287,51 @@ fn item_box(
         x1: placed.x + nats,
         y0: placed.y(top),
         y1: placed.y(bottom),
+    })
+}
+
+/// The surprisal of a gap's children, as well as what is known tells, until
+/// samples tell more: with q = p and their number known, that of their mean
+/// weight, since children sorted by p are nearly alike side by side;
+/// otherwise the mean surprisal of the known children beside the gap.
+/// Infinite with neither.
+#[allow(clippy::too_many_arguments)]
+fn gap_nats(
+    tree: &Tree,
+    lens: Lens,
+    node: NodeId,
+    d: &Distribution,
+    before: usize,
+    ln_mass: f64,
+    rank: Rank,
+    end: Option<Rank>,
+) -> Result<f64> {
+    if let (true, Some(end)) = (lens.p == lens.q, end) {
+        if rank < end {
+            return Ok(f64::from(end - rank).ln() - ln_mass);
+        }
+    }
+    let above = before
+        .checked_sub(1)
+        .map(|run| &d.runs()[run])
+        .filter(|run| !run.is_empty())
+        .map(|run| (run, run.len() - 1));
+    let below = d
+        .runs()
+        .get(before)
+        .filter(|run| !run.is_empty())
+        .map(|run| (run, 0));
+    let (mut sum, mut known) = (0.0, 0.0);
+    for (run, at) in above.into_iter().chain(below) {
+        let nats = tree.nats_q(node, lens, run.branch(at), run.ln_p(at))?;
+        if nats.is_finite() {
+            (sum, known) = (sum + nats, known + 1.0);
+        }
+    }
+    Ok(if 0.0 < known {
+        sum / known
+    } else {
+        f64::INFINITY
     })
 }
 
@@ -1151,8 +1199,17 @@ mod tests {
             .iter()
             .find(|b| b.kind == BoxKind::Gap)
             .expect("the unknown quarter is a gap");
-        assert_eq!((gap.rank, gap.count, gap.x1), (2, 998, f64::INFINITY));
+        // Until sampled, its 998 children are drawn at their mean weight.
+        assert_eq!((gap.rank, gap.count), (2, 998));
+        near(gap.x1 - gap.x0, (998.0f64 / 0.25).ln());
         near(gap.y0, 0.75);
+        // Not knowing how many, it is drawn as the child above it.
+        let mut uncounted = Tree::new(1);
+        let run = Run::new(0, vec![4, 7], vec![0.0, 0.5f64.ln(), 0.25f64.ln()]).unwrap();
+        uncounted.insert(ROOT, 0, vec![run]).unwrap();
+        let frame_ = layout(&uncounted, LENS, cam(ROOT, 0.0, top(ROOT), 0.0), VIEW, 1.0).unwrap();
+        let gap_ = frame_.boxes.iter().find(|b| b.kind == BoxKind::Gap).unwrap();
+        near(gap_.x1 - gap_.x0, 4f64.ln());
         // The gap is sampled in proportion to its 200 visible pixels, all
         // of its points inside it; both children are asked for by points in
         // their parts of the root, which descend into them.

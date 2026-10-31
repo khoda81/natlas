@@ -109,13 +109,16 @@ export function draw(
     if (width <= 0 || height <= 0) continue;
     visible = true;
 
-    // A gap is unknown, as the background already says: only its label shows.
+    // A gap with no estimate yet is unknown, as the background already says:
+    // only its label shows. One with an estimate is drawn as a silhouette.
     let ink = scheme.inkMuted;
-    if (box.kind !== "gap") {
-      const level = ramp.level(rampPosition(box.p, box.q, equal));
+    if (box.kind !== "gap" || Number.isFinite(box.x1)) {
+      // With p = q, a child's q is its p, and a silhouette's is its typical
+      // child's weight, where its p is the whole silhouette's mass.
+      const level = ramp.level(rampPosition(equal ? box.q : box.p, box.q, equal));
       ink = ramp.ink[level]!;
       ctx.fillStyle = ramp.fill[level]!;
-      const bordered = box.kind !== "merged" && GAP_MIN <= width && GAP_MIN <= height;
+      const bordered = box.kind !== "merged" && box.kind !== "gap" && GAP_MIN <= width && GAP_MIN <= height;
       ctx.fillRect(
         rect.x0,
         rect.y0,
@@ -183,7 +186,7 @@ export function draw(
 /** What a gap or the origin says of itself: how many children it holds, where known. */
 function gapGlyph(box: Box): Glyph {
   if (box.kind !== "gap" || box.count === 0) return MORE;
-  return { text: box.count === 1 ? "1 branch" : `${box.count.toLocaleString()} branches` };
+  return { text: box.count === 1 ? "1 child" : `${box.count.toLocaleString()} children` };
 }
 
 /** ``kind`` drawn ``size`` tall from ``x``, centered on ``y``: filled with ``tint``, edged in ``ink``. */

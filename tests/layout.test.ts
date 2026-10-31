@@ -34,12 +34,13 @@ describe("layout", () => {
     ]);
   });
 
-  it("counts the branches in a gap where the source says where the node ends", () => {
+  it("counts the children in a gap where the source says where the node ends, and draws them at their mean weight", () => {
     const tree = new IntervalTree(1);
     tree.insert(ROOT, 0, { ...answer([0.5, 0.25], [4, 7]), count: 9 });
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };
     const gap = layout(tree, lens, cam, view).boxes.find((box) => box.kind === "gap")!;
-    expect([gap.rank, gap.count, gap.x1]).toEqual([2, 7, Infinity]);
+    expect([gap.rank, gap.count]).toEqual([2, 7]);
+    expect(gap.x1 - gap.x0).toBeCloseTo(Math.log(7 / 0.25), 12);
   });
 
   it("selects the containing known branch where its continuation is unknown", () => {

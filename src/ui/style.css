@@ -71,6 +71,26 @@ body {
   touch-action: none;
 }
 
+/* The ruler's caption, laid over its right end in the ruler's font (render.ts). */
+.units {
+  position: absolute;
+  right: 8px;
+  bottom: 0;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  max-width: none;
+  background: none;
+  color: var(--ink-muted);
+  font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.units:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
 #canvas.dragging {
   cursor: crosshair;
 }

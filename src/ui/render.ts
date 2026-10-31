@@ -419,6 +419,11 @@ function drawNote(ctx: CanvasRenderingContext2D, view: Viewport, palette: Palett
   ctx.restore();
 }
 
+/** The ruler's caption, shown by the units switch over its right end. */
+export function rulerCaption(units: Units): string {
+  return `−log q · ${units.name}`;
+}
+
 function ruler(ctx: CanvasRenderingContext2D, cam: Camera, view: Viewport, units: Units, palette: Palette): void {
   const { scheme } = palette;
   const pxPerUnit = cam.k * units.nats;
@@ -430,8 +435,9 @@ function ruler(ctx: CanvasRenderingContext2D, cam: Camera, view: Viewport, units
   ctx.strokeStyle = scheme.inkMuted;
   ctx.lineWidth = 1;
   ctx.textBaseline = "middle";
-  const caption = `−log q · ${units.name}`;
-  const captionLeft = view.width - 8 - measure(ctx, caption);
+  // The units switch shows the caption in this font, 8px from the right
+  // edge (style.css); ticks stop short of it.
+  const captionLeft = view.width - 8 - measure(ctx, rulerCaption(units));
   const first = Math.ceil(cam.x / units.nats / step);
   const last = Math.floor((cam.x + view.width / cam.k) / units.nats / step);
   ctx.beginPath();
@@ -449,5 +455,4 @@ function ruler(ctx: CanvasRenderingContext2D, cam: Camera, view: Viewport, units
     ctx.fillText(text, x + 3, top + 12);
   }
   ctx.stroke();
-  ctx.fillText(caption, captionLeft, top + 12);
 }

@@ -19,7 +19,7 @@ import type { Glyph, Reading } from "../readings/reading";
 import { drag, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, viewKey } from "./view-state";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
-import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, type Units } from "./render";
+import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, rulerCaption, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
 const KEY_DEPTH_SPEED = 300;
@@ -40,6 +40,7 @@ const TRANSITION_MS = 320;
 const FLIGHT_MS = 140;
 const SEARCH_MS = 150;
 const SAVE_MS = 200;
+const UNITS_KEY = "natlas.units";
 const LOCAL_SERVER = "http://localhost:8421/";
 
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -110,7 +111,7 @@ export class App {
   private pixelRatio = 1;
   private frame: Frame | null = null;
   private geometry: { frame: Frame; key: string } | null = null;
-  private units: Units = NATS;
+  private units: Units = storedUnits();
   private palette = Palette.current();
   private hover: Selection | null = null;
   private lastPick: { frame: Frame; x: number; y: number; selection: Selection | null } | null = null;
@@ -149,6 +150,7 @@ export class App {
     this.pSelect.addEventListener("change", () => this.setLens({ ...this.lens, p: Number(this.pSelect.value) }));
     this.qSelect.addEventListener("change", () => this.setLens({ ...this.lens, q: Number(this.qSelect.value) }));
     element("swap").addEventListener("click", () => this.setLens({ p: this.lens.q, q: this.lens.p }));
+    this.unitsButton.textContent = rulerCaption(this.units);
     this.unitsButton.addEventListener("click", () => this.toggleUnits());
     element("help-toggle").addEventListener("click", () => this.toggleHelp());
     this.bindDrop();
@@ -1068,7 +1070,12 @@ export class App {
 
   private toggleUnits(): void {
     this.units = this.units === NATS ? BITS : NATS;
-    this.unitsButton.textContent = this.units.name;
+    this.unitsButton.textContent = rulerCaption(this.units);
+    try {
+      localStorage.setItem(UNITS_KEY, this.units.name);
+    } catch {
+      // Remembering the units is only a convenience.
+    }
     this.invalidate();
   }
 
@@ -1086,6 +1093,14 @@ export class App {
 /** Depth at which a box of ln p mass fills the view, or its children start, if sooner. */
 function rootLike(lnMass: number, x1: number): number {
   return Math.min(-lnMass, x1);
+}
+
+function storedUnits(): Units {
+  try {
+    return localStorage.getItem(UNITS_KEY) === BITS.name ? BITS : NATS;
+  } catch {
+    return NATS;
+  }
 }
 
 function liveServer(): string | undefined {

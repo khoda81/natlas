@@ -43,7 +43,7 @@ describe("IntervalTree", () => {
     expect(tree.chain(child, grandchild)).toEqual([child, grandchild]);
     expect(tree.descend(tree.root, [5, 2])).toBe(grandchild);
     const other = new IntervalTree(1);
-    expect(other.hash(other.descend(other.root, [5, 2]))).toBe(tree.hash(grandchild));
+    expect(other.descend(other.root, [5, 2])).toBe(grandchild);
   });
 
   it("tells an unexpanded node from one with nothing within the horizon", () => {

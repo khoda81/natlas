@@ -70,7 +70,7 @@ export class SnapshotSource implements Source {
     const nodes = walked(tree, from, to);
     for (const [index, node] of nodes.entries()) {
       const next = nodes[index + 1];
-      const recorded = this.recorded.raw.find(tree.hash(node));
+      const recorded = this.recorded.raw.contains(node) ? node : undefined;
       const cut = recorded === undefined ? undefined : this.recorded.cut(recorded, 0, horizon, next === undefined ? undefined : tree.branch(next));
       yield { node, reply: cut ?? { branches: [], lnWeights: [], leftover: 1, complete: 0 } };
     }
@@ -108,7 +108,7 @@ export class ConnectSource implements Source {
     const nodes = walked(tree, from, to);
     const path = from === to ? [] : nodes.map((node) => tree.branch(node));
     let index = 0;
-    for await (const listing of this.client.expand({ node: tree.hash(from), path, horizon }, { signal })) {
+    for await (const listing of this.client.expand({ node: from, path, horizon }, { signal })) {
       const node = nodes[index++];
       if (node === undefined) throw new Error("the server listed more nodes than the path holds");
       const last = listing.lnWeights.at(-1);

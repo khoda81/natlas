@@ -105,7 +105,7 @@ export class App {
   private dataset: Dataset | null = null;
   private reading: Reading | null = null;
   private lens: Lens = { p: 0, q: 0 };
-  private cam: Camera = { origin: 0, x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
+  private cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: { node: ROOT, slot: 0 }, a: 0 };
   private view: Viewport = { width: 1, height: 1 };
   private frame: Frame | null = null;
   private geometry: { frame: Frame; key: string } | null = null;
@@ -430,7 +430,7 @@ export class App {
     this.cancelNavigation();
     const { width, height } = this.view;
     const k = width / Math.log(Math.max(8, height / 4));
-    this.cam = { origin: 0, x: 0, k, anchor: { node: 0, slot: 0 }, a: 0 };
+    this.cam = { origin: ROOT, x: 0, k, anchor: { node: ROOT, slot: 0 }, a: 0 };
     this.focus = null;
     this.transition = null;
     this.invalidate();

@@ -17,7 +17,9 @@ describe(`behavior frozen at ${reference.baseline}`, () => {
         const value = { frame, picks: samplePoints(view.width, view.height).map(([x, y]) => pick(frame, cam, view, x, y)),
           demand: wants(tree, lens, cam, view, frame) };
         reanchor(cam, frame);
-        expect(createHash("sha256").update(JSON.stringify({ ...value, cam })).digest("hex"))
+        // Node ids are hashes; naming each by its path keeps the record readable.
+        const json = JSON.stringify({ ...value, cam }, (key, id) => key === "node" || key === "origin" ? `path:${tree.path(id).join(",")}` : id);
+        expect(createHash("sha256").update(json).digest("hex"))
           .toBe(reference.results.find(result => result.name === name)!.hash);
       } finally { frame.dispose(); }
     });

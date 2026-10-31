@@ -58,7 +58,7 @@ function measure(ctx: CanvasRenderingContext2D, text: string): number {
   return width;
 }
 
-export function slotKey(node: number, slot: number): string {
+export function slotKey(node: NodeId, slot: number): string {
   return `${node}:${slot}`;
 }
 

@@ -29,7 +29,7 @@ async function one(source: Source, tree: IntervalTree, node: NodeId, horizon: nu
 
 /** The recording's root listing, whichever node asked. */
 async function rootReply(horizon: number): Promise<Reply> {
-  return one(snapshot(), new IntervalTree(1), 0, horizon);
+  return one(snapshot(), new IntervalTree(1), 0n, horizon);
 }
 
 describe("SnapshotSource", () => {
@@ -122,7 +122,7 @@ describe("ConnectSource", () => {
       expect(fallback.map(({ node }) => tree.path(node))).toEqual([[5], [5, 6], [5, 6, 7]]);
       expect(fallback.at(-1)).toEqual({ node: deep, reply: { branches: [3], lnWeights: [0], leftover: 0, complete: 8 } });
       expect(requests).toEqual([
-        { node: tree.hash(parent), path: [7], horizon: 8 },
+        { node: parent, path: [7], horizon: 8 },
         { node: 0n, path: [5, 6, 7], horizon: 8 },
       ]);
       // The fallback walks from the root: every node down the path, the
@@ -130,7 +130,7 @@ describe("ConnectSource", () => {
       const walk = await steps(source, tree, tree.root, deep, 8);
       expect(walk.map(({ node }) => tree.path(node))).toEqual([[5], [5, 6], [5, 6, 7]]);
       expect(walk[0]!.reply.complete).toBe(20);
-      known.add(tree.hash(parent));
+      known.add(parent);
       await steps(source, tree, parent, deep, 8);
       expect(requests).toHaveLength(4);
     } finally {
@@ -162,9 +162,9 @@ describe("Expander", () => {
   it("refills capacity using current demand without another render", async () => {
     const tree = new IntervalTree(1);
     const calls: number[][] = [];
-    const child = tree.child(0, 1);
+    const child = tree.child(0n, 1);
     const expander = new Expander(tree, [rooted((tree, _from, to) => void calls.push(tree.path(to)))], 1);
-    expander.request(() => [{ node: tree.listing(0, 0) === undefined ? 0 : child, measure: 0, horizon: 2, priority: 1 }]);
+    expander.request(() => [{ node: tree.listing(0n, 0) === undefined ? 0n : child, measure: 0, horizon: 2, priority: 1 }]);
     try {
       await waitUntil(() => tree.listing(child, 0) !== undefined);
       expect(calls).toEqual([[], [1]]);
@@ -183,10 +183,10 @@ describe("Expander", () => {
       active--;
     });
     const expander = new Expander(tree, [source], 1);
-    const child = tree.child(0, 1);
-    expander.request([{ node: 0, measure: 0, horizon: 2, priority: 1 }]);
+    const child = tree.child(0n, 1);
+    expander.request([{ node: 0n, measure: 0, horizon: 2, priority: 1 }]);
     try {
-      const reached = await Promise.all([expander.reach(0, 0, 1), expander.reach(child, 0, 1)]);
+      const reached = await Promise.all([expander.reach(0n, 0, 1), expander.reach(child, 0, 1)]);
       expect(reached).toEqual([true, true]);
       expect(peak).toBe(1);
       expect(calls.filter((path) => path.length === 0)).toHaveLength(1);
@@ -224,12 +224,12 @@ describe("Expander", () => {
   it("stops unreachable recorded searches and ignores responses after disposal", async () => {
     const tree = new IntervalTree(1);
     const expander = new Expander(tree, [snapshot()]);
-    expect(await expander.reach(0, 0, 99)).toBe(false);
-    expect(tree.listing(0, 0)?.horizon).toBe(16);
+    expect(await expander.reach(0n, 0, 99)).toBe(false);
+    expect(tree.listing(0n, 0)?.horizon).toBe(16);
     expander.dispose();
     let release!: () => void;
     const pending = new Expander(new IntervalTree(1), [rooted(() => new Promise<void>((resolve) => { release = resolve; }))]);
-    pending.request([{ node: 0, measure: 0, horizon: 2, priority: 1 }]);
+    pending.request([{ node: 0n, measure: 0, horizon: 2, priority: 1 }]);
     await waitUntil(() => release !== undefined);
     pending.dispose();
     release();
@@ -249,7 +249,7 @@ describe("Expander", () => {
     };
     const expander = new Expander(tree, [source]);
     expander.onError = (error) => errors.push(error);
-    const old = tree.child(0, 1);
+    const old = tree.child(0n, 1);
     expander.request([{ node: old, measure: 0, horizon: 2, priority: 1 }]);
     await waitUntil(() => signals.length === 1);
     expander.cancel();

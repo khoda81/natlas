@@ -23,14 +23,13 @@ impl PythonTree {
         }
     }
 
-    /// The nodes from the node hashed `hash` down `path`, inclusive. A hash
+    /// The nodes from `node` down `path`, inclusive. A hash
     /// this tree never learned raises KeyError, which a client answers by
     /// naming the node from the root.
-    fn walk(&mut self, hash: u64, path: Vec<u32>) -> PyResult<Vec<u32>> {
-        let mut node = self
-            .inner
-            .find(hash)
-            .ok_or_else(|| PyKeyError::new_err(format!("unknown node {hash:#018x}")))?;
+    fn walk(&mut self, mut node: u64, path: Vec<u32>) -> PyResult<Vec<u64>> {
+        if !self.inner.contains(node) {
+            return Err(PyKeyError::new_err(format!("unknown node {node:#018x}")));
+        }
         let mut nodes = Vec::with_capacity(path.len() + 1);
         nodes.push(node);
         for branch in path {
@@ -40,7 +39,7 @@ impl PythonTree {
         Ok(nodes)
     }
 
-    fn path(&self, node: u32) -> PyResult<Vec<u32>> {
+    fn path(&self, node: u64) -> PyResult<Vec<u32>> {
         self.inner.path(node).map_err(error)
     }
 }

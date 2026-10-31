@@ -4,9 +4,10 @@
 
 import { Tree } from "./wasm";
 
-export type NodeId = number;
+/** A node's id: hashed from its branches, shared by the client and every server. */
+export type NodeId = bigint;
 /** The empty sequence; every tree's first node. */
-export const ROOT: NodeId = 0;
+export const ROOT: NodeId = 0n;
 /** One of a node's 2^32 branches. What it denotes is up to a reading. */
 export type Branch = number;
 
@@ -53,8 +54,8 @@ export class IntervalTree {
   revision = 0;
   private readonly listeners = new Set<() => void>();
   private readonly revisions = new Map<NodeId, number>();
-  private readonly parents = new Map<NodeId, NodeId | null>([[0, null]]);
-  private readonly branches = new Map<NodeId, Branch>([[0, -1]]);
+  private readonly parents = new Map<NodeId, NodeId | null>([[ROOT, null]]);
+  private readonly branches = new Map<NodeId, Branch>([[ROOT, -1]]);
   private readonly paths = new Map<NodeId, Branch[]>();
 
   constructor(readonly measures: number) {
@@ -74,14 +75,9 @@ export class IntervalTree {
     return this.raw.descend(node, Uint32Array.from(path));
   }
 
-  /** The node's id on the wire, shared with every server. */
-  hash(id: NodeId): bigint {
-    return this.raw.hash(id);
-  }
-
   parent(id: NodeId): NodeId | null {
     if (this.parents.has(id)) return this.parents.get(id)!;
-    const parent = this.raw.parent(id) as NodeId | null;
+    const parent = this.raw.parent(id) ?? null;
     this.parents.set(id, parent);
     return parent;
   }
@@ -104,7 +100,7 @@ export class IntervalTree {
 
   /** Nodes from `origin` down to `id`, inclusive. */
   chain(origin: NodeId, id: NodeId): NodeId[] {
-    return this.raw.chain(origin, id) as NodeId[];
+    return [...this.raw.chain(origin, id)];
   }
 
   listing(id: NodeId, measure: number): Listing | undefined {

@@ -19,8 +19,8 @@ export function listing(weights: number[], branches = weights.map((_, i) => i), 
 export function chainTree(weights: number[], path: number[], measures = 1): IntervalTree {
   const tree = new IntervalTree(measures);
   const children = listing(weights);
-  tree.setListing(0, 0, children);
-  let node: NodeId = 0;
+  tree.setListing(0n, 0, children);
+  let node: NodeId = 0n;
   for (const branch of path) {
     node = tree.child(node, branch);
     tree.setListing(node, 0, children);

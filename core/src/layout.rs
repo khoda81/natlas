@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::tree::{Branch, Lens, NodeId, Slots, Tree};
+use crate::tree::{node_id, Branch, Lens, NodeId, Slots, Tree};
 use crate::Result;
 
 pub const MAX_SAFE_SLOT: u64 = 9_007_199_254_740_991;
@@ -10,6 +10,7 @@ pub const MAX_SAFE_SLOT: u64 = 9_007_199_254_740_991;
 /// The top edge of a slot; a slot at or past the node's slot count is its bottom.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Boundary {
+    #[serde(with = "node_id")]
     pub node: NodeId,
     pub slot: u64,
 }
@@ -19,6 +20,7 @@ pub struct Camera {
     /// The node the view is measured from, standing as the root does: x is
     /// q-surprisal from its children's left edge and the view spans e^-x of
     /// its interval. It bounds the view; nothing above it is needed.
+    #[serde(with = "node_id")]
     pub origin: NodeId,
     pub x: f64,
     pub k: f64,
@@ -45,6 +47,7 @@ pub enum BoxKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LayoutBox {
+    #[serde(with = "node_id")]
     pub node: NodeId,
     /// First slot; a merged box covers `count` consecutive slots.
     pub slot: u64,
@@ -64,6 +67,7 @@ pub struct LayoutBox {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Walked {
+    #[serde(with = "node_id")]
     pub node: NodeId,
     pub ln_mass: f64,
     pub x: f64,
@@ -72,6 +76,7 @@ pub struct Walked {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Unexpanded {
+    #[serde(with = "node_id")]
     pub node: NodeId,
     pub branch: Branch,
     pub ln_mass: f64,
@@ -86,6 +91,7 @@ pub struct BoundaryPosition {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Cover {
+    #[serde(with = "node_id")]
     pub node: NodeId,
     pub y: f64,
 }
@@ -1014,7 +1020,7 @@ pub fn pick(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::Listing;
+    use crate::tree::{child_hash, Listing};
 
     const VIEW: Viewport = Viewport {
         width: 1000.0,
@@ -1103,18 +1109,26 @@ mod tests {
     fn deep_layout_retains_anchor_precision_and_finds_deepest_cover() {
         let path = (0..80).map(|i| i % 2).collect::<Vec<_>>();
         let tree = chain_tree(&[0.5, 0.5], &path);
+        let id = |path: &[u32]| {
+            path.iter()
+                .fold(0, |node, &branch| child_hash(node, branch))
+        };
+        let (deepest, above) = (id(&path), id(&path[..79]));
         let cam = Camera {
             origin: 0,
             x: 80.0 * std::f64::consts::LN_2,
             k: 100.0,
-            anchor: Boundary { node: 80, slot: 1 },
+            anchor: Boundary {
+                node: deepest,
+                slot: 1,
+            },
             a: 0.5,
         };
         let frame = layout(&tree, LENS, cam, VIEW, 1.0).unwrap();
         let mut children = frame
             .boxes
             .iter()
-            .filter(|b| b.node == 80)
+            .filter(|b| b.node == deepest)
             .collect::<Vec<_>>();
         children.sort_by_key(|b| b.slot);
         assert_eq!(children.len(), 2);
@@ -1125,7 +1139,7 @@ mod tests {
         let own = frame
             .boxes
             .iter()
-            .find(|b| b.node == 79 && b.slot == u64::from(path[79]))
+            .find(|b| b.node == above && b.slot == u64::from(path[79]))
             .unwrap();
         near(own.y0, 0.0);
         near(own.y1, 1.0);
@@ -1136,12 +1150,21 @@ mod tests {
         let shallow_cam = Camera {
             origin: 0,
             x: std::f64::consts::LN_2,
-            anchor: Boundary { node: 1, slot: 0 },
+            anchor: Boundary {
+                node: id(&[0]),
+                slot: 0,
+            },
             a: 0.0,
             ..cam
         };
         let shallow = layout(&shallow_tree, LENS, shallow_cam, VIEW, 1.0).unwrap();
-        assert_eq!(shallow.cover, Some(Cover { node: 1, y: 0.0 }));
+        assert_eq!(
+            shallow.cover,
+            Some(Cover {
+                node: id(&[0]),
+                y: 0.0
+            })
+        );
         let root = layout(
             &shallow_tree,
             LENS,
@@ -1209,7 +1232,10 @@ mod tests {
             origin: 0,
             x: 0.5,
             k: 100.0,
-            anchor: Boundary { node: 1, slot: 0 },
+            anchor: Boundary {
+                node: child_hash(0, 0),
+                slot: 0,
+            },
             a: 0.4,
         };
         let a = clamp_position(&clamp_tree, LENS, cam).unwrap();
@@ -1333,7 +1359,7 @@ mod tests {
             slot: 0,
             count: 1,
             kind: BoxKind::Leaf,
-            branch: Some(node),
+            branch: Some(node as u32),
             p: 1.0,
             q: 1.0,
             ln_mass: 0.0,

@@ -65,16 +65,17 @@ export class Frame {
 
   constructor(readonly raw: LayoutFrame) {
     const packed = raw.boxes();
+    const nodes = raw.nodes();
     this.boxes = boxBuffers.pop() ?? [];
-    for (let i = 0, box = 0; i < packed.length; i += 12, box++) {
-      const b = this.boxes[box] ??= { node: 0, slot: 0, count: 0, kind: "node", branch: null,
+    for (let i = 0, box = 0; i < packed.length; i += 11, box++) {
+      const b = this.boxes[box] ??= { node: 0n, slot: 0, count: 0, kind: "node", branch: null,
         p: 0, q: 0, lnMass: 0, x0: 0, x1: 0, y0: 0, y1: 0 };
-      b.node = packed[i]!; b.slot = packed[i + 1]!; b.count = packed[i + 2]!;
-      b.kind = KINDS[packed[i + 3]!]!; b.branch = packed[i + 4] === -1 ? null : packed[i + 4]!;
-      b.p = packed[i + 5]!; b.q = packed[i + 6]!; b.lnMass = packed[i + 7]!;
-      b.x0 = packed[i + 8]!; b.x1 = packed[i + 9]!; b.y0 = packed[i + 10]!; b.y1 = packed[i + 11]!;
+      b.node = nodes[box]!; b.slot = packed[i]!; b.count = packed[i + 1]!;
+      b.kind = KINDS[packed[i + 2]!]!; b.branch = packed[i + 3] === -1 ? null : packed[i + 3]!;
+      b.p = packed[i + 4]!; b.q = packed[i + 5]!; b.lnMass = packed[i + 6]!;
+      b.x0 = packed[i + 7]!; b.x1 = packed[i + 8]!; b.y0 = packed[i + 9]!; b.y1 = packed[i + 10]!;
     }
-    this.boxes.length = packed.length / 12;
+    this.boxes.length = packed.length / 11;
     this.cover = raw.cover() as Frame["cover"];
   }
 

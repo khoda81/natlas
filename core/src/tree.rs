@@ -5,7 +5,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
-pub type NodeId = u32;
+/// A node's id, hashed from its branches by [`child_hash`] and shared by every
+/// client and server.
+pub type NodeId = u64;
+pub const ROOT: NodeId = 0;
+
+/// Serde for a node id: JavaScript receives a BigInt, since a 64-bit hash is
+/// no exact Number.
+pub mod node_id {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(id: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u128(u128::from(*id))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        u64::deserialize(deserializer)
+    }
+}
 /// One of a node's 2^32 branches. Every branch exists; one a measure never
 /// lists has weight zero. What a branch denotes is up to the reader.
 pub type Branch = u32;
@@ -358,7 +375,6 @@ pub fn child_hash(parent: u64, branch: Branch) -> u64 {
 struct Node {
     /// Parent and the branch to this node; `None` only for the root.
     edge: Option<(NodeId, Branch)>,
-    hash: u64,
     depth: usize,
     children: HashMap<Branch, NodeId>,
     listings: Vec<Option<Arc<Known>>>,
@@ -366,10 +382,9 @@ struct Node {
 }
 
 impl Node {
-    fn new(edge: Option<(NodeId, Branch)>, hash: u64, depth: usize, measures: usize) -> Self {
+    fn new(edge: Option<(NodeId, Branch)>, depth: usize, measures: usize) -> Self {
         Self {
             edge,
-            hash,
             depth,
             children: HashMap::new(),
             listings: vec![None; measures],
@@ -380,55 +395,47 @@ impl Node {
 
 #[derive(Debug)]
 pub struct Tree {
-    nodes: Vec<Node>,
-    hashes: HashMap<u64, NodeId>,
+    nodes: HashMap<NodeId, Node>,
     measures: usize,
 }
 
 impl Tree {
     pub fn new(measures: usize) -> Self {
         Self {
-            nodes: vec![Node::new(None, 0, 0, measures)],
-            hashes: HashMap::from([(0, 0)]),
+            nodes: HashMap::from([(ROOT, Node::new(None, 0, measures))]),
             measures,
         }
     }
 
     pub fn root(&self) -> NodeId {
-        0
+        ROOT
     }
 
     fn node(&self, id: NodeId) -> Result<&Node> {
         self.nodes
-            .get(id as usize)
-            .ok_or_else(|| format!("unknown node {id}"))
+            .get(&id)
+            .ok_or_else(|| format!("unknown node {id:#018x}"))
     }
 
     fn node_mut(&mut self, id: NodeId) -> Result<&mut Node> {
         self.nodes
-            .get_mut(id as usize)
-            .ok_or_else(|| format!("unknown node {id}"))
+            .get_mut(&id)
+            .ok_or_else(|| format!("unknown node {id:#018x}"))
     }
 
     /// The child of `parent` along `branch`, created on first use.
     pub fn child(&mut self, parent: NodeId, branch: Branch) -> Result<NodeId> {
         let node = self.node(parent)?;
-        if let Some(&id) = node.children.get(&branch) {
-            return Ok(id);
+        if node.children.contains_key(&branch) {
+            return Ok(child_hash(parent, branch));
         }
-        let hash = child_hash(node.hash, branch);
+        let id = child_hash(parent, branch);
         let depth = node.depth + 1;
-        if self.hashes.contains_key(&hash) {
-            return Err(format!("node hash {hash:#018x} collides"));
+        if self.nodes.contains_key(&id) {
+            return Err(format!("node id {id:#018x} collides"));
         }
-        let id = u32::try_from(self.nodes.len()).map_err(|_| "too many nodes".to_string())?;
-        self.nodes.push(Node::new(
-            Some((parent, branch)),
-            hash,
-            depth,
-            self.measures,
-        ));
-        self.hashes.insert(hash, id);
+        self.nodes
+            .insert(id, Node::new(Some((parent, branch)), depth, self.measures));
         self.node_mut(parent)?.children.insert(branch, id);
         Ok(id)
     }
@@ -459,12 +466,9 @@ impl Tree {
             .collect()
     }
 
-    pub fn find(&self, hash: u64) -> Option<NodeId> {
-        self.hashes.get(&hash).copied()
-    }
-
-    pub fn hash(&self, id: NodeId) -> Result<u64> {
-        Ok(self.node(id)?.hash)
+    /// Whether this tree has learned the node.
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.nodes.contains_key(&id)
     }
 
     pub fn depth(&self, id: NodeId) -> Result<usize> {
@@ -682,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn nodes_have_stable_ids_paths_chains_and_shared_hashes() {
+    fn nodes_are_named_by_their_shared_hashes() {
         let mut tree = Tree::new(2);
         let child = tree.child(0, 5).unwrap();
         let grandchild = tree.child(child, 2).unwrap();
@@ -702,10 +706,10 @@ mod tests {
         // order it learned them in.
         let mut other = Tree::new(1);
         let far = other.descend(0, &[5, 2]).unwrap();
-        assert_eq!(other.hash(far).unwrap(), tree.hash(grandchild).unwrap());
-        assert_eq!(tree.find(other.hash(far).unwrap()), Some(grandchild));
-        assert_eq!(tree.hash(0).unwrap(), 0);
-        assert_eq!(tree.find(child_hash(0, 9)), None);
+        assert_eq!(far, grandchild);
+        assert_eq!(grandchild, child_hash(child_hash(0, 5), 2));
+        assert!(tree.contains(far));
+        assert!(!tree.contains(child_hash(0, 9)));
     }
 
     #[test]

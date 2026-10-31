@@ -4,8 +4,8 @@ import type { Camera, Lens, Viewport } from "../src/core/layout";
 import type { Listing } from "../src/core/tree";
 
 interface FixtureTree {
-  child(parent: number, branch: number): number;
-  setListing(node: number, measure: number, value: Listing): void;
+  child(parent: bigint, branch: number): bigint;
+  setListing(node: bigint, measure: number, value: Listing): void;
 }
 
 export function layoutCases<T extends FixtureTree>(Tree: new (measures: number) => T) {
@@ -23,33 +23,33 @@ export function layoutCases<T extends FixtureTree>(Tree: new (measures: number) 
     const weights = Array.from({ length: count }, () => random() ** 4);
     const total = weights.reduce((a, b) => a + b, 0);
     if (count) {
-      tree.setListing(0, 0, listing(weights.map(w => w * 0.97 / total), undefined, 0.03));
-      tree.setListing(0, 1, listing(weights.map(w => (w + 0.1) / (total + count * 0.1)), weights.map((_, i) => i).reverse()));
+      tree.setListing(0n, 0, listing(weights.map(w => w * 0.97 / total), undefined, 0.03));
+      tree.setListing(0n, 1, listing(weights.map(w => (w + 0.1) / (total + count * 0.1)), weights.map((_, i) => i).reverse()));
       for (let i = 0; i < Math.min(count, 12); i++) {
-        const child = tree.child(0, i);
+        const child = tree.child(0n, i);
         tree.setListing(child, 0, listing([0.6, 0.24, 0.1], [9, 2, 0], 0.06));
         tree.setListing(child, 1, listing([0.7, 0.3], [2, 0]));
       }
     }
     for (let i = 0; i < 9; i++) {
       cases.push({ name: `${count}/${i}`, tree, lens: { p: i % 2, q: Math.floor(i / 3) % 2 },
-        cam: { origin: 0, x: i * 0.7, k: [13, 140, 1000][i % 3]!, a: i % 3 === 0 ? -0.2 : 0, anchor: { node: 0, slot: i % Math.max(1, count) } },
+        cam: { origin: 0n, x: i * 0.7, k: [13, 140, 1000][i % 3]!, a: i % 3 === 0 ? -0.2 : 0, anchor: { node: 0n, slot: i % Math.max(1, count) } },
         view: { width: 1234, height: 789 }, mergePx: i % 3 === 0 ? 10 : 1 });
     }
   }
   const vocabulary = new Tree(1);
-  vocabulary.setListing(0, 0, listing(Array(150000).fill(1 / 150000)));
+  vocabulary.setListing(0n, 0, listing(Array(150000).fill(1 / 150000)));
   cases.push({ name: "vocabulary/150000", tree: vocabulary, lens: { p: 0, q: 0 },
-    cam: { origin: 0, x: 0.2, k: 100, anchor: { node: 0, slot: 74999 }, a: 0.5 },
+    cam: { origin: 0n, x: 0.2, k: 100, anchor: { node: 0n, slot: 74999 }, a: 0.5 },
     view: { width: 1234, height: 789 }, mergePx: 1 });
   const deep = new Tree(1);
-  let node = 0;
+  let node = 0n;
   for (let depth = 0; depth <= 80; depth++) {
     deep.setListing(node, 0, listing([0.6, 0.3, 0.1]));
     if (depth < 80) node = deep.child(node, depth % 3);
     if ([1, 7, 30, 79].includes(depth)) for (const a of [-0.5, 0.4, 1.1]) {
       cases.push({ name: `deep/${depth}/${a}`, tree: deep, lens: { p: 0, q: 0 },
-        cam: { origin: 0, x: depth * 1.1, k: 170, anchor: { node, slot: 1 }, a },
+        cam: { origin: 0n, x: depth * 1.1, k: 170, anchor: { node, slot: 1 }, a },
         view: { width: 1234, height: 789 }, mergePx: 1 });
     }
   }

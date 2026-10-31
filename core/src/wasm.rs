@@ -37,34 +37,29 @@ impl Tree {
         }
     }
 
-    pub fn root(&self) -> u32 {
+    pub fn root(&self) -> u64 {
         self.inner.root()
     }
 
-    /// Get or create a child, returning its stable numeric node id.
-    pub fn child(&mut self, parent: u32, branch: u32) -> std::result::Result<u32, JsError> {
+    /// Get or create a child, returning its id: the hash every server shares.
+    pub fn child(&mut self, parent: u64, branch: u32) -> std::result::Result<u64, JsError> {
         self.inner.child(parent, branch).map_err(js_error)
     }
 
-    pub fn descend(&mut self, node: u32, path: &[u32]) -> std::result::Result<u32, JsError> {
+    pub fn descend(&mut self, node: u64, path: &[u32]) -> std::result::Result<u64, JsError> {
         self.inner.descend(node, path).map_err(js_error)
     }
 
-    /// The node's id on the wire, shared with every server.
-    pub fn hash(&self, id: u32) -> std::result::Result<u64, JsError> {
-        self.inner.hash(id).map_err(js_error)
+    pub fn contains(&self, id: u64) -> bool {
+        self.inner.contains(id)
     }
 
-    pub fn find(&self, hash: u64) -> Option<u32> {
-        self.inner.find(hash)
-    }
-
-    pub fn parent(&self, id: u32) -> std::result::Result<JsValue, JsError> {
-        to_js(&self.inner.parent(id).map_err(js_error)?)
+    pub fn parent(&self, id: u64) -> std::result::Result<Option<u64>, JsError> {
+        self.inner.parent(id).map_err(js_error)
     }
 
     /// Branch from the parent, or -1 for the root. A number safely represents every u32 branch.
-    pub fn branch(&self, id: u32) -> std::result::Result<f64, JsError> {
+    pub fn branch(&self, id: u64) -> std::result::Result<f64, JsError> {
         Ok(self
             .inner
             .branch(id)
@@ -73,13 +68,13 @@ impl Tree {
     }
 
     /// Branches from the root to `id`, as a Uint32Array.
-    pub fn path(&self, id: u32) -> std::result::Result<Vec<u32>, JsError> {
+    pub fn path(&self, id: u64) -> std::result::Result<Vec<u32>, JsError> {
         self.inner.path(id).map_err(js_error)
     }
 
-    /// Node ids from `origin` through `id`, as a plain number array.
-    pub fn chain(&self, origin: u32, id: u32) -> std::result::Result<JsValue, JsError> {
-        to_js(&self.inner.chain(origin, id).map_err(js_error)?)
+    /// Node ids from `origin` through `id`, as a BigUint64Array.
+    pub fn chain(&self, origin: u64, id: u64) -> std::result::Result<Vec<u64>, JsError> {
+        self.inner.chain(origin, id).map_err(js_error)
     }
 
     /// Typed arrays cross into Wasm as copies of their memory, so a listing
@@ -88,7 +83,7 @@ impl Tree {
     #[wasm_bindgen(js_name = setListing)]
     pub fn set_listing(
         &mut self,
-        id: u32,
+        id: u64,
         measure: usize,
         branches: Vec<u32>,
         ln_weights: Vec<f64>,
@@ -115,7 +110,7 @@ impl Tree {
     /// placing `through` too; null without a listing.
     pub fn cut(
         &self,
-        id: u32,
+        id: u64,
         measure: usize,
         horizon: u32,
         through: Option<u32>,
@@ -135,7 +130,7 @@ impl Tree {
     /// when p does not list it.
     pub fn edge(
         &self,
-        id: u32,
+        id: u64,
         p: usize,
         q: usize,
         branch: u32,
@@ -152,24 +147,24 @@ impl Tree {
         }))
     }
 
-    pub fn listing(&self, id: u32, measure: usize) -> std::result::Result<JsValue, JsError> {
+    pub fn listing(&self, id: u64, measure: usize) -> std::result::Result<JsValue, JsError> {
         match self.inner.listing(id, measure).map_err(js_error)? {
             Some(listing) => to_js(listing),
             None => Ok(JsValue::NULL),
         }
     }
 
-    pub fn expanded(&self, id: u32, measure: usize) -> std::result::Result<bool, JsError> {
+    pub fn expanded(&self, id: u64, measure: usize) -> std::result::Result<bool, JsError> {
         self.inner.expanded(id, measure).map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = hasListing)]
-    pub fn has_listing(&self, id: u32, measure: usize) -> std::result::Result<bool, JsError> {
+    pub fn has_listing(&self, id: u64, measure: usize) -> std::result::Result<bool, JsError> {
         Ok(self.inner.listing(id, measure).map_err(js_error)?.is_some())
     }
 
     /// Scalar queries never copy a model's vocabulary into JavaScript.
-    pub fn horizon(&self, id: u32, measure: usize) -> std::result::Result<f64, JsError> {
+    pub fn horizon(&self, id: u64, measure: usize) -> std::result::Result<f64, JsError> {
         Ok(self
             .inner
             .listing(id, measure)
@@ -177,7 +172,7 @@ impl Tree {
             .map_or(-1.0, |v| v.horizon))
     }
 
-    pub fn complete(&self, id: u32, measure: usize) -> std::result::Result<f64, JsError> {
+    pub fn complete(&self, id: u64, measure: usize) -> std::result::Result<f64, JsError> {
         Ok(self
             .inner
             .listing(id, measure)
@@ -188,7 +183,7 @@ impl Tree {
     #[wasm_bindgen(js_name = slotOf)]
     pub fn slot_of(
         &self,
-        id: u32,
+        id: u64,
         p: usize,
         q: usize,
         branch: u32,
@@ -201,7 +196,7 @@ impl Tree {
             .map_or(-1.0, |v| v as f64))
     }
 
-    pub fn statistics(&self, id: u32, p: usize, q: usize) -> std::result::Result<JsValue, JsError> {
+    pub fn statistics(&self, id: u64, p: usize, q: usize) -> std::result::Result<JsValue, JsError> {
         to_js(
             &self
                 .inner
@@ -214,7 +209,7 @@ impl Tree {
     #[wasm_bindgen(js_name = qBound)]
     pub fn q_bound(
         &self,
-        id: u32,
+        id: u64,
         p: usize,
         q: usize,
         slot: usize,
@@ -226,7 +221,7 @@ impl Tree {
             .q_bound(slot))
     }
 
-    pub fn slots(&self, id: u32, p: usize, q: usize) -> std::result::Result<JsValue, JsError> {
+    pub fn slots(&self, id: u64, p: usize, q: usize) -> std::result::Result<JsValue, JsError> {
         let slots = self.inner.slots(id, Lens { p, q }).map_err(js_error)?;
         to_js(&slots.view())
     }
@@ -273,12 +268,16 @@ impl Drop for LayoutFrame {
 
 #[wasm_bindgen]
 impl LayoutFrame {
-    /// Twelve f64s per visible box; numeric ids and integer slots remain exact.
+    /// Each visible box's node, parallel to `boxes`.
+    pub fn nodes(&self) -> Vec<u64> {
+        self.inner.boxes.iter().map(|b| b.node).collect()
+    }
+
+    /// Eleven f64s per visible box; integer slots remain exact.
     pub fn boxes(&self) -> Vec<f64> {
-        let mut packed = Vec::with_capacity(self.inner.boxes.len() * 12);
+        let mut packed = Vec::with_capacity(self.inner.boxes.len() * 11);
         for b in &self.inner.boxes {
             packed.extend_from_slice(&[
-                f64::from(b.node),
                 b.slot as f64,
                 b.count as f64,
                 match b.kind {
@@ -352,7 +351,7 @@ pub fn normalize_boundary(
     tree: &Tree,
     p: usize,
     q: usize,
-    origin: u32,
+    origin: u64,
     boundary: JsValue,
 ) -> std::result::Result<JsValue, JsError> {
     let boundary: Boundary = from_js(boundary)?;
@@ -379,8 +378,8 @@ pub fn place_node(
     tree: &Tree,
     p: usize,
     q: usize,
-    origin: u32,
-    id: u32,
+    origin: u64,
+    id: u64,
 ) -> std::result::Result<JsValue, JsError> {
     to_js(&layout::place(&tree.inner, Lens { p, q }, origin, id).map_err(js_error)?)
 }

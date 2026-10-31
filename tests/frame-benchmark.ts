@@ -68,19 +68,19 @@ function setup(count: number, zipf: boolean, deep = false, real = false) {
   const weights = Array.from({ length: count }, (_, i) => zipf ? (i + 1) ** -1.15 : 1);
   const total = weights.reduce((a, b) => a + b, 0);
   const listing = { branches: weights.map((_, i) => i), lnWeights: weights.map(w => Math.log(w / total)), horizon: 4096, complete: 4096, leftover: 0 };
-  driver.tree.setListing(0, 0, real ? live!.listing : listing);
+  driver.tree.setListing(0n, 0, real ? live!.listing : listing);
   if (zipf) {
-    driver.tree.setListing(0, 1, { ...listing, branches: listing.branches.toReversed() });
+    driver.tree.setListing(0n, 1, { ...listing, branches: listing.branches.toReversed() });
     driver.setLens({ p: 0, q: 1 });
   }
   if (deep) {
-    let node = 0;
+    let node = 0n;
     for (let depth = 0; depth < 80; depth++) {
       node = driver.tree.child(node, depth % 3);
       driver.tree.setListing(node, 0, { branches: [0, 1, 2], lnWeights: [0.6, 0.3, 0.1].map(Math.log), horizon: 4096, complete: 4096, leftover: 0 });
     }
-    driver.cam = { origin: 0, x: 125, k: 140, anchor: { node, slot: 1 }, a: 0.4 };
-  } else driver.cam = { origin: 0, x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
+    driver.cam = { origin: 0n, x: 125, k: 140, anchor: { node, slot: 1 }, a: 0.4 };
+  } else driver.cam = { origin: 0n, x: 0, k: 100, anchor: { node: 0n, slot: 0 }, a: 0 };
   driver.resize();
   const rect = canvas.getBoundingClientRect();
   driver.pointer = { x: rect.left + driver.view.width * 0.7, y: rect.top + driver.view.height * 0.43 };

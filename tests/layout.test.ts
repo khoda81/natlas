@@ -15,7 +15,7 @@ describe("layout", () => {
     const frame = layout(tree, lens, cam, view);
     expect(pick(tree, lens, frame, cam, view, 500, 400)).toMatchObject({ box: { node: ROOT }, exact: false });
     expect(pick(tree, lens, frame, cam, view, -1, 400)).toBeNull();
-    expect(frame.misses).toMatchObject([{ node: ROOT, branch: null, measure: 0, from: 0, lnTop: 0, lnBottom: -Infinity }]);
+    expect(frame.misses).toMatchObject([{ node: ROOT, target: ROOT, measure: 0, from: 0, to: null, lnTop: 0, lnBottom: -Infinity }]);
     expect(frame.cover).toEqual({ node: ROOT, y: 0 });
   });
 
@@ -29,6 +29,14 @@ describe("layout", () => {
       [3, near(0.5), near(0.75), near(Math.log(4))],
       [9, near(0.75), near(1), near(Math.log(4))],
     ]);
+  });
+
+  it("counts the branches in a gap where the source says where the node ends", () => {
+    const tree = new IntervalTree(1);
+    tree.insert(ROOT, 0, { ...run([0.5, 0.25], [4, 7]), children: 9 });
+    const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };
+    const gap = layout(tree, lens, cam, view).boxes.find((box) => box.kind === "gap")!;
+    expect([gap.rank, gap.count, gap.x1]).toEqual([2, 7, Infinity]);
   });
 
   it("selects the containing known branch where its continuation is unknown", () => {

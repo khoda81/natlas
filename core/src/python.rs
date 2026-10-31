@@ -77,12 +77,20 @@ impl PythonTree {
         self.inner.forget(node, measure).map_err(error)
     }
 
-    /// Begin an Expand request. An invalid window raises ValueError, an
-    /// unknown node KeyError.
-    fn start(
+    /// Begin an Expand down `path` below `node`. An unknown node raises
+    /// KeyError.
+    fn start_path(&self, node: u64, path: Vec<u32>, horizon: u32) -> PyResult<PythonWalk> {
+        self.known(node)?;
+        Ok(PythonWalk {
+            inner: Walk::path(node, path, horizon),
+        })
+    }
+
+    /// Begin an Expand down a window within `node`. An empty window raises
+    /// ValueError, an unknown node KeyError.
+    fn start_window(
         &self,
         node: u64,
-        path: Vec<u32>,
         ln_top: f64,
         ln_bottom: f64,
         horizon: u32,
@@ -90,11 +98,12 @@ impl PythonTree {
         self.known(node)?;
         let window = Window::new(ln_top, ln_bottom).map_err(error)?;
         Ok(PythonWalk {
-            inner: Walk::new(node, path, window, horizon),
+            inner: Walk::window(node, window, horizon),
         })
     }
 
-    /// The walk's next message as ("run", node, rank, branches, ln_below),
+    /// The walk's next message as ("run", node, rank, branches, ln_below,
+    /// children), children None where the node's end is unknown;
     /// ("missing", node) when it needs that node's distribution first, or
     /// None once it is done.
     fn advance(
@@ -109,13 +118,14 @@ impl PythonTree {
                 .advance(&mut self.inner, measure)
                 .map_err(error)?
             {
-                Advance::Run(node, run) => Some(
+                Advance::Run(node, run, children) => Some(
                     (
                         "run",
                         node,
                         run.rank(),
                         run.branches().to_vec(),
                         run.ln_below().to_vec(),
+                        children,
                     )
                         .into_pyobject(py)?
                         .into_any()

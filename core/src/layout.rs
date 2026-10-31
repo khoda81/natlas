@@ -89,19 +89,22 @@ pub struct LayoutBox {
     pub y1: f64,
 }
 
-/// What a frame lacks, as the Expand request that fills it: `node` and the
-/// optional `branch` below it name the target, whose `window` (ln of mass
-/// below its edges) should be listed down to `horizon`.
+/// What a frame lacks, as the Expand request that fills it: the window of
+/// `node` in view, as ln of the mass below its edges, listed down to
+/// `horizon`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Miss {
     #[serde(with = "node_id")]
     pub node: NodeId,
-    pub branch: Option<Branch>,
+    /// The node whose children are lacking: `node`, or a child it holds.
+    #[serde(with = "node_id")]
+    pub target: NodeId,
     pub measure: usize,
-    /// The first rank the target lacks: while that does not change, asking
-    /// again finds nothing new.
+    /// The target's lacking ranks, from `from` to `to` or to its end: while
+    /// they stay the same, asking again finds nothing new.
     pub from: Rank,
+    pub to: Option<Rank>,
     pub ln_top: f64,
     pub ln_bottom: f64,
     pub horizon: u32,
@@ -418,29 +421,10 @@ impl Layout<'_> {
         (y1.min(1.0) - y0.max(0.0)).max(0.0) * self.view.height
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn want(
-        &mut self,
-        node: NodeId,
-        branch: Option<Branch>,
-        measure: usize,
-        from: Rank,
-        top: f64,
-        bottom: f64,
-        horizon: u32,
-        priority: f64,
-    ) {
-        if let Ok(window) = Window::new(top.min(0.0), bottom) {
-            self.frame.misses.push(Miss {
-                node,
-                branch,
-                measure,
-                from,
-                ln_top: window.top(),
-                ln_bottom: window.bottom(),
-                horizon,
-                priority,
-            });
+    /// Ask for a miss whose window is not empty.
+    fn want(&mut self, miss: Miss) {
+        if Window::new(miss.ln_top, miss.ln_bottom).is_ok() {
+            self.frame.misses.push(miss);
         }
     }
 
@@ -453,7 +437,17 @@ impl Layout<'_> {
             let (y0, y1) = placed.span();
             let px = self.px(y0, y1);
             if px >= MIN_PX {
-                self.want(node, None, self.lens.p, 0, top, bottom, horizon(px), px);
+                self.want(Miss {
+                    node,
+                    target: node,
+                    measure: self.lens.p,
+                    from: 0,
+                    to: None,
+                    ln_top: top,
+                    ln_bottom: bottom,
+                    horizon: horizon(px),
+                    priority: px,
+                });
             }
             return Ok(());
         };
@@ -475,7 +469,7 @@ impl Layout<'_> {
                     if skip == Some(rank) {
                         d.next(found)
                     } else if y1 - y0 >= self.merge {
-                        self.child(node, &placed, d, found, y0, y1)?;
+                        self.child(node, &placed, d, found, (y0, y1), (top, bottom))?;
                         d.next(found)
                     } else {
                         // A band through the child about `merge` below, short
@@ -495,14 +489,15 @@ impl Layout<'_> {
         Ok(())
     }
 
+    /// A child spanning `y0..y1`, in a node whose view spans the edges `view`.
     fn child(
         &mut self,
         node: NodeId,
         placed: &Placed,
         d: &Distribution,
         item: Item,
-        y0: f64,
-        y1: f64,
+        (y0, y1): (f64, f64),
+        view: (f64, f64),
     ) -> Result<()> {
         let tree = self.tree;
         let mut b = item_box(tree, self.lens, node, placed, d, item)?;
@@ -525,20 +520,21 @@ impl Layout<'_> {
         if kind == BoxKind::Node {
             return self.lay(id, child, None);
         }
-        // Named through its parent, which the source has placed already.
+        // The part in view, as a window on the parent, which the source has
+        // already reached: it descends into the child and lists it there.
         let px = self.px(y0, y1);
         if px >= MIN_PX {
-            let (top, bottom) = (child.ln_below(0.0), child.ln_below(1.0));
-            self.want(
+            self.want(Miss {
                 node,
-                Some(branch),
-                self.lens.p,
-                0,
-                top,
-                bottom,
-                horizon(px),
-                px,
-            );
+                target: id,
+                measure: self.lens.p,
+                from: 0,
+                to: None,
+                ln_top: top.min(view.0),
+                ln_bottom: bottom.max(view.1),
+                horizon: horizon(px),
+                priority: px,
+            });
         }
         Ok(())
     }
@@ -565,17 +561,17 @@ impl Layout<'_> {
         let px = self.px(y0, y1);
         let ceiling = (placed.ln_scale + d.gap_ceiling(before)).exp() * self.view.height;
         if px >= MIN_PX && ceiling >= 0.5f64.powi(HEADROOM as i32) {
-            let window = (d.item_top(item).min(top), d.item_bottom(item).max(bottom));
-            self.want(
+            self.want(Miss {
                 node,
-                None,
-                self.lens.p,
-                rank,
-                window.0,
-                window.1,
-                horizon(px),
-                px,
-            );
+                target: node,
+                measure: self.lens.p,
+                from: rank,
+                to: d.item_end(item),
+                ln_top: d.item_top(item).min(top),
+                ln_bottom: d.item_bottom(item).max(bottom),
+                horizon: horizon(px),
+                priority: px,
+            });
         }
         Ok(())
     }
@@ -644,23 +640,22 @@ impl Layout<'_> {
         if q.is_some_and(|q| q.covers(-f64::from(need) * LN_2)) {
             return Ok(());
         }
-        let from = q
+        let head = q
             .and_then(|q| q.runs().first())
-            .filter(|run| run.rank() == 0)
-            .map_or(0, Run::end);
+            .filter(|run| run.rank() == 0);
         let (y0, y1) = placed.span();
         let px = self.px(y0, y1);
-        let horizon = (need + HEADROOM).min(MAX_HORIZON);
-        self.want(
+        self.want(Miss {
             node,
-            None,
-            self.lens.q,
-            from,
-            0.0,
-            f64::NEG_INFINITY,
-            horizon,
-            px,
-        );
+            target: node,
+            measure: self.lens.q,
+            from: head.map_or(0, Run::end),
+            to: q.and_then(|q| q.runs().get(usize::from(head.is_some())).map(Run::rank)),
+            ln_top: 0.0,
+            ln_bottom: f64::NEG_INFINITY,
+            horizon: (need + HEADROOM).min(MAX_HORIZON),
+            priority: px,
+        });
         Ok(())
     }
 }
@@ -1069,21 +1064,23 @@ mod tests {
         let named: Vec<_> = frame
             .misses
             .iter()
-            .map(|m| (m.node, m.branch, m.from))
+            .map(|m| (m.node, m.target, m.from, m.to))
             .collect();
-        // The gap from rank 2, and both children through the root.
-        assert!(named.contains(&(ROOT, None, 2)));
-        assert!(named.contains(&(ROOT, Some(4), 0)));
-        assert!(named.contains(&(ROOT, Some(7), 0)));
+        // The gap from rank 2 to the bottom, and both children through the root.
+        assert!(named.contains(&(ROOT, ROOT, 2, None)));
+        assert!(named.contains(&(ROOT, child_hash(ROOT, 4), 0, None)));
+        assert!(named.contains(&(ROOT, child_hash(ROOT, 7), 0, None)));
         let gap_miss = frame.misses.iter().find(|m| m.from == 2).unwrap();
         near(gap_miss.ln_top, 0.25f64.ln());
         assert_eq!(gap_miss.ln_bottom, f64::NEG_INFINITY);
-        // A child's request covers only what the view shows of it.
-        let child_miss = frame.misses.iter().find(|m| m.branch == Some(4)).unwrap();
-        assert_eq!(
-            (child_miss.ln_top, child_miss.ln_bottom),
-            (0.0, f64::NEG_INFINITY)
-        );
+        // A child is asked for as its part of the parent in view: all of it.
+        let child_miss = frame
+            .misses
+            .iter()
+            .find(|m| m.target == child_hash(ROOT, 4))
+            .unwrap();
+        assert_eq!(child_miss.ln_top, 0.0);
+        near(child_miss.ln_bottom, 0.5f64.ln());
     }
 
     #[test]

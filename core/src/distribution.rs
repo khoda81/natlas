@@ -100,6 +100,12 @@ impl Run {
         })
     }
 
+    /// The node's children end at `rank`: nothing is below it. A node
+    /// without children is the end at rank 0.
+    pub fn end_at(rank: Rank) -> Run {
+        Self::new(rank, Vec::new(), vec![f64::NEG_INFINITY]).expect("an end is a valid run")
+    }
+
     pub fn rank(&self) -> Rank {
         self.rank
     }
@@ -361,6 +367,13 @@ impl Distribution {
             }
             None => self.complete().then_some(f64::NEG_INFINITY),
         }
+    }
+
+    /// How many children have weight, where the node's end is known: the
+    /// rank its last child ends at.
+    pub fn count(&self) -> Option<Rank> {
+        let last = self.runs.last().expect("a distribution has a run");
+        (last.ln_below[last.len()] == f64::NEG_INFINITY).then(|| last.end())
     }
 
     /// Whether every child is known.
@@ -696,6 +709,15 @@ mod tests {
         assert_eq!(d.locate(0.001f64.ln()), Some(Item::Gap { before: 2 }));
         close(d.edge(5).unwrap(), 0.03f64.ln());
         assert_eq!(d.edge(3), None);
+        // The node's end, as an empty run, bounds the bottom gap and counts it.
+        let mut ending = Distribution::new(run(0, &[7, 8], &[0.5, 0.25], 0.25));
+        assert_eq!(ending.count(), None);
+        ending.insert(Run::end_at(9));
+        assert_eq!(ending.count(), Some(9));
+        assert_eq!(ending.item_end(Item::Gap { before: 1 }), Some(9));
+        assert_eq!(ending.next(Item::Gap { before: 1 }), None);
+        assert_eq!(ending.edge(9), Some(f64::NEG_INFINITY));
+        assert!(Distribution::new(Run::end_at(0)).ended());
         let late = Distribution::new(run(3, &[1], &[0.1], 0.1));
         assert_eq!(late.locate(0.0), Some(Item::Gap { before: 0 }));
         assert_eq!(late.edge(0), Some(0.0));

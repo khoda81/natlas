@@ -88,25 +88,24 @@ class Model:
             self.tree.walk(0, list(path))
 
     def expand(
-        self,
-        measure: int,
-        node: int,
-        path: Sequence[int],
-        ln_top: float,
-        ln_bottom: float,
-        horizon: int,
-        canceled: threading.Event,
+        self, measure: int, request: pb.ExpandRequest, canceled: threading.Event
     ) -> Iterator[pb.Run]:
         """The protocol's Expand: one run per node, computing each
         distribution the walk needs as it gets there.
 
-        Raises KeyError, before yielding, when this server has not learned
-        ``node``, and ValueError for an empty window. Stops early once
+        Raises KeyError, before yielding, when this server has not learned the
+        request's node, and ValueError for an empty window. Stops early once
         ``canceled`` is set.
         """
+        node, horizon = request.node, request.horizon
+        path = list(request.path.branches)
         with self.names:
-            walk = self.tree.start(node, list(path), ln_top, ln_bottom, horizon)
-            # The path is known ahead, so the model reads it in one pass.
+            if request.WhichOneof("target") == "window":
+                window = request.window
+                walk = self.tree.start_window(node, window.ln_top, window.ln_bottom, horizon)
+            else:
+                walk = self.tree.start_path(node, path, horizon)
+            # A path is known ahead, so the model reads it in one pass.
             ahead = tuple(self.tree.path(node)) + tuple(path)
         started = time.perf_counter()
         computed = 0
@@ -121,10 +120,10 @@ class Model:
                 if step is None:
                     break
                 if step[0] == "run":
-                    _, used, rank, branches, ln_below = step
+                    _, used, rank, branches, ln_below, children = step
                     if used in recent:
                         recent.move_to_end(used)
-                    yield pb.Run(rank=rank, branches=branches, ln_below=ln_below)
+                    yield pb.Run(rank=rank, branches=branches, ln_below=ln_below, children=children)
                     continue
                 missing = step[1]
                 with self.names:
@@ -212,10 +211,12 @@ def app(
                 return _stream(
                     [_end({"code": "invalid_argument", "message": str(error)})]
                 )
+            target = request_message.WhichOneof("target")
+            window = request_message.window
             # NaN fails both comparisons.
-            if not request_message.ln_bottom < request_message.ln_top <= 0:
+            if target is None or (target == "window" and not window.ln_bottom < window.ln_top <= 0):
                 return _stream(
-                    [_end({"code": "invalid_argument", "message": "an empty window"})]
+                    [_end({"code": "invalid_argument", "message": "an Expand needs a path or a nonempty window"})]
                 )
             # The walk runs on its own thread, holding the model for its whole
             # length, and hands each run over as it is listed. A client that
@@ -225,15 +226,7 @@ def app(
 
             def work() -> None:
                 try:
-                    for run in model.expand(
-                        measure,
-                        request_message.node,
-                        request_message.path,
-                        request_message.ln_top,
-                        request_message.ln_bottom,
-                        request_message.horizon,
-                        canceled,
-                    ):
+                    for run in model.expand(measure, request_message, canceled):
                         items.put(_envelope(0, run.SerializeToString()))
                     items.put(_end())
                 except KeyError as error:

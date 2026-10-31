@@ -16,19 +16,21 @@ function snapshot(labels = TextLabels.none(), paths: number[][] = [[], [1]]): Sn
   return new SnapshotSource(toBinary(SnapshotSchema, create(SnapshotSchema, { recordings })), labels);
 }
 
-async function steps(source: Source, tree: IntervalTree, request: Partial<ExpandRequest>): Promise<Step[]> {
+async function steps(source: Source, tree: IntervalTree, request: ExpandRequest): Promise<Step[]> {
   const result: Step[] = [];
-  for await (const step of source.expand(tree, { node: ROOT, path: [], ...WHOLE, horizon: 8, ...request })) result.push(step);
+  for await (const step of source.expand(tree, request)) result.push(step);
   return result;
 }
+
+const whole = (horizon: number, node = ROOT): ExpandRequest => ({ node, window: WHOLE, horizon });
 
 describe("SnapshotSource", () => {
   it("lists a window down to its horizon, as a server would", async () => {
     const source = snapshot();
     const tree = new IntervalTree(1);
-    const [shallow] = await steps(source, tree, { horizon: 2 });
+    const [shallow] = await steps(source, tree, whole(2));
     expect(shallow!.run.branches).toEqual([0]);
-    const [deep] = await steps(source, tree, { horizon: 4 });
+    const [deep] = await steps(source, tree, whole(4));
     expect(deep!.run.branches).toEqual([0, 1, 2]);
     expect(Array.from(deep!.run.lnBelow).at(-1)).toBeCloseTo(Math.log(0.2), 12);
   });
@@ -36,17 +38,17 @@ describe("SnapshotSource", () => {
   it("places each branch of a path, naming every node, and stops where the recording does", async () => {
     const source = snapshot(TextLabels.none(), [[], [1], [1, 4]]);
     const tree = new IntervalTree(1);
-    const walk = await steps(source, tree, { path: [1, 4, 0] });
+    const walk = await steps(source, tree, { node: ROOT, path: [1, 4, 0], horizon: 8 });
     expect(walk.map(({ node }) => tree.path(node))).toEqual([[], [1], [1, 4]]);
     expect(walk.map(({ run }) => Array.from(run.branches))).toEqual([[1], [4], [0]]);
-    expect(await steps(source, tree, { node: tree.descend(ROOT, [9, 9]) })).toEqual([]);
+    expect(await steps(source, tree, whole(8, tree.descend(ROOT, [9, 9])))).toEqual([]);
   });
 
   it("descends a window inside one child", async () => {
     const source = snapshot(TextLabels.none(), [[], [0]]);
     const tree = new IntervalTree(1);
     // (0.6, 0.9] lies inside branch 0's (0.5, 1].
-    const walk = await steps(source, tree, { lnTop: Math.log(0.9), lnBottom: Math.log(0.6) });
+    const walk = await steps(source, tree, { node: ROOT, window: { lnTop: Math.log(0.9), lnBottom: Math.log(0.6) }, horizon: 8 });
     expect(walk.map(({ node }) => tree.path(node))).toEqual([[], [0]]);
     expect(walk[0]!.run.branches).toEqual([0]);
   });
@@ -60,8 +62,10 @@ describe("SnapshotSource", () => {
 });
 
 describe("ConnectSource", () => {
-  it("names a request by its node's id, and from the root once the server has not learned it", async () => {
-    const requests: { node: bigint; path: number[] }[] = [];
+  it("names a request by its node's id, and by a path from the root once the server has not learned it", async () => {
+    const requests: string[] = [];
+    const learned = new Set([ROOT]);
+    const names = new IntervalTree(1);
     const envelope = (flags: number, body: Uint8Array) => {
       const frame = new Uint8Array(5 + body.length);
       new DataView(frame.buffer).setUint8(0, flags);
@@ -69,26 +73,37 @@ describe("ConnectSource", () => {
       frame.set(body, 5);
       return frame;
     };
+    const message = (value: Parameters<typeof create<typeof RunSchema>>[1]) => envelope(0, toBinary(RunSchema, create(RunSchema, value)));
     const server = Bun.serve({
       port: 0,
       async fetch(request) {
         const body = new Uint8Array(await request.arrayBuffer());
-        const { node, path } = fromBinary(ExpandRequestSchema, body.subarray(5));
-        requests.push({ node, path: [...path] });
+        const { node, target } = fromBinary(ExpandRequestSchema, body.subarray(5));
         const end = (error?: object) => envelope(2, new TextEncoder().encode(JSON.stringify(error ? { error } : {})));
-        const reply = node === ROOT
-          ? [...path.map((branch) => envelope(0, toBinary(RunSchema, create(RunSchema, { rank: 0, branches: [branch], lnBelow: [0, -1] })))),
-            envelope(0, toBinary(RunSchema, create(RunSchema, run([1])))), end()]
-          : [end({ code: "not_found", message: "unknown node" })];
-        return new Response(new Blob(reply), { headers: { "content-type": "application/connect+proto" } });
+        const respond = (chunks: BlobPart[]) => new Response(new Blob(chunks), { headers: { "content-type": "application/connect+proto" } });
+        requests.push(target.case === "path" ? `${node === ROOT ? "root" : "deep"} path ${target.value.branches}` : `${node === ROOT ? "root" : "deep"} window`);
+        if (!learned.has(node)) return respond([end({ code: "not_found", message: "unknown node" })]);
+        if (target.case !== "path") return respond([message(run([1])), end()]);
+        // Placing each branch teaches the server the nodes along the path.
+        const { branches } = target.value;
+        const placed = branches.map((branch, i) => {
+          learned.add(names.descend(node, branches.slice(0, i + 1)));
+          return message({ rank: 0, branches: [branch], lnBelow: [0, -1] });
+        });
+        return respond([...placed, message(run([1])), end()]);
       },
     });
     try {
+      const source = new ConnectSource(`http://localhost:${server.port}/`);
       const tree = new IntervalTree(1);
       const deep = tree.descend(ROOT, [5, 6]);
-      const walk = await steps(new ConnectSource(`http://localhost:${server.port}/`), tree, { node: deep, path: [7] });
-      expect(requests).toEqual([{ node: deep, path: [7] }, { node: ROOT, path: [5, 6, 7] }]);
+      const walk = await steps(source, tree, { node: deep, path: [7], horizon: 8 });
       expect(walk.map(({ node }) => tree.path(node))).toEqual([[], [5], [5, 6], [5, 6, 7]]);
+      // A window on a node the server has not learned: a path teaches it, then the window.
+      const other = tree.descend(ROOT, [9]);
+      const window = await steps(source, tree, whole(8, other));
+      expect(window.map(({ node }) => tree.path(node))).toEqual([[], [9], [9]]);
+      expect(requests).toEqual(["deep path 7", "root path 5,6,7", "deep window", "root path 9", "deep window"]);
     } finally {
       server.stop(true);
     }
@@ -107,7 +122,7 @@ function counting(answer: (request: ExpandRequest) => Step[] | Promise<Step[]>):
   };
 }
 
-const rootMiss: Miss = { node: ROOT, branch: null, measure: 0, from: 0, lnTop: 0, lnBottom: -Infinity, horizon: 8, priority: 1 };
+const rootMiss: Miss = { node: ROOT, target: ROOT, measure: 0, from: 0, to: null, lnTop: 0, lnBottom: -Infinity, horizon: 8, priority: 1 };
 
 describe("Expander", () => {
   it("asks once for what a view lacks, and not again for what a source could not give", async () => {
@@ -123,17 +138,32 @@ describe("Expander", () => {
     } finally { expander.dispose(); }
   });
 
-  it("names a child through its parent and refills capacity from current demand", async () => {
+  it("asks for a child by a window on its parent, and refills capacity from current demand", async () => {
     const tree = new IntervalTree(1);
-    const source = counting(({ node, path }) => {
-      const target = path.length === 0 ? node : tree.child(node, path[0]!);
-      return [{ node: target, run: run([0.5, 0.5]) }];
-    });
+    const child = tree.child(ROOT, 1);
+    const source = counting(() => tree.has(ROOT, 0)
+      ? [{ node: ROOT, run: run([0.5], [1], 1, 0) }, { node: child, run: run([0.5, 0.5]) }]
+      : [{ node: ROOT, run: run([0.5, 0.5]) }]);
     const expander = new Expander(tree, [source], 1);
     try {
-      expander.request(() => tree.has(ROOT, 0) ? [{ ...rootMiss, branch: 1 }] : [rootMiss]);
-      await waitUntil(() => tree.has(tree.child(ROOT, 1), 0));
-      expect(source.requests.map(({ node, path }) => [node, path])).toEqual([[ROOT, []], [ROOT, [1]]]);
+      expander.request(() => tree.has(ROOT, 0) ? [{ ...rootMiss, target: child, lnBottom: Math.log(0.5) }] : [rootMiss]);
+      await waitUntil(() => tree.has(child, 0));
+      expect(source.requests.map((request) => "window" in request ? [request.node, request.window.lnBottom] : null))
+        .toEqual([[ROOT, -Infinity], [ROOT, Math.log(0.5)]]);
+    } finally { expander.dispose(); }
+  });
+
+  it("asks again for a gap that an answer split, keyed by both its ends", async () => {
+    const tree = new IntervalTree(1);
+    tree.insert(ROOT, 0, run([0.5, 0.25], [0, 1], 0));
+    // The answer lands inside the gap: ranks 2–4 stay unknown above it.
+    const source = counting(() => [{ node: ROOT, run: run([0.01], [9], 5, 0.1) }]);
+    const expander = new Expander(tree, [source]);
+    const gap = (to: number | null): Miss => ({ ...rootMiss, from: 2, to, lnTop: Math.log(0.25) });
+    try {
+      expander.request(() => [gap(tree.raw.entry(ROOT, 0, 0, 9).length === 0 ? null : 5)]);
+      await waitUntil(() => source.requests.length === 2);
+      expect(source.requests).toHaveLength(2);
     } finally { expander.dispose(); }
   });
 
@@ -152,7 +182,7 @@ describe("Expander", () => {
     const expander = new Expander(tree, [source]);
     try {
       expect(await expander.walk(ROOT, target, 0, 4)).toBe(true);
-      expect(requests.map(({ node, path }) => [node, path])).toEqual([[tree.descend(ROOT, [1]), [2, 3]]]);
+      expect(requests.map((request) => "path" in request ? [request.node, request.path] : null)).toEqual([[tree.descend(ROOT, [1]), [2, 3]]]);
       expect(await expander.walk(ROOT, target, 0, 4)).toBe(true);
       expect(requests).toHaveLength(1);
       // Past what was recorded, the walk ends.

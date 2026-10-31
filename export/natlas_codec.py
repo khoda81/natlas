@@ -15,14 +15,18 @@ def labels_json(labels: Sequence[bytes]) -> str:
     return json.dumps([base64.b64encode(label).decode() for label in labels])
 
 
-def run(branches: Sequence[int], ln_weights: Sequence[float], ln_rest: float) -> pb.Run:
-    """A node's heaviest children from rank 0, and ``ln_rest`` of its mass
-    below them: each edge summed from the light end, so tiny masses survive."""
+def run(
+    branches: Sequence[int], ln_weights: Sequence[float], ln_rest: float, children: int | None = None
+) -> pb.Run:
+    """A node's heaviest children from rank 0, ``ln_rest`` of its mass below
+    them, and how many children have weight, where known: each edge summed
+    from the light end, so tiny masses survive."""
     ln_below = [ln_rest]
     for ln_weight in reversed(ln_weights):
         ln_below.append(_ln_add(ln_below[-1], ln_weight))
     # A whole node is mass 1, whatever rounding made of its sum.
-    return pb.Run(rank=0, branches=branches, ln_below=[min(edge, 0.0) for edge in reversed(ln_below)])
+    edges = [min(edge, 0.0) for edge in reversed(ln_below)]
+    return pb.Run(rank=0, branches=branches, ln_below=edges, children=children)
 
 
 def _ln_add(a: float, b: float) -> float:

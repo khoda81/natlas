@@ -104,11 +104,17 @@ def messages(body):
     return result
 
 
-WHOLE = (0.0, -math.inf)
+def request(node, path=None, window=None, horizon=16):
+    """Expand down ``path`` or, when given, ``window``."""
+    if window is not None:
+        target = {"window": pb.Window(ln_top=window[0], ln_bottom=window[1])}
+    else:
+        target = {"path": pb.Path(branches=path or [])}
+    return pb.ExpandRequest(node=node, horizon=horizon, **target)
 
 
-def runs(model, node, path, horizon=16, measure=0, window=WHOLE):
-    return list(model.expand(measure, node, path, *window, horizon, threading.Event()))
+def runs(model, node, path=None, horizon=16, measure=0, window=None):
+    return list(model.expand(measure, request(node, path, window, horizon), threading.Event()))
 
 
 def weights(run):
@@ -132,16 +138,16 @@ class CoreTests(unittest.TestCase):
 
     def test_a_walk_lists_what_the_core_holds_and_asks_for_what_it_lacks(self):
         tree = Tree(1)
-        walk = tree.start(0, [], 0.0, -math.inf, 2)
+        walk = tree.start_window(0, 0.0, -math.inf, 2)
         self.assertEqual(tree.advance(walk, 0), ("missing", 0))
         with np.errstate(divide="ignore"):
             tree.set(0, 0, np.log([0.2, 0.5, 0.0, 0.3]))
-        kind, node, rank, branches, ln_below = tree.advance(walk, 0)
-        self.assertEqual((kind, node, rank, branches), ("run", 0, 0, [1, 3]))
+        kind, node, rank, branches, ln_below, children = tree.advance(walk, 0)
+        self.assertEqual((kind, node, rank, branches, children), ("run", 0, 0, [1, 3], 3))
         self.assertAlmostEqual(math.exp(ln_below[-1]), 0.2, places=12)
         self.assertIsNone(tree.advance(walk, 0))
         with self.assertRaises(ValueError):
-            tree.start(0, [], -1.0, -0.5, 1)
+            tree.start_window(0, -1.0, -0.5, 1)
 
 
 class ModelTests(unittest.TestCase):
@@ -163,9 +169,11 @@ class ModelTests(unittest.TestCase):
         model, _ = fixture()
         (root,) = runs(model, 0, [], horizon=4)
         self.assertEqual(list(root.branches), [0, 1, 2])
+        # The rest stays unknown, but not how many branches it holds.
+        self.assertEqual(root.children, 5)
         self.assertAlmostEqual(sum(weights(root)), 0.95, places=12)
         # (0.5, 0.9] of the root lies inside branch 0's (0.4, 1].
-        descent = runs(model, 0, [], horizon=4, window=(math.log(0.9), math.log(0.5)))
+        descent = runs(model, 0, horizon=4, window=(math.log(0.9), math.log(0.5)))
         self.assertEqual([list(run.branches) for run in descent[:1]], [[0]])
         self.assertEqual(model.measures[0].calls[-1], (99, 0))
 
@@ -182,7 +190,7 @@ class ModelTests(unittest.TestCase):
         model, _ = fixture()
         ended = runs(model, 0, [0] * 5, 40)
         self.assertEqual(len(ended), 6)
-        self.assertEqual(ended[-1], pb.Run(rank=0, ln_below=[-math.inf]))
+        self.assertEqual(ended[-1], pb.Run(rank=0, ln_below=[-math.inf], children=0))
         # Branch 5 is past the vocabulary: nothing places it.
         self.assertEqual(len(runs(model, 0, [5], 40)), 0)
         with self.assertRaises(KeyError):
@@ -191,7 +199,7 @@ class ModelTests(unittest.TestCase):
     def test_a_canceled_walk_stops_at_the_next_node(self):
         model, _ = fixture()
         canceled = threading.Event()
-        walk = model.expand(0, 0, [0, 1, 2], *WHOLE, 16, canceled)
+        walk = model.expand(0, request(0, [0, 1, 2]), canceled)
         next(walk)
         canceled.set()
         self.assertEqual(list(walk), [])
@@ -213,11 +221,10 @@ class TransportTests(unittest.TestCase):
             },
         )
 
-    def runs(self, node, path, horizon=16, window=WHOLE):
-        request = pb.ExpandRequest(
-            node=node, path=path, ln_top=window[0], ln_bottom=window[1], horizon=horizon
+    def runs(self, node, path, horizon=16):
+        response = self.expand(
+            service._envelope(0, request(node, path, horizon=horizon).SerializeToString())
         )
-        response = self.expand(service._envelope(0, request.SerializeToString()))
         self.assertEqual(response.status_code, 200)
         frames = messages(response.content)
         return [
@@ -232,7 +239,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(again, runs[1:])
         self.assertEqual(self.model.measures[0].calls, [(99,), (99, 0), (99, 0, 1)])
         response = self.expand(
-            service._envelope(0, pb.ExpandRequest(node=0).SerializeToString())
+            service._envelope(0, request(0).SerializeToString())
         )
         self.assertEqual(response.headers["access-control-allow-origin"], "*")
 
@@ -270,8 +277,15 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
 
     def test_invalid_requests_return_protocol_errors(self):
-        empty = pb.ExpandRequest(node=0).SerializeToString()
-        for body in [b"", b"\x00\x00\x00\x00\x04\x80", service._envelope(0, b"\x80"), service._envelope(0, empty)]:
+        untargeted = pb.ExpandRequest(node=0).SerializeToString()
+        empty = request(0, window=(-1.0, -0.5)).SerializeToString()
+        for body in [
+            b"",
+            b"\x00\x00\x00\x00\x04\x80",
+            service._envelope(0, b"\x80"),
+            service._envelope(0, untargeted),
+            service._envelope(0, empty),
+        ]:
             frames = messages(self.expand(body).content)
             self.assertEqual(
                 json.loads(frames[-1][1])["error"]["code"], "invalid_argument"

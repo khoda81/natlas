@@ -57,15 +57,17 @@ export interface Box {
   y1: number;
 }
 
-/** What a frame lacks, as the Expand request that fills it: ``node``, and
- * ``branch`` below it when given, name the target, whose window should be
- * listed down to ``horizon``. Asking again finds nothing new while the
- * target's first missing rank stays ``from``. */
+/** What a frame lacks, as the Expand request that fills it: the window of
+ * ``node`` in view, as ln of the mass below its edges, listed down to
+ * ``horizon``. ``target`` is the node whose children are lacking, ``node`` or
+ * a child it holds; asking again finds nothing new while its lacking ranks,
+ * ``from`` up to ``to`` or its end, stay the same. */
 export interface Miss {
   node: NodeId;
-  branch: Branch | null;
+  target: NodeId;
   measure: number;
   from: Rank;
+  to: Rank | null;
   lnTop: number;
   lnBottom: number;
   horizon: number;

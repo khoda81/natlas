@@ -129,7 +129,7 @@ export function draw(
     );
 
     if (box.kind !== "merged" && height >= LABEL_MIN_HEIGHT && width >= LABEL_MIN_WIDTH) {
-      labels.push({ box, rect, glyph: box.branch === null ? MORE : state.glyph(box.node, box.branch), ink, grows: box.branch !== null });
+      labels.push({ box, rect, glyph: box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box), ink, grows: box.branch !== null });
     }
   }
 
@@ -169,6 +169,12 @@ export function draw(
 
   outline(ctx, frame, cam, view, state, scheme.ink);
   ruler(ctx, cam, view, state.units, palette);
+}
+
+/** What a gap or the origin says of itself: how many children it holds, where known. */
+function gapGlyph(box: Box): Glyph {
+  if (box.kind !== "gap" || box.count === 0) return MORE;
+  return { text: box.count === 1 ? "1 branch" : `${box.count.toLocaleString()} branches` };
 }
 
 /** ``kind`` drawn ``size`` tall from ``x``, centered on ``y``: filled with ``tint``, edged in ``ink``. */

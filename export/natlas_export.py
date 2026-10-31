@@ -92,6 +92,7 @@ def snapshots(
                 [distribution.token(rank) for rank in listed],
                 [-distribution.nats(rank) for rank in listed],
                 distribution.mass(len(listed), len(distribution)),
+                _weighted(distribution),
             )
         )
 
@@ -119,7 +120,7 @@ def _recording_of(
     top = heapq.nlargest(max_list, range(len(weights)), key=weights.__getitem__)
     count = _coverage_count([weights[branch] for branch in top], min_list, max_list, coverage)
     if not count:
-        return _recording(path, [], [], 0.0)
+        return _recording(path, [], [], 0.0, 0)
     horizon = _horizon(_ln(weights[top[count - 1]]))
     if include is not None:
         horizon = max(horizon, _horizon(_ln(weights[include])))
@@ -128,7 +129,8 @@ def _recording_of(
     heavy = [branch for branch, weight in enumerate(weights) if weight >= threshold]
     listed = sorted(heavy, key=lambda branch: (-weights[branch], branch))
     rest = math.fsum(weight for weight in weights if weight < threshold)
-    return _recording(path, listed, [_ln(weights[branch]) for branch in listed], rest)
+    children = sum(1 for weight in weights if weight > 0)
+    return _recording(path, listed, [_ln(weights[branch]) for branch in listed], rest, children)
 
 
 def _recording(
@@ -136,9 +138,24 @@ def _recording(
     branches: Sequence[int],
     ln_weights: Sequence[float],
     rest: float,
+    children: int,
 ) -> pb.Recording:
-    """A recorded node: its heaviest children, and what they leave unknown."""
-    return pb.Recording(path=path, run=run(branches, ln_weights, _ln(rest)))
+    """A recorded node: its heaviest children, what they leave unknown, and
+    how many children have weight."""
+    return pb.Recording(path=path, run=run(branches, ln_weights, _ln(rest), children))
+
+
+def _weighted(distribution) -> int:
+    """How many of natwalk's ranked tokens have weight: they rank heaviest
+    first, so the weightless ones are a suffix."""
+    low, high = 0, len(distribution)
+    while low < high:
+        middle = (low + high) // 2
+        if math.isfinite(distribution.nats(middle)):
+            low = middle + 1
+        else:
+            high = middle
+    return low
 
 
 def _coverage_count(weights: Sequence[float], min_list: int, max_list: int, coverage: float) -> int:

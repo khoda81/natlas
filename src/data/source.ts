@@ -10,19 +10,18 @@ import { type NotesFile, NoteLabels } from "../readings/notes";
 import type { Labels } from "../readings/reading";
 import { type Branch, IntervalTree, type NodeId, ROOT, type Run } from "../core/tree";
 
-/** The protocol's Expand: ``path`` below ``node``, then the window within the
- * node it reaches, as ln of the mass below its edges, listed down to
- * ``horizon`` bits. */
-export interface ExpandRequest {
-  node: NodeId;
-  path: Branch[];
+/** A part of a node, as ln of the mass below each of its edges. */
+export interface Window {
   lnTop: number;
   lnBottom: number;
-  horizon: number;
 }
 
 /** The whole of a node, as a window. */
-export const WHOLE = { lnTop: 0, lnBottom: -Infinity } as const;
+export const WHOLE: Window = { lnTop: 0, lnBottom: -Infinity };
+
+/** The protocol's Expand, reading below ``node`` down a path or down a
+ * window, listing down to ``horizon`` bits. */
+export type ExpandRequest = { node: NodeId; horizon: number } & ({ path: Branch[] } | { window: Window });
 
 /** One message of an answer: a node's run. */
 export interface Step {
@@ -38,9 +37,10 @@ export interface Source {
 }
 
 /** Name each message's node in ``tree``: the start, then the child along the
- * path's next branch, then the single child the window descends into. */
-async function* named(tree: IntervalTree, { node, path }: ExpandRequest, runs: AsyncIterable<Run> | Iterable<Run>): AsyncIterable<Step> {
-  let current = node;
+ * path's next branch, or the single child the window descends into. */
+async function* named(tree: IntervalTree, request: ExpandRequest, runs: AsyncIterable<Run> | Iterable<Run>): AsyncIterable<Step> {
+  const path = "path" in request ? request.path : [];
+  let current = request.node;
   let next: Branch | undefined;
   let depth = 0;
   for await (const run of runs) {
@@ -85,8 +85,10 @@ export class SnapshotSource implements Source {
   }
 
   async *expand(tree: IntervalTree, request: ExpandRequest): AsyncIterable<Step> {
-    const { node, path, lnTop, lnBottom, horizon } = request;
-    const runs = this.recorded.raw.answer(node, 0, Uint32Array.from(path), lnTop, lnBottom, horizon) as Run[];
+    const { node, horizon } = request;
+    const runs = ("path" in request
+      ? this.recorded.raw.answerPath(node, 0, Uint32Array.from(request.path), horizon)
+      : this.recorded.raw.answerWindow(node, 0, request.window.lnTop, request.window.lnBottom, horizon)) as Run[];
     yield* named(tree, request, runs);
   }
 
@@ -103,20 +105,33 @@ export class ConnectSource implements Source {
     this.client = createClient(Natlas, createConnectTransport({ baseUrl, useBinaryFormat: true }));
   }
 
-  /** Name the request from its node's id, and from the root when the server
-   * has not learned that id (it restarted, or never saw it). */
+  /** Name the request from its node's id. Where the server has not learned
+   * that id (it restarted, or never saw it), a path from the root names it,
+   * and a window is asked again once the path has. */
   async *expand(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step> {
     let answered = false;
     try {
-      for await (const step of named(tree, request, this.client.expand(request, { signal }))) {
+      for await (const step of this.ask(tree, request, signal)) {
         answered = true;
         yield step;
       }
     } catch (error) {
       if (answered || request.node === ROOT || ConnectError.from(error).code !== Code.NotFound) throw error;
-      const rooted = { ...request, node: ROOT, path: [...tree.path(request.node), ...request.path] };
-      yield* named(tree, rooted, this.client.expand(rooted, { signal }));
+      const path = tree.path(request.node);
+      if ("path" in request) {
+        yield* this.ask(tree, { node: ROOT, path: [...path, ...request.path], horizon: request.horizon }, signal);
+      } else {
+        yield* this.ask(tree, { node: ROOT, path, horizon: request.horizon }, signal);
+        yield* this.ask(tree, request, signal);
+      }
     }
+  }
+
+  private ask(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step> {
+    const target = "path" in request
+      ? { case: "path" as const, value: { branches: request.path } }
+      : { case: "window" as const, value: request.window };
+    return named(tree, request, this.client.expand({ node: request.node, horizon: request.horizon, target }, { signal }));
   }
 
   async search(text: string, signal?: AbortSignal): Promise<Branch[]> {

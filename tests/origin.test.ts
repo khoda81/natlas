@@ -13,7 +13,7 @@ it("opens a deep node on its own: its frame asks for it and then its children, n
   const asked = () => {
     const frame = layout(tree, lens, cam, view);
     try {
-      return frame.misses.map(({ node, branch, measure }) => `${tree.path(node).length + (branch === null ? 0 : 1)}:${measure}`);
+      return frame.misses.map(({ node, target, measure }) => `${tree.path(node).length + (target === node ? 0 : 1)}:${measure}`);
     } finally { frame.dispose(); }
   };
   expect(asked()).toEqual(["3000:0"]);

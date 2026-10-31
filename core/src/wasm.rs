@@ -28,6 +28,8 @@ struct Message<'a> {
     rank: u32,
     branches: &'a [u32],
     ln_below: &'a [f64],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    children: Option<u32>,
 }
 
 /// The integer-sequence tree, its distributions and their geometry, owned by
@@ -84,9 +86,9 @@ impl Tree {
         self.inner.chain(origin, id).map_err(js_error)
     }
 
-    /// Add a run a source sent, validated here; whether anything changed.
-    /// Typed arrays cross as copies, so a whole vocabulary never becomes
-    /// JavaScript objects.
+    /// Add a run a source sent, validated here, and the node's end where
+    /// the source knows it; whether anything changed. Typed arrays cross as
+    /// copies, so a whole vocabulary never becomes JavaScript objects.
     pub fn insert(
         &mut self,
         id: u64,
@@ -94,9 +96,15 @@ impl Tree {
         rank: u32,
         branches: Vec<u32>,
         ln_below: Vec<f64>,
+        children: Option<u32>,
     ) -> std::result::Result<bool, JsError> {
         let run = Run::new(rank, branches, ln_below).map_err(js_error)?;
-        self.inner.insert(id, measure, run).map_err(js_error)
+        // The end first: a run that contradicts it keeps the run.
+        let ended = match children {
+            Some(count) => self.inner.insert(id, measure, Run::end_at(count)),
+            None => Ok(false),
+        };
+        Ok(ended.map_err(js_error)? | self.inner.insert(id, measure, run).map_err(js_error)?)
     }
 
     /// Whether `measure` has said anything of the node's children.
@@ -140,34 +148,56 @@ impl Tree {
         to_js(&self.inner.statistics(id, Lens { p, q }).map_err(js_error)?)
     }
 
-    /// What this tree, as a recording, answers to an Expand request: the
-    /// messages it can give before it lacks a distribution.
-    #[allow(clippy::too_many_arguments)]
-    pub fn answer(
+    /// What this tree, as a recording, answers to an Expand down a path.
+    #[wasm_bindgen(js_name = answerPath)]
+    pub fn answer_path(
         &mut self,
         node: u64,
         measure: usize,
         path: Vec<u32>,
+        horizon: u32,
+    ) -> std::result::Result<JsValue, JsError> {
+        self.answer(node, measure, Walk::path(node, path, horizon))
+    }
+
+    /// What this tree, as a recording, answers to an Expand down a window.
+    #[wasm_bindgen(js_name = answerWindow)]
+    pub fn answer_window(
+        &mut self,
+        node: u64,
+        measure: usize,
         ln_top: f64,
         ln_bottom: f64,
         horizon: u32,
     ) -> std::result::Result<JsValue, JsError> {
         let window = Window::new(ln_top, ln_bottom).map_err(js_error)?;
+        self.answer(node, measure, Walk::window(node, window, horizon))
+    }
+}
+
+impl Tree {
+    /// The messages a walk gives before it lacks a distribution.
+    fn answer(
+        &mut self,
+        node: u64,
+        measure: usize,
+        mut walk: Walk,
+    ) -> std::result::Result<JsValue, JsError> {
         let mut runs = Vec::new();
         if self.inner.contains(node) {
-            let mut walk = Walk::new(node, path, window, horizon);
-            while let Advance::Run(_, run) =
+            while let Advance::Run(_, run, children) =
                 walk.advance(&mut self.inner, measure).map_err(js_error)?
             {
-                runs.push(run);
+                runs.push((run, children));
             }
         }
         let messages: Vec<_> = runs
             .iter()
-            .map(|run| Message {
+            .map(|(run, children)| Message {
                 rank: run.rank(),
                 branches: run.branches(),
                 ln_below: run.ln_below(),
+                children: *children,
             })
             .collect();
         to_js(&messages)

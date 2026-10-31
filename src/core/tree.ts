@@ -24,6 +24,8 @@ export interface Run {
   branches: ArrayLike<Branch>;
   /** ln of the mass at and below each edge; one more than branches. */
   lnBelow: ArrayLike<number>;
+  /** How many of the node's children have weight, where the source knows. */
+  children?: number;
 }
 
 /** A child as a lens sees it within its parent. */
@@ -116,8 +118,8 @@ export class IntervalTree {
   revisionOf(id: NodeId): number { return this.revisions.get(id) ?? 0; }
 
   /** Add a run a source sent. Listeners hear only of runs that changed something. */
-  insert(id: NodeId, measure: number, { rank, branches, lnBelow }: Run): void {
-    if (!this.raw.insert(id, measure, rank, Uint32Array.from(branches), Float64Array.from(lnBelow))) return;
+  insert(id: NodeId, measure: number, { rank, branches, lnBelow, children }: Run): void {
+    if (!this.raw.insert(id, measure, rank, Uint32Array.from(branches), Float64Array.from(lnBelow), children)) return;
     this.revision++;
     this.revisions.set(id, this.revision);
     for (const listener of this.listeners) listener();

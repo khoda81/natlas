@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file natlas/natlas.proto.
  */
 export const file_natlas_natlas: GenFile = /*@__PURE__*/
-  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMiXwoNRXhwYW5kUmVxdWVzdBIMCgRub2RlGAEgASgGEgwKBHBhdGgYAiADKA0SDgoGbG5fdG9wGAMgASgBEhEKCWxuX2JvdHRvbRgEIAEoARIPCgdob3Jpem9uGAUgASgNIjcKA1J1bhIMCgRyYW5rGAEgASgNEhAKCGJyYW5jaGVzGAIgAygNEhAKCGxuX2JlbG93GAMgAygBIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIjMKCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEhgKA3J1bhgCIAEoCzILLm5hdGxhcy5SdW4ycQoGTmF0bGFzEi4KBkV4cGFuZBIVLm5hdGxhcy5FeHBhbmRSZXF1ZXN0GgsubmF0bGFzLlJ1bjABEjcKBlNlYXJjaBIVLm5hdGxhcy5TZWFyY2hSZXF1ZXN0GhYubmF0bGFzLlNlYXJjaFJlc3BvbnNlYgZwcm90bzM");
+  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMieAoNRXhwYW5kUmVxdWVzdBIMCgRub2RlGAEgASgGEhwKBHBhdGgYAiABKAsyDC5uYXRsYXMuUGF0aEgAEiAKBndpbmRvdxgDIAEoCzIOLm5hdGxhcy5XaW5kb3dIABIPCgdob3Jpem9uGAQgASgNQggKBnRhcmdldCIYCgRQYXRoEhAKCGJyYW5jaGVzGAEgAygNIisKBldpbmRvdxIOCgZsbl90b3AYASABKAESEQoJbG5fYm90dG9tGAIgASgBIlsKA1J1bhIMCgRyYW5rGAEgASgNEhAKCGJyYW5jaGVzGAIgAygNEhAKCGxuX2JlbG93GAMgAygBEhUKCGNoaWxkcmVuGAQgASgNSACIAQFCCwoJX2NoaWxkcmVuIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIjMKCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEhgKA3J1bhgCIAEoCzILLm5hdGxhcy5SdW4ycQoGTmF0bGFzEi4KBkV4cGFuZBIVLm5hdGxhcy5FeHBhbmRSZXF1ZXN0GgsubmF0bGFzLlJ1bjABEjcKBlNlYXJjaBIVLm5hdGxhcy5TZWFyY2hSZXF1ZXN0GhYubmF0bGFzLlNlYXJjaFJlc3BvbnNlYgZwcm90bzM");
 
 /**
  * @generated from message natlas.ExpandRequest
@@ -22,29 +22,26 @@ export type ExpandRequest = Message<"natlas.ExpandRequest"> & {
   node: bigint;
 
   /**
-   * @generated from field: repeated uint32 path = 2;
+   * @generated from oneof natlas.ExpandRequest.target
    */
-  path: number[];
+  target: {
+    /**
+     * @generated from field: natlas.Path path = 2;
+     */
+    value: Path;
+    case: "path";
+  } | {
+    /**
+     * @generated from field: natlas.Window window = 3;
+     */
+    value: Window;
+    case: "window";
+  } | { case: undefined; value?: undefined };
 
   /**
-   * The window within the node `path` reaches, as ln of the mass below each
-   * of its edges: (0, -inf) is the whole node. It must not be empty.
+   * In bits.
    *
-   * @generated from field: double ln_top = 3;
-   */
-  lnTop: number;
-
-  /**
-   * @generated from field: double ln_bottom = 4;
-   */
-  lnBottom: number;
-
-  /**
-   * In bits. The listing runs from the child holding the window's top down
-   * across the window, while each child weighs at least 2^-horizon of the
-   * window; the first always.
-   *
-   * @generated from field: uint32 horizon = 5;
+   * @generated from field: uint32 horizon = 4;
    */
   horizon: number;
 };
@@ -55,6 +52,51 @@ export type ExpandRequest = Message<"natlas.ExpandRequest"> & {
  */
 export const ExpandRequestSchema: GenMessage<ExpandRequest> = /*@__PURE__*/
   messageDesc(file_natlas_natlas, 0);
+
+/**
+ * Branches below a node; none names the node itself.
+ *
+ * @generated from message natlas.Path
+ */
+export type Path = Message<"natlas.Path"> & {
+  /**
+   * @generated from field: repeated uint32 branches = 1;
+   */
+  branches: number[];
+};
+
+/**
+ * Describes the message natlas.Path.
+ * Use `create(PathSchema)` to create a new message.
+ */
+export const PathSchema: GenMessage<Path> = /*@__PURE__*/
+  messageDesc(file_natlas_natlas, 1);
+
+/**
+ * A part of a node, as ln of the mass below each of its edges: (0, -inf) is
+ * the whole node. As exact deep in a node's light tail as at its top. It must
+ * not be empty.
+ *
+ * @generated from message natlas.Window
+ */
+export type Window = Message<"natlas.Window"> & {
+  /**
+   * @generated from field: double ln_top = 1;
+   */
+  lnTop: number;
+
+  /**
+   * @generated from field: double ln_bottom = 2;
+   */
+  lnBottom: number;
+};
+
+/**
+ * Describes the message natlas.Window.
+ * Use `create(WindowSchema)` to create a new message.
+ */
+export const WindowSchema: GenMessage<Window> = /*@__PURE__*/
+  messageDesc(file_natlas_natlas, 2);
 
 /**
  * Consecutive ranks of a node's children in the measure's order: heaviest
@@ -82,6 +124,14 @@ export type Run = Message<"natlas.Run"> & {
    * @generated from field: repeated double ln_below = 3;
    */
   lnBelow: number[];
+
+  /**
+   * How many of the node's children have weight, where the source knows:
+   * the rank its last child ends at.
+   *
+   * @generated from field: optional uint32 children = 4;
+   */
+  children?: number | undefined;
 };
 
 /**
@@ -89,7 +139,7 @@ export type Run = Message<"natlas.Run"> & {
  * Use `create(RunSchema)` to create a new message.
  */
 export const RunSchema: GenMessage<Run> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 1);
+  messageDesc(file_natlas_natlas, 3);
 
 /**
  * @generated from message natlas.SearchRequest
@@ -106,7 +156,7 @@ export type SearchRequest = Message<"natlas.SearchRequest"> & {
  * Use `create(SearchRequestSchema)` to create a new message.
  */
 export const SearchRequestSchema: GenMessage<SearchRequest> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 2);
+  messageDesc(file_natlas_natlas, 4);
 
 /**
  * @generated from message natlas.SearchResponse
@@ -125,7 +175,7 @@ export type SearchResponse = Message<"natlas.SearchResponse"> & {
  * Use `create(SearchResponseSchema)` to create a new message.
  */
 export const SearchResponseSchema: GenMessage<SearchResponse> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 3);
+  messageDesc(file_natlas_natlas, 5);
 
 /**
  * A recorded server, used for static datasets: what it knows of each node.
@@ -144,7 +194,7 @@ export type Snapshot = Message<"natlas.Snapshot"> & {
  * Use `create(SnapshotSchema)` to create a new message.
  */
 export const SnapshotSchema: GenMessage<Snapshot> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 4);
+  messageDesc(file_natlas_natlas, 6);
 
 /**
  * @generated from message natlas.Recording
@@ -168,25 +218,32 @@ export type Recording = Message<"natlas.Recording"> & {
  * Use `create(RecordingSchema)` to create a new message.
  */
 export const RecordingSchema: GenMessage<Recording> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 5);
+  messageDesc(file_natlas_natlas, 7);
 
 /**
  * @generated from service natlas.Natlas
  */
 export const Natlas: GenService<{
   /**
-   * Answers one node at a time, each message a Run of that node's children:
-   * first the starting node and every node down `path`, each placing the
-   * path's next branch alone; then, from the node the path reaches, every
-   * node down through a child that holds the whole window, each placing
-   * that child alone; last, the node where the window spans more than one
-   * child, listing them. So every message but the last is a single child,
-   * and the next message is that child's: id(node, its branch).
+   * Reads the tree below a node one of two ways, answering one node at a
+   * time, each message a Run of that node's children:
+   *
+   * - down a path: the starting node and every node down the path, each
+   *   placing the path's next branch alone, then the node the path reaches,
+   *   listed from its heaviest child;
+   * - down a window: every node down through a child that holds all of the
+   *   window, each placing that child alone, then the node where the window
+   *   spans more than one child, listing them across it.
+   *
+   * So every message but the last is a single child, and the next message is
+   * that child's: id(node, its branch). A listing runs while each child
+   * weighs at least 2^-horizon of the window, or of the node; its first
+   * child always.
    *
    * A server may end the stream early at any node, and ends it before a
    * branch of weight zero, which has no place. It answers NOT_FOUND when it
    * has not learned the starting node, and the client names it from the
-   * root.
+   * root with a path.
    *
    * @generated from rpc natlas.Natlas.Expand
    */

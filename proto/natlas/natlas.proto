@@ -27,18 +27,25 @@ package natlas;
 // to chance at 64 bits.
 
 service Natlas {
-  // Answers one node at a time, each message a Run of that node's children:
-  // first the starting node and every node down `path`, each placing the
-  // path's next branch alone; then, from the node the path reaches, every
-  // node down through a child that holds the whole window, each placing
-  // that child alone; last, the node where the window spans more than one
-  // child, listing them. So every message but the last is a single child,
-  // and the next message is that child's: id(node, its branch).
+  // Reads the tree below a node one of two ways, answering one node at a
+  // time, each message a Run of that node's children:
+  //
+  // - down a path: the starting node and every node down the path, each
+  //   placing the path's next branch alone, then the node the path reaches,
+  //   listed from its heaviest child;
+  // - down a window: every node down through a child that holds all of the
+  //   window, each placing that child alone, then the node where the window
+  //   spans more than one child, listing them across it.
+  //
+  // So every message but the last is a single child, and the next message is
+  // that child's: id(node, its branch). A listing runs while each child
+  // weighs at least 2^-horizon of the window, or of the node; its first
+  // child always.
   //
   // A server may end the stream early at any node, and ends it before a
   // branch of weight zero, which has no place. It answers NOT_FOUND when it
   // has not learned the starting node, and the client names it from the
-  // root.
+  // root with a path.
   rpc Expand(ExpandRequest) returns (stream Run);
   // The sequence for a text, under the server's text mapping. The server
   // learns the ids along it, so expanding them needs no path.
@@ -47,15 +54,25 @@ service Natlas {
 
 message ExpandRequest {
   fixed64 node = 1;
-  repeated uint32 path = 2;
-  // The window within the node `path` reaches, as ln of the mass below each
-  // of its edges: (0, -inf) is the whole node. It must not be empty.
-  double ln_top = 3;
-  double ln_bottom = 4;
-  // In bits. The listing runs from the child holding the window's top down
-  // across the window, while each child weighs at least 2^-horizon of the
-  // window; the first always.
-  uint32 horizon = 5;
+  oneof target {
+    Path path = 2;
+    Window window = 3;
+  }
+  // In bits.
+  uint32 horizon = 4;
+}
+
+// Branches below a node; none names the node itself.
+message Path {
+  repeated uint32 branches = 1;
+}
+
+// A part of a node, as ln of the mass below each of its edges: (0, -inf) is
+// the whole node. As exact deep in a node's light tail as at its top. It must
+// not be empty.
+message Window {
+  double ln_top = 1;
+  double ln_bottom = 2;
 }
 
 // Consecutive ranks of a node's children in the measure's order: heaviest
@@ -68,6 +85,9 @@ message Run {
   // branches. Summed from the light end, so tiny masses survive. A node
   // without children answers rank 0, no branches, and the one edge -inf.
   repeated double ln_below = 3;
+  // How many of the node's children have weight, where the source knows:
+  // the rank its last child ends at.
+  optional uint32 children = 4;
 }
 
 message SearchRequest {

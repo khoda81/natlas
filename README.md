@@ -85,11 +85,11 @@ server never lists has weight zero.
 
 Nodes are named on the wire by 64-bit ids hashed from their branches (SplitMix64
 over the parent's id and the branch), so the client and every server name a node
-alike without exchanging the sequence. A request names a node by a known id and
-the branches below it: normally the parent's id and one branch, so it stays
-small however deep the node is. A server that has not learned that id (it
-restarted, or never saw the parent) answers `not_found`, and the client names
-the node once more from the root with its whole path.
+alike without exchanging the sequence. A request starts from a node the
+server already reached, so it stays small however deep the node is. A server
+that has not learned that id (it restarted, or never saw the node) answers
+`not_found`, and the client names the node once more from the root with its
+whole path.
 
 A node's children are ranked heaviest first, ties by increasing branch, and
 known in **runs** of consecutive ranks. A run carries its branches and the ln
@@ -100,18 +100,21 @@ not yet known.
 
 Each server serves one measure through two Connect RPCs:
 
-- `Expand(node, path, window, horizon)` streams one `Run` per node. It first
-  places each branch of `path` below `node`, one single-child run per node;
-  then, from the node the path reaches, it follows the `window` down through
-  every child that holds all of it, again one single-child run per node; and
-  last it lists the node where the window spans several children, from the
-  child holding the window's top across the window while each weighs at least
-  2^−horizon of it. The window is ln of the mass below its two edges, (0, −∞)
-  for the whole node, so it addresses a node's deep tail as exactly as its
-  head. Every message but the last is one child, which names the next node.
-  Discovery asks for a child through its parent's id and one branch, a gap or
-  the part of a node in view by its window, and a text by its path from the
-  deepest node already placed.
+- `Expand(node, path | window, horizon)` reads the tree below `node` one of
+  two ways, streaming one `Run` per node. Down a **path**, it places each
+  branch, one single-child run per node, then lists the node the path
+  reaches from its heaviest child. Down a **window**, it follows every child
+  that holds all of it, again one single-child run per node, then lists the
+  node where the window spans several children, from the child holding the
+  window's top across it. A listing runs while each child weighs at least
+  2^−horizon of the window or node. A window is ln of the mass below its two
+  edges, (0, −∞) for the whole node, so it addresses a node's deep tail as
+  exactly as its head. Every message but the last is one child, which names
+  the next node. Views read by windows: a child in view is the part of its
+  parent in view, so the server descends into it, and a gap is the part of
+  its node it covers. Flights and restores read by paths, from the deepest
+  node already placed. A window on a node the server has not learned is
+  asked again after a path from the root teaches it.
 - `Search(text)` maps text to its complete path, using the model's tokenizer,
   and teaches the server the ids along it. The browser searches on input and
   opens the result only when it is selected. Music services return
@@ -126,8 +129,12 @@ selection still resolves their individual branches.
 
 Layout reads only what the tree holds and lists what the view lacks as Expand
 requests; the client sends each once, a few at a time, and redraws when an
-answer changes the tree. A request a source answers with nothing is not asked
-again until something else changes its node.
+answer changes the tree. A request is known by the ranks it lacks, both ends
+of a gap, so a gap an answer splits is asked again; one a source answers with
+nothing is not asked again until something else changes its node. A run
+may also say how many of its node's children have weight; a gap then shows
+how many branches it holds. Recordings converted from listings do not say,
+so their gaps at a node's bottom show only "…".
 
 A `Snapshot` records runs per node with its complete path, and answers Expand
 through the same walk a server uses. Recorded search includes listed leaves as

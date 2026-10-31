@@ -5,12 +5,12 @@
 
 import type { Miss } from "../core/layout";
 import type { IntervalTree, NodeId } from "../core/tree";
-import { type ExpandRequest, type Source, WHOLE } from "./source";
+import type { ExpandRequest, Source } from "./source";
 
 const RETRY_MS = 2000;
 
 export class Expander {
-  /** Requests in flight, by target, measure and first missing rank. */
+  /** Requests in flight, by target, measure and lacking ranks. */
   private readonly pending = new Map<string, Promise<void>>();
   /** Answered requests, with their target's revision then: asking again
    * finds nothing new until something changes it. */
@@ -39,7 +39,7 @@ export class Expander {
 
   /** Whether ``measure``'s source answered with nothing for ``node``'s children. */
   exhausted(node: NodeId, measure: number): boolean {
-    return !this.tree.has(node, measure) && this.asked.get(`${node}:${measure}:0`) === this.tree.revisionOf(node);
+    return !this.tree.has(node, measure) && this.asked.get(`${node}:${measure}:0:null`) === this.tree.revisionOf(node);
   }
 
   /**
@@ -74,8 +74,8 @@ export class Expander {
     let retry = Infinity;
     for (const miss of this.demand().sort((a, b) => b.priority - a.priority)) {
       if (this.pending.size >= this.limit) break;
-      const target = miss.branch === null ? miss.node : this.tree.child(miss.node, miss.branch);
-      const key = `${target}:${miss.measure}:${miss.from}`;
+      const { target } = miss;
+      const key = `${target}:${miss.measure}:${miss.from}:${miss.to}`;
       if (this.pending.has(key) || this.asked.get(key) === this.tree.revisionOf(target)) continue;
       const after = (this.failed.get(key) ?? -Infinity) + RETRY_MS - performance.now();
       if (after > 0) {
@@ -83,8 +83,7 @@ export class Expander {
         continue;
       }
       const { signal } = this.abort;
-      const request: ExpandRequest = { node: miss.node, path: miss.branch === null ? [] : [miss.branch],
-        lnTop: miss.lnTop, lnBottom: miss.lnBottom, horizon: miss.horizon };
+      const request: ExpandRequest = { node: miss.node, window: { lnTop: miss.lnTop, lnBottom: miss.lnBottom }, horizon: miss.horizon };
       void this.fetch(key, target, miss.measure, request).catch((error: unknown) => {
         if (!signal.aborted) {
           this.failed.set(key, performance.now());
@@ -109,7 +108,7 @@ export class Expander {
     while (first < last && placed(first)) first++;
     if (first === last && this.tree.has(target, measure)) return true;
     const path = chain.slice(first + 1).map((node) => this.tree.branch(node));
-    await this.fetch(`${target}:${measure}:walk`, target, measure, { node: chain[first]!, path, ...WHOLE, horizon });
+    await this.fetch(`${target}:${measure}:walk`, target, measure, { node: chain[first]!, path, horizon });
     return chain.every((_, index) => index === last ? this.tree.has(target, measure) : placed(index));
   }
 

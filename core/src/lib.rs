@@ -1,4 +1,5 @@
 //! Integer-sequence distributions, independent of the renderer and transport.
+pub mod distribution;
 pub mod layout;
 pub mod tree;
 

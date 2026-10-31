@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13natlas/natlas.proto\x12\x06natlas\"<\n\rExpandRequest\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x0c\n\x04path\x18\x02 \x03(\r\x12\x0f\n\x07horizon\x18\x03 \x01(\r\"D\n\x07Listing\x12\x10\n\x08\x62ranches\x18\x01 \x03(\r\x12\x12\n\nln_weights\x18\x02 \x03(\x01\x12\x13\n\x0bln_leftover\x18\x03 \x01(\x01\"\x1d\n\rSearchRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\"\x1e\n\x0eSearchResponse\x12\x0c\n\x04path\x18\x01 \x03(\r\"1\n\x08Snapshot\x12%\n\nexpansions\x18\x01 \x03(\x0b\x32\x11.natlas.Expansion\"L\n\tExpansion\x12\x0c\n\x04path\x18\x01 \x03(\r\x12\x0f\n\x07horizon\x18\x02 \x01(\r\x12 \n\x07listing\x18\x03 \x01(\x0b\x32\x0f.natlas.Listing2u\n\x06Natlas\x12\x32\n\x06\x45xpand\x12\x15.natlas.ExpandRequest\x1a\x0f.natlas.Listing0\x01\x12\x37\n\x06Search\x12\x15.natlas.SearchRequest\x1a\x16.natlas.SearchResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13natlas/natlas.proto\x12\x06natlas\"_\n\rExpandRequest\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x0c\n\x04path\x18\x02 \x03(\r\x12\x0e\n\x06ln_top\x18\x03 \x01(\x01\x12\x11\n\tln_bottom\x18\x04 \x01(\x01\x12\x0f\n\x07horizon\x18\x05 \x01(\r\"7\n\x03Run\x12\x0c\n\x04rank\x18\x01 \x01(\r\x12\x10\n\x08\x62ranches\x18\x02 \x03(\r\x12\x10\n\x08ln_below\x18\x03 \x03(\x01\"\x1d\n\rSearchRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\"\x1e\n\x0eSearchResponse\x12\x0c\n\x04path\x18\x01 \x03(\r\"1\n\x08Snapshot\x12%\n\nrecordings\x18\x02 \x03(\x0b\x32\x11.natlas.Recording\"3\n\tRecording\x12\x0c\n\x04path\x18\x01 \x03(\r\x12\x18\n\x03run\x18\x02 \x01(\x0b\x32\x0b.natlas.Run2q\n\x06Natlas\x12.\n\x06\x45xpand\x12\x15.natlas.ExpandRequest\x1a\x0b.natlas.Run0\x01\x12\x37\n\x06Search\x12\x15.natlas.SearchRequest\x1a\x16.natlas.SearchResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,17 +32,17 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'natlas.natlas_pb2', _global
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_EXPANDREQUEST']._serialized_start=31
-  _globals['_EXPANDREQUEST']._serialized_end=91
-  _globals['_LISTING']._serialized_start=93
-  _globals['_LISTING']._serialized_end=161
-  _globals['_SEARCHREQUEST']._serialized_start=163
-  _globals['_SEARCHREQUEST']._serialized_end=192
-  _globals['_SEARCHRESPONSE']._serialized_start=194
-  _globals['_SEARCHRESPONSE']._serialized_end=224
-  _globals['_SNAPSHOT']._serialized_start=226
-  _globals['_SNAPSHOT']._serialized_end=275
-  _globals['_EXPANSION']._serialized_start=277
-  _globals['_EXPANSION']._serialized_end=353
-  _globals['_NATLAS']._serialized_start=355
-  _globals['_NATLAS']._serialized_end=472
+  _globals['_EXPANDREQUEST']._serialized_end=126
+  _globals['_RUN']._serialized_start=128
+  _globals['_RUN']._serialized_end=183
+  _globals['_SEARCHREQUEST']._serialized_start=185
+  _globals['_SEARCHREQUEST']._serialized_end=214
+  _globals['_SEARCHRESPONSE']._serialized_start=216
+  _globals['_SEARCHRESPONSE']._serialized_end=246
+  _globals['_SNAPSHOT']._serialized_start=248
+  _globals['_SNAPSHOT']._serialized_end=297
+  _globals['_RECORDING']._serialized_start=299
+  _globals['_RECORDING']._serialized_end=350
+  _globals['_NATLAS']._serialized_start=352
+  _globals['_NATLAS']._serialized_end=465
 # @@protoc_insertion_point(module_scope)

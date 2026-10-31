@@ -1,50 +1,38 @@
 # Rendering performance
 
-The optimization keeps the native canvas drawing commands, fonts, geometry,
-branch grouping, picking order, discovery requests, and interactions. The 2 ms
-target is a CPU budget for each render callback, including its synchronous DOM
+The 2 ms target is a CPU budget for each render callback, including its synchronous DOM
 layout. It has not been achieved for every frame. A 180 Hz display has a 5.56 ms
 refresh interval; the tighter 2 ms application budget leaves room for browser
 paint, compositing, input, and other work.
 
 ## Frame ownership and invalidation
 
-Rust retains the complete layout frame. JavaScript receives a packed numeric
-array of visible rectangles, while picking and reanchoring query the retained
-frame directly. Hidden vocabulary entries no longer make a Rust → JavaScript →
-Rust round trip on every render.
+Rust lays out the frame and keeps it. JavaScript receives a packed numeric
+array of visible rectangles and the requests the view lacks; picking and
+reanchoring query the retained frame and the tree directly.
 
-Subpixel branches share an immutable slot snapshot and their node metadata.
-Their successive accumulated y coordinates are retained in compact numeric
-buffers, and picking searches those coordinates. Accumulation order stays the
-same: replacing it with prefix-sum subtraction changes rounding at depth and at
-merge boundaries. Expanded-child exceptions are snapshotted, so later discovery
-cannot mutate an existing frame's selections.
+A node's layout costs one binary search to the first visible child, then one
+step per drawn box: children at least a pixel tall, bands about a pixel tall,
+and gaps. A band's area-preserving width comes from a per-run suffix sum of
+p (−ln p) when p = q, and from a few sampled children otherwise, so a frame
+never visits the children hidden inside a band. Picking walks down from the
+origin through the laid-out nodes to the one child under the point.
 
-Slots cache log weights, entropy, cross-entropy, and branch lookup alongside the
-existing probability sums. Compact integer vocabularies use direct lookup;
-sparse branches still support the entire unsigned 32-bit range. Scalar coverage,
-membership, and statistics queries avoid exporting full listings just to read a
-field or update the inspector.
-
-The UI and completion-driven fetch pump share geometry only when the tree
-revision, lens, camera, and viewport match. A changed anchor remains a changed
-cache key, even when it denotes the same interval: rebuilding from that anchor
-can change floating-point rounding and edge pixels. A full request queue does
-not recalculate demand until a slot becomes available.
+The UI and the fetch pump share geometry only when the tree revision, lens,
+camera, and viewport match. A changed anchor remains a changed cache key, even
+when it denotes the same interval: rebuilding from that anchor can change
+floating-point rounding and edge pixels. The inspector keeps a node's entropy
+and cross-entropy, a pass over all its children, until the node, the lens, or
+what is known of the node changes.
 
 Frames have explicit lifetimes. The UI retains the displayed frame while a
 newer demand frame is prepared, frees superseded frames, and reuses up to two
 native and JavaScript buffer sets. All views into a frame become invalid after
-`Frame.dispose()`. Diagnostic exports such as `frame.known` remain available,
-but materialize hidden branches and should stay outside the render path.
+`Frame.dispose()`.
 
 Immutable paths and glyphs are cached, and the inspector and top path panel
 reuse DOM nodes. Text widths are memoized at the original font size, with a
-bounded cache and invalidation on display-scale changes. Every render still
-issues the original canvas drawing commands: skipping an apparently identical
-draw changes accumulated antialiasing at fractional canvas edges. Bitmap copies
-and transformed fonts were also rejected because they changed pixels.
+bounded cache and invalidation on display-scale changes.
 
 ## Reproduce the browser benchmark
 
@@ -55,7 +43,7 @@ bun run bench
 Open the printed loopback URL and click **Run frame benchmark**. The harness
 uses the real `App.render` method and page styles. Its synthetic sources keep
 four requests pending, so no model inference or network response is needed.
-Listing ingestion and fixture construction happen before the timed frames.
+Run ingestion and fixture construction happen before the timed frames.
 
 Each scenario warms up for 15 frames, measures one callback per animation frame,
 and forces DOM layout before stopping the timer. Results include all samples,
@@ -69,59 +57,44 @@ Useful URL parameters:
 
 - `?frames=300&label=current`: 300 measured frames per scenario.
 - `?scenario=long%20tail%20camera&frames=300&label=camera`: one scenario.
-- `?scenario=none&frames=1&label=pixels`: only settled UI parity snapshots.
+- `?scenario=none&frames=1&label=pixels`: only settled UI snapshots.
 - `?trace=1&frames=300&label=trace`: include per-frame layout, hover, DOM,
   measurement, and canvas-call timings. Tracing itself adds overhead.
 
 Reports are written to `/tmp/natlas-frame-benchmark/<label>.json`, including
 canvas PNGs/hashes and the inspector, path, and readout markup. Pixel readback
 happens after the measurements because it can change the canvas backend. Each
-parity snapshot renders three times so path-panel resizing and repeated draws
+snapshot renders three times so path-panel resizing and repeated draws
 are represented.
 
 `PORT` and `NATLAS_PERF_OUTPUT` override the port and output directory.
-`NATLAS_PERF_ROOT` selects a comparison checkout; compile that checkout's own
-Wasm first and make its dependencies available. The harness can export the
-older combined `App` module without running its network startup. Keep baseline
-and current measurements sequential to avoid CPU contention.
+`NATLAS_PERF_ROOT` selects a comparison checkout whose tree API matches this
+harness; compile that checkout's own Wasm first and make its dependencies
+available. A checkout with another API runs its own `bun scripts/bench-frames.ts`
+on another `PORT`. Keep baseline and current measurements sequential to avoid
+CPU contention.
 
 An optional `NATLAS_PERF_FIXTURE` JSON file containing `{listing, labels}` enables
-`?live=1&frames=300&label=model`, which replays the captured root distribution
-and label bytes without contacting its model. `listing` uses the core's
-`Listing` shape (`branches`, `lnWeights`, `leftover`, `horizon`, `complete`);
-`labels` is the usual labels JSON array.
+`?live=1&frames=300&label=model`, which replays a captured root distribution
+and label bytes without contacting its model. `listing` holds a complete
+distribution heaviest first, `branches` and `lnWeights`; `labels` is the usual
+labels JSON array.
 
-## Behavior checks
+## Measured results, 2026-10-31
 
-`bun run test` includes 49 fixtures, frozen at `c03ef09c` and refrozen after the
-move to branch ids and view origins once they matched `06660bea` to 3e-15, covering empty
-trees, distinct measures, partial tails, merging, 150,000 branches, and an
-80-level anchor. Hashes cover every geometry field and its order, sampled
-cursor selections, reanchoring, and discovery demand. Separate tests retain old
-frames across listing updates and buffer reuse, and verify scalar queries
-without allowing full vocabulary exports.
+Headless Chromium on Linux, a 1200 px wide canvas at device scale 1, 15
+warm-up frames and 300 measured frames per scenario. The previous commit, run
+the same way on the same machine, is the baseline; these numbers are not
+comparable with ones taken elsewhere.
 
-The browser harness additionally compares settled canvas pixels and inspector,
-path, and readout output with that baseline. These checks cover deterministic
-fixtures; they complement interaction checks and profiling in the user's
-browser rather than proving every possible tree or browser configuration.
+| Scenario | Before (median) | After (median) | After (p95) | After, frames ≥ 2 ms |
+| --- | ---: | ---: | ---: | ---: |
+| 150,000 uniform branches, hover | 13.840 ms | 1.310 ms | 2.020 ms | 17/300 |
+| 150,000 uniform branches, moving camera | 15.250 ms | 2.710 ms | 3.725 ms | 261/300 |
+| 150,000 long-tail branches, hover | 14.200 ms | 1.485 ms | 2.345 ms | 80/300 |
+| 150,000 long-tail branches, moving camera | 21.695 ms | 9.350 ms | 13.060 ms | 298/300 |
+| 80-level tree, moving camera | 0.845 ms | 1.055 ms | 1.840 ms | 6/300 |
 
-## Measured results, 2026-10-30
-
-Chromium 155 on Linux, a 1280 px wide canvas at device scale 1.25, 15 warm-up
-frames and 300 measured frames per scenario, with the native drawing path:
-
-| Scenario | Median | p95 | Frames ≥ 2 ms |
-| --- | ---: | ---: | ---: |
-| 150,000 uniform branches, hover | 1.140 ms | 1.830 ms | 8/300 |
-| 150,000 uniform branches, moving camera | 2.170 ms | 3.370 ms | 182/300 |
-| 150,000 long-tail branches, hover | 0.945 ms | 1.625 ms | 4/300 |
-| 150,000 long-tail branches, moving camera | 4.565 ms | 6.475 ms | 287/300 |
-| 80-level tree, moving camera | 0.540 ms | 1.005 ms | 2/300 |
-
-All three settled browser snapshots matched the baseline exactly for canvas
-pixels, inspector markup, path markup, and readout. These timings exclude cold
-listing ingestion and inference. They establish the large improvement and the
-remaining gap, not an every-frame 2 ms guarantee. Native text drawing remains
-a substantial cost in the text-heavy camera case; changing its rendering path
-needs a separate decision about added complexity and visual equivalence.
+Layout itself takes about 0.2 ms of the long-tail camera frame; canvas text
+drawing takes most of the rest. These timings exclude ingesting runs and
+inference.

@@ -1,57 +1,42 @@
 import { describe, expect, it } from "bun:test";
-import { IntervalTree, isTail, slotOf } from "../src/core/tree";
-import { listing } from "./build";
-
-describe("Slots", () => {
-  it("lists p's children in p's order and keeps p's leftover as one tail slot", () => {
-    const tree = new IntervalTree(1);
-    tree.setListing(tree.root, 0, listing([0.5, 0.3], [10, 20], 2));
-    const slots = tree.slots(tree.root, { p: 0, q: 0 });
-    expect(slots.branches).toEqual([10, 20]);
-    expect(slots.count).toBe(3);
-    expect(isTail(slots, 2)).toBe(true);
-    expect(slots.p[2]).toBeCloseTo(0.2, 9);
-    expect(slotOf(slots, 20)).toBe(1);
-  });
-
-  it("bounds q where q has not listed a child", () => {
-    const tree = new IntervalTree(2);
-    tree.setListing(tree.root, 0, listing([0.5, 0.3], [0, 1], 2));
-    tree.setListing(tree.root, 1, listing([0.6, 0.3], [1, 2], 2));
-    const slots = tree.slots(tree.root, { p: 0, q: 1 });
-    expect(slots.q.map((weight) => Number(weight.toFixed(9)))).toEqual([0.1, 0.6, 0.3]);
-    expect(slots.qBound).toEqual([true, false, true]);
-  });
-
-  it("bounds a tail's children by the horizon and the lightest listed child", () => {
-    const tree = new IntervalTree(1);
-    tree.setListing(tree.root, 0, { ...listing([0.5, 0.3], [0, 1], 2), complete: 4 });
-    expect(tree.slots(tree.root, { p: 0, q: 0 }).q[2]).toBe(2 ** -4);
-  });
-});
+import { IntervalTree, ROOT } from "../src/core/tree";
+import { run } from "./build";
 
 describe("IntervalTree", () => {
-  it("names nodes by their branches from the root", () => {
+  it("names nodes by their branches from the root, alike in every tree", () => {
     const tree = new IntervalTree(2);
-    const child = tree.child(tree.root, 5);
+    const child = tree.child(ROOT, 5);
     const grandchild = tree.child(child, 2);
-    expect(tree.child(tree.root, 5)).toBe(child);
+    expect(tree.child(ROOT, 5)).toBe(child);
     expect(tree.parent(grandchild)).toBe(child);
     expect(tree.branch(grandchild)).toBe(2);
     expect(tree.path(grandchild)).toEqual([5, 2]);
-    expect(tree.chain(tree.root, grandchild)).toEqual([tree.root, child, grandchild]);
-    expect(tree.chain(child, grandchild)).toEqual([child, grandchild]);
-    expect(tree.descend(tree.root, [5, 2])).toBe(grandchild);
-    const other = new IntervalTree(1);
-    expect(other.descend(other.root, [5, 2])).toBe(grandchild);
+    expect(tree.chain(ROOT, grandchild)).toEqual([ROOT, child, grandchild]);
+    expect(tree.descend(ROOT, [5, 2])).toBe(grandchild);
+    expect(new IntervalTree(1).descend(ROOT, [5, 2])).toBe(grandchild);
   });
 
-  it("tells an unexpanded node from one with nothing within the horizon", () => {
+  it("places children by p in p's order and sizes them by q, unknown until q says", () => {
+    const tree = new IntervalTree(2);
+    tree.insert(ROOT, 0, run([0.75, 0.25], [9, 4]));
+    const lens = { p: 0, q: 1 };
+    expect(tree.entry(ROOT, lens, 4)).toEqual({ rank: 1, before: expect.closeTo(0.75, 12), lnP: expect.closeTo(Math.log(0.25), 12), natsQ: Infinity });
+    tree.insert(ROOT, 1, run([0.5, 0.5], [4, 9]));
+    expect(tree.entry(ROOT, lens, 4)?.natsQ).toBeCloseTo(Math.log(2), 12);
+    expect(tree.entry(ROOT, lens, 7)).toBeUndefined();
+    expect(tree.statistics(ROOT, lens)).toEqual({ entropy: expect.closeTo(-0.75 * Math.log(0.75) - 0.25 * Math.log(0.25), 12),
+      cross: expect.closeTo(Math.log(2), 12), bounded: false });
+  });
+
+  it("tells a node without children from one not yet asked, and notifies only on change", () => {
     const tree = new IntervalTree(1);
-    expect(tree.expanded(tree.root, 0)).toBe(false);
-    tree.setListing(tree.root, 0, { ...listing([]), complete: 0 });
-    expect(tree.expanded(tree.root, 0)).toBe(false);
-    tree.setListing(tree.root, 0, listing([]));
-    expect(tree.expanded(tree.root, 0)).toBe(true);
+    let changes = 0;
+    tree.subscribe(() => changes++);
+    expect(tree.has(ROOT, 0)).toBe(false);
+    tree.insert(ROOT, 0, { rank: 0, branches: [], lnBelow: [-Infinity] });
+    expect(tree.ended(ROOT, 0)).toBe(true);
+    tree.insert(ROOT, 0, { rank: 0, branches: [], lnBelow: [-Infinity] });
+    expect(changes).toBe(1);
+    expect(() => tree.insert(ROOT, 0, { rank: 0, branches: [1], lnBelow: [0] })).toThrow("edges");
   });
 });

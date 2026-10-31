@@ -12,14 +12,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from natlas import natlas_pb2 as pb  # noqa: E402
-from natlas_codec import labels_json  # noqa: E402
+from natlas_codec import labels_json, run  # noqa: E402
 from natwalk import Tree  # noqa: E402
 from natwalk.tree import NodeId  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "public" / "data"
-
-# A node without children lists nothing at any horizon.
-_LEAF_HORIZON = (1 << 32) - 1
 
 # The weight of every branch at one node under one further measure, indexed by branch.
 type Measure = Callable[[NodeId], Sequence[float]]
@@ -59,14 +56,14 @@ def snapshots(
 ) -> list[pb.Snapshot]:
     """Record every discovered node under natwalk's own measure, then under each extra one.
 
-    A node's listing goes down to the whole bit below its ``listed_count``-th
-    child: natwalk's discovered children always fit, and so does every child
-    at least that heavy, as Expand requires.
+    A node's run reaches its ``listed_count``-th child, so natwalk's
+    discovered children always fit; natwalk's own nats keep precision where p
+    is close to 1.
 
     natwalk's root sits at ``start``, a structural path of branches from the
     global root; ``ancestry`` gives every measure's weights, natwalk's own
-    first, at each node on that path, whose listing then reaches at least the
-    next branch. Every recorded expansion holds its complete path from the
+    first, at each node on that path, whose run then reaches at least the
+    next branch. Every recorded node holds its complete path from the
     global root.
     """
     if start and len(ancestry) != 1 + len(extra):
@@ -75,27 +72,23 @@ def snapshots(
     def path(node_id: NodeId) -> tuple[int, ...]:
         return tuple(start) + tuple(tree.path(node_id))
 
-    def along_start(measure: int) -> list[pb.Expansion]:
+    def along_start(measure: int) -> list[pb.Recording]:
         return [
-            _expansion_of(start[:depth], ancestry[measure](start[:depth]), min_list, max_list, coverage, branch)
+            _recording_of(start[:depth], ancestry[measure](start[:depth]), min_list, max_list, coverage, branch)
             for depth, branch in enumerate(start)
         ]
 
-    own = pb.Snapshot(expansions=along_start(0) if start else [])
+    own = pb.Snapshot(recordings=along_start(0) if start else [])
     for node_id, node in enumerate(tree.nodes):
         distribution = node.distribution
         count = listed_count(tree, node_id, min_list=min_list, max_list=max_list, coverage=coverage)
         while count and not math.isfinite(distribution.nats(count - 1)):
             count -= 1
-        # natwalk's own nats keep precision where p is close to 1.
-        horizon = _horizon(-distribution.nats(count - 1)) if count else _LEAF_HORIZON
-        listed = list(range(count))
-        while count and len(listed) < len(distribution) and distribution.nats(len(listed)) <= horizon * math.log(2):
-            listed.append(len(listed))
-        own.expansions.append(
-            _expansion(
+        # Ranks are natwalk's own, so the run needs no ties past them.
+        listed = range(count)
+        own.recordings.append(
+            _recording(
                 path(node_id),
-                horizon,
                 [distribution.token(rank) for rank in listed],
                 [-distribution.nats(rank) for rank in listed],
                 distribution.mass(len(listed), len(distribution)),
@@ -104,29 +97,29 @@ def snapshots(
 
     recorded = [own]
     for index, measure in enumerate(extra, start=1):
-        snapshot = pb.Snapshot(expansions=along_start(index) if start else [])
+        snapshot = pb.Snapshot(recordings=along_start(index) if start else [])
         for node_id in range(len(tree.nodes)):
             # A sequence natwalk has ended has no continuation under any measure.
             weights = measure(node_id) if len(tree[node_id].distribution) else []
-            snapshot.expansions.append(_expansion_of(path(node_id), weights, min_list, max_list, coverage))
+            snapshot.recordings.append(_recording_of(path(node_id), weights, min_list, max_list, coverage))
         recorded.append(snapshot)
     return recorded
 
 
-def _expansion_of(
+def _recording_of(
     path: Sequence[int],
     weights: Sequence[float],
     min_list: int,
     max_list: int,
     coverage: float,
     include: int | None = None,
-) -> pb.Expansion:
-    """A node's listing from the weight of every branch, down to the bit below
+) -> pb.Recording:
+    """A node's run from the weight of every branch, down to the bit below
     ``coverage``, and at least down to branch ``include``."""
     top = heapq.nlargest(max_list, range(len(weights)), key=weights.__getitem__)
     count = _coverage_count([weights[branch] for branch in top], min_list, max_list, coverage)
     if not count:
-        return _expansion(path, _LEAF_HORIZON, [], [], 0.0)
+        return _recording(path, [], [], 0.0)
     horizon = _horizon(_ln(weights[top[count - 1]]))
     if include is not None:
         horizon = max(horizon, _horizon(_ln(weights[include])))
@@ -135,18 +128,17 @@ def _expansion_of(
     heavy = [branch for branch, weight in enumerate(weights) if weight >= threshold]
     listed = sorted(heavy, key=lambda branch: (-weights[branch], branch))
     rest = math.fsum(weight for weight in weights if weight < threshold)
-    return _expansion(path, horizon, listed, [_ln(weights[branch]) for branch in listed], rest)
+    return _recording(path, listed, [_ln(weights[branch]) for branch in listed], rest)
 
 
-def _expansion(
+def _recording(
     path: Sequence[int],
-    horizon: int,
     branches: Sequence[int],
     ln_weights: Sequence[float],
     rest: float,
-) -> pb.Expansion:
-    listing = pb.Listing(branches=branches, ln_weights=ln_weights, ln_leftover=_ln(rest))
-    return pb.Expansion(path=path, horizon=horizon, listing=listing)
+) -> pb.Recording:
+    """A recorded node: its heaviest children, and what they leave unknown."""
+    return pb.Recording(path=path, run=run(branches, ln_weights, _ln(rest)))
 
 
 def _coverage_count(weights: Sequence[float], min_list: int, max_list: int, coverage: float) -> int:
@@ -193,7 +185,7 @@ def write(
         paths.append(path)
         entries.append({"name": measure, "file": path.name})
         size = path.stat().st_size / 1e6
-        print(f"wrote {path} ({measure}, {len(snapshot.expansions)} nodes, {size:.2f} MB)", file=sys.stderr)
+        print(f"wrote {path} ({measure}, {len(snapshot.recordings)} nodes, {size:.2f} MB)", file=sys.stderr)
 
     manifest_path = DATA_DIR / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else []

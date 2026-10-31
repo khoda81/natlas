@@ -4,9 +4,7 @@ import init, {
   extent,
   layout,
   LayoutFrame,
-  normalizeBoundary,
-  place,
-  repairBoundary,
+  repair,
   Tree,
 } from "./generated/natlas_core";
 
@@ -20,8 +18,6 @@ export {
   extent,
   layout,
   LayoutFrame,
-  normalizeBoundary,
-  place,
-  repairBoundary,
+  repair,
   Tree,
 };

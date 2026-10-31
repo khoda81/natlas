@@ -1,55 +1,22 @@
-// Fetch the listings a frame needs, the view's origin first: it fills the view.
+// What frames lack, fetched once: a read-through cache. Layout reads only
+// what the tree holds and lists what it lacks as requests; this asks the
+// sources for them, a few at a time, and the tree's change notifications
+// redraw whatever depended on them.
 
-import { type Camera, type Frame, logView, type Viewport } from "../core/layout";
-import type { Source } from "./source";
-import type { Branch, IntervalTree, Lens, NodeId } from "../core/tree";
+import type { Miss } from "../core/layout";
+import type { IntervalTree, NodeId } from "../core/tree";
+import { type ExpandRequest, type Source, WHOLE } from "./source";
 
-const HEADROOM = 4;
-const MAX_HORIZON = 4096;
 const RETRY_MS = 2000;
-const MIN_PX = 2;
-
-export interface Want {
-  node: NodeId;
-  measure: number;
-  horizon: number;
-  /** Larger first. */
-  priority: number;
-}
-
-export function wants(tree: IntervalTree, lens: Lens, cam: Camera, view: Viewport, frame: Frame): Want[] {
-  const right = cam.x + view.width / cam.k;
-  const lambda = logView(cam);
-  const result: Want[] = [];
-  const want = (node: () => NodeId, lnMass: number, x: number, p = true) => {
-    const heightPx = Math.exp(lnMass - lambda) * view.height;
-    if (heightPx < MIN_PX || !(x < right)) return;
-    const target = node();
-    if (p) result.push({ node: target, measure: lens.p, horizon: Math.ceil(Math.log2(heightPx)), priority: heightPx });
-    if (lens.q !== lens.p) {
-      result.push({ node: target, measure: lens.q, horizon: Math.ceil((right - x) / Math.LN2), priority: heightPx });
-    }
-  };
-
-  if (!tree.hasListing(cam.origin, lens.p) || !tree.hasListing(cam.origin, lens.q)) {
-    want(() => cam.origin, 0, 0);
-  }
-  for (const { node, branch, lnMass, x1 } of frame.unexpanded) {
-    want(() => tree.child(node, branch), lnMass, x1);
-  }
-  for (const box of frame.boxes) {
-    if (box.kind === "tail") want(() => box.node, box.lnMass - Math.log(box.p), box.x0);
-  }
-  if (lens.q !== lens.p) {
-    for (const { node, lnMass, x } of frame.walked) want(() => node, lnMass, x, false);
-  }
-  return result;
-}
 
 export class Expander {
+  /** Requests in flight, by target, measure and first missing rank. */
   private readonly pending = new Map<string, Promise<void>>();
+  /** Answered requests, with their target's revision then: asking again
+   * finds nothing new until something changes it. */
+  private readonly asked = new Map<string, number>();
   private readonly failed = new Map<string, number>();
-  private demand: () => Want[] = () => [];
+  private demand: () => Miss[] = () => [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
   /** Aborts the work in flight for the current view. */
@@ -64,9 +31,15 @@ export class Expander {
     private readonly limit = 4,
   ) {}
 
-  request(demand: Want[] | (() => Want[])): void {
-    this.demand = typeof demand === "function" ? demand : () => demand;
+  /** What the current view lacks, read again whenever a request can start. */
+  request(demand: () => Miss[]): void {
+    this.demand = demand;
     this.pump();
+  }
+
+  /** Whether ``measure``'s source answered with nothing for ``node``'s children. */
+  exhausted(node: NodeId, measure: number): boolean {
+    return !this.tree.has(node, measure) && this.asked.get(`${node}:${measure}:0`) === this.tree.revisionOf(node);
   }
 
   /**
@@ -99,20 +72,20 @@ export class Expander {
   private pump(): void {
     if (this.disposed || this.pending.size >= this.limit) return;
     let retry = Infinity;
-    for (const { node, measure, horizon } of this.demand().sort((a, b) => b.priority - a.priority)) {
+    for (const miss of this.demand().sort((a, b) => b.priority - a.priority)) {
       if (this.pending.size >= this.limit) break;
-      const key = `${node}:${measure}`;
-      if (this.pending.has(key)) continue;
-      const covered = this.tree.horizon(node, measure);
-      const ask = Math.min(MAX_HORIZON, horizon + HEADROOM);
-      if (horizon <= covered || ask <= covered) continue;
+      const target = miss.branch === null ? miss.node : this.tree.child(miss.node, miss.branch);
+      const key = `${target}:${miss.measure}:${miss.from}`;
+      if (this.pending.has(key) || this.asked.get(key) === this.tree.revisionOf(target)) continue;
       const after = (this.failed.get(key) ?? -Infinity) + RETRY_MS - performance.now();
       if (after > 0) {
         retry = Math.min(retry, after);
         continue;
       }
       const { signal } = this.abort;
-      void this.fetch(this.tree.parent(node) ?? node, node, measure, ask).catch((error: unknown) => {
+      const request: ExpandRequest = { node: miss.node, path: miss.branch === null ? [] : [miss.branch],
+        lnTop: miss.lnTop, lnBottom: miss.lnBottom, horizon: miss.horizon };
+      void this.fetch(key, target, miss.measure, request).catch((error: unknown) => {
         if (!signal.aborted) {
           this.failed.set(key, performance.now());
           this.onError(error);
@@ -122,55 +95,26 @@ export class Expander {
     if (retry < Infinity) this.schedule(retry);
   }
 
-  /** Expand until the branch is listed, coalescing with visible discovery. */
-  async reach(node: NodeId, measure: number, branch: Branch): Promise<boolean> {
-    const listed = () => this.tree.slotOf(node, { p: measure, q: measure }, branch) !== undefined;
-    while (!listed()) {
-      if (this.disposed) throw new Error("dataset changed while finding a path");
-      const pending = this.pending.get(`${node}:${measure}`);
-      if (pending !== undefined) {
-        await pending;
-        continue;
-      }
-      const covered = this.tree.horizon(node, measure);
-      if (this.tree.complete(node, measure) < covered) return false;
-      if (covered >= MAX_HORIZON) return false;
-      const horizon = Math.min(MAX_HORIZON, Math.max(16, 2 * Math.max(0, covered)));
-      await this.fetch(this.tree.parent(node) ?? node, node, measure, horizon);
-    }
-    return true;
-  }
-
   /**
-   * List every node from ``origin`` down to ``target`` through the branch
-   * toward ``target``, and ``target`` down to ``horizon``, asking only for
-   * what is missing: one walk from the deepest node already placed. True
-   * once all of it is listed; false where the source has nothing more.
+   * Place every node from ``origin`` down to ``target`` and list ``target``
+   * down to ``horizon``, in one request from the deepest node already placed.
+   * True once all of it is known; false where the source has nothing more.
    */
   async walk(origin: NodeId, target: NodeId, measure: number, horizon: number): Promise<boolean> {
     const lens = { p: measure, q: measure };
     const chain = this.tree.chain(origin, target);
+    const last = chain.length - 1;
+    const placed = (index: number) => this.tree.entry(chain[index]!, lens, this.tree.branch(chain[index + 1]!)) !== undefined;
     let first = 0;
-    while (first < chain.length - 1 && this.tree.slotOf(chain[first]!, lens, this.tree.branch(chain[first + 1]!)) !== undefined) first++;
-    const lacking = chain[first]!;
-    if (first === chain.length - 1 && this.tree.horizon(target, measure) >= horizon) return true;
-    // A recording that vouches for less than it was asked has no more to say.
-    if (this.tree.hasListing(lacking, measure) && this.tree.complete(lacking, measure) < this.tree.horizon(lacking, measure)) return false;
-    const from = this.tree.parent(lacking);
-    if (from === null && lacking !== target) {
-      // Nothing names the root's listing through a branch; widen it instead.
-      if (!(await this.reach(lacking, measure, this.tree.branch(chain[1]!)))) return false;
-      return this.walk(origin, target, measure, horizon);
-    }
-    await this.fetch(from ?? lacking, target, measure, horizon);
-    return chain.every((node, index) => index === chain.length - 1
-      ? this.tree.hasListing(node, measure)
-      : this.tree.slotOf(node, lens, this.tree.branch(chain[index + 1]!)) !== undefined);
+    while (first < last && placed(first)) first++;
+    if (first === last && this.tree.has(target, measure)) return true;
+    const path = chain.slice(first + 1).map((node) => this.tree.branch(node));
+    await this.fetch(`${target}:${measure}:walk`, target, measure, { node: chain[first]!, path, ...WHOLE, horizon });
+    return chain.every((_, index) => index === last ? this.tree.has(target, measure) : placed(index));
   }
 
-  /** Fetch the listings of the walk from ``from`` to ``to``, keyed by ``to``. */
-  private fetch(from: NodeId, to: NodeId, measure: number, horizon: number): Promise<void> {
-    const key = `${to}:${measure}`;
+  /** One request, unless the same is in flight; ``target``'s revision marks it answered. */
+  private fetch(key: string, target: NodeId, measure: number, request: ExpandRequest): Promise<void> {
     const pending = this.pending.get(key);
     if (pending !== undefined) return pending;
     const { signal } = this.abort;
@@ -179,12 +123,11 @@ export class Expander {
       else this.active++;
       try {
         signal.throwIfAborted();
-        for await (const { node, reply } of this.sources[measure]!.expand(this.tree, from, to, horizon, signal)) {
+        for await (const { node, run } of this.sources[measure]!.expand(this.tree, request, signal)) {
           signal.throwIfAborted();
-          // A listing through a light branch covers more than was asked.
-          const covered = Math.max(horizon, reply.complete);
-          if (covered >= this.tree.horizon(node, measure)) this.tree.setListing(node, measure, { ...reply, horizon: covered });
+          this.tree.insert(node, measure, run);
         }
+        this.asked.set(key, this.tree.revisionOf(target));
         this.failed.delete(key);
       } finally {
         const next = this.waiting.shift();

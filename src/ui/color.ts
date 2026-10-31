@@ -12,7 +12,7 @@ export interface Scheme {
   inkOnLight: string;
   sequential: string[];
   diverging: string[];
-  tail: string;
+  gap: string;
 }
 
 const LIGHT: Scheme = {
@@ -23,7 +23,7 @@ const LIGHT: Scheme = {
   inkOnLight: "#0b0b0b",
   sequential: ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#104281"],
   diverging: ["#1c5cab", "#5598e7", "#b7d3f6", "#f0efec", "#f6c4c1", "#e34948", "#a92b2b"],
-  tail: "#c9c8c1",
+  gap: "#c9c8c1",
 };
 
 const DARK: Scheme = {
@@ -34,7 +34,7 @@ const DARK: Scheme = {
   inkOnLight: "#0b0b0b",
   sequential: ["#0d366b", "#184f95", "#256abf", "#3987e5", "#6da7ec", "#9ec5f4"],
   diverging: ["#9ec5f4", "#5598e7", "#2f5f9e", "#383835", "#8a3535", "#e34948", "#f4a3a1"],
-  tail: "#4a4a45",
+  gap: "#4a4a45",
 };
 
 const LEVELS = 256;
@@ -85,13 +85,13 @@ class Ramp {
 export class Palette {
   readonly sequential: Ramp;
   readonly diverging: Ramp;
-  readonly tailInk: string;
+  readonly gapInk: string;
 
   constructor(readonly scheme: Scheme) {
     this.sequential = new Ramp(scheme.sequential, scheme);
     this.diverging = new Ramp(scheme.diverging, scheme);
     const ink = (hex: string) => (luminance(parse(hex)) > 0.3 ? scheme.inkOnLight : scheme.inkOnDark);
-    this.tailInk = ink(scheme.tail);
+    this.gapInk = ink(scheme.gap);
   }
 
   static current(): Palette {

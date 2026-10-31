@@ -1,22 +1,22 @@
-// Anchored integer-distribution geometry and best-effort picking, implemented
-// by the shared Rust core. These adapters keep camera mutation at the UI edge.
+// Anchored integer-distribution geometry, picking, and what a view lacks,
+// implemented by the shared Rust core. These adapters keep camera mutation
+// at the UI edge.
 
 import {
   clampPosition,
-  layout as layoutFrame,
-  normalizeBoundary,
-  place as placeNode,
-  repairBoundary,
   extent as measureExtent,
+  layout as layoutFrame,
+  repair as repairAnchor,
   type LayoutFrame,
 } from "./wasm";
-import type { Branch, IntervalTree, Lens, NodeId } from "./tree";
+import type { Branch, IntervalTree, Lens, NodeId, Rank } from "./tree";
 
 export type { Lens } from "./tree";
 
-export interface Boundary {
+/** The top edge of a node's child at ``rank``; rank 0 is the node's top. */
+export interface Edge {
   node: NodeId;
-  slot: number;
+  rank: Rank;
 }
 
 export interface Camera {
@@ -26,7 +26,8 @@ export interface Camera {
   origin: NodeId;
   x: number;
   k: number;
-  anchor: Boundary;
+  /** A known edge at or below the origin, ``a`` view heights below the view's top. */
+  anchor: Edge;
   a: number;
 }
 
@@ -35,15 +36,19 @@ export interface Viewport {
   height: number;
 }
 
-export type BoxKind = "node" | "leaf" | "tail" | "merged";
+/** A child with known children, one without, children not yet known, or children too thin to draw apart. */
+export type BoxKind = "node" | "leaf" | "gap" | "merged";
 
 export interface Box {
   node: NodeId;
-  slot: number;
+  /** The first rank the box covers. */
+  rank: Rank;
+  /** Children covered; 0 for a gap of unknown size. */
   count: number;
   kind: BoxKind;
   branch: Branch | null;
   p: number;
+  /** NaN while unknown. */
   q: number;
   lnMass: number;
   x0: number;
@@ -52,15 +57,30 @@ export interface Box {
   y1: number;
 }
 
-const KINDS: BoxKind[] = ["node", "leaf", "tail", "merged"];
+/** What a frame lacks, as the Expand request that fills it: ``node``, and
+ * ``branch`` below it when given, name the target, whose window should be
+ * listed down to ``horizon``. Asking again finds nothing new while the
+ * target's first missing rank stays ``from``. */
+export interface Miss {
+  node: NodeId;
+  branch: Branch | null;
+  measure: number;
+  from: Rank;
+  lnTop: number;
+  lnBottom: number;
+  horizon: number;
+  /** Visible pixels; larger first. */
+  priority: number;
+}
+
+const KINDS: BoxKind[] = ["node", "leaf", "gap", "merged"];
 const boxBuffers: Box[][] = [];
 
-/** Rust owns the full frame. Only visible rectangles cross the Wasm boundary. */
+/** Rust owns the full frame. Only visible rectangles and requests cross the Wasm boundary. */
 export class Frame {
   readonly boxes: Box[];
   readonly cover: { node: NodeId; y: number } | null;
-  private walkedCache?: { node: NodeId; lnMass: number; x: number }[];
-  private unexpandedCache?: { node: NodeId; branch: Branch; lnMass: number; x1: number }[];
+  private missesCache?: Miss[];
   private disposed = false;
 
   constructor(readonly raw: LayoutFrame) {
@@ -68,9 +88,9 @@ export class Frame {
     const nodes = raw.nodes();
     this.boxes = boxBuffers.pop() ?? [];
     for (let i = 0, box = 0; i < packed.length; i += 11, box++) {
-      const b = this.boxes[box] ??= { node: 0n, slot: 0, count: 0, kind: "node", branch: null,
+      const b = this.boxes[box] ??= { node: 0n, rank: 0, count: 0, kind: "node", branch: null,
         p: 0, q: 0, lnMass: 0, x0: 0, x1: 0, y0: 0, y1: 0 };
-      b.node = nodes[box]!; b.slot = packed[i]!; b.count = packed[i + 1]!;
+      b.node = nodes[box]!; b.rank = packed[i]!; b.count = packed[i + 1]!;
       b.kind = KINDS[packed[i + 2]!]!; b.branch = packed[i + 3] === -1 ? null : packed[i + 3]!;
       b.p = packed[i + 4]!; b.q = packed[i + 5]!; b.lnMass = packed[i + 6]!;
       b.x0 = packed[i + 7]!; b.x1 = packed[i + 8]!; b.y0 = packed[i + 9]!; b.y1 = packed[i + 10]!;
@@ -79,25 +99,12 @@ export class Frame {
     this.cover = raw.cover() as Frame["cover"];
   }
 
-  get walked(): { node: NodeId; lnMass: number; x: number }[] {
-    return this.walkedCache ??= this.raw.walked();
+  get misses(): Miss[] {
+    return this.missesCache ??= this.raw.misses();
   }
 
-  get unexpanded(): { node: NodeId; branch: Branch; lnMass: number; x1: number }[] {
-    return this.unexpandedCache ??= this.raw.unexpanded();
-  }
-
-  // Diagnostic views are deliberately lazy: never export hidden vocabulary
-  // entries to paint, hit-test, reanchor, or calculate discovery demand.
-  get known(): Box[] { return this.raw.known(); }
-  get boundaries(): { boundary: Boundary; y: number }[] { return this.raw.boundaries(); }
   get originTop(): number { return this.raw.originTop(); }
   get originBottom(): number { return this.raw.originBottom(); }
-
-  toJSON() {
-    return { boxes: this.boxes, known: this.known, walked: this.walked, unexpanded: this.unexpanded,
-      boundaries: this.boundaries, originTop: this.originTop, originBottom: this.originBottom, cover: this.cover };
-  }
 
   /** All frame views are invalid after disposal; buffers may be reused. */
   dispose(): void {
@@ -115,6 +122,7 @@ export interface Selection {
 }
 
 export interface LayoutOptions {
+  /** Children thinner than this many pixels join a band. */
   mergePx: number;
 }
 
@@ -133,17 +141,9 @@ export function layout(
   return new Frame(layoutFrame(tree.raw, lens.p, lens.q, cam, view, options.mergePx ?? 1));
 }
 
-export function normalize(tree: IntervalTree, lens: Lens, origin: NodeId, boundary: Boundary): Boundary {
-  return normalizeBoundary(tree.raw, lens.p, lens.q, origin, boundary) as Boundary;
-}
-
+/** Move the anchor up to the deepest edge p still places: a lens or a replaced distribution can take one away. */
 export function repair(tree: IntervalTree, lens: Lens, cam: Camera): void {
-  cam.anchor = repairBoundary(tree.raw, lens.p, lens.q, cam) as Boundary;
-}
-
-/** `id`'s ln p mass and right edge in nats below `origin`. */
-export function place(tree: IntervalTree, lens: Lens, origin: NodeId, id: NodeId): { lnMass: number; x1: number } {
-  return placeNode(tree.raw, lens.p, lens.q, origin, id) as { lnMass: number; x1: number };
+  cam.anchor = repairAnchor(tree.raw, lens.p, lens.q, cam) as Edge;
 }
 
 /** The origin's interval edges in view heights. */
@@ -152,7 +152,7 @@ export function extent(tree: IntervalTree, lens: Lens, cam: Camera): { top: numb
 }
 
 export function reanchor(cam: Camera, frame: Frame): void {
-  const position = frame.raw.reanchor() as { anchor: Boundary; a: number } | null;
+  const position = frame.raw.reanchor() as { anchor: Edge; a: number } | null;
   if (position !== null) {
     cam.anchor = position.anchor;
     cam.a = position.a;
@@ -163,6 +163,7 @@ export function clamp(tree: IntervalTree, lens: Lens, cam: Camera): void {
   cam.a = clampPosition(tree.raw, lens.p, lens.q, cam);
 }
 
-export function pick(frame: Frame, cam: Camera, view: Viewport, x: number, y: number): Selection | null {
-  return frame.raw.pick(cam.x, cam.k, view.width, view.height, x, y) as Selection | null;
+/** The child under a screen point, however thin, found in the frame drawn with ``cam``. */
+export function pick(tree: IntervalTree, lens: Lens, frame: Frame, cam: Camera, view: Viewport, x: number, y: number): Selection | null {
+  return frame.raw.pick(tree.raw, lens.p, lens.q, cam, view, x, y) as Selection | null;
 }

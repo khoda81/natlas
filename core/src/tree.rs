@@ -1,8 +1,11 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+//! The integer-sequence tree every client and server names alike: nodes by
+//! hashed ids, and what each measure says of a node's children.
 
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
+use serde::Serialize;
+
+use crate::distribution::{ln_between, Distribution, Run, Step, Window, MAX_DESCENT};
 use crate::Result;
 
 /// A node's id, hashed from its branches by [`child_hash`] and shared by every
@@ -23,341 +26,17 @@ pub mod node_id {
         u64::deserialize(deserializer)
     }
 }
+
 /// One of a node's 2^32 branches. Every branch exists; one a measure never
 /// lists has weight zero. What a branch denotes is up to the reader.
 pub type Branch = u32;
 
+/// The measure whose order and weights split heights, and the one whose
+/// surprisal sets widths.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct Lens {
     pub p: usize,
     pub q: usize,
-}
-
-/// What a measure said about a node's children: the heaviest ones, in order.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Listing {
-    /// The horizon asked for, in bits, so it is not asked for again.
-    pub horizon: f64,
-    pub branches: Vec<Branch>,
-    pub ln_weights: Vec<f64>,
-    /// Weight of every branch not listed.
-    pub leftover: f64,
-    /// The horizon the source vouches for: no unlisted branch is heavier than
-    /// 2^-complete. A recording can vouch for less than was asked.
-    pub complete: f64,
-}
-
-impl Listing {
-    fn validate(&self) -> Result<()> {
-        if self.branches.len() != self.ln_weights.len() {
-            return Err(format!(
-                "listing has {} branches but {} log weights",
-                self.branches.len(),
-                self.ln_weights.len()
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.leftover) || self.horizon.is_nan() || self.complete.is_nan()
-        {
-            return Err("listing has an invalid leftover or horizon".into());
-        }
-        let mut previous = 0.0;
-        for &weight in &self.ln_weights {
-            if weight.is_nan() || weight > previous {
-                return Err("listing weights must be log probabilities, heaviest first".into());
-            }
-            previous = weight;
-        }
-        Ok(())
-    }
-}
-
-fn ln_add(a: f64, b: f64) -> f64 {
-    let high = a.max(b);
-    if high == f64::NEG_INFINITY {
-        high
-    } else {
-        high + (a.min(b) - high).exp().ln_1p()
-    }
-}
-
-/// Upper bound on the weight of any child `listing` leaves out.
-fn unlisted_bound(listing: &Listing) -> f64 {
-    let last = listing.ln_weights.last().map_or(1.0, |weight| weight.exp());
-    listing.leftover.min(last).min(2f64.powf(-listing.complete))
-}
-
-/// Slot of each listed branch: direct for compact vocabularies, hashed otherwise.
-#[derive(Debug)]
-enum Index {
-    Dense(Vec<usize>),
-    Sparse(HashMap<Branch, usize>),
-}
-
-impl Index {
-    fn new(branches: &[Branch]) -> Result<Self> {
-        let duplicate = |branch| format!("branch {branch} is listed twice");
-        let length = branches
-            .iter()
-            .max()
-            .map_or(0, |&branch| u64::from(branch) + 1);
-        if length <= 1_048_576 && length <= (branches.len() as u64).saturating_mul(4) {
-            let mut slots = vec![usize::MAX; length as usize];
-            for (slot, &branch) in branches.iter().enumerate() {
-                if slots[branch as usize] != usize::MAX {
-                    return Err(duplicate(branch));
-                }
-                slots[branch as usize] = slot;
-            }
-            Ok(Self::Dense(slots))
-        } else {
-            let mut slots = HashMap::with_capacity(branches.len());
-            for (slot, &branch) in branches.iter().enumerate() {
-                if slots.insert(branch, slot).is_some() {
-                    return Err(duplicate(branch));
-                }
-            }
-            Ok(Self::Sparse(slots))
-        }
-    }
-
-    fn get(&self, branch: Branch) -> Option<usize> {
-        match self {
-            Self::Dense(slots) => slots
-                .get(branch as usize)
-                .copied()
-                .filter(|&slot| slot != usize::MAX),
-            Self::Sparse(slots) => slots.get(&branch).copied(),
-        }
-    }
-}
-
-/// A validated listing and the index every lens of it shares.
-#[derive(Debug)]
-struct Known {
-    listing: Listing,
-    index: Index,
-}
-
-/// A node's slots under one lens: p's listed branches, then p's leftover.
-#[derive(Debug)]
-pub struct Slots {
-    p_known: Option<Arc<Known>>,
-    /// Conditional p weight per slot; the tail holds p's leftover.
-    p: Vec<f64>,
-    /// Conditional q weight per slot, or an upper bound where `q_bound`.
-    q: Vec<f64>,
-    ln_p: Vec<f64>,
-    nats_q: Vec<f64>,
-    q_bound: Vec<bool>,
-    prefixes: Vec<f64>,
-    suffixes: Vec<f64>,
-    entropy: f64,
-    equal_entropy: f64,
-    cross: f64,
-    bounded: bool,
-}
-
-impl Slots {
-    fn new(p_known: Option<&Arc<Known>>, q_known: Option<&Arc<Known>>) -> Self {
-        let p = p_known.map(|known| &known.listing);
-        let q = q_known.map(|known| &known.listing);
-        let listed = p.map_or(0, |listing| listing.branches.len());
-        let tail = p.is_some_and(|listing| listing.leftover > 0.0);
-        let count = listed + usize::from(tail);
-        let mut p_weights = vec![0.0; count];
-
-        if let Some(listing) = p {
-            for (weight, ln_weight) in p_weights.iter_mut().zip(&listing.ln_weights) {
-                *weight = ln_weight.exp();
-            }
-            if tail {
-                p_weights[listed] = listing.leftover;
-            }
-        }
-
-        // Whatever q leaves out weighs at most this; a child it lists only under
-        // p's tail can be heavier.
-        let unlisted = q.map_or(1.0, unlisted_bound);
-        let mut tail_bound = unlisted;
-        let equal = matches!((p_known, q_known), (Some(p), Some(q)) if Arc::ptr_eq(p, q));
-        let mut q_weights = if equal {
-            p_weights.clone()
-        } else {
-            vec![unlisted; count]
-        };
-        let mut q_bound = vec![!equal; count];
-        if let (Some(listing), false) = (q, equal) {
-            for (rank, &branch) in listing.branches.iter().enumerate() {
-                let weight = listing.ln_weights[rank].exp();
-                match p_known.and_then(|known| known.index.get(branch)) {
-                    None => tail_bound = tail_bound.max(weight),
-                    Some(slot) => {
-                        q_weights[slot] = weight;
-                        q_bound[slot] = false;
-                    }
-                }
-            }
-        }
-        if tail {
-            q_weights[listed] = tail_bound;
-            q_bound[listed] = true;
-        }
-
-        // Forward and backward sums avoid cancellation at slot boundaries.
-        let mut prefixes = vec![0.0; count + 1];
-        let mut suffixes = vec![0.0; count + 1];
-        for slot in 0..count {
-            prefixes[slot + 1] = prefixes[slot] + p_weights[slot];
-        }
-        for slot in (0..count).rev() {
-            suffixes[slot] = suffixes[slot + 1] + p_weights[slot];
-        }
-
-        // Log weights come straight from the listings, not back through exp.
-        let mut ln_p: Vec<_> = p_weights.iter().map(|p| p.ln()).collect();
-        if let Some(listing) = p {
-            ln_p[..listed].copy_from_slice(&listing.ln_weights);
-        }
-        let mut nats_q: Vec<_> = q_weights.iter().map(|q| -q.ln()).collect();
-        if equal {
-            for slot in 0..listed {
-                nats_q[slot] = -ln_p[slot];
-            }
-        } else if let Some(listing) = q {
-            for (&branch, &ln) in listing.branches.iter().zip(&listing.ln_weights) {
-                if let Some(slot) = p_known.and_then(|known| known.index.get(branch)) {
-                    nats_q[slot] = -ln;
-                }
-            }
-        }
-        let mut entropy = 0.0;
-        let mut equal_entropy = 0.0;
-        let mut cross = 0.0;
-        for slot in 0..count {
-            let p = p_weights[slot];
-            if p == 0.0 {
-                continue;
-            }
-            entropy -= p * ln_p[slot];
-            equal_entropy -= p * if slot == listed {
-                -nats_q[slot]
-            } else {
-                ln_p[slot]
-            };
-            cross += p * nats_q[slot];
-        }
-        let bounded = tail || q_bound.iter().any(|&bound| bound);
-
-        Self {
-            p_known: p_known.cloned(),
-            p: p_weights,
-            q: q_weights,
-            ln_p,
-            nats_q,
-            q_bound,
-            prefixes,
-            suffixes,
-            entropy,
-            equal_entropy,
-            cross,
-            bounded,
-        }
-    }
-
-    fn branches(&self) -> &[Branch] {
-        self.p_known
-            .as_ref()
-            .map_or(&[], |known| &known.listing.branches)
-    }
-
-    pub fn listed(&self) -> usize {
-        self.branches().len()
-    }
-
-    pub fn count(&self) -> usize {
-        self.p.len()
-    }
-
-    pub fn p(&self, slot: usize) -> f64 {
-        self.p[slot]
-    }
-
-    pub fn q(&self, slot: usize) -> f64 {
-        self.q[slot]
-    }
-
-    pub fn ln_p(&self, slot: usize) -> f64 {
-        self.ln_p[slot]
-    }
-
-    pub fn nats_q(&self, slot: usize) -> f64 {
-        self.nats_q[slot]
-    }
-
-    /// The slot's branch; `None` for the tail.
-    pub fn branch(&self, slot: usize) -> Option<Branch> {
-        self.branches().get(slot).copied()
-    }
-
-    pub fn slot_of(&self, branch: Branch) -> Option<usize> {
-        self.p_known.as_ref()?.index.get(branch)
-    }
-
-    pub fn statistics(&self, equal: bool) -> SlotStatistics {
-        SlotStatistics {
-            entropy: if equal {
-                self.equal_entropy
-            } else {
-                self.entropy
-            },
-            cross: self.cross,
-            bounded: self.bounded,
-        }
-    }
-
-    pub fn q_bound(&self, slot: usize) -> bool {
-        self.q_bound.get(slot).copied().unwrap_or(false)
-    }
-
-    /// Σ p over slots [0, slot): accumulated forward, so free of cancellation.
-    pub fn prefix(&self, slot: usize) -> f64 {
-        self.prefixes[slot.min(self.count())]
-    }
-
-    /// Σ p over slots [slot, count): accumulated backward, so free of cancellation.
-    pub fn suffix(&self, slot: usize) -> f64 {
-        self.suffixes[slot.min(self.count())]
-    }
-
-    pub fn view(&self) -> SlotsView<'_> {
-        SlotsView {
-            branches: self.branches(),
-            p: &self.p,
-            q: &self.q,
-            q_bound: &self.q_bound,
-            listed: self.listed(),
-            count: self.count(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-pub struct SlotStatistics {
-    pub entropy: f64,
-    pub cross: f64,
-    pub bounded: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SlotsView<'a> {
-    branches: &'a [Branch],
-    p: &'a [f64],
-    q: &'a [f64],
-    q_bound: &'a [bool],
-    listed: usize,
-    count: usize,
 }
 
 /// A node's id shared by every client and server: hashed from its path, so
@@ -375,22 +54,28 @@ pub fn child_hash(parent: u64, branch: Branch) -> u64 {
 struct Node {
     /// Parent and the branch to this node; `None` only for the root.
     edge: Option<(NodeId, Branch)>,
-    depth: usize,
-    children: HashMap<Branch, NodeId>,
-    listings: Vec<Option<Arc<Known>>>,
-    views: RwLock<HashMap<Lens, Arc<Slots>>>,
+    distributions: Vec<Option<Distribution>>,
 }
 
-impl Node {
-    fn new(edge: Option<(NodeId, Branch)>, depth: usize, measures: usize) -> Self {
-        Self {
-            edge,
-            depth,
-            children: HashMap::new(),
-            listings: vec![None; measures],
-            views: RwLock::new(HashMap::new()),
-        }
-    }
+/// A child as a lens sees it within its parent.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Entry {
+    pub rank: u32,
+    /// p mass between the parent's top and the child's.
+    pub before: f64,
+    pub ln_p: f64,
+    /// −ln q; infinite while q is unknown.
+    pub nats_q: f64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+pub struct Statistics {
+    /// Over the known children.
+    pub entropy: f64,
+    pub cross: f64,
+    /// Whether children or their q are still unknown, so both are lower bounds.
+    pub bounded: bool,
 }
 
 #[derive(Debug)]
@@ -401,14 +86,23 @@ pub struct Tree {
 
 impl Tree {
     pub fn new(measures: usize) -> Self {
-        Self {
-            nodes: HashMap::from([(ROOT, Node::new(None, 0, measures))]),
+        let mut tree = Self {
+            nodes: HashMap::new(),
             measures,
-        }
+        };
+        tree.insert_node(ROOT, None);
+        tree
     }
 
-    pub fn root(&self) -> NodeId {
-        ROOT
+    fn insert_node(&mut self, id: NodeId, edge: Option<(NodeId, Branch)>) {
+        let distributions = (0..self.measures).map(|_| None).collect();
+        self.nodes.insert(
+            id,
+            Node {
+                edge,
+                distributions,
+            },
+        );
     }
 
     fn node(&self, id: NodeId) -> Result<&Node> {
@@ -423,56 +117,34 @@ impl Tree {
             .ok_or_else(|| format!("unknown node {id:#018x}"))
     }
 
-    /// The child of `parent` along `branch`, created on first use.
+    /// The child of `parent` along `branch`, learned on first use.
     pub fn child(&mut self, parent: NodeId, branch: Branch) -> Result<NodeId> {
-        let node = self.node(parent)?;
-        if node.children.contains_key(&branch) {
-            return Ok(child_hash(parent, branch));
-        }
+        self.node(parent)?;
         let id = child_hash(parent, branch);
-        let depth = node.depth + 1;
-        if self.nodes.contains_key(&id) {
-            return Err(format!("node id {id:#018x} collides"));
+        match self.nodes.get(&id) {
+            Some(node) if node.edge != Some((parent, branch)) => {
+                Err(format!("node id {id:#018x} collides"))
+            }
+            Some(_) => Ok(id),
+            None => {
+                self.insert_node(id, Some((parent, branch)));
+                Ok(id)
+            }
         }
-        self.nodes
-            .insert(id, Node::new(Some((parent, branch)), depth, self.measures));
-        self.node_mut(parent)?.children.insert(branch, id);
-        Ok(id)
     }
 
-    /// Follow `path` down from `node`, creating only missing nodes.
+    /// Follow `path` down from `node`, learning only missing nodes.
     pub fn descend(&mut self, mut node: NodeId, path: &[Branch]) -> Result<NodeId> {
+        self.node(node)?;
         for &branch in path {
             node = self.child(node, branch)?;
         }
         Ok(node)
     }
 
-    pub(crate) fn child_id(&self, parent: NodeId, branch: Branch) -> Result<Option<NodeId>> {
-        Ok(self.node(parent)?.children.get(&branch).copied())
-    }
-
-    /// A frame only needs the expanded exceptions, not a kind record for each
-    /// of the hundred thousand unexpanded vocabulary entries.
-    pub(crate) fn expanded_branches(&self, id: NodeId, measure: usize) -> Result<HashSet<Branch>> {
-        self.node(id)?
-            .children
-            .iter()
-            .filter_map(|(&branch, &child)| match self.expanded(child, measure) {
-                Ok(true) => Some(Ok(branch)),
-                Ok(false) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect()
-    }
-
     /// Whether this tree has learned the node.
     pub fn contains(&self, id: NodeId) -> bool {
         self.nodes.contains_key(&id)
-    }
-
-    pub fn depth(&self, id: NodeId) -> Result<usize> {
-        Ok(self.node(id)?.depth)
     }
 
     pub fn parent(&self, id: NodeId) -> Result<Option<NodeId>> {
@@ -488,9 +160,9 @@ impl Tree {
         let mut chain = vec![id];
         let mut current = id;
         while current != origin {
-            current = self
-                .parent(current)?
-                .ok_or_else(|| format!("node {origin} is not an ancestor of node {id}"))?;
+            current = self.parent(current)?.ok_or_else(|| {
+                format!("node {origin:#018x} is not an ancestor of node {id:#018x}")
+            })?;
             chain.push(current);
         }
         chain.reverse();
@@ -499,7 +171,7 @@ impl Tree {
 
     /// Branches from the root down to `id`.
     pub fn path(&self, id: NodeId) -> Result<Vec<Branch>> {
-        let mut path = Vec::with_capacity(self.depth(id)?);
+        let mut path = Vec::new();
         let mut current = self.node(id)?;
         while let Some((parent, branch)) = current.edge {
             path.push(branch);
@@ -517,104 +189,193 @@ impl Tree {
         }
     }
 
-    pub fn listing(&self, id: NodeId, measure: usize) -> Result<Option<&Listing>> {
+    /// What `measure` has said of the node's children; nothing for a node
+    /// this tree has not learned.
+    pub fn distribution(&self, id: NodeId, measure: usize) -> Result<Option<&Distribution>> {
         self.check_measure(measure)?;
-        Ok(self.node(id)?.listings[measure]
-            .as_deref()
-            .map(|known| &known.listing))
-    }
-
-    /// Whether `measure` has said anything about this node's children.
-    pub fn expanded(&self, id: NodeId, measure: usize) -> Result<bool> {
         Ok(self
-            .listing(id, measure)?
-            .is_some_and(|listing| !listing.branches.is_empty() || listing.complete > 0.0))
+            .nodes
+            .get(&id)
+            .and_then(|node| node.distributions[measure].as_ref()))
     }
 
-    pub fn set_listing(&mut self, id: NodeId, measure: usize, listing: Listing) -> Result<()> {
+    /// Add a run a source sent, and whether anything changed.
+    pub fn insert(&mut self, id: NodeId, measure: usize, run: Run) -> Result<bool> {
         self.check_measure(measure)?;
-        listing.validate()?;
-        let index = Index::new(&listing.branches)?;
-        let node = self.node_mut(id)?;
-        node.listings[measure] = Some(Arc::new(Known { listing, index }));
-        node.views.get_mut().expect("slot cache poisoned").clear();
+        let slot = &mut self.node_mut(id)?.distributions[measure];
+        Ok(match slot {
+            Some(distribution) => distribution.insert(run),
+            None => {
+                *slot = Some(Distribution::new(run));
+                true
+            }
+        })
+    }
+
+    /// Replace everything known of the node's children under `measure`.
+    pub fn set(&mut self, id: NodeId, measure: usize, distribution: Distribution) -> Result<()> {
+        self.check_measure(measure)?;
+        self.node_mut(id)?.distributions[measure] = Some(distribution);
         Ok(())
     }
 
-    pub fn clear_listing(&mut self, id: NodeId, measure: usize) -> Result<()> {
+    pub fn forget(&mut self, id: NodeId, measure: usize) -> Result<()> {
         self.check_measure(measure)?;
-        let node = self.node_mut(id)?;
-        node.listings[measure] = None;
-        node.views.get_mut().expect("slot cache poisoned").clear();
+        self.node_mut(id)?.distributions[measure] = None;
         Ok(())
     }
 
-    /// What a source answers from this node's listing to a request at
-    /// `horizon` bits that must also place `through`: every child at least
-    /// 2^-horizon heavy, at least through `through`, and every child as heavy
-    /// as the last listed one. The leftover is summed from the light end so
-    /// tiny ones survive, and it vouches for no more than the listing does.
-    /// `None` without a listing.
-    pub fn cut(
-        &self,
-        id: NodeId,
-        measure: usize,
-        horizon: u32,
-        through: Option<Branch>,
-    ) -> Result<Option<Listing>> {
-        self.check_measure(measure)?;
-        let Some(known) = self.node(id)?.listings[measure].as_deref() else {
+    /// −ln q of a child of `id`, infinite while unknown: an unknown width
+    /// reaches past any view.
+    pub fn nats_q(&self, id: NodeId, lens: Lens, branch: Branch, ln_p: f64) -> Result<f64> {
+        if lens.p == lens.q {
+            return Ok(-ln_p);
+        }
+        Ok(self
+            .distribution(id, lens.q)?
+            .and_then(|q| q.ln_p(branch))
+            .map_or(f64::INFINITY, |ln_q| -ln_q))
+    }
+
+    /// Where p places the child along `branch` in `id`, if it does.
+    pub fn entry(&self, id: NodeId, lens: Lens, branch: Branch) -> Result<Option<Entry>> {
+        let Some(p) = self.distribution(id, lens.p)? else {
             return Ok(None);
         };
-        let weights = &known.listing.ln_weights;
-        let mut threshold = if horizon == 0 {
-            f64::INFINITY
-        } else {
-            -f64::from(horizon) * std::f64::consts::LN_2
+        let Some(rank) = p.rank(branch) else {
+            return Ok(None);
         };
-        if let Some(slot) = through.and_then(|branch| known.index.get(branch)) {
-            threshold = threshold.min(weights[slot]);
-        }
-        let end = weights.partition_point(|&weight| weight >= threshold);
-        let mut leftover = known.listing.leftover.ln();
-        for &weight in weights[end..].iter().rev() {
-            leftover = ln_add(leftover, weight);
-        }
-        let vouched = match end {
-            0 => f64::from(horizon),
-            _ => f64::from(horizon).max(-weights[end - 1] / std::f64::consts::LN_2),
-        };
-        Ok(Some(Listing {
-            horizon: f64::from(horizon),
-            branches: known.listing.branches[..end].to_vec(),
-            ln_weights: weights[..end].to_vec(),
-            leftover: leftover.exp(),
-            complete: vouched.min(known.listing.complete),
+        let top = p.edge(rank).expect("a ranked branch has a known edge");
+        let ln_p = p.ln_p(branch).expect("a ranked branch has a weight");
+        Ok(Some(Entry {
+            rank,
+            before: ln_between(0.0, top).exp(),
+            ln_p,
+            nats_q: self.nats_q(id, lens, branch, ln_p)?,
         }))
     }
 
-    pub fn slots(&self, id: NodeId, lens: Lens) -> Result<Arc<Slots>> {
-        self.check_measure(lens.p)?;
-        self.check_measure(lens.q)?;
-        let node = self.node(id)?;
-        if let Some(slots) = node
-            .views
-            .read()
-            .expect("slot cache poisoned")
-            .get(&lens)
-            .cloned()
-        {
-            return Ok(slots);
+    pub fn statistics(&self, id: NodeId, lens: Lens) -> Result<Statistics> {
+        let Some(p) = self.distribution(id, lens.p)? else {
+            return Ok(Statistics {
+                entropy: 0.0,
+                cross: 0.0,
+                bounded: true,
+            });
+        };
+        let mut entropy = 0.0;
+        let mut cross = 0.0;
+        let mut bounded = !p.complete();
+        for run in p.runs() {
+            entropy += run.ln_surprisal(0, run.len()).exp();
+            if lens.p != lens.q {
+                for at in 0..run.len() {
+                    let ln_p = run.ln_p(at);
+                    let nats = self.nats_q(id, lens, run.branch(at), ln_p)?;
+                    if nats.is_finite() {
+                        cross += ln_p.exp() * nats;
+                    } else {
+                        bounded = true;
+                    }
+                }
+            }
         }
-        let slots = Arc::new(Slots::new(
-            node.listings[lens.p].as_ref(),
-            node.listings[lens.q].as_ref(),
-        ));
-        node.views
-            .write()
-            .expect("slot cache poisoned")
-            .insert(lens, Arc::clone(&slots));
-        Ok(slots)
+        if lens.p == lens.q {
+            cross = entropy;
+        }
+        Ok(Statistics {
+            entropy,
+            cross,
+            bounded,
+        })
+    }
+}
+
+/// One request of the protocol's Expand walked through a tree: the path's
+/// branches placed one node at a time, then the window followed down through
+/// children that hold it, then listed. A recording answers from what it has;
+/// a server computes each missing distribution as the walk asks for it.
+#[derive(Debug)]
+pub struct Walk {
+    node: NodeId,
+    path: Vec<Branch>,
+    at: usize,
+    window: Window,
+    horizon: u32,
+    descended: usize,
+    done: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Advance {
+    /// The next message: this node's run.
+    Run(NodeId, Run),
+    /// The walk needs this node's distribution before it can go on.
+    Missing(NodeId),
+    Done,
+}
+
+impl Walk {
+    pub fn new(node: NodeId, path: Vec<Branch>, window: Window, horizon: u32) -> Self {
+        Self {
+            node,
+            path,
+            at: 0,
+            window,
+            horizon,
+            descended: 0,
+            done: false,
+        }
+    }
+
+    pub fn advance(&mut self, tree: &mut Tree, measure: usize) -> Result<Advance> {
+        if self.done {
+            return Ok(Advance::Done);
+        }
+        let node = self.node;
+        let Some(distribution) = tree.distribution(node, measure)? else {
+            return Ok(Advance::Missing(node));
+        };
+        let (run, next) = if let Some(&branch) = self.path.get(self.at) {
+            // A branch of weight zero has no place: the walk ends before it.
+            let Some(run) = distribution.place(branch) else {
+                self.done = true;
+                return Ok(Advance::Done);
+            };
+            self.at += 1;
+            (run, Some((branch, self.window)))
+        } else {
+            let step = if self.descended < MAX_DESCENT {
+                distribution.step(self.window, self.horizon)
+            } else {
+                distribution.list(self.window, self.horizon).map(Step::List)
+            };
+            match step {
+                Some(Step::Descend {
+                    run,
+                    branch,
+                    window,
+                }) => {
+                    self.descended += 1;
+                    (run, Some((branch, window)))
+                }
+                Some(Step::List(run)) => (run, None),
+                // A node without children says so with its one empty run.
+                None if distribution.ended() => (distribution.runs()[0].clone(), None),
+                None => {
+                    self.done = true;
+                    return Ok(Advance::Done);
+                }
+            }
+        };
+        match next {
+            Some((branch, window)) => {
+                self.node = tree.child(node, branch)?;
+                self.window = window;
+            }
+            None => self.done = true,
+        }
+        Ok(Advance::Run(node, run))
     }
 }
 
@@ -622,158 +383,96 @@ impl Tree {
 mod tests {
     use super::*;
 
-    fn listing(weights: &[f64], branches: &[u32], complete: f64) -> Listing {
-        Listing {
-            horizon: complete,
-            branches: branches.to_vec(),
-            ln_weights: weights.iter().map(|weight| weight.ln()).collect(),
-            leftover: (1.0 - weights.iter().sum::<f64>()).max(0.0),
-            complete,
-        }
-    }
-
-    #[test]
-    fn slots_keep_p_order_tail_and_q_upper_bounds() {
-        let p = listing(&[0.5, 0.3], &[0, 1], 2.0);
-        let mut tree = Tree::new(2);
-        tree.set_listing(0, 0, p.clone()).unwrap();
-        tree.set_listing(0, 1, listing(&[0.6, 0.3], &[1, 2], 2.0))
-            .unwrap();
-        let slots = tree.slots(0, Lens { p: 0, q: 1 }).unwrap();
-        assert_eq!(slots.branches(), [0, 1]);
-        assert_eq!(slots.count(), 3);
-        assert_eq!(slots.branch(2), None);
-        assert!((slots.p(2) - 0.2).abs() < 1e-12);
-        assert!((slots.suffix(1) - 0.5).abs() < 1e-12);
-        assert_eq!(slots.slot_of(1), Some(1));
-        for (actual, expected) in slots.q.iter().zip([0.1, 0.6, 0.3]) {
-            assert!((actual - expected).abs() < 1e-12);
-        }
-        assert_eq!(slots.q_bound, vec![true, false, true]);
-
-        let same = tree.slots(0, Lens { p: 0, q: 0 }).unwrap();
-        assert!((same.q(2) - 0.2).abs() < 1e-12);
-        assert_eq!(same.ln_p(0), 0.5f64.ln());
-        assert_eq!(same.nats_q(1), -0.3f64.ln());
-        tree.set_listing(0, 0, Listing { complete: 4.0, ..p })
-            .unwrap();
-        assert_eq!(
-            tree.slots(0, Lens { p: 0, q: 0 }).unwrap().q(2),
-            2f64.powi(-4)
-        );
-    }
-
-    #[test]
-    fn listings_are_validated_at_the_boundary() {
-        let mut tree = Tree::new(1);
-        for (branches, weights) in [
-            (vec![0, 2, 0], vec![0.5, 0.3, 0.2]),
-            (vec![0, u32::MAX, 0], vec![0.5, 0.3, 0.2]),
-            (vec![0, 1], vec![0.3, 0.5]),
-        ] {
-            assert!(tree
-                .set_listing(0, 0, listing(&weights, &branches, 40.0))
-                .is_err());
-        }
-        let mut positive = listing(&[0.5], &[0], 40.0);
-        positive.ln_weights[0] = 1e-9;
-        assert!(tree.set_listing(0, 0, positive).is_err());
-        let sparse = listing(&[0.5, 0.3, 0.2], &[0, u32::MAX, 7], 40.0);
-        tree.set_listing(0, 0, sparse).unwrap();
-        let slots = tree.slots(0, Lens { p: 0, q: 0 }).unwrap();
-        assert_eq!(slots.slot_of(u32::MAX), Some(1));
-        assert_eq!(slots.slot_of(1), None);
+    fn weights(weights: &[f64]) -> Distribution {
+        Distribution::from_weights(&weights.iter().map(|w| w.ln()).collect::<Vec<_>>()).unwrap()
     }
 
     #[test]
     fn nodes_are_named_by_their_shared_hashes() {
         let mut tree = Tree::new(2);
-        let child = tree.child(0, 5).unwrap();
+        let child = tree.child(ROOT, 5).unwrap();
         let grandchild = tree.child(child, 2).unwrap();
-        assert_eq!(tree.child(0, 5).unwrap(), child);
-        assert_ne!(tree.child(0, 6).unwrap(), child);
-        assert_eq!(tree.parent(0).unwrap(), None);
+        assert_eq!(grandchild, child_hash(child_hash(ROOT, 5), 2));
+        assert_eq!(tree.child(ROOT, 5).unwrap(), child);
+        assert_eq!(tree.parent(ROOT).unwrap(), None);
         assert_eq!(tree.parent(grandchild).unwrap(), Some(child));
-        assert_eq!(tree.branch(0).unwrap(), None);
         assert_eq!(tree.branch(grandchild).unwrap(), Some(2));
         assert_eq!(tree.path(grandchild).unwrap(), [5, 2]);
-        assert_eq!(tree.depth(grandchild).unwrap(), 2);
-        assert_eq!(tree.chain(0, grandchild).unwrap(), [0, child, grandchild]);
-        assert_eq!(tree.chain(child, grandchild).unwrap(), [child, grandchild]);
+        assert_eq!(
+            tree.chain(ROOT, grandchild).unwrap(),
+            [ROOT, child, grandchild]
+        );
         assert!(tree.chain(grandchild, child).is_err());
-
-        // Another tree names the same paths by the same hashes, whatever
-        // order it learned them in.
         let mut other = Tree::new(1);
-        let far = other.descend(0, &[5, 2]).unwrap();
-        assert_eq!(far, grandchild);
-        assert_eq!(grandchild, child_hash(child_hash(0, 5), 2));
-        assert!(tree.contains(far));
-        assert!(!tree.contains(child_hash(0, 9)));
+        assert_eq!(other.descend(ROOT, &[5, 2]).unwrap(), grandchild);
+        assert!(!tree.contains(child_hash(ROOT, 9)));
+        // Another parent claiming the same id is a collision, refused.
+        tree.insert_node(child_hash(ROOT, 3), Some((ROOT, 4)));
+        assert!(tree.child(ROOT, 3).is_err());
     }
 
     #[test]
-    fn slots_are_cached_per_lens_and_invalidated_by_listing_updates() {
+    fn entries_place_children_by_p_and_size_them_by_q() {
         let mut tree = Tree::new(2);
+        tree.set(ROOT, 0, weights(&[0.25, 0.75])).unwrap();
         let lens = Lens { p: 0, q: 1 };
-        tree.set_listing(0, 0, listing(&[0.5, 0.5], &[4, 5], 40.0))
-            .unwrap();
-        tree.set_listing(0, 1, listing(&[0.5, 0.5], &[4, 5], 40.0))
-            .unwrap();
-        let first = tree.slots(0, lens).unwrap();
-        assert!(Arc::ptr_eq(&first, &tree.slots(0, lens).unwrap()));
-        tree.set_listing(0, 1, listing(&[0.75, 0.25], &[4, 5], 40.0))
-            .unwrap();
-        let updated = tree.slots(0, lens).unwrap();
-        assert!(!Arc::ptr_eq(&first, &updated));
-        assert!((updated.q(0) - 0.75).abs() < 1e-12);
+        let entry = tree.entry(ROOT, lens, 0).unwrap().unwrap();
+        assert_eq!(entry.rank, 1);
+        assert!((entry.before - 0.75).abs() < 1e-12);
+        assert_eq!(entry.nats_q, f64::INFINITY);
+        tree.set(ROOT, 1, weights(&[0.5, 0.5])).unwrap();
+        let entry = tree.entry(ROOT, lens, 0).unwrap().unwrap();
+        assert!((entry.nats_q - 2f64.ln()).abs() < 1e-12);
+        assert_eq!(tree.entry(ROOT, lens, 7).unwrap(), None);
+        let statistics = tree.statistics(ROOT, lens).unwrap();
+        assert!(!statistics.bounded);
+        assert!((statistics.cross - 2f64.ln()).abs() < 1e-12);
     }
 
     #[test]
-    fn expansion_distinguishes_an_empty_reply_from_no_reply() {
+    fn a_walk_places_its_path_then_descends_and_lists_the_window() {
         let mut tree = Tree::new(1);
-        assert!(!tree.expanded(0, 0).unwrap());
-        let mut empty = listing(&[], &[], 0.0);
-        tree.set_listing(0, 0, empty.clone()).unwrap();
-        assert!(!tree.expanded(0, 0).unwrap());
-        empty.complete = 40.0;
-        tree.set_listing(0, 0, empty).unwrap();
-        assert!(tree.expanded(0, 0).unwrap());
-    }
+        let mut walk = Walk::new(ROOT, vec![2], Window::WHOLE, 1);
+        assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Missing(ROOT));
+        tree.set(ROOT, 0, weights(&[0.6, 0.3, 0.1])).unwrap();
+        let Advance::Run(node, run) = walk.advance(&mut tree, 0).unwrap() else {
+            panic!("the root places branch 2");
+        };
+        assert_eq!((node, run.rank(), run.branches()), (ROOT, 2, &[2][..]));
+        let child = child_hash(ROOT, 2);
+        assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Missing(child));
+        tree.set(child, 0, weights(&[0.5, 0.5])).unwrap();
+        assert!(
+            matches!(walk.advance(&mut tree, 0).unwrap(), Advance::Run(node, _) if node == child)
+        );
+        assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
 
-    #[test]
-    fn cuts_list_down_to_the_horizon_and_through_a_branch() {
-        let tiny = 1e-30f64;
-        let mut tree = Tree::new(1);
-        tree.set_listing(
-            0,
-            0,
-            Listing {
-                horizon: 100.0,
-                branches: vec![4, 1, 2, 3],
-                ln_weights: vec![(1.0 - 3.0 * tiny).ln(), tiny.ln(), tiny.ln(), tiny.ln()],
-                leftover: 0.0,
-                complete: 100.0,
-            },
-        )
-        .unwrap();
-        let cut = |horizon, through| tree.cut(0, 0, horizon, through).unwrap().unwrap();
-        let none = cut(0, None);
-        assert!(none.branches.is_empty());
-        assert!((none.leftover - 1.0).abs() < 1e-15);
-        assert_eq!(none.complete, 0.0);
-        let one = cut(8, None);
-        assert_eq!(one.branches, [4]);
-        assert!((one.leftover / (3.0 * tiny) - 1.0).abs() < 1e-12);
-        assert_eq!(one.complete, 8.0);
-        // Through a light branch: its ties come along, and coverage reaches it.
-        let through = cut(8, Some(2));
-        assert_eq!(through.branches, [4, 1, 2, 3]);
-        assert_eq!(through.leftover, 0.0);
-        assert_eq!(through.complete, -tiny.ln() / std::f64::consts::LN_2);
-        // A branch the listing does not have places nothing more.
-        assert_eq!(cut(8, Some(9)).branches, [4]);
-        assert!(tree.cut(0, 0, 8, None).unwrap().is_some());
-        assert!(Tree::new(1).cut(0, 0, 8, None).unwrap().is_none());
+        // A window inside branch 0 of the root descends into it.
+        let window = Window::new(-0.1, -0.5).unwrap();
+        let mut walk = Walk::new(ROOT, vec![], window, 8);
+        let Advance::Run(ROOT, run) = walk.advance(&mut tree, 0).unwrap() else {
+            panic!("the root names the child holding the window");
+        };
+        assert_eq!(run.branches(), [0]);
+        assert_eq!(
+            walk.advance(&mut tree, 0).unwrap(),
+            Advance::Missing(child_hash(ROOT, 0))
+        );
+
+        // A path through a weightless branch ends before it; an ended node
+        // says so.
+        tree.set(child, 0, Distribution::from_weights(&[]).unwrap())
+            .unwrap();
+        let mut walk = Walk::new(ROOT, vec![2, 0], Window::WHOLE, 8);
+        assert!(matches!(
+            walk.advance(&mut tree, 0).unwrap(),
+            Advance::Run(ROOT, _)
+        ));
+        assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
+        let mut walk = Walk::new(child, vec![], Window::WHOLE, 8);
+        let Advance::Run(_, run) = walk.advance(&mut tree, 0).unwrap() else {
+            panic!("an ended node lists its empty run");
+        };
+        assert!(run.is_empty());
     }
 }

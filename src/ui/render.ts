@@ -16,7 +16,7 @@ export const BITS: Units = { name: "bits", nats: Math.LN2 };
 
 export interface DrawState {
   hover: Selection | null;
-  /** ``node:slot`` keys of the hovered box's ancestor slots. */
+  /** ``node:rank`` keys of the hovered box's ancestor children. */
   ancestors: Set<string>;
   units: Units;
   /** How the child along ``branch`` of node ``node`` reads. */
@@ -58,8 +58,8 @@ function measure(ctx: CanvasRenderingContext2D, text: string): number {
   return width;
 }
 
-export function slotKey(node: NodeId, slot: number): string {
-  return `${node}:${slot}`;
+export function childKey(node: NodeId, rank: number): string {
+  return `${node}:${rank}`;
 }
 
 export interface ScreenRect {
@@ -111,16 +111,16 @@ export function draw(
 
     let fill: string;
     let ink: string;
-    if (box.kind === "tail") {
-      fill = scheme.tail;
-      ink = palette.tailInk;
+    if (box.kind === "gap") {
+      fill = scheme.gap;
+      ink = palette.gapInk;
     } else {
       const level = ramp.level(rampPosition(box.p, box.q, equal));
       fill = ramp.fill[level]!;
       ink = ramp.ink[level]!;
     }
     ctx.fillStyle = fill;
-    const bordered = box.kind !== "merged" && box.kind !== "tail" && width >= GAP_MIN && height >= GAP_MIN;
+    const bordered = box.kind !== "merged" && box.kind !== "gap" && width >= GAP_MIN && height >= GAP_MIN;
     ctx.fillRect(
       rect.x0,
       rect.y0,
@@ -243,7 +243,7 @@ function outline(
   ctx.lineWidth = 1;
   ctx.globalAlpha = 0.35;
   for (const box of frame.boxes) {
-    if (box.kind === "merged" || !state.ancestors.has(slotKey(box.node, box.slot))) continue;
+    if (box.kind === "merged" || !state.ancestors.has(childKey(box.node, box.rank))) continue;
     const rect = screenRect(box, cam, view);
     ctx.strokeRect(rect.x0 + 0.5, rect.y0 + 0.5, rect.x1 - rect.x0 - 2, rect.y1 - rect.y0 - 2);
   }

@@ -1,6 +1,6 @@
-// Browser adapter for the Rust integer-sequence distribution tree. Rust owns
-// nodes, listings, derived slot caches, paths, and all geometry queries; this
-// wrapper only adds change notifications for the fetch/render loop.
+// Browser adapter for the Rust integer-sequence tree. Rust owns nodes,
+// distributions, and all geometry; this wrapper adds change notifications
+// for the fetch/render loop and caches immutable paths.
 
 import { Tree } from "./wasm";
 
@@ -10,47 +10,36 @@ export type NodeId = bigint;
 export const ROOT: NodeId = 0n;
 /** One of a node's 2^32 branches. What it denotes is up to a reading. */
 export type Branch = number;
+/** A child's position in its measure's order: 0 is the heaviest. */
+export type Rank = number;
 
 export interface Lens {
   p: number;
   q: number;
 }
 
-/** What a measure said about a node's children: the heaviest, in order. */
-export interface Listing {
+/** Consecutive ranks of a node's children, as a source sends them. */
+export interface Run {
+  rank: Rank;
   branches: ArrayLike<Branch>;
-  /** Natural log of each listed child's conditional weight. */
-  lnWeights: ArrayLike<number>;
-  /** Weight of every child not listed. */
-  leftover: number;
-  /** The horizon asked for, in bits. */
-  horizon: number;
-  /** The horizon the source vouches for; a recording can vouch for less. */
-  complete: number;
+  /** ln of the mass at and below each edge; one more than branches. */
+  lnBelow: ArrayLike<number>;
 }
 
-export interface Slots {
-  readonly branches: Branch[];
-  readonly p: number[];
-  readonly q: number[];
-  readonly qBound: boolean[];
-  readonly listed: number;
-  readonly count: number;
-}
-
-export function slotOf(slots: Slots, branch: Branch): number | undefined {
-  const slot = slots.branches.indexOf(branch);
-  return slot < 0 ? undefined : slot;
-}
-
-export function isTail(slots: Slots, slot: number): boolean {
-  return slot === slots.listed && slots.count > slots.listed;
+/** A child as a lens sees it within its parent. */
+export interface Entry {
+  rank: Rank;
+  /** p mass between the parent's top and the child's. */
+  before: number;
+  lnP: number;
+  /** −ln q; infinite while q is unknown. */
+  natsQ: number;
 }
 
 export class IntervalTree {
   readonly raw: Tree;
   readonly root: NodeId;
-  /** Listings, unlike paths, can change. Cache keys include this revision. */
+  /** Distributions, unlike paths, change. Cache keys include this revision. */
   revision = 0;
   private readonly listeners = new Set<() => void>();
   private readonly revisions = new Map<NodeId, number>();
@@ -103,60 +92,32 @@ export class IntervalTree {
     return [...this.raw.chain(origin, id)];
   }
 
-  listing(id: NodeId, measure: number): Listing | undefined {
-    return (this.raw.listing(id, measure) as Listing | null) ?? undefined;
+  /** Whether `measure` has said anything of the node's children. */
+  has(id: NodeId, measure: number): boolean {
+    return this.raw.has(id, measure);
   }
 
-  /** What a source answers from this listing at ``horizon`` bits, placing
-   * ``through`` too, as the protocol's Expand cuts it; undefined without one. */
-  cut(id: NodeId, measure: number, horizon: number, through?: Branch): Listing | undefined {
-    return (this.raw.cut(id, measure, horizon, through) as Listing | null) ?? undefined;
+  /** Whether `measure` says the node has no children at all. */
+  ended(id: NodeId, measure: number): boolean {
+    return this.raw.ended(id, measure);
   }
 
-  /** Where the child along ``branch`` sits in ``id``; undefined if p does not list it. */
-  edge(id: NodeId, lens: Lens, branch: Branch): { slot: number; before: number; lnP: number; natsQ: number; qBound: boolean } | undefined {
-    const edge = this.raw.edge(id, lens.p, lens.q, branch);
-    if (edge.length === 0) return undefined;
-    return { slot: edge[0]!, before: edge[1]!, lnP: edge[2]!, natsQ: edge[3]!, qBound: edge[4] === 1 };
-  }
-
-  expanded(id: NodeId, measure: number): boolean {
-    return this.raw.expanded(id, measure);
-  }
-
-  hasListing(id: NodeId, measure: number): boolean {
-    return this.raw.hasListing(id, measure);
-  }
-
-  horizon(id: NodeId, measure: number): number {
-    return this.raw.horizon(id, measure);
-  }
-
-  complete(id: NodeId, measure: number): number {
-    return this.raw.complete(id, measure);
-  }
-
-  slotOf(id: NodeId, lens: Lens, branch: Branch): number | undefined {
-    const slot = this.raw.slotOf(id, lens.p, lens.q, branch);
-    return slot < 0 ? undefined : slot;
+  /** Where p places the child along ``branch`` in ``id``; undefined where it does not. */
+  entry(id: NodeId, lens: Lens, branch: Branch): Entry | undefined {
+    const entry = this.raw.entry(id, lens.p, lens.q, branch);
+    if (entry.length === 0) return undefined;
+    return { rank: entry[0]!, before: entry[1]!, lnP: entry[2]!, natsQ: entry[3]! };
   }
 
   statistics(id: NodeId, lens: Lens): { entropy: number; cross: number; bounded: boolean } {
     return this.raw.statistics(id, lens.p, lens.q);
   }
 
-  qBound(id: NodeId, lens: Lens, slot: number): boolean {
-    return this.raw.qBound(id, lens.p, lens.q, slot);
-  }
-
   revisionOf(id: NodeId): number { return this.revisions.get(id) ?? 0; }
 
-  slots(id: NodeId, lens: Lens): Slots {
-    return this.raw.slots(id, lens.p, lens.q) as Slots;
-  }
-
-  setListing(id: NodeId, measure: number, { branches, lnWeights, leftover, horizon, complete }: Listing): void {
-    this.raw.setListing(id, measure, Uint32Array.from(branches), Float64Array.from(lnWeights), leftover, horizon, complete);
+  /** Add a run a source sent. Listeners hear only of runs that changed something. */
+  insert(id: NodeId, measure: number, { rank, branches, lnBelow }: Run): void {
+    if (!this.raw.insert(id, measure, rank, Uint32Array.from(branches), Float64Array.from(lnBelow))) return;
     this.revision++;
     this.revisions.set(id, this.revision);
     for (const listener of this.listeners) listener();

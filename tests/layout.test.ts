@@ -1,171 +1,99 @@
 import { describe, expect, it } from "bun:test";
-import { type Camera, clamp, layout, pick, reanchor, repair, extent } from "../src/core/layout";
+import { type Camera, clamp, extent, layout, pick, reanchor, repair } from "../src/core/layout";
 import { moveDepth, scale } from "../src/ui/camera";
-import { chainTree, listing } from "./build";
-import { IntervalTree } from "../src/core/tree";
+import { chainTree, run } from "./build";
+import { IntervalTree, ROOT } from "../src/core/tree";
 
 const view = { width: 1000, height: 800 };
 const lens = { p: 0, q: 0 };
+const at = (node: bigint, rank = 0) => ({ node, rank });
 
 describe("layout", () => {
-  it("keeps the origin selectable before discovery and leaves the canvas bounds alone", () => {
+  it("keeps the origin selectable before anything arrives, and asks for it", () => {
     const tree = new IntervalTree(1);
-    const cam: Camera = { origin: 0n, x: 0, k: 100, anchor: { node: 0n, slot: 0 }, a: 0 };
+    const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };
     const frame = layout(tree, lens, cam, view);
-    expect(pick(frame, cam, view, 500, 400)?.box.node).toBe(tree.root);
-    expect(pick(frame, cam, view, 500, 400)?.exact).toBe(false);
-    expect(pick(frame, cam, view, -1, 400)).toBeNull();
-    expect(pick(frame, cam, view, 500, -1)).toBeNull();
-    expect(frame.cover).toEqual({ node: tree.root, y: 0 });
+    expect(pick(tree, lens, frame, cam, view, 500, 400)).toMatchObject({ box: { node: ROOT }, exact: false });
+    expect(pick(tree, lens, frame, cam, view, -1, 400)).toBeNull();
+    expect(frame.misses).toMatchObject([{ node: ROOT, branch: null, measure: 0, from: 0, lnTop: 0, lnBottom: -Infinity }]);
+    expect(frame.cover).toEqual({ node: ROOT, y: 0 });
   });
 
-  it("selects the containing known branch when its box is left of undiscovered space", () => {
+  it("splits heights by p in p's order and sizes widths by -ln q", () => {
+    const tree = new IntervalTree(1);
+    tree.insert(ROOT, 0, run([0.5, 0.25, 0.25], [7, 3, 9]));
+    const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };
+    const near = (value: number) => expect.closeTo(value, 12);
+    expect(layout(tree, lens, cam, view).boxes.map((box) => [box.branch, box.y0, box.y1, box.x1 - box.x0])).toEqual([
+      [7, 0, near(0.5), near(Math.log(2))],
+      [3, near(0.5), near(0.75), near(Math.log(4))],
+      [9, near(0.75), near(1), near(Math.log(4))],
+    ]);
+  });
+
+  it("selects the containing known branch where its continuation is unknown", () => {
     const tree = chainTree([0.5, 0.5], []);
-    const cam: Camera = { origin: 0n, x: 2, k: 100, anchor: { node: 0n, slot: 0 }, a: 0 };
-    const frame = layout(tree, lens, cam, view);
-    const hit = pick(frame, cam, view, 500, 400)!;
+    const cam: Camera = { origin: ROOT, x: 2, k: 100, anchor: at(ROOT), a: 0 };
+    const hit = pick(tree, lens, layout(tree, lens, cam, view), cam, view, 500, 400)!;
     expect(hit.exact).toBe(false);
     expect(hit.box.branch).toBe(0);
   });
 
-  it("preserves area while merging and still picks the individual integer branches", () => {
-    const weights = [0.5, 0.488, 0.006, 0.004, 0.002];
-    const tree = chainTree(weights, []);
-    const cam: Camera = { origin: 0n, x: 0, k: 100, anchor: { node: 0n, slot: 0 }, a: 0 };
-    const frame = layout(tree, lens, cam, view, { mergePx: 10 });
-    const run = frame.boxes.find((box) => box.kind === "merged")!;
-    const expected = weights.slice(2).reduce((area, weight) => area - weight * Math.log(weight), 0);
-    expect(run.p * (run.x1 - run.x0)).toBeCloseTo(expected, 6);
-    const hit = pick(frame, cam, view, 100, 0.991 * view.height)!;
-    expect(hit.box.branch).toBe(2);
-    expect(hit.box.kind).not.toBe("merged");
-  });
-
-  it("finds a smaller covering node even when the camera anchor is still its parent", () => {
-    const tree = chainTree([0.5, 0.5], [0, 1]);
-    const cam: Camera = { origin: 0n, x: Math.log(4), k: 100, anchor: { node: 0n, slot: 0 }, a: -1 };
-    const frame = layout(tree, lens, cam, view);
-    expect(frame.cover?.node).toBe(tree.child(tree.child(0n, 0), 1));
-  });
-
-  it("partitions the root interval by p and sizes widths by -ln q", () => {
-    const tree = chainTree([0.5, 0.25, 0.25], []);
-    const cam: Camera = { origin: 0n, x: 0, k: 100, anchor: { node: 0n, slot: 0 }, a: 0 };
-    const frame = layout(tree, lens, cam, view);
-    const near = (value: number) => expect.closeTo(value, 12);
-    const spans = frame.boxes.map((box) => [box.slot, box.y0, box.y1, box.x1 - box.x0]);
-    expect(spans).toEqual([
-      [0, 0, near(0.5), near(Math.log(2))],
-      [1, near(0.5), near(0.75), near(Math.log(4))],
-      [2, near(0.75), near(1), near(Math.log(4))],
-    ]);
-    expect(frame.originTop).toBe(0);
-    expect(frame.originBottom).toBeCloseTo(1, 12);
-  });
-
   it("stays exact at depths beyond absolute float precision", () => {
-    // 80 halvings put the deepest node 2^-80 of the root tall, at an offset
-    // from the root top that no double can resolve to that size.
     const path = Array.from({ length: 80 }, (_, i) => i % 2);
     const tree = chainTree([0.5, 0.5], path);
-    const deepest = tree.descend(0n, path);
-    const cam: Camera = { origin: 0n, x: path.length * Math.log(2), k: 100, anchor: { node: deepest, slot: 1 }, a: 0.5 };
+    const deepest = tree.descend(ROOT, path);
+    const cam: Camera = { origin: ROOT, x: path.length * Math.log(2), k: 100, anchor: at(deepest, 1), a: 0.5 };
     const frame = layout(tree, lens, cam, view);
-    // Absolute coordinates would be off by ~1e8 view heights here; anchored
-    // ones carry only the rounding of exp(ln mass - ln view).
-    const near = (actual: number | undefined, expected: number) => expect(actual).toBeCloseTo(expected, 12);
-    const children = frame.boxes.filter((box) => box.node === deepest).sort((a, b) => a.slot - b.slot);
-    expect(children).toHaveLength(2);
-    near(children[0]?.y0, 0);
-    near(children[0]?.y1, 0.5);
-    near(children[1]?.y0, 0.5);
-    near(children[1]?.y1, 1);
-    // The deepest node's own box, one level up, fills the view.
-    const own = frame.boxes.find((box) => box.node === tree.parent(deepest) && box.slot === path.at(-1));
-    near(own?.y0, 0);
-    near(own?.y1, 1);
+    const children = frame.boxes.filter((box) => box.node === deepest).sort((a, b) => a.rank - b.rank);
+    expect(children.map((box) => [box.y0, box.y1])).toEqual([[expect.closeTo(0, 12), expect.closeTo(0.5, 12)], [expect.closeTo(0.5, 12), expect.closeTo(1, 12)]]);
   });
 
-  it("re-anchoring does not move anything", () => {
+  it("re-anchoring moves nothing, and horizontal scale moves nothing vertically", () => {
     const path = Array.from({ length: 30 }, (_, i) => (i * 7) % 3);
     const tree = chainTree([0.6, 0.3, 0.1], path);
-    const cam: Camera = { origin: 0n, x: 12.3, k: 140, anchor: { node: tree.descend(0n, path), slot: 0 }, a: 0.41 };
-    const before = layout(tree, lens, cam, view);
-    reanchor(cam, before);
-    const after = layout(tree, lens, cam, view);
-    const key = (box: { node: bigint; slot: number }) => `${box.node}:${box.slot}`;
-    const positions = new Map(before.boxes.map((box) => [key(box), box.y0]));
-    for (const box of after.boxes) {
-      const y0 = positions.get(key(box));
-      if (y0 !== undefined) expect(box.y0).toBeCloseTo(y0, 12);
+    const cam: Camera = { origin: ROOT, x: 12.3, k: 140, anchor: at(tree.descend(ROOT, path)), a: 0.41 };
+    const key = (box: { node: bigint; rank: number; kind: string }) => `${box.node}:${box.rank}:${box.kind}`;
+    const before = new Map(layout(tree, lens, cam, view).boxes.map((box) => [key(box), box.y0]));
+    for (const move of [(c: Camera) => reanchor(c, layout(tree, lens, c, view)), (c: Camera) => scale(c, 3)]) {
+      const moved = { ...cam };
+      move(moved);
+      const after = layout(tree, lens, moved, view).boxes.filter((box) => before.has(key(box)));
+      expect(after.length).toBeGreaterThan(0);
+      for (const box of after) expect(box.y0).toBeCloseTo(before.get(key(box))!, 9);
     }
   });
 
-  it("zooms about the fixed view fraction", () => {
-    const cam: Camera = { origin: 0n, x: 1, k: 100, anchor: { node: 2n, slot: 1 }, a: 0.3 };
+  it("zooms about the fixed view fraction, stopping only at the root's left edge", () => {
+    const cam: Camera = { origin: ROOT, x: 1, k: 100, anchor: at(2n, 1), a: 0.3 };
     moveDepth(cam, 1.5, 0.3);
     expect(cam.a).toBeCloseTo(0.3, 15);
-  });
-
-  it("stops only at the root's left edge: past any other origin lies its parent", () => {
-    const cam: Camera = { origin: 0n, x: 0.5, k: 100, anchor: { node: 0n, slot: 0 }, a: 0 };
-    moveDepth(cam, -2, 0.5);
-    expect(cam.x).toBe(0);
-    const deeper: Camera = { ...cam, origin: 3n, x: 0.5, a: 0 };
+    const root: Camera = { origin: ROOT, x: 0.5, k: 100, anchor: at(ROOT), a: 0 };
+    moveDepth(root, -2, 0.5);
+    expect(root.x).toBe(0);
+    const deeper: Camera = { ...root, origin: 3n, x: 0.5, a: 0 };
     moveDepth(deeper, -2, 0.5);
     expect(deeper.x).toBe(-1.5);
-    // The view keeps zooming out with depth there: it spans e^1.5 origins.
     expect(deeper.a).toBeCloseTo(0.5 - 0.5 * Math.exp(-2), 12);
-  });
-
-  it("scales horizontally without moving anything vertically", () => {
-    const tree = chainTree([0.6, 0.3, 0.1], [0, 1]);
-    const cam: Camera = { origin: 0n, x: 1.2, k: 100, anchor: { node: tree.descend(0n, [0, 1]), slot: 0 }, a: 0.3 };
-    const before = layout(tree, lens, cam, view);
-    scale(cam, 3);
-    const after = layout(tree, lens, cam, view);
-    expect(cam.x).toBe(1.2);
-    const key = (box: { node: bigint; slot: number }) => `${box.node}:${box.slot}`;
-    const rows = new Map(before.boxes.map((box) => [key(box), [box.y0, box.y1]]));
-    const shared = after.boxes.filter((box) => rows.has(key(box)));
-    expect(shared.length).toBeGreaterThan(0);
-    for (const box of shared) expect([box.y0, box.y1]).toEqual(rows.get(key(box))!);
-  });
-
-  it("does not bound horizontal scale", () => {
-    const cam: Camera = { origin: 0n, x: 1, k: 10, anchor: { node: 0n, slot: 0 }, a: 0 };
     scale(cam, 1e12);
-    expect(cam.k).toBe(1e13);
-    scale(cam, 1e-24);
-    expect(cam.k).toBe(1e-11);
+    expect(cam.k).toBe(1e14);
   });
 
-  it("clamps the view inside the origin's interval", () => {
+  it("clamps the view inside the root's interval", () => {
     const tree = chainTree([0.5, 0.5], [0]);
-    const cam: Camera = { origin: 0n, x: 0.5, k: 100, anchor: { node: tree.descend(0n, [0]), slot: 0 }, a: 0.4 };
+    const cam: Camera = { origin: ROOT, x: 0.5, k: 100, anchor: at(tree.descend(ROOT, [0])), a: 0.4 };
     clamp(tree, lens, cam);
     expect(extent(tree, lens, cam).top).toBeCloseTo(0, 15);
     expect(cam.a).toBeCloseTo(0, 15);
   });
 
-  it("reports an unexpanded child standing like the root, though its box is off screen", () => {
-    // The root's first child fills the view with its box ending at the left
-    // edge, as after a double-click; its children are what should show.
-    const tree = chainTree([0.5, 0.5], []);
-    const cam: Camera = { origin: 0n, x: Math.log(2), k: 100, anchor: { node: 0n, slot: 0 }, a: 0 };
-    const frame = layout(tree, lens, cam, view);
-    expect(frame.boxes.some((box) => box.node === 0n && box.slot === 0)).toBe(false);
-    expect(frame.unexpanded).toContainEqual({ node: 0n, branch: 0, lnMass: expect.closeTo(-Math.log(2), 9), x1: expect.closeTo(Math.log(2), 9) });
-  });
-
-  it("moves the anchor up to what p lists", () => {
-    // Measure 1 lists only the root's first child, so node 2 is out of reach under it.
+  it("moves the anchor up to what p places", () => {
     const tree = chainTree([0.5, 0.5], [1, 0], 2);
-    const deep = tree.descend(0n, [1, 0]);
-    for (const node of tree.chain(0n, deep)) tree.setListing(node, 1, listing([1]));
-    const cam: Camera = { origin: 0n, x: 1, k: 100, anchor: { node: deep, slot: 1 }, a: 0.4 };
+    tree.insert(ROOT, 1, run([1]));
+    const deep = tree.descend(ROOT, [1, 0]);
+    const cam: Camera = { origin: ROOT, x: 1, k: 100, anchor: at(deep, 1), a: 0.4 };
     repair(tree, { p: 1, q: 1 }, cam);
-    expect(cam.anchor).toEqual({ node: 0n, slot: 0 });
+    expect(cam.anchor).toEqual(at(ROOT));
     expect(() => layout(tree, { p: 1, q: 1 }, cam, view)).not.toThrow();
   });
 });

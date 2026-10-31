@@ -48,9 +48,10 @@ _COMPRESSED = 0x01
 _END_STREAM = 0x02
 _CONTENT_TYPE = "application/connect+proto"
 _PROTO_CONTENT_TYPE = "application/proto"
-# Distributions kept per measure, 8 bytes per vocabulary entry each. A walk
-# leaves the deepest nodes along it, the ones in view.
-_CACHED = 64
+# Distributions kept per measure. The core keeps each sorted, about 24 bytes
+# per vocabulary entry. A walk leaves the deepest nodes along it, the ones in
+# view.
+_CACHED = 32
 
 
 class Model:
@@ -70,12 +71,10 @@ class Model:
         # Branches the model has; every other branch has weight zero.
         self.vocabulary = vocabulary
         self.measures = measures
-        # Node ids are the core's; each measure's distributions stay here, on
-        # the server, as arrays cut per request.
-        self.tree = Tree()
-        self.cache: list[OrderedDict[int, np.ndarray]] = [
-            OrderedDict() for _ in measures
-        ]
+        # Node ids, distributions and Expand's walk are the core's; this keeps
+        # only which distributions to forget first.
+        self.tree = Tree(len(measures))
+        self.recent: list[OrderedDict[int, None]] = [OrderedDict() for _ in measures]
         # Requests run on worker threads. One forward pass at a time keeps the
         # device busy once and the cache whole; ``names`` guards the tree for
         # the moments it is read or written, so naming a node never waits on
@@ -93,88 +92,65 @@ class Model:
         measure: int,
         node: int,
         path: Sequence[int],
+        ln_top: float,
+        ln_bottom: float,
         horizon: int,
         canceled: threading.Event,
-    ) -> Iterator[pb.Listing]:
-        """The listing of the node ``path`` names below ``node``, preceded by
-        every node between them, as the protocol's Expand: each down to
-        2^-horizon and through the path's next branch.
+    ) -> Iterator[pb.Run]:
+        """The protocol's Expand: one run per node, computing each
+        distribution the walk needs as it gets there.
 
         Raises KeyError, before yielding, when this server has not learned
-        ``node``. Stops early once ``canceled`` is set.
+        ``node``, and ValueError for an empty window. Stops early once
+        ``canceled`` is set.
         """
         with self.names:
-            nodes = self.tree.walk(node, list(path))
-            nodes = nodes[1:] if path else nodes
-            full = tuple(self.tree.path(nodes[-1]))
-        first = len(full) - len(nodes) + 1
-        # Past a branch beyond the vocabulary, every node has weight zero.
-        valid = next(
-            (i for i, branch in enumerate(full) if branch >= self.vocabulary), len(full)
-        )
+            walk = self.tree.start(node, list(path), ln_top, ln_bottom, horizon)
+            # The path is known ahead, so the model reads it in one pass.
+            ahead = tuple(self.tree.path(node)) + tuple(path)
         started = time.perf_counter()
         computed = 0
+        recent = self.recent[measure]
         with self.lock:
-            walk, walked = None, None
-            for index, node_id in enumerate(nodes):
-                if canceled.is_set():
-                    return
-                end = first + index
-                prefix = full[:end]
-                through = full[end] if end < len(full) else None
-                if end > valid or self.ends(prefix):
-                    for _ in nodes[index:]:
-                        yield pb.Listing(ln_leftover=-math.inf)
-                    return
-                if horizon == 0 and through is None:
-                    yield pb.Listing(ln_leftover=0.0)
+            # A model walk along ``along``, yielding the distribution after
+            # its first ``at`` tokens next.
+            reading, along, at = None, (), 0
+            while not canceled.is_set():
+                with self.names:
+                    step = self.tree.advance(walk, measure)
+                if step is None:
+                    break
+                if step[0] == "run":
+                    _, used, rank, branches, ln_below = step
+                    if used in recent:
+                        recent.move_to_end(used)
+                    yield pb.Run(rank=rank, branches=branches, ln_below=ln_below)
                     continue
-                cache = self.cache[measure]
-                ln_weights = cache.get(node_id)
-                if ln_weights is None:
-                    if walk is None or walked != end:
-                        walk = self.measures[measure].walk(
-                            self.root + full, len(self.root) + end
-                        )
-                        walked = end
-                    ln_weights = next(walk)
-                    walked += 1
-                    computed += 1
-                    cache[node_id] = ln_weights
-                    if len(cache) > _CACHED:
-                        cache.popitem(last=False)
+                missing = step[1]
+                with self.names:
+                    tokens = tuple(self.tree.path(missing))
+                if self.ends(tokens) or any(branch >= self.vocabulary for branch in tokens):
+                    ln_weights = np.empty(0)
                 else:
-                    cache.move_to_end(node_id)
-                yield cut(ln_weights, horizon, through)
+                    if reading is None or along[: len(tokens)] != tokens or at != len(tokens):
+                        along = ahead if ahead[: len(tokens)] == tokens else tokens
+                        reading = self.measures[measure].walk(self.root + along, len(self.root) + len(tokens))
+                        at = len(tokens)
+                    ln_weights = next(reading)
+                    at += 1
+                    computed += 1
+                with self.names:
+                    self.tree.set(missing, measure, np.ascontiguousarray(ln_weights, dtype=np.float64))
+                recent[missing] = None
+                if len(recent) > _CACHED:
+                    forgotten, _ = recent.popitem(last=False)
+                    with self.names:
+                        self.tree.forget(forgotten, measure)
         elapsed = (time.perf_counter() - started) * 1000
         print(
-            f"expand m{measure} depth {len(full)} walking {len(nodes)} horizon {horizon}: {computed} computed, {elapsed:.0f} ms",
+            f"expand m{measure} depth {len(ahead)} horizon {horizon}: {computed} computed, {elapsed:.0f} ms",
             file=sys.stderr,
         )
-
-
-def cut(ln_weights: np.ndarray, horizon: int, through: int | None) -> pb.Listing:
-    """The protocol's listing of one distribution: every branch at least
-    2^-horizon heavy and at least as heavy as ``through``, heaviest first and
-    ties by branch, with the rest summed directly rather than as 1 minus the
-    listed, so a tiny rest survives."""
-    threshold = -horizon * math.log(2) if horizon else math.inf
-    if (
-        through is not None
-        and through < len(ln_weights)
-        and ln_weights[through] > -math.inf
-    ):
-        threshold = min(threshold, ln_weights[through])
-    keep = ln_weights >= threshold
-    listed = np.flatnonzero(keep)
-    branches = listed[np.argsort(-ln_weights[listed], kind="stable")]
-    rest = ln_weights[~keep]
-    ln_leftover = float(np.logaddexp.reduce(rest)) if rest.size else -math.inf
-    return pb.Listing(
-        branches=branches.tolist(),
-        ln_weights=np.minimum(ln_weights[branches], 0.0).tolist(),
-        ln_leftover=min(ln_leftover, 0.0),
-    )
 
 
 def _envelope(flags: int, payload: bytes) -> bytes:
@@ -236,22 +212,29 @@ def app(
                 return _stream(
                     [_end({"code": "invalid_argument", "message": str(error)})]
                 )
+            # NaN fails both comparisons.
+            if not request_message.ln_bottom < request_message.ln_top <= 0:
+                return _stream(
+                    [_end({"code": "invalid_argument", "message": "an empty window"})]
+                )
             # The walk runs on its own thread, holding the model for its whole
-            # length, and hands each listing over as it is cut. A client that
+            # length, and hands each run over as it is listed. A client that
             # hangs up stops it at the next node.
             items: queue.Queue[bytes | None] = queue.Queue()
             canceled = threading.Event()
 
             def work() -> None:
                 try:
-                    for listing in model.expand(
+                    for run in model.expand(
                         measure,
                         request_message.node,
                         request_message.path,
+                        request_message.ln_top,
+                        request_message.ln_bottom,
                         request_message.horizon,
                         canceled,
                     ):
-                        items.put(_envelope(0, listing.SerializeToString()))
+                        items.put(_envelope(0, run.SerializeToString()))
                     items.put(_end())
                 except KeyError as error:
                     items.put(_end({"code": "not_found", "message": error.args[0]}))

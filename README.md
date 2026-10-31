@@ -24,18 +24,18 @@ made likelier, and their extra width is what it told the model, KL(p‖q).
 
 ## The picture
 
-Pick one measure **p** and one measure **q** (by default the same). A slot of
+Pick one measure **p** and one measure **q** (by default the same). A child of
 node N is a box
 
-- **height** ∝ p: N's interval split by p, recursively, so a box's height is
-  the p-probability of its whole path;
+- **height** ∝ p: N's interval split by p, heaviest first, recursively, so a
+  box's height is the p-probability of its whole path;
 - **width** = −log q nats, starting where N's own box ends, so a box's left
   edge is the q-surprisal of its path.
 
-A node's slot boxes therefore cover N's mass × Σ p·(−log q) in area: entropy
+A node's child boxes therefore cover N's mass × Σ p·(−log q) in area: entropy
 when p = q, cross-entropy otherwise. Comparing p with q = p shows KL(p‖q) as the
 extra area. Color repeats the conditional p when p = q and shows ln(p/q) per
-slot otherwise, red where q under-weights it.
+child otherwise, red where q under-weights it.
 
 ## The canvas
 
@@ -47,17 +47,22 @@ edge keeps the same screen height however deep it is. Scrolling deeper is
 therefore also zooming in. With p ≠ q the picture depends on the origin, since
 x counts q-surprisal while the height follows p.
 
-Opening a text flies there: the servers walk its path and send each node's
-listing as they compute it, and the camera descends along the nodes placed so
+Opening a text flies there: the servers walk its path and place each branch
+along it as they compute it, and the camera descends along the nodes placed so
 far, a bar along the top showing how far. Only the root bounds the view. Past
 any other origin, left, above or below, lies its parent, which is fetched as
 soon as the view goes there; until it arrives that space stays empty, and then
 the parent becomes the origin without moving the picture (with p = q).
 
 Absolute vertical coordinates would lose precision a few dozen nats deep, so
-the camera is anchored to a nearby slot boundary instead, and every position is
-a same-sign sum of masses outward from it (see `core/src/layout.rs`). The tests pin
-exact geometry 80 halvings deep.
+the camera is anchored to a nearby child's edge instead. An edge is stored as
+ln of the mass below it, and since children rank heaviest first, the mass
+below a child is at most the number of children below it times its own weight:
+every edge stays exact relative to the children around it, however light they
+are. Each node is laid out from its two edges nearest the anchor, one binary
+search to the first visible child, and children thinner than a pixel join
+area-preserving bands (see `core/src/layout.rs`). The tests pin exact geometry
+80 halvings deep and beside children 2^−3000 of their parent.
 
 | input | motion |
 |---|---|
@@ -84,46 +89,59 @@ alike without exchanging the sequence. A request names a node by a known id and
 the branches below it: normally the parent's id and one branch, so it stays
 small however deep the node is. A server that has not learned that id (it
 restarted, or never saw the parent) answers `not_found`, and the client names
-the node once more from the root with its whole path. Numeric node indices
-inside the core are local and never go over the wire.
+the node once more from the root with its whole path.
+
+A node's children are ranked heaviest first, ties by increasing branch, and
+known in **runs** of consecutive ranks. A run carries its branches and the ln
+of the mass below each of its edges, summed from the light end so tiny masses
+survive. What lies between runs is a **gap**: its mass is known, its children
+are not. A gap is drawn reaching past any view, and so is a child whose q is
+not yet known.
 
 Each server serves one measure through two Connect RPCs:
 
-- `Expand(node, path, horizon)` streams one `Listing { branches, ln_weights,
-  ln_leftover }` per node along `path` below `node`, ending with the node the
-  path names (an empty path names `node` itself). Each lists its children
-  heaviest first, down to conditional probability 2^−horizon and at least
-  through the path's next branch, so the client can place the next node; the
-  n-th message is the node n branches down. Discovery asks for one node, by its
-  parent's id and one branch; opening a text walks from the deepest node the
-  client can already place. Weights are exact natural log probabilities, the
-  same at every horizon, and `ln_leftover` is the log weight of everything not
-  listed, summed directly so tiny remainders survive: −∞ once the listing
-  covers the node, as for a node with no children.
+- `Expand(node, path, window, horizon)` streams one `Run` per node. It first
+  places each branch of `path` below `node`, one single-child run per node;
+  then, from the node the path reaches, it follows the `window` down through
+  every child that holds all of it, again one single-child run per node; and
+  last it lists the node where the window spans several children, from the
+  child holding the window's top across the window while each weighs at least
+  2^−horizon of it. The window is ln of the mass below its two edges, (0, −∞)
+  for the whole node, so it addresses a node's deep tail as exactly as its
+  head. Every message but the last is one child, which names the next node.
+  Discovery asks for a child through its parent's id and one branch, a gap or
+  the part of a node in view by its window, and a text by its path from the
+  deepest node already placed.
 - `Search(text)` maps text to its complete path, using the model's tokenizer,
   and teaches the server the ids along it. The browser searches on input and
   opens the result only when it is selected. Music services return
   `unimplemented` for text search.
 
-Comparing p with q means asking both servers about the same nodes. The client
-asks for enough children to resolve their height in pixels under p and their
-width under q. Missing q weights are upper bounds, so their drawn widths are
-lower bounds. Listed branches use the same colors whether their children are
-known yet. Tiny adjacent branches merge into borderless, area-preserving
-runs while selection still resolves their individual branches.
+Comparing p with q means asking both servers about the same nodes. p's ranks
+order and split heights; q is per-branch metadata, asked for down to the view's
+right edge, so any branch q has not listed is wider than the view. Listed
+branches use the same colors whether their children are known yet. Children
+thinner than a pixel merge into borderless, area-preserving bands while
+selection still resolves their individual branches.
 
-A `Snapshot` records one `Listing` per node with its complete path and the
-horizon it vouches for. Recorded search includes listed leaves as well as
-expanded nodes, and returns an exact match, a completion, or the deepest
-recorded prefix. Text with no recorded match shows an error. Recordings from
-the odds-coded format convert once, without model inference:
+Layout reads only what the tree holds and lists what the view lacks as Expand
+requests; the client sends each once, a few at a time, and redraws when an
+answer changes the tree. A request a source answers with nothing is not asked
+again until something else changes its node.
+
+A `Snapshot` records runs per node with its complete path, and answers Expand
+through the same walk a server uses. Recorded search includes listed leaves as
+well as expanded nodes, and returns an exact match, a completion, or the
+deepest recorded prefix. Text with no recorded match shows an error.
+Recordings of listings, the previous format, convert once, without model
+inference:
 
 ```bash
 uv run scripts/migrate-snapshots.py           # all public/data/*.pb
 uv run scripts/migrate-snapshots.py tree.pb   # selected files
 ```
 
-The converter keeps originals in `public/data/.snapshot-backups/`.
+The converter keeps originals in `public/data/.snapshot-backups/listing/`.
 Regenerating data is also supported.
 
 The browser saves the origin, the smallest known node covering the viewport and
@@ -149,12 +167,14 @@ internal to the model. `/manifest.json` describes the measures and
 finds a local server and lists it first; `?server=URL` points it elsewhere.
 Edit the text in the top path inspector and select a result to fly there.
 
-`export/service.py` owns the model-independent RPC handlers, node naming
-through the shared Rust core, and a bounded LRU of complete distributions,
-which it cuts per request on the server without sorting the vocabulary. A walk
-holds the model for its whole length on a worker thread, sends each listing as
-it is cut, and stops when the client hangs up; naming a node never waits on
-inference. transformers models keep the KV cache of the last path they read and
+`export/service.py` owns the model-independent RPC handlers and the model's
+forward passes. Node naming, the distributions themselves (sorted once per
+node, about 24 bytes per vocabulary entry, the 32 most recent per measure) and
+Expand's walk belong to the shared Rust core, which recordings in the browser
+use too; the server computes each distribution the walk reports missing,
+reading a request's path in one pass. A walk holds the model for its whole
+length on a worker thread, sends each run as it is placed or listed, and stops
+when the client hangs up; naming a node never waits on inference. transformers models keep the KV cache of the last path they read and
 walk a path in chunks of positions, whose last bits can differ slightly
 (about 1e-5 in ln p in float32) from a position computed alone.
 
@@ -241,12 +261,12 @@ tokenizer, `context:N` (p seeing only its last N tokens) or `temperature:T`.
 
 The source is split by responsibility:
 
-- `core/`: Rust tree, hashed node ids, cached listings and derived slots,
-  recorded-listing cuts, anchored geometry, best-effort picking and
-  covering-anchor queries.
+- `core/`: Rust tree, hashed node ids, runs and gaps per measure, Expand's
+  walk for servers and recordings alike, anchored geometry, picking and the
+  requests a view lacks.
 - `src/core/`: thin TypeScript adapters to that core, compiled to WebAssembly.
-- `src/data/`: live/recorded sources, dataset loading and completion-driven
-  expansion scheduling.
+- `src/data/`: live/recorded sources, dataset loading and the read-through
+  fetching of what views lack.
 - `src/readings/`: text and music readings of branches.
 - `src/ui/`: canvas drawing, camera controls, the top path editor, branch details and saved views.
 - `export/`: Python model adapters, Connect service and snapshot exporters.
@@ -264,7 +284,7 @@ bun run dev       # builds the core, then serves http://localhost:5173
 bun run test      # browser adapters + native Rust + Python/Connect tests
 bun run typecheck
 bun run build     # static site in dist/, including the .wasm and datasets
-bun run bench     # browser frame timings and canvas/inspector parity snapshots
+bun run bench     # browser frame timings and canvas/inspector snapshots
 bun run proto     # regenerate TypeScript/Python bindings; needs protoc
 ```
 
@@ -273,7 +293,7 @@ For faster targeted checks after the core has been built:
 ```bash
 bun test
 cargo test --manifest-path core/Cargo.toml
-uv run tests/server_test.py   # node naming, cuts, walks, transport and migration
+uv run tests/server_test.py   # node naming, walks, windows, transport and migration
 ```
 
 The Python tests use deterministic distributions and load no model. For manual

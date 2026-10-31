@@ -1,29 +1,30 @@
-// Build trees from listings as a source would send them.
+// Build trees from runs as a source would send them.
 
-import { IntervalTree, type Listing, type NodeId } from "../src/core/tree";
+import { IntervalTree, type NodeId, ROOT, type Run } from "../src/core/tree";
 
-export const HORIZON = 40;
-
-/** Children with ``weights``, heaviest first, along branches 0, 1, … unless given. */
-export function listing(weights: number[], branches = weights.map((_, i) => i), horizon = HORIZON): Listing {
-  return {
-    branches,
-    lnWeights: weights.map(Math.log),
-    leftover: Math.max(0, 1 - weights.reduce((a, b) => a + b, 0)),
-    horizon,
-    complete: horizon,
-  };
+/** ln(e^a + e^b). */
+function lnAdd(a: number, b: number): number {
+  const high = Math.max(a, b);
+  return high === -Infinity ? high : high + Math.log1p(Math.exp(Math.min(a, b) - high));
 }
 
-/** A one-measure tree whose nodes all split their interval with ``weights``, expanded along ``path``. */
+/** Children with ``weights``, heaviest first, from ``rank``, along branches
+ * 0, 1, … unless given, with ``rest`` of the node's mass below them. */
+export function run(weights: number[], branches = weights.map((_, i) => i), rank = 0,
+  rest = Math.max(0, 1 - weights.reduce((a, b) => a + b, 0))): Run & { branches: number[]; lnBelow: number[] } {
+  const lnBelow = [Math.log(rest)];
+  for (const weight of weights.toReversed()) lnBelow.unshift(Math.min(0, lnAdd(lnBelow[0]!, Math.log(weight))));
+  return { rank, branches, lnBelow };
+}
+
+/** A tree whose nodes along ``path`` all split their interval with ``weights``. */
 export function chainTree(weights: number[], path: number[], measures = 1): IntervalTree {
   const tree = new IntervalTree(measures);
-  const children = listing(weights);
-  tree.setListing(0n, 0, children);
-  let node: NodeId = 0n;
+  tree.insert(ROOT, 0, run(weights));
+  let node: NodeId = ROOT;
   for (const branch of path) {
     node = tree.child(node, branch);
-    tree.setListing(node, 0, children);
+    tree.insert(node, 0, run(weights));
   }
   return tree;
 }

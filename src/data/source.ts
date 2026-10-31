@@ -8,35 +8,57 @@ import { Natlas, SnapshotSchema } from "../gen/natlas/natlas_pb";
 import { TextLabels } from "../readings/labels";
 import { type NotesFile, NoteLabels } from "../readings/notes";
 import type { Labels } from "../readings/reading";
-import { type Branch, IntervalTree, type Listing, type NodeId, ROOT } from "../core/tree";
+import { type Branch, IntervalTree, type NodeId, ROOT, type Run } from "../core/tree";
 
-/** A node's children as a source lists them; `complete` is what it vouches for. */
-export type Reply = Omit<Listing, "horizon">;
+/** The protocol's Expand: ``path`` below ``node``, then the window within the
+ * node it reaches, as ln of the mass below its edges, listed down to
+ * ``horizon`` bits. */
+export interface ExpandRequest {
+  node: NodeId;
+  path: Branch[];
+  lnTop: number;
+  lnBottom: number;
+  horizon: number;
+}
 
-/** One node's reply in a walk. */
+/** The whole of a node, as a window. */
+export const WHOLE = { lnTop: 0, lnBottom: -Infinity } as const;
+
+/** One message of an answer: a node's run. */
 export interface Step {
   node: NodeId;
-  reply: Reply;
+  run: Run;
 }
 
 export interface Source {
-  /**
-   * The children of ``to`` and of every node between ``from`` and it, in
-   * order, as the protocol's Expand: each down to 2^-horizon and through the
-   * path's next branch. ``from`` is ``to`` itself, its parent, or an ancestor
-   * the client can already place the path through.
-   */
-  expand(tree: IntervalTree, from: NodeId, to: NodeId, horizon: number, signal?: AbortSignal): AsyncIterable<Step>;
+  /** The protocol's Expand, each message's node named in ``tree``. */
+  expand(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step>;
   /** Map text to branches from the root, when this source has a text mapping. */
   search?(text: string, signal?: AbortSignal): Promise<Branch[]>;
 }
 
-/** The nodes a walk from ``from`` to ``to`` lists: those below ``from``, or ``to`` alone. */
-function walked(tree: IntervalTree, from: NodeId, to: NodeId): NodeId[] {
-  return from === to ? [to] : tree.chain(from, to).slice(1);
+/** Name each message's node in ``tree``: the start, then the child along the
+ * path's next branch, then the single child the window descends into. */
+async function* named(tree: IntervalTree, { node, path }: ExpandRequest, runs: AsyncIterable<Run> | Iterable<Run>): AsyncIterable<Step> {
+  let current = node;
+  let next: Branch | undefined;
+  let depth = 0;
+  for await (const run of runs) {
+    if (depth > 0) {
+      if (next === undefined) throw new Error("the source went on after listing its window");
+      current = tree.child(current, next);
+    }
+    const branch = path[depth];
+    if (branch !== undefined && (run.branches.length !== 1 || run.branches[0] !== branch)) {
+      throw new Error("the source placed another branch than the path's");
+    }
+    yield { node: current, run };
+    next = branch ?? (run.branches.length === 1 ? run.branches[0] : undefined);
+    depth++;
+  }
 }
 
-/** A recorded server. Its own tree learns the recorded nodes' ids. */
+/** A recorded server. Its own tree holds the recording and answers as a server would. */
 export class SnapshotSource implements Source {
   private readonly recorded = new IntervalTree(1);
   private readonly paths: Branch[][] = [];
@@ -46,19 +68,15 @@ export class SnapshotSource implements Source {
     private readonly textLabels = TextLabels.none(),
   ) {
     const snapshot = fromBinary(SnapshotSchema, bytes);
+    if (snapshot.recordings.length === 0) {
+      throw new Error("an empty recording, or one in an older format: run scripts/migrate-snapshots.py");
+    }
     const paths = new Map<string, Branch[]>();
-    for (const { path, horizon, listing } of snapshot.expansions) {
-      if (listing === undefined) throw new Error("a recorded expansion has no listing");
-      const node = this.recorded.descend(this.recorded.root, path);
-      this.recorded.setListing(node, 0, {
-        branches: listing.branches,
-        lnWeights: listing.lnWeights,
-        leftover: Math.exp(listing.lnLeftover),
-        horizon,
-        complete: horizon,
-      });
+    for (const { path, run } of snapshot.recordings) {
+      if (run === undefined) throw new Error("a recorded node has no run");
+      this.recorded.insert(this.recorded.descend(ROOT, path), 0, run);
       paths.set(path.join(","), path);
-      for (const branch of listing.branches) {
+      for (const branch of run.branches) {
         const child = [...path, branch];
         paths.set(child.join(","), child);
       }
@@ -66,14 +84,10 @@ export class SnapshotSource implements Source {
     this.paths = [...paths.values()];
   }
 
-  async *expand(tree: IntervalTree, from: NodeId, to: NodeId, horizon: number): AsyncIterable<Step> {
-    const nodes = walked(tree, from, to);
-    for (const [index, node] of nodes.entries()) {
-      const next = nodes[index + 1];
-      const recorded = this.recorded.raw.contains(node) ? node : undefined;
-      const cut = recorded === undefined ? undefined : this.recorded.cut(recorded, 0, horizon, next === undefined ? undefined : tree.branch(next));
-      yield { node, reply: cut ?? { branches: [], lnWeights: [], leftover: 1, complete: 0 } };
-    }
+  async *expand(tree: IntervalTree, request: ExpandRequest): AsyncIterable<Step> {
+    const { node, path, lnTop, lnBottom, horizon } = request;
+    const runs = this.recorded.raw.answer(node, 0, Uint32Array.from(path), lnTop, lnBottom, horizon) as Run[];
+    yield* named(tree, request, runs);
   }
 
   async search(text: string): Promise<Branch[]> {
@@ -81,7 +95,7 @@ export class SnapshotSource implements Source {
   }
 }
 
-/** A live server: every expansion honors the requested horizon. */
+/** A live server. */
 export class ConnectSource implements Source {
   private readonly client;
 
@@ -89,32 +103,19 @@ export class ConnectSource implements Source {
     this.client = createClient(Natlas, createConnectTransport({ baseUrl, useBinaryFormat: true }));
   }
 
-  /** Name the walk from ``from``'s id, and from the root when the server has
-   * not learned that id (it restarted, or never saw it). */
-  async *expand(tree: IntervalTree, from: NodeId, to: NodeId, horizon: number, signal?: AbortSignal): AsyncIterable<Step> {
-    let listed = false;
+  /** Name the request from its node's id, and from the root when the server
+   * has not learned that id (it restarted, or never saw it). */
+  async *expand(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step> {
+    let answered = false;
     try {
-      for await (const step of this.walk(tree, from, to, horizon, signal)) {
-        listed = true;
+      for await (const step of named(tree, request, this.client.expand(request, { signal }))) {
+        answered = true;
         yield step;
       }
     } catch (error) {
-      if (listed || from === ROOT || ConnectError.from(error).code !== Code.NotFound) throw error;
-      yield* this.walk(tree, ROOT, to, horizon, signal);
-    }
-  }
-
-  private async *walk(tree: IntervalTree, from: NodeId, to: NodeId, horizon: number, signal?: AbortSignal): AsyncIterable<Step> {
-    const nodes = walked(tree, from, to);
-    const path = from === to ? [] : nodes.map((node) => tree.branch(node));
-    let index = 0;
-    for await (const listing of this.client.expand({ node: from, path, horizon }, { signal })) {
-      const node = nodes[index++];
-      if (node === undefined) throw new Error("the server listed more nodes than the path holds");
-      const last = listing.lnWeights.at(-1);
-      // Every child as heavy as the last listed one is listed.
-      const complete = last === undefined ? horizon : Math.max(horizon, -last / Math.LN2);
-      yield { node, reply: { branches: listing.branches, lnWeights: listing.lnWeights, leftover: Math.exp(listing.lnLeftover), complete } };
+      if (answered || request.node === ROOT || ConnectError.from(error).code !== Code.NotFound) throw error;
+      const rooted = { ...request, node: ROOT, path: [...tree.path(request.node), ...request.path] };
+      yield* named(tree, rooted, this.client.expand(rooted, { signal }));
     }
   }
 

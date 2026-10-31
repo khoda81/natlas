@@ -3,7 +3,8 @@
 import { App } from "../src/ui/main";
 import { TextLabels } from "../src/readings/labels";
 import type { Camera, Frame, Viewport } from "../src/core/layout";
-import type { IntervalTree, Lens, Listing } from "../src/core/tree";
+import type { IntervalTree, Lens } from "../src/core/tree";
+import { run } from "./build";
 import type { Dataset } from "../src/data/source";
 import type { Expander } from "../src/data/expand";
 
@@ -55,7 +56,8 @@ if (params.has("trace")) {
 const tick = () => new Promise<number>(requestAnimationFrame);
 const encoder = new TextEncoder();
 const labels = new TextLabels(Array.from({ length: 512 }, (_, i) => encoder.encode([" the", "tree", "سلام", "🙂", "\n", "and"][i % 6]!)));
-let live: { listing: Listing; labels: string[] } | null = null;
+/** A live model's complete root distribution, heaviest first. */
+let live: { listing: { branches: number[]; lnWeights: number[] }; labels: string[] } | null = null;
 let liveLabels: TextLabels | null = null;
 
 function setup(count: number, zipf: boolean, deep = false, real = false) {
@@ -67,20 +69,23 @@ function setup(count: number, zipf: boolean, deep = false, real = false) {
   driver.setDataset(dataset);
   const weights = Array.from({ length: count }, (_, i) => zipf ? (i + 1) ** -1.15 : 1);
   const total = weights.reduce((a, b) => a + b, 0);
-  const listing = { branches: weights.map((_, i) => i), lnWeights: weights.map(w => Math.log(w / total)), horizon: 4096, complete: 4096, leftover: 0 };
-  driver.tree.setListing(0n, 0, real ? live!.listing : listing);
+  const branches = weights.map((_, i) => i);
+  const root = real
+    ? run(live!.listing.lnWeights.map(Math.exp), live!.listing.branches, 0, 0)
+    : run(weights.map((w) => w / total), branches, 0, 0);
+  driver.tree.insert(0n, 0, root);
   if (zipf) {
-    driver.tree.setListing(0n, 1, { ...listing, branches: listing.branches.toReversed() });
+    driver.tree.insert(0n, 1, { ...root, branches: branches.toReversed() });
     driver.setLens({ p: 0, q: 1 });
   }
   if (deep) {
     let node = 0n;
     for (let depth = 0; depth < 80; depth++) {
       node = driver.tree.child(node, depth % 3);
-      driver.tree.setListing(node, 0, { branches: [0, 1, 2], lnWeights: [0.6, 0.3, 0.1].map(Math.log), horizon: 4096, complete: 4096, leftover: 0 });
+      driver.tree.insert(node, 0, run([0.6, 0.3, 0.1]));
     }
-    driver.cam = { origin: 0n, x: 125, k: 140, anchor: { node, slot: 1 }, a: 0.4 };
-  } else driver.cam = { origin: 0n, x: 0, k: 100, anchor: { node: 0n, slot: 0 }, a: 0 };
+    driver.cam = { origin: 0n, x: 125, k: 140, anchor: { node, rank: 1 }, a: 0.4 };
+  } else driver.cam = { origin: 0n, x: 0, k: 100, anchor: { node: 0n, rank: 0 }, a: 0 };
   driver.resize();
   const rect = canvas.getBoundingClientRect();
   driver.pointer = { x: rect.left + driver.view.width * 0.7, y: rect.top + driver.view.height * 0.43 };

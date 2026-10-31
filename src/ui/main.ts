@@ -1,4 +1,4 @@
-import { Expander, wants } from "../data/expand";
+import { Expander } from "../data/expand";
 import {
   type Box,
   type Camera,
@@ -7,7 +7,6 @@ import {
   type Lens,
   layout,
   logView,
-  normalize,
   pick,
   reanchor,
   repair,
@@ -20,7 +19,7 @@ import type { Glyph, Reading } from "../readings/reading";
 import { drag, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, viewKey } from "./view-state";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
-import { BITS, draw, NATS, RULER_HEIGHT, slotKey, type Units } from "./render";
+import { BITS, draw, NATS, RULER_HEIGHT, childKey, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
 const KEY_DEPTH_SPEED = 900;
@@ -80,13 +79,16 @@ export class App {
   private editing = false;
   private shownText = "";
   private shownPath: { node: NodeId; branch: number | null; more?: string } | null = null;
-  /** The box the path panel shows, as node:slot:kind. */
+  /** The box the path panel shows, as node:rank:kind. */
   private shown = "";
   private whereHeight: number | null = null;
   private windowHeight = window.innerHeight;
   private inspected = "";
   private readoutText = "";
   private inspector: { chip: HTMLElement; kind: HTMLElement; rows: [HTMLElement, HTMLElement][] } | null = null;
+  /** The inspected node's statistics: a pass over all its children, so kept
+   * while the node, the lens, and what is known of the node stay the same. */
+  private nodeStatistics: { key: string; value: { entropy: number; cross: number; bounded: boolean } } | null = null;
   private readonly glyphs = new Map<string, Glyph>();
   private loading = 0;
   private navigation = 0;
@@ -105,7 +107,7 @@ export class App {
   private dataset: Dataset | null = null;
   private reading: Reading | null = null;
   private lens: Lens = { p: 0, q: 0 };
-  private cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: { node: ROOT, slot: 0 }, a: 0 };
+  private cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: { node: ROOT, rank: 0 }, a: 0 };
   private view: Viewport = { width: 1, height: 1 };
   private frame: Frame | null = null;
   private geometry: { frame: Frame; key: string } | null = null;
@@ -199,6 +201,7 @@ export class App {
     this.geometry = null;
     this.inspected = "";
     this.inspector = null;
+    this.nodeStatistics = null;
     this.glyphs.clear();
     this.cancelNavigation();
     const tree = new IntervalTree(dataset.measures.length);
@@ -288,7 +291,7 @@ export class App {
       if (tree !== this.tree || generation !== this.navigation) return;
       this.focus = null;
       if (placed) {
-        this.cam = { origin, x: saved.x, k: saved.k, anchor: { node: cover, slot: 0 }, a: saved.a };
+        this.cam = { origin, x: saved.x, k: saved.k, anchor: { node: cover, rank: 0 }, a: saved.a };
       } else {
         this.setStatus("The saved path is only partly available.");
       }
@@ -311,8 +314,8 @@ export class App {
     const { origin } = this.cam;
     const parent = tree.parent(origin);
     if (parent === null || !(this.cam.x < 0 || frame.originTop > 0 || frame.originBottom < 1)) return;
-    const edge = tree.edge(parent, this.lens, tree.branch(origin));
-    if (edge === undefined || edge.qBound) {
+    const edge = tree.entry(parent, this.lens, tree.branch(origin));
+    if (edge === undefined || !Number.isFinite(edge.natsQ)) {
       void this.place(parent, origin);
       return;
     }
@@ -368,11 +371,11 @@ export class App {
     const { chain } = flight;
     while (flight.reached < chain.length - 1) {
       const node = chain[flight.reached]!;
-      const edge = tree.edge(node, this.lens, tree.branch(chain[flight.reached + 1]!));
-      if (edge === undefined) break;
+      const edge = tree.entry(node, this.lens, tree.branch(chain[flight.reached + 1]!));
+      if (edge === undefined || !Number.isFinite(edge.natsQ)) break;
       // The anchor moves from this node's top to its child's, keeping the picture.
       this.cam.a += Math.exp(flight.lnMass - logView(this.cam)) * edge.before;
-      this.cam.anchor = { node, slot: edge.slot };
+      this.cam.anchor = { node, rank: edge.rank };
       flight.lnMass += edge.lnP;
       flight.x1 += edge.natsQ;
       flight.reached++;
@@ -407,7 +410,7 @@ export class App {
       this.transition = { image, start: performance.now() };
     }
     this.focus = null;
-    this.cam = { origin: node, x: 0, k, anchor: { node, slot: 0 }, a: 0 };
+    this.cam = { origin: node, x: 0, k, anchor: { node, rank: 0 }, a: 0 };
     if (this.dataset?.searchable) this.showPath(node, null);
     this.invalidate();
   }
@@ -430,7 +433,7 @@ export class App {
     this.cancelNavigation();
     const { width, height } = this.view;
     const k = width / Math.log(Math.max(8, height / 4));
-    this.cam = { origin: ROOT, x: 0, k, anchor: { node: ROOT, slot: 0 }, a: 0 };
+    this.cam = { origin: ROOT, x: 0, k, anchor: { node: ROOT, rank: 0 }, a: 0 };
     this.focus = null;
     this.transition = null;
     this.invalidate();
@@ -471,8 +474,7 @@ export class App {
     if (previous !== null && previous !== frame) previous.dispose();
     this.expander?.request(() => {
       if (tree !== this.tree) return [];
-      const camera = { ...this.cam };
-      return wants(tree, this.lens, camera, this.view, this.currentFrame(camera));
+      return this.currentFrame({ ...this.cam }).misses;
     });
     if (!this.focus && !this.flight) reanchor(this.cam, frame);
     this.reachOut(frame);
@@ -482,11 +484,11 @@ export class App {
     const ancestors = new Set<string>();
     if (this.hover) {
       const selected = this.hover.box;
-      ancestors.add(slotKey(selected.node, selected.slot));
+      ancestors.add(childKey(selected.node, selected.rank));
       for (const node of tree.chain(this.cam.origin, selected.node).slice(1)) {
         const parent = tree.parent(node)!;
-        const slot = tree.slotOf(parent, this.lens, tree.branch(node));
-        if (slot !== undefined) ancestors.add(slotKey(parent, slot));
+        const entry = tree.entry(parent, this.lens, tree.branch(node));
+        if (entry !== undefined) ancestors.add(childKey(parent, entry.rank));
       }
     }
     const origin = this.originNote(tree);
@@ -516,14 +518,13 @@ export class App {
   private originNote(tree: IntervalTree): { text: string; loading: boolean } | null {
     const { origin } = this.cam;
     const measures = [...new Set([this.lens.p, this.lens.q])];
-    const waiting = measures.filter((measure) => !tree.hasListing(origin, measure));
-    if (waiting.length > 0) {
-      return { text: `Loading ${waiting.map((measure) => this.dataset!.measures[measure]).join(" and ")} …`, loading: true };
+    if (tree.ended(origin, this.lens.p)) return { text: "The sequence ends here · press 0 for the root", loading: false };
+    if (measures.some((measure) => this.expander!.exhausted(origin, measure))) {
+      return { text: "This recording does not continue here · press 0 for the root", loading: false };
     }
-    const listing = tree.listing(origin, this.lens.p)!;
-    if (listing.branches.length > 0) return null;
-    if (listing.leftover === 0) return { text: "The sequence ends here · press 0 for the root", loading: false };
-    return listing.complete === 0 ? { text: "This recording does not continue here · press 0 for the root", loading: false } : null;
+    const waiting = measures.filter((measure) => !tree.has(origin, measure));
+    if (waiting.length === 0) return null;
+    return { text: `Loading ${waiting.map((measure) => this.dataset!.measures[measure]).join(" and ")} …`, loading: true };
   }
 
   /** Draw the previous view over this one, fading and growing as if passed through. */
@@ -548,7 +549,7 @@ export class App {
 
   private geometryKey(camera = this.cam): string {
     const { origin, x, k, a, anchor } = camera;
-    return `${this.tree!.revision}:${this.lens.p}:${this.lens.q}:${origin}:${x}:${k}:${anchor.node}:${anchor.slot}:${a}:${this.view.width}:${this.view.height}`;
+    return `${this.tree!.revision}:${this.lens.p}:${this.lens.q}:${origin}:${x}:${k}:${anchor.node}:${anchor.rank}:${a}:${this.view.width}:${this.view.height}`;
   }
 
   /** Also shared with the completion-driven fetch pump between paint frames. */
@@ -606,7 +607,7 @@ export class App {
       this.invalidate();
     });
     canvas.addEventListener("dblclick", (event) => {
-      const selection = this.frame ? pick(this.frame, this.cam, this.view, event.offsetX, event.offsetY) : null;
+      const selection = this.frame ? pick(this.tree!, this.lens, this.frame, this.cam, this.view, event.offsetX, event.offsetY) : null;
       if (selection) this.startFocus(selection.box);
     });
   }
@@ -825,7 +826,7 @@ export class App {
 
   private startFocus(box: Box): void {
     if (this.tree === null) return;
-    this.cam.anchor = normalize(this.tree, this.lens, this.cam.origin, { node: box.node, slot: box.slot });
+    this.cam.anchor = { node: box.node, rank: box.rank };
     this.cam.a = box.y0;
     this.focus = {
       box,
@@ -860,7 +861,7 @@ export class App {
     const pointer = this.pointerPosition();
     if (pointer && !this.dragging && this.frame) {
       if (this.lastPick?.frame !== this.frame || this.lastPick.x !== pointer.x || this.lastPick.y !== pointer.y) {
-        this.lastPick = { frame: this.frame, x: pointer.x, y: pointer.y, selection: pick(this.frame, this.cam, this.view, pointer.x, pointer.y) };
+        this.lastPick = { frame: this.frame, x: pointer.x, y: pointer.y, selection: pick(this.tree!, this.lens, this.frame, this.cam, this.view, pointer.x, pointer.y) };
       }
       this.hover = this.lastPick.selection;
     } else this.hover = null;
@@ -935,24 +936,27 @@ export class App {
     }
     const { box, exact } = selection;
 
-    const key = `${box.node}:${box.slot}:${box.kind}:${box.branch}:${box.p}:${box.q}:${box.lnMass}:${exact}:${this.lens.p}:${this.lens.q}:${this.units.name}:${tree.revisionOf(box.node)}`;
+    const key = `${box.node}:${box.rank}:${box.kind}:${box.branch}:${box.p}:${box.q}:${box.lnMass}:${exact}:${this.lens.p}:${this.lens.q}:${this.units.name}:${tree.revisionOf(box.node)}`;
     if (this.inspected === key) return;
     this.inspected = key;
 
     const last = box.branch === null ? "…" : this.glyph(box.node, box.branch).text;
     const { p, q } = this.lens;
     const names = this.dataset?.measures ?? [];
-    const qBound = box.kind === "tail" || (box.kind !== "merged" && tree.qBound(box.node, this.lens, box.slot));
-    const [atMost, atLeast] = qBound ? ["≤ ", "≥ "] : ["", ""];
+    const known = !Number.isNaN(box.q);
     const rows: [string, string][] = [
       [`p · ${names[p]}`, `${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
     ];
-    if (p !== q || box.kind === "tail") {
-      rows.push([`q · ${names[q]}`, `${atMost}${box.q.toPrecision(4)}  (${atLeast}${this.fmt(-Math.log(box.q))})`]);
+    if (p !== q || box.kind === "gap") {
+      rows.push([`q · ${names[q]}`, known ? `${box.q.toPrecision(4)}  (${this.fmt(-Math.log(box.q))})` : "not yet known"]);
     }
-    rows.push(["p · −log q", `${atLeast}${this.fmt(-box.p * Math.log(box.q))}`]);
+    rows.push(["p · −log q", known ? this.fmt(-box.p * Math.log(box.q)) : "not yet known"]);
     rows.push([this.cam.origin === tree.root ? "−log P (path)" : "−log P (from origin)", this.fmt(-box.lnMass)]);
-    const stats = tree.statistics(box.node, this.lens);
+    const statisticsKey = `${box.node}:${p}:${q}:${tree.revisionOf(box.node)}`;
+    if (this.nodeStatistics?.key !== statisticsKey) {
+      this.nodeStatistics = { key: statisticsKey, value: tree.statistics(box.node, this.lens) };
+    }
+    const stats = this.nodeStatistics.value;
     const bound = stats.bounded ? "≥ " : "";
     if (p === q) rows.push(["H at node", `${bound}${this.fmt(stats.entropy)}`]);
     else {
@@ -980,7 +984,7 @@ export class App {
       setText(this.inspector.rows[i]![1], rows[i]![1]);
     }
     setText(this.inspector.kind, exact
-      ? `${box.kind === "node" ? "expanded" : box.kind === "leaf" ? "unexpanded" : box.kind} · ${this.units.name}`
+      ? `${box.kind === "node" ? "expanded" : box.kind === "leaf" ? "unexpanded" : "not yet listed"} · ${this.units.name}`
       : `known subtree · continuation unknown · ${this.units.name}`);
     this.details.hidden = false;
     this.inspect.hidden = false;

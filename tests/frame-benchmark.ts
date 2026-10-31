@@ -73,16 +73,16 @@ function setup(count: number, zipf: boolean, deep = false, real = false) {
   const root = real
     ? run(live!.listing.lnWeights.map(Math.exp), live!.listing.branches, 0, 0)
     : run(weights.map((w) => w / total), branches, 0, 0);
-  driver.tree.insert(0n, 0, root);
+  driver.tree.insert(0n, 0, { runs: [root] });
   if (zipf) {
-    driver.tree.insert(0n, 1, { ...root, branches: branches.toReversed() });
+    driver.tree.insert(0n, 1, { runs: [{ ...root, branches: branches.toReversed() }] });
     driver.setLens({ p: 0, q: 1 });
   }
   if (deep) {
     let node = 0n;
     for (let depth = 0; depth < 80; depth++) {
       node = driver.tree.child(node, depth % 3);
-      driver.tree.insert(node, 0, run([0.6, 0.3, 0.1]));
+      driver.tree.insert(node, 0, { runs: [run([0.6, 0.3, 0.1])] });
     }
     driver.cam = { origin: 0n, x: 125, k: 140, anchor: { node, rank: 1 }, a: 0.4 };
   } else driver.cam = { origin: 0n, x: 0, k: 100, anchor: { node: 0n, rank: 0 }, a: 0 };

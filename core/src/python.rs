@@ -4,8 +4,8 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::distribution::{Distribution, Window};
-use crate::tree::{Advance, Tree, Walk};
+use crate::distribution::Distribution;
+use crate::tree::{Advance, Read, Tree, Walk};
 
 fn error(message: String) -> PyErr {
     PyValueError::new_err(message)
@@ -79,33 +79,25 @@ impl PythonTree {
 
     /// Begin an Expand down `path` below `node`. An unknown node raises
     /// KeyError.
-    fn start_path(&self, node: u64, path: Vec<u32>, horizon: u32) -> PyResult<PythonWalk> {
-        self.known(node)?;
-        Ok(PythonWalk {
-            inner: Walk::path(node, path, horizon),
-        })
+    fn start_path(&self, node: u64, path: Vec<u32>) -> PyResult<PythonWalk> {
+        self.start(node, Read::Path(path))
     }
 
-    /// Begin an Expand down a window within `node`. An empty window raises
-    /// ValueError, an unknown node KeyError.
-    fn start_window(
-        &self,
-        node: u64,
-        ln_top: f64,
-        ln_bottom: f64,
-        horizon: u32,
-    ) -> PyResult<PythonWalk> {
-        self.known(node)?;
-        let window = Window::new(ln_top, ln_bottom).map_err(error)?;
-        Ok(PythonWalk {
-            inner: Walk::window(node, window, horizon),
-        })
+    /// Begin an Expand for the children of `node` holding `points`, each ln
+    /// of the mass below it. A point above 0 raises ValueError.
+    fn start_points(&self, node: u64, points: Vec<f64>) -> PyResult<PythonWalk> {
+        self.start(node, Read::Points(points))
     }
 
-    /// The walk's next message as ("run", node, rank, branches, ln_below,
-    /// children), children None where the node's end is unknown;
-    /// ("missing", node) when it needs that node's distribution first, or
-    /// None once it is done.
+    /// Begin an Expand for the children of `node` along `branches`.
+    fn start_branches(&self, node: u64, branches: Vec<u32>) -> PyResult<PythonWalk> {
+        self.start(node, Read::Branches(branches))
+    }
+
+    /// The walk's next message as ("children", node, runs, children): runs
+    /// as (rank, branches, ln_below), children the node's count or None where
+    /// its end is unknown; ("missing", node) when it needs that node's
+    /// distribution first; or None once it is done.
     fn advance(
         &mut self,
         walk: &mut PythonWalk,
@@ -118,19 +110,18 @@ impl PythonTree {
                 .advance(&mut self.inner, measure)
                 .map_err(error)?
             {
-                Advance::Run(node, run, children) => Some(
-                    (
-                        "run",
-                        node,
-                        run.rank(),
-                        run.branches().to_vec(),
-                        run.ln_below().to_vec(),
-                        children,
+                Advance::Children(node, runs, children) => {
+                    let runs: Vec<_> = runs
+                        .iter()
+                        .map(|run| (run.rank(), run.branches().to_vec(), run.ln_below().to_vec()))
+                        .collect();
+                    Some(
+                        ("children", node, runs, children)
+                            .into_pyobject(py)?
+                            .into_any()
+                            .unbind(),
                     )
-                        .into_pyobject(py)?
-                        .into_any()
-                        .unbind(),
-                ),
+                }
                 Advance::Missing(node) => {
                     Some(("missing", node).into_pyobject(py)?.into_any().unbind())
                 }
@@ -141,6 +132,13 @@ impl PythonTree {
 }
 
 impl PythonTree {
+    fn start(&self, node: u64, read: Read) -> PyResult<PythonWalk> {
+        self.known(node)?;
+        Ok(PythonWalk {
+            inner: Walk::new(node, read).map_err(error)?,
+        })
+    }
+
     fn known(&self, node: u64) -> PyResult<()> {
         if self.inner.contains(node) {
             Ok(())

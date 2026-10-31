@@ -38,8 +38,6 @@ const FOCUS_MS = 450;
 const TRANSITION_MS = 320;
 /** The flight to a node closes this share of its distance every ``FLIGHT_MS``. */
 const FLIGHT_MS = 140;
-/** How deep a walk lists each node it passes, besides the next branch, in bits. */
-const WALK_HORIZON = 16;
 const SEARCH_MS = 150;
 const SAVE_MS = 200;
 const LOCAL_SERVER = "http://localhost:8421/";
@@ -273,7 +271,7 @@ export class App {
   /** Walk every measure in view from ``origin`` to ``target``; true once all placed it. */
   private async walk(origin: NodeId, target: NodeId): Promise<boolean> {
     const measures = [...new Set([this.lens.p, this.lens.q])];
-    const placed = await Promise.all(measures.map((measure) => this.expander!.walk(origin, target, measure, WALK_HORIZON)));
+    const placed = await Promise.all(measures.map((measure) => this.expander!.walk(origin, target, measure)));
     return placed.every(Boolean);
   }
 

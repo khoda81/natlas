@@ -1,6 +1,6 @@
 // Build trees from runs as a source would send them.
 
-import { IntervalTree, type NodeId, ROOT, type Run } from "../src/core/tree";
+import { type Children, IntervalTree, type NodeId, ROOT, type Run } from "../src/core/tree";
 
 /** ln(e^a + e^b). */
 function lnAdd(a: number, b: number): number {
@@ -17,14 +17,19 @@ export function run(weights: number[], branches = weights.map((_, i) => i), rank
   return { rank, branches, lnBelow };
 }
 
+/** An answer placing those children, as one run. */
+export function answer(...args: Parameters<typeof run>): Children & { runs: ReturnType<typeof run>[] } {
+  return { runs: [run(...args)] };
+}
+
 /** A tree whose nodes along ``path`` all split their interval with ``weights``. */
 export function chainTree(weights: number[], path: number[], measures = 1): IntervalTree {
   const tree = new IntervalTree(measures);
-  tree.insert(ROOT, 0, run(weights));
+  tree.insert(ROOT, 0, answer(weights));
   let node: NodeId = ROOT;
   for (const branch of path) {
     node = tree.child(node, branch);
-    tree.insert(node, 0, run(weights));
+    tree.insert(node, 0, answer(weights));
   }
   return tree;
 }

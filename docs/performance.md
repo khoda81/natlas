@@ -13,9 +13,11 @@ reanchoring query the retained frame and the tree directly.
 
 A node's layout costs one binary search to the first visible child, then one
 step per drawn box: children at least a pixel tall, bands about a pixel tall,
-and gaps. A band's area-preserving width comes from a per-run suffix sum of
-p (−ln p) when p = q, and from a few sampled children otherwise, so a frame
-never visits the children hidden inside a band. Picking walks down from the
+and gaps. A band's width is estimated from its known children: over a known
+run, from a per-run suffix sum of p (−ln p) when p = q, and from a few of its
+children otherwise, so a frame never visits the children hidden inside a
+band. What the view lacks is asked for as points to sample, at most 4096 per
+request. Picking walks down from the
 origin through the laid-out nodes to the one child under the point.
 
 The UI and the fetch pump share geometry only when the tree revision, lens,

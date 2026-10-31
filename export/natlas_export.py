@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from natlas import natlas_pb2 as pb  # noqa: E402
-from natlas_codec import labels_json, run  # noqa: E402
+from natlas_codec import children, labels_json  # noqa: E402
 from natwalk import Tree  # noqa: E402
 from natwalk.tree import NodeId  # noqa: E402
 
@@ -129,8 +129,8 @@ def _recording_of(
     heavy = [branch for branch, weight in enumerate(weights) if weight >= threshold]
     listed = sorted(heavy, key=lambda branch: (-weights[branch], branch))
     rest = math.fsum(weight for weight in weights if weight < threshold)
-    children = sum(1 for weight in weights if weight > 0)
-    return _recording(path, listed, [_ln(weights[branch]) for branch in listed], rest, children)
+    count = sum(1 for weight in weights if 0 < weight)
+    return _recording(path, listed, [_ln(weights[branch]) for branch in listed], rest, count)
 
 
 def _recording(
@@ -138,11 +138,11 @@ def _recording(
     branches: Sequence[int],
     ln_weights: Sequence[float],
     rest: float,
-    children: int,
+    count: int,
 ) -> pb.Recording:
     """A recorded node: its heaviest children, what they leave unknown, and
     how many children have weight."""
-    return pb.Recording(path=path, run=run(branches, ln_weights, _ln(rest), children))
+    return pb.Recording(path=path, children=children(branches, ln_weights, _ln(rest), count))
 
 
 def _weighted(distribution) -> int:

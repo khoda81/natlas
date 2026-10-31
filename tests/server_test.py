@@ -104,23 +104,24 @@ def messages(body):
     return result
 
 
-def request(node, path=None, window=None, horizon=16):
-    """Expand down ``path`` or, when given, ``window``."""
-    if window is not None:
-        target = {"window": pb.Window(ln_top=window[0], ln_bottom=window[1])}
+def request(node, path=None, points=None, branches=None):
+    """Expand down ``path``, or at ``points``, or along ``branches``."""
+    if points is not None:
+        read = {"points": pb.Points(ln_below=points)}
+    elif branches is not None:
+        read = {"branches": pb.Branches(branches=branches)}
     else:
-        target = {"path": pb.Path(branches=path or [])}
-    return pb.ExpandRequest(node=node, horizon=horizon, **target)
+        read = {"path": pb.Path(branches=path or [])}
+    return pb.ExpandRequest(node=node, **read)
 
 
-def runs(model, node, path=None, horizon=16, measure=0, window=None):
-    return list(model.expand(measure, request(node, path, window, horizon), threading.Event()))
+def answers(model, node, path=None, points=None, branches=None, measure=0):
+    return list(model.expand(measure, request(node, path, points, branches), threading.Event()))
 
 
-def weights(run):
-    """Each child's weight, from the run's edges."""
-    below = np.exp(run.ln_below)
-    return list(below[:-1] - below[1:])
+def placed(children):
+    """The branches one message places, run by run."""
+    return [list(run.branches) for run in children.runs]
 
 
 class CoreTests(unittest.TestCase):
@@ -136,65 +137,66 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             tree.walk(node_id([1, 2]), [])
 
-    def test_a_walk_lists_what_the_core_holds_and_asks_for_what_it_lacks(self):
+    def test_a_walk_places_what_the_core_holds_and_asks_for_what_it_lacks(self):
         tree = Tree(1)
-        walk = tree.start_window(0, 0.0, -math.inf, 2)
+        walk = tree.start_points(0, [math.log(0.9), math.log(0.4)])
         self.assertEqual(tree.advance(walk, 0), ("missing", 0))
         with np.errstate(divide="ignore"):
             tree.set(0, 0, np.log([0.2, 0.5, 0.0, 0.3]))
-        kind, node, rank, branches, ln_below, children = tree.advance(walk, 0)
-        self.assertEqual((kind, node, rank, branches, children), ("run", 0, 0, [1, 3], 3))
+        kind, node, runs, count = tree.advance(walk, 0)
+        self.assertEqual((kind, node, count), ("children", 0, 3))
+        ((rank, branches, ln_below),) = runs
+        self.assertEqual((rank, branches), (0, [1, 3]))
         self.assertAlmostEqual(math.exp(ln_below[-1]), 0.2, places=12)
         self.assertIsNone(tree.advance(walk, 0))
         with self.assertRaises(ValueError):
-            tree.start_window(0, -1.0, -0.5, 1)
+            tree.start_points(0, [0.5])
 
 
 class ModelTests(unittest.TestCase):
     def test_a_path_is_placed_branch_by_branch_from_one_pass_of_the_model(self):
         model, _ = fixture()
-        walked = runs(model, 0, [0, 1, 2], horizon=1)
-        self.assertEqual([list(run.branches) for run in walked], [[0], [1], [2], [0]])
-        self.assertEqual([run.rank for run in walked], [0, 1, 2, 0])
+        walked = answers(model, 0, [0, 1, 2])
+        self.assertEqual([placed(children) for children in walked], [[[0]], [[1]], [[2]]])
+        self.assertEqual([children.runs[0].rank for children in walked], [0, 1, 2])
         measure = model.measures[0]
         self.assertEqual(measure.walks, [((99, 0, 1, 2), 1)])
-        self.assertEqual(len(measure.calls), 4)
+        self.assertEqual(measure.calls, [(99,), (99, 0), (99, 0, 1)])
         # The nodes along it are kept: naming the last by its parent
         # computes nothing.
-        again = runs(model, node_id([0, 1]), [2], horizon=1)
-        self.assertEqual(again, walked[2:])
-        self.assertEqual(len(measure.calls), 4)
+        self.assertEqual(answers(model, node_id([0, 1]), [2]), walked[2:])
+        self.assertEqual(len(measure.calls), 3)
 
-    def test_a_window_lists_down_to_its_horizon_or_descends_into_one_child(self):
+    def test_points_place_the_children_holding_them_or_descend_into_one(self):
         model, _ = fixture()
-        (root,) = runs(model, 0, [], horizon=4)
-        self.assertEqual(list(root.branches), [0, 1, 2])
-        # The rest stays unknown, but not how many branches it holds.
-        self.assertEqual(root.children, 5)
-        self.assertAlmostEqual(sum(weights(root)), 0.95, places=12)
-        # (0.5, 0.9] of the root lies inside branch 0's (0.4, 1].
-        descent = runs(model, 0, horizon=4, window=(math.log(0.9), math.log(0.5)))
-        self.assertEqual([list(run.branches) for run in descent[:1]], [[0]])
+        # 0.9 lies in branch 0's (0.4, 1], 0.3 in branch 1's (0.15, 0.4].
+        (root,) = answers(model, 0, points=[math.log(0.9), math.log(0.3)])
+        self.assertEqual((placed(root), root.count), ([[0, 1]], 5))
+        # 0.9 and 0.5 both lie in branch 0: the points descend into it,
+        # where they fall 0.83 and 0.17 of the way up, in its branches 0 and 1.
+        descent = answers(model, 0, points=[math.log(0.9), math.log(0.5)])
+        self.assertEqual([placed(children) for children in descent], [[[0]], [[0, 1]]])
         self.assertEqual(model.measures[0].calls[-1], (99, 0))
+        (branches,) = answers(model, 0, branches=[4, 1, 7])
+        self.assertEqual(placed(branches), [[1], [4]])
 
     def test_eviction_forgets_the_oldest_and_recomputes_it_alike(self):
         model, _ = fixture()
         measure = model.measures[0]
         with patch.object(service, "_CACHED", 1):
-            first = runs(model, 0, [0])
-            runs(model, 0, [1])
-            self.assertEqual(runs(model, 0, [0]), first)
-        self.assertEqual(measure.calls.count((99,)), 3)
+            first = answers(model, 0, [0, 1])
+            self.assertEqual(answers(model, 0, [0, 1]), first)
+        self.assertEqual(measure.calls.count((99,)), 2)
 
     def test_ended_and_weightless_branches(self):
         model, _ = fixture()
-        ended = runs(model, 0, [0] * 5, 40)
-        self.assertEqual(len(ended), 6)
-        self.assertEqual(ended[-1], pb.Run(rank=0, ln_below=[-math.inf], children=0))
+        self.assertEqual(len(answers(model, 0, [0] * 5)), 5)
+        ended = answers(model, node_id([0] * 5), points=[-1.0])
+        self.assertEqual(ended, [pb.Children(count=0)])
         # Branch 5 is past the vocabulary: nothing places it.
-        self.assertEqual(len(runs(model, 0, [5], 40)), 0)
+        self.assertEqual(answers(model, 0, [5]), [])
         with self.assertRaises(KeyError):
-            runs(model, node_id([3, 3]), [])
+            answers(model, node_id([3, 3]), [])
 
     def test_a_canceled_walk_stops_at_the_next_node(self):
         model, _ = fixture()
@@ -221,31 +223,29 @@ class TransportTests(unittest.TestCase):
             },
         )
 
-    def runs(self, node, path, horizon=16):
-        response = self.expand(
-            service._envelope(0, request(node, path, horizon=horizon).SerializeToString())
-        )
+    def answers(self, node, path):
+        response = self.expand(service._envelope(0, request(node, path).SerializeToString()))
         self.assertEqual(response.status_code, 200)
         frames = messages(response.content)
         return [
-            pb.Run.FromString(data) for flags, data in frames if not flags
+            pb.Children.FromString(data) for flags, data in frames if not flags
         ], json.loads(frames[-1][1])
 
-    def test_a_stream_holds_one_run_per_node_down_the_path(self):
-        runs, end = self.runs(0, [0, 1], horizon=1)
+    def test_a_stream_holds_one_message_per_node_down_the_path(self):
+        answered, end = self.answers(0, [0, 1])
         self.assertEqual(end, {})
-        self.assertEqual([list(run.branches) for run in runs], [[0], [1], [0]])
-        again, _ = self.runs(node_id([0]), [1], horizon=1)
-        self.assertEqual(again, runs[1:])
-        self.assertEqual(self.model.measures[0].calls, [(99,), (99, 0), (99, 0, 1)])
+        self.assertEqual([placed(children) for children in answered], [[[0]], [[1]]])
+        again, _ = self.answers(node_id([0]), [1])
+        self.assertEqual(again, answered[1:])
+        self.assertEqual(self.model.measures[0].calls, [(99,), (99, 0)])
         response = self.expand(
             service._envelope(0, request(0).SerializeToString())
         )
         self.assertEqual(response.headers["access-control-allow-origin"], "*")
 
     def test_an_unlearned_id_is_not_found(self):
-        runs, end = self.runs(node_id([2]), [3])
-        self.assertEqual(runs, [])
+        answered, end = self.answers(node_id([2]), [3])
+        self.assertEqual(answered, [])
         self.assertEqual(end["error"]["code"], "not_found")
 
     def test_search_teaches_the_server_the_ids_along_the_text(self):
@@ -259,9 +259,9 @@ class TransportTests(unittest.TestCase):
             list(pb.SearchResponse.FromString(response.content).path), [0, 1, 2]
         )
         self.assertEqual(self.model.measures[0].calls, [])
-        _, end = self.runs(node_id([0, 1]), [2])
+        _, end = self.answers(node_id([0, 1]), [2])
         self.assertEqual(end, {})
-        self.assertEqual(self.model.measures[0].calls, [(99, 0, 1), (99, 0, 1, 2)])
+        self.assertEqual(self.model.measures[0].calls, [(99, 0, 1)])
         self.assertNotIn("start", self.client.get("/manifest.json").json()[0])
 
     def test_search_answers_while_a_forward_pass_runs(self):
@@ -278,7 +278,7 @@ class TransportTests(unittest.TestCase):
 
     def test_invalid_requests_return_protocol_errors(self):
         untargeted = pb.ExpandRequest(node=0).SerializeToString()
-        empty = request(0, window=(-1.0, -0.5)).SerializeToString()
+        empty = request(0, points=[0.5]).SerializeToString()
         for body in [
             b"",
             b"\x00\x00\x00\x00\x04\x80",
@@ -299,25 +299,24 @@ class TransportTests(unittest.TestCase):
 
 
 class MigrationTests(unittest.TestCase):
-    def test_listing_recordings_become_runs_once(self):
+    def test_run_recordings_become_children_once(self):
         spec = importlib.util.spec_from_file_location(
             "migration", ROOT / "scripts/migrate-snapshots.py"
         )
         migration = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(migration)
-        Snapshot = migration.listing_schema()
+        Snapshot = migration.run_schema()
         old = Snapshot()
-        expansion = old.expansions.add(path=[0xFFFFFFFF], horizon=8)
-        expansion.listing.branches.extend([3, 1])
-        expansion.listing.ln_weights.extend([math.log(0.5), math.log(0.25)])
-        expansion.listing.ln_leftover = math.log(0.25)
+        recording = old.recordings.add(path=[0xFFFFFFFF])
+        recording.run.branches.extend([3, 1])
+        recording.run.ln_below.extend([0.0, math.log(0.5), math.log(0.25)])
+        recording.run.children = 7
         converted = migration.convert(old.SerializeToString(), Snapshot)
-        (recording,) = pb.Snapshot.FromString(converted).recordings
-        self.assertEqual(list(recording.path), [0xFFFFFFFF])
-        self.assertEqual((recording.run.rank, list(recording.run.branches)), (0, [3, 1]))
-        self.assertEqual(
-            [round(math.exp(edge), 12) for edge in recording.run.ln_below], [1.0, 0.5, 0.25]
-        )
+        (current,) = pb.Snapshot.FromString(converted).recordings
+        self.assertEqual(list(current.path), [0xFFFFFFFF])
+        (run,) = current.children.runs
+        self.assertEqual((run.rank, list(run.branches), current.children.count), (0, [3, 1], 7))
+        self.assertEqual(list(run.ln_below), [0.0, math.log(0.5), math.log(0.25)])
         self.assertIsNone(migration.convert(converted, Snapshot))
 
 

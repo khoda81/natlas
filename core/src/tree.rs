@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::distribution::{ln_between, Distribution, Rank, Run, Step, Window, MAX_DESCENT};
+use crate::distribution::{ln_between, Distribution, Rank, Run, MAX_DESCENT};
 use crate::Result;
 
 /// A node's id, hashed from its branches by [`child_hash`] and shared by every
@@ -200,16 +200,18 @@ impl Tree {
     }
 
     /// Add a run a source sent, and whether anything changed.
-    pub fn insert(&mut self, id: NodeId, measure: usize, run: Run) -> Result<bool> {
+    /// Add one answer's runs for the node, and whether anything changed.
+    pub fn insert(&mut self, id: NodeId, measure: usize, runs: Vec<Run>) -> Result<bool> {
         self.check_measure(measure)?;
         let slot = &mut self.node_mut(id)?.distributions[measure];
-        Ok(match slot {
-            Some(distribution) => distribution.insert(run),
+        match slot {
+            Some(distribution) => distribution.insert(runs),
+            None if runs.is_empty() => Ok(false),
             None => {
-                *slot = Some(Distribution::new(run));
-                true
+                *slot = Some(Distribution::from_answer(runs)?);
+                Ok(true)
             }
-        })
+        }
     }
 
     /// Replace everything known of the node's children under `measure`.
@@ -291,54 +293,57 @@ impl Tree {
     }
 }
 
-/// One request of the protocol's Expand walked through a tree, read one of
-/// two ways: down a path, placing each branch, then listing the node it
-/// reaches; or down a window, through every child holding all of it, then
-/// listing the node where it spans several children. A recording answers
-/// from what it has; a server computes each missing distribution as the walk
-/// asks for it.
+/// How an Expand reads the tree below its node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Read {
+    /// Down these branches, placing each.
+    Path(Vec<Branch>),
+    /// The children holding these points, each ln of the mass below it, and
+    /// down through a child holding all of them.
+    Points(Vec<f64>),
+    /// These children of the node.
+    Branches(Vec<Branch>),
+}
+
+/// One request of the protocol's Expand walked through a tree, one node at a
+/// time. A recording answers from what it has; a server computes each
+/// missing distribution as the walk asks for it.
 #[derive(Debug)]
 pub struct Walk {
     node: NodeId,
-    path: Vec<Branch>,
+    read: Read,
+    /// Branches of the path placed so far.
     at: usize,
-    window: Window,
-    horizon: u32,
     descended: usize,
     done: bool,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Advance {
-    /// The next message: this node's run, and how many children the node
-    /// has where its source knows.
-    Run(NodeId, Run, Option<Rank>),
+    /// The next message: what this read places of the node's children, and
+    /// how many children it has where its source knows.
+    Children(NodeId, Vec<Run>, Option<Rank>),
     /// The walk needs this node's distribution before it can go on.
     Missing(NodeId),
     Done,
 }
 
 impl Walk {
-    /// Down `path` below `node`, then the whole node it reaches.
-    pub fn path(node: NodeId, path: Vec<Branch>, horizon: u32) -> Self {
-        Self::new(node, path, Window::WHOLE, horizon)
-    }
-
-    /// Down `window` within `node`.
-    pub fn window(node: NodeId, window: Window, horizon: u32) -> Self {
-        Self::new(node, Vec::new(), window, horizon)
-    }
-
-    fn new(node: NodeId, path: Vec<Branch>, window: Window, horizon: u32) -> Self {
-        Self {
+    /// A read of `node`; points must be ln masses, at most 0.
+    pub fn new(node: NodeId, read: Read) -> Result<Self> {
+        if let Read::Points(points) = &read {
+            if points.iter().any(|point| point.is_nan() || 0.0 < *point) {
+                return Err("points must be ln masses below edges".into());
+            }
+        }
+        Ok(Self {
             node,
-            path,
+            read,
             at: 0,
-            window,
-            horizon,
             descended: 0,
             done: false,
-        }
+        })
     }
 
     pub fn advance(&mut self, tree: &mut Tree, measure: usize) -> Result<Advance> {
@@ -350,46 +355,53 @@ impl Walk {
             return Ok(Advance::Missing(node));
         };
         let count = distribution.count();
-        let (run, next) = if let Some(&branch) = self.path.get(self.at) {
-            // A branch of weight zero has no place: the walk ends before it.
-            let Some(run) = distribution.place(branch) else {
-                self.done = true;
-                return Ok(Advance::Done);
-            };
-            self.at += 1;
-            (run, Some((branch, self.window)))
-        } else {
-            let step = if self.descended < MAX_DESCENT {
-                distribution.step(self.window, self.horizon)
-            } else {
-                distribution.list(self.window, self.horizon).map(Step::List)
-            };
-            match step {
-                Some(Step::Descend {
-                    run,
-                    branch,
-                    window,
-                }) => {
-                    self.descended += 1;
-                    (run, Some((branch, window)))
-                }
-                Some(Step::List(run)) => (run, None),
-                // A node without children says so with its one empty run.
-                None if distribution.ended() => (distribution.runs()[0].clone(), None),
-                None => {
+        // What this node places, the child the walk goes on to, if any, and
+        // whether it reads that child too: a path's last branch names the
+        // node it reaches, which the walk learns but does not read.
+        let (runs, next, more) = match &mut self.read {
+            Read::Path(path) => {
+                // A branch of weight zero has no place: the walk ends before it.
+                let Some(run) = path
+                    .get(self.at)
+                    .and_then(|&branch| distribution.place(branch))
+                else {
                     self.done = true;
                     return Ok(Advance::Done);
+                };
+                let branch = path[self.at];
+                self.at += 1;
+                (vec![run], Some(branch), self.at < path.len())
+            }
+            Read::Branches(branches) => {
+                let mut children: Vec<_> = branches
+                    .iter()
+                    .filter_map(|&branch| distribution.locate_rank(distribution.rank(branch)?))
+                    .collect();
+                children.sort_unstable();
+                children.dedup();
+                (distribution.runs_of(&children), None, false)
+            }
+            Read::Points(points) => {
+                let (children, all) = distribution.children_at(points);
+                let runs = distribution.runs_of(&children);
+                match (children.as_slice(), all) {
+                    ([child], true) if self.descended < MAX_DESCENT => {
+                        self.descended += 1;
+                        for point in points.iter_mut() {
+                            *point = distribution.within(*child, *point);
+                        }
+                        let branch = runs[0].branch(0);
+                        (runs, Some(branch), true)
+                    }
+                    _ => (runs, None, false),
                 }
             }
         };
-        match next {
-            Some((branch, window)) => {
-                self.node = tree.child(node, branch)?;
-                self.window = window;
-            }
-            None => self.done = true,
+        if let Some(branch) = next {
+            self.node = tree.child(node, branch)?;
         }
-        Ok(Advance::Run(node, run, count))
+        self.done = !more;
+        Ok(Advance::Children(node, runs, count))
     }
 }
 
@@ -444,49 +456,60 @@ mod tests {
     }
 
     #[test]
-    fn a_walk_places_its_path_then_descends_and_lists_the_window() {
+    fn a_walk_places_a_path_and_finds_children_at_points() {
         let mut tree = Tree::new(1);
-        let mut walk = Walk::path(ROOT, vec![2], 1);
+        let mut walk = Walk::new(ROOT, Read::Path(vec![2, 1])).unwrap();
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Missing(ROOT));
         tree.set(ROOT, 0, weights(&[0.6, 0.3, 0.1])).unwrap();
-        let Advance::Run(node, run, _) = walk.advance(&mut tree, 0).unwrap() else {
+        let Advance::Children(ROOT, runs, Some(3)) = walk.advance(&mut tree, 0).unwrap() else {
             panic!("the root places branch 2");
         };
-        assert_eq!((node, run.rank(), run.branches()), (ROOT, 2, &[2][..]));
+        assert_eq!((runs[0].rank(), runs[0].branches()), (2, &[2][..]));
         let child = child_hash(ROOT, 2);
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Missing(child));
         tree.set(child, 0, weights(&[0.5, 0.5])).unwrap();
         assert!(
-            matches!(walk.advance(&mut tree, 0).unwrap(), Advance::Run(node, _, Some(2)) if node == child)
+            matches!(walk.advance(&mut tree, 0).unwrap(), Advance::Children(node, _, _) if node == child)
         );
+        // The path's last branch placed, the walk is done: it lists nothing more.
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
 
-        // A window inside branch 0 of the root descends into it.
-        let window = Window::new(-0.1, -0.5).unwrap();
-        let mut walk = Walk::window(ROOT, window, 8);
-        let Advance::Run(ROOT, run, _) = walk.advance(&mut tree, 0).unwrap() else {
-            panic!("the root names the child holding the window");
+        // Points across two children list both; points all inside branch 0
+        // (0.4, 1] descend into it, rescaled.
+        let mut walk = Walk::new(ROOT, Read::Points(vec![0.9f64.ln(), 0.2f64.ln()])).unwrap();
+        let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
+            panic!("the root lists the children at the points");
         };
-        assert_eq!(run.branches(), [0]);
+        assert_eq!(runs[0].branches(), [0, 1]);
+        assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
+        let mut walk = Walk::new(ROOT, Read::Points(vec![0.9f64.ln(), 0.5f64.ln()])).unwrap();
+        assert!(matches!(
+            walk.advance(&mut tree, 0).unwrap(),
+            Advance::Children(ROOT, _, _)
+        ));
         assert_eq!(
             walk.advance(&mut tree, 0).unwrap(),
             Advance::Missing(child_hash(ROOT, 0))
         );
 
+        // Branches list just those children; a weightless one is left out.
+        let mut walk = Walk::new(ROOT, Read::Branches(vec![1, 2, 7])).unwrap();
+        let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
+            panic!("the root lists the branches it has");
+        };
+        assert_eq!(runs[0].branches(), [1, 2]);
+        assert!(Walk::new(ROOT, Read::Points(vec![0.5])).is_err());
+
         // A path through a weightless branch ends before it; an ended node
-        // says so.
+        // says it has no children.
         tree.set(child, 0, Distribution::from_weights(&[]).unwrap())
             .unwrap();
-        let mut walk = Walk::path(ROOT, vec![2, 0], 8);
-        assert!(matches!(
+        let mut walk = Walk::new(child, Read::Points(vec![-1.0])).unwrap();
+        assert_eq!(
             walk.advance(&mut tree, 0).unwrap(),
-            Advance::Run(ROOT, ..)
-        ));
+            Advance::Children(child, vec![], Some(0))
+        );
+        let mut walk = Walk::new(child, Read::Path(vec![0])).unwrap();
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
-        let mut walk = Walk::path(child, vec![], 8);
-        let Advance::Run(_, run, _) = walk.advance(&mut tree, 0).unwrap() else {
-            panic!("an ended node lists its empty run");
-        };
-        assert!(run.is_empty());
     }
 }

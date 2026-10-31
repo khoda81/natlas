@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file natlas/natlas.proto.
  */
 export const file_natlas_natlas: GenFile = /*@__PURE__*/
-  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMieAoNRXhwYW5kUmVxdWVzdBIMCgRub2RlGAEgASgGEhwKBHBhdGgYAiABKAsyDC5uYXRsYXMuUGF0aEgAEiAKBndpbmRvdxgDIAEoCzIOLm5hdGxhcy5XaW5kb3dIABIPCgdob3Jpem9uGAQgASgNQggKBnRhcmdldCIYCgRQYXRoEhAKCGJyYW5jaGVzGAEgAygNIisKBldpbmRvdxIOCgZsbl90b3AYASABKAESEQoJbG5fYm90dG9tGAIgASgBIlsKA1J1bhIMCgRyYW5rGAEgASgNEhAKCGJyYW5jaGVzGAIgAygNEhAKCGxuX2JlbG93GAMgAygBEhUKCGNoaWxkcmVuGAQgASgNSACIAQFCCwoJX2NoaWxkcmVuIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIjMKCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEhgKA3J1bhgCIAEoCzILLm5hdGxhcy5SdW4ycQoGTmF0bGFzEi4KBkV4cGFuZBIVLm5hdGxhcy5FeHBhbmRSZXF1ZXN0GgsubmF0bGFzLlJ1bjABEjcKBlNlYXJjaBIVLm5hdGxhcy5TZWFyY2hSZXF1ZXN0GhYubmF0bGFzLlNlYXJjaFJlc3BvbnNlYgZwcm90bzM");
+  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMiiwEKDUV4cGFuZFJlcXVlc3QSDAoEbm9kZRgBIAEoBhIcCgRwYXRoGAIgASgLMgwubmF0bGFzLlBhdGhIABIgCgZwb2ludHMYAyABKAsyDi5uYXRsYXMuUG9pbnRzSAASJAoIYnJhbmNoZXMYBCABKAsyEC5uYXRsYXMuQnJhbmNoZXNIAEIGCgRyZWFkIhgKBFBhdGgSEAoIYnJhbmNoZXMYASADKA0iGgoGUG9pbnRzEhAKCGxuX2JlbG93GAEgAygBIhwKCEJyYW5jaGVzEhAKCGJyYW5jaGVzGAEgAygNIkMKCENoaWxkcmVuEhkKBHJ1bnMYASADKAsyCy5uYXRsYXMuUnVuEhIKBWNvdW50GAIgASgNSACIAQFCCAoGX2NvdW50IjcKA1J1bhIMCgRyYW5rGAEgASgNEhAKCGJyYW5jaGVzGAIgAygNEhAKCGxuX2JlbG93GAMgAygBIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIj0KCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEiIKCGNoaWxkcmVuGAMgASgLMhAubmF0bGFzLkNoaWxkcmVuMnYKBk5hdGxhcxIzCgZFeHBhbmQSFS5uYXRsYXMuRXhwYW5kUmVxdWVzdBoQLm5hdGxhcy5DaGlsZHJlbjABEjcKBlNlYXJjaBIVLm5hdGxhcy5TZWFyY2hSZXF1ZXN0GhYubmF0bGFzLlNlYXJjaFJlc3BvbnNlYgZwcm90bzM");
 
 /**
  * @generated from message natlas.ExpandRequest
@@ -22,9 +22,9 @@ export type ExpandRequest = Message<"natlas.ExpandRequest"> & {
   node: bigint;
 
   /**
-   * @generated from oneof natlas.ExpandRequest.target
+   * @generated from oneof natlas.ExpandRequest.read
    */
-  target: {
+  read: {
     /**
      * @generated from field: natlas.Path path = 2;
      */
@@ -32,18 +32,17 @@ export type ExpandRequest = Message<"natlas.ExpandRequest"> & {
     case: "path";
   } | {
     /**
-     * @generated from field: natlas.Window window = 3;
+     * @generated from field: natlas.Points points = 3;
      */
-    value: Window;
-    case: "window";
+    value: Points;
+    case: "points";
+  } | {
+    /**
+     * @generated from field: natlas.Branches branches = 4;
+     */
+    value: Branches;
+    case: "branches";
   } | { case: undefined; value?: undefined };
-
-  /**
-   * In bits.
-   *
-   * @generated from field: uint32 horizon = 4;
-   */
-  horizon: number;
 };
 
 /**
@@ -54,7 +53,7 @@ export const ExpandRequestSchema: GenMessage<ExpandRequest> = /*@__PURE__*/
   messageDesc(file_natlas_natlas, 0);
 
 /**
- * Branches below a node; none names the node itself.
+ * Branches down from a node.
  *
  * @generated from message natlas.Path
  */
@@ -73,30 +72,70 @@ export const PathSchema: GenMessage<Path> = /*@__PURE__*/
   messageDesc(file_natlas_natlas, 1);
 
 /**
- * A part of a node, as ln of the mass below each of its edges: (0, -inf) is
- * the whole node. As exact deep in a node's light tail as at its top. It must
- * not be empty.
+ * Points of a node, each ln of the mass below it: at most 0, as exact deep
+ * in a node's light tail as at its top.
  *
- * @generated from message natlas.Window
+ * @generated from message natlas.Points
  */
-export type Window = Message<"natlas.Window"> & {
+export type Points = Message<"natlas.Points"> & {
   /**
-   * @generated from field: double ln_top = 1;
+   * @generated from field: repeated double ln_below = 1;
    */
-  lnTop: number;
-
-  /**
-   * @generated from field: double ln_bottom = 2;
-   */
-  lnBottom: number;
+  lnBelow: number[];
 };
 
 /**
- * Describes the message natlas.Window.
- * Use `create(WindowSchema)` to create a new message.
+ * Describes the message natlas.Points.
+ * Use `create(PointsSchema)` to create a new message.
  */
-export const WindowSchema: GenMessage<Window> = /*@__PURE__*/
+export const PointsSchema: GenMessage<Points> = /*@__PURE__*/
   messageDesc(file_natlas_natlas, 2);
+
+/**
+ * Branches of one node.
+ *
+ * @generated from message natlas.Branches
+ */
+export type Branches = Message<"natlas.Branches"> & {
+  /**
+   * @generated from field: repeated uint32 branches = 1;
+   */
+  branches: number[];
+};
+
+/**
+ * Describes the message natlas.Branches.
+ * Use `create(BranchesSchema)` to create a new message.
+ */
+export const BranchesSchema: GenMessage<Branches> = /*@__PURE__*/
+  messageDesc(file_natlas_natlas, 3);
+
+/**
+ * What a source places of one node's children.
+ *
+ * @generated from message natlas.Children
+ */
+export type Children = Message<"natlas.Children"> & {
+  /**
+   * @generated from field: repeated natlas.Run runs = 1;
+   */
+  runs: Run[];
+
+  /**
+   * How many of the node's children have weight, where the source knows:
+   * the rank its last child ends at. A node without children says 0.
+   *
+   * @generated from field: optional uint32 count = 2;
+   */
+  count?: number | undefined;
+};
+
+/**
+ * Describes the message natlas.Children.
+ * Use `create(ChildrenSchema)` to create a new message.
+ */
+export const ChildrenSchema: GenMessage<Children> = /*@__PURE__*/
+  messageDesc(file_natlas_natlas, 4);
 
 /**
  * Consecutive ranks of a node's children in the measure's order: heaviest
@@ -118,20 +157,11 @@ export type Run = Message<"natlas.Run"> & {
   /**
    * ln of the mass at and below each edge, conditional on the node: edge i
    * tops rank `rank + i`, and the last bottoms the run, one more edge than
-   * branches. Summed from the light end, so tiny masses survive. A node
-   * without children answers rank 0, no branches, and the one edge -inf.
+   * branches. Summed from the light end, so tiny masses survive.
    *
    * @generated from field: repeated double ln_below = 3;
    */
   lnBelow: number[];
-
-  /**
-   * How many of the node's children have weight, where the source knows:
-   * the rank its last child ends at.
-   *
-   * @generated from field: optional uint32 children = 4;
-   */
-  children?: number | undefined;
 };
 
 /**
@@ -139,7 +169,7 @@ export type Run = Message<"natlas.Run"> & {
  * Use `create(RunSchema)` to create a new message.
  */
 export const RunSchema: GenMessage<Run> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 3);
+  messageDesc(file_natlas_natlas, 5);
 
 /**
  * @generated from message natlas.SearchRequest
@@ -156,7 +186,7 @@ export type SearchRequest = Message<"natlas.SearchRequest"> & {
  * Use `create(SearchRequestSchema)` to create a new message.
  */
 export const SearchRequestSchema: GenMessage<SearchRequest> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 4);
+  messageDesc(file_natlas_natlas, 6);
 
 /**
  * @generated from message natlas.SearchResponse
@@ -175,7 +205,7 @@ export type SearchResponse = Message<"natlas.SearchResponse"> & {
  * Use `create(SearchResponseSchema)` to create a new message.
  */
 export const SearchResponseSchema: GenMessage<SearchResponse> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 5);
+  messageDesc(file_natlas_natlas, 7);
 
 /**
  * A recorded server, used for static datasets: what it knows of each node.
@@ -194,7 +224,7 @@ export type Snapshot = Message<"natlas.Snapshot"> & {
  * Use `create(SnapshotSchema)` to create a new message.
  */
 export const SnapshotSchema: GenMessage<Snapshot> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 6);
+  messageDesc(file_natlas_natlas, 8);
 
 /**
  * @generated from message natlas.Recording
@@ -208,9 +238,9 @@ export type Recording = Message<"natlas.Recording"> & {
   path: number[];
 
   /**
-   * @generated from field: natlas.Run run = 2;
+   * @generated from field: natlas.Children children = 3;
    */
-  run?: Run | undefined;
+  children?: Children | undefined;
 };
 
 /**
@@ -218,29 +248,30 @@ export type Recording = Message<"natlas.Recording"> & {
  * Use `create(RecordingSchema)` to create a new message.
  */
 export const RecordingSchema: GenMessage<Recording> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 7);
+  messageDesc(file_natlas_natlas, 9);
 
 /**
  * @generated from service natlas.Natlas
  */
 export const Natlas: GenService<{
   /**
-   * Reads the tree below a node one of two ways, answering one node at a
-   * time, each message a Run of that node's children:
+   * Reads the tree below a node one of three ways, answering one node at a
+   * time with the children it places there:
    *
-   * - down a path: the starting node and every node down the path, each
-   *   placing the path's next branch alone, then the node the path reaches,
-   *   listed from its heaviest child;
-   * - down a window: every node down through a child that holds all of the
-   *   window, each placing that child alone, then the node where the window
-   *   spans more than one child, listing them across it.
+   * - a path: the starting node and every node down the path, each placing
+   *   the path's next branch;
+   * - points, each ln of the mass below it: the children holding them, and
+   *   where all of them fall in one child, that child alone and the same
+   *   points within it, so a view samples its children and a deep zoom
+   *   reaches them in one request;
+   * - branches: those children of the node, for a measure read only for q.
    *
-   * So every message but the last is a single child, and the next message is
-   * that child's: id(node, its branch). A listing runs while each child
-   * weighs at least 2^-horizon of the window, or of the node; its first
-   * child always.
+   * So every message but the last places a single child, and the next
+   * message is that child's: id(node, its branch). Each child is placed
+   * once, however many points it holds; a point in a part the server does
+   * not know places nothing.
    *
-   * A server may end the stream early at any node, and ends it before a
+   * A server may end the stream early at any node, and ends a path before a
    * branch of weight zero, which has no place. It answers NOT_FOUND when it
    * has not learned the starting node, and the client names it from the
    * root with a path.
@@ -250,7 +281,7 @@ export const Natlas: GenService<{
   expand: {
     methodKind: "server_streaming";
     input: typeof ExpandRequestSchema;
-    output: typeof RunSchema;
+    output: typeof ChildrenSchema;
   },
   /**
    * The sequence for a text, under the server's text mapping. The server

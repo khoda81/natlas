@@ -8,25 +8,15 @@ import { Natlas, SnapshotSchema } from "../gen/natlas/natlas_pb";
 import { TextLabels } from "../readings/labels";
 import { type NotesFile, NoteLabels } from "../readings/notes";
 import type { Labels } from "../readings/reading";
-import { type Branch, IntervalTree, type NodeId, ROOT, type Run } from "../core/tree";
+import type { Read } from "../core/layout";
+import { type Branch, type Children, IntervalTree, type NodeId, ROOT } from "../core/tree";
 
-/** A part of a node, as ln of the mass below each of its edges. */
-export interface Window {
-  lnTop: number;
-  lnBottom: number;
-}
+/** The protocol's Expand: a read below ``node``. */
+export type ExpandRequest = { node: NodeId } & Read;
 
-/** The whole of a node, as a window. */
-export const WHOLE: Window = { lnTop: 0, lnBottom: -Infinity };
-
-/** The protocol's Expand, reading below ``node`` down a path or down a
- * window, listing down to ``horizon`` bits. */
-export type ExpandRequest = { node: NodeId; horizon: number } & ({ path: Branch[] } | { window: Window });
-
-/** One message of an answer: a node's run. */
-export interface Step {
+/** One message of an answer: what it places of a node's children. */
+export interface Step extends Children {
   node: NodeId;
-  run: Run;
 }
 
 export interface Source {
@@ -37,23 +27,22 @@ export interface Source {
 }
 
 /** Name each message's node in ``tree``: the start, then the child along the
- * path's next branch, or the single child the window descends into. */
-async function* named(tree: IntervalTree, request: ExpandRequest, runs: AsyncIterable<Run> | Iterable<Run>): AsyncIterable<Step> {
+ * path's next branch, or the single child the points descend into. */
+async function* named(tree: IntervalTree, request: ExpandRequest, answers: AsyncIterable<Children> | Iterable<Children>): AsyncIterable<Step> {
   const path = "path" in request ? request.path : [];
   let current = request.node;
   let next: Branch | undefined;
   let depth = 0;
-  for await (const run of runs) {
+  for await (const { runs, count } of answers) {
     if (depth > 0) {
-      if (next === undefined) throw new Error("the source went on after listing its window");
+      if (next === undefined) throw new Error("the source went on past a node it placed more than one child of");
       current = tree.child(current, next);
     }
+    const only = runs.length === 1 && runs[0]!.branches.length === 1 ? runs[0]!.branches[0] : undefined;
     const branch = path[depth];
-    if (branch !== undefined && (run.branches.length !== 1 || run.branches[0] !== branch)) {
-      throw new Error("the source placed another branch than the path's");
-    }
-    yield { node: current, run };
-    next = branch ?? (run.branches.length === 1 ? run.branches[0] : undefined);
+    if (branch !== undefined && only !== branch) throw new Error("the source placed another branch than the path's");
+    yield { node: current, runs, count };
+    next = branch ?? only;
     depth++;
   }
 }
@@ -72,24 +61,23 @@ export class SnapshotSource implements Source {
       throw new Error("an empty recording, or one in an older format: run scripts/migrate-snapshots.py");
     }
     const paths = new Map<string, Branch[]>();
-    for (const { path, run } of snapshot.recordings) {
-      if (run === undefined) throw new Error("a recorded node has no run");
-      this.recorded.insert(this.recorded.descend(ROOT, path), 0, run);
+    for (const { path, children } of snapshot.recordings) {
+      if (children === undefined) throw new Error("a recorded node has no children");
+      this.recorded.insert(this.recorded.descend(ROOT, path), 0, children);
       paths.set(path.join(","), path);
-      for (const branch of run.branches) {
-        const child = [...path, branch];
-        paths.set(child.join(","), child);
+      for (const run of children.runs) {
+        for (const branch of run.branches) {
+          const child = [...path, branch];
+          paths.set(child.join(","), child);
+        }
       }
     }
     this.paths = [...paths.values()];
   }
 
   async *expand(tree: IntervalTree, request: ExpandRequest): AsyncIterable<Step> {
-    const { node, horizon } = request;
-    const runs = ("path" in request
-      ? this.recorded.raw.answerPath(node, 0, Uint32Array.from(request.path), horizon)
-      : this.recorded.raw.answerWindow(node, 0, request.window.lnTop, request.window.lnBottom, horizon)) as Run[];
-    yield* named(tree, request, runs);
+    const { node, ...read } = request;
+    yield* named(tree, request, this.recorded.raw.answer(node, 0, read) as Children[]);
   }
 
   async search(text: string): Promise<Branch[]> {
@@ -107,7 +95,7 @@ export class ConnectSource implements Source {
 
   /** Name the request from its node's id. Where the server has not learned
    * that id (it restarted, or never saw it), a path from the root names it,
-   * and a window is asked again once the path has. */
+   * and any other read is asked again once the path has. */
   async *expand(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step> {
     let answered = false;
     try {
@@ -119,19 +107,21 @@ export class ConnectSource implements Source {
       if (answered || request.node === ROOT || ConnectError.from(error).code !== Code.NotFound) throw error;
       const path = tree.path(request.node);
       if ("path" in request) {
-        yield* this.ask(tree, { node: ROOT, path: [...path, ...request.path], horizon: request.horizon }, signal);
+        yield* this.ask(tree, { node: ROOT, path: [...path, ...request.path] }, signal);
       } else {
-        yield* this.ask(tree, { node: ROOT, path, horizon: request.horizon }, signal);
+        yield* this.ask(tree, { node: ROOT, path }, signal);
         yield* this.ask(tree, request, signal);
       }
     }
   }
 
   private ask(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step> {
-    const target = "path" in request
+    const read = "path" in request
       ? { case: "path" as const, value: { branches: request.path } }
-      : { case: "window" as const, value: request.window };
-    return named(tree, request, this.client.expand({ node: request.node, horizon: request.horizon, target }, { signal }));
+      : "points" in request
+        ? { case: "points" as const, value: { lnBelow: request.points } }
+        : { case: "branches" as const, value: { branches: request.branches } };
+    return named(tree, request, this.client.expand({ node: request.node, read }, { signal }));
   }
 
   async search(text: string, signal?: AbortSignal): Promise<Branch[]> {

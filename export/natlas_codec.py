@@ -1,4 +1,4 @@
-"""What recordings and readers share: runs from weights, and each branch's bytes."""
+"""What recordings and readers share: children from weights, and each branch's bytes."""
 
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ def labels_json(labels: Sequence[bytes]) -> str:
     return json.dumps([base64.b64encode(label).decode() for label in labels])
 
 
-def run(
-    branches: Sequence[int], ln_weights: Sequence[float], ln_rest: float, children: int | None = None
-) -> pb.Run:
+def children(
+    branches: Sequence[int], ln_weights: Sequence[float], ln_rest: float, count: int | None = None
+) -> pb.Children:
     """A node's heaviest children from rank 0, ``ln_rest`` of its mass below
     them, and how many children have weight, where known: each edge summed
     from the light end, so tiny masses survive."""
@@ -26,7 +26,7 @@ def run(
         ln_below.append(_ln_add(ln_below[-1], ln_weight))
     # A whole node is mass 1, whatever rounding made of its sum.
     edges = [min(edge, 0.0) for edge in reversed(ln_below)]
-    return pb.Run(rank=0, branches=branches, ln_below=edges, children=children)
+    return pb.Children(runs=[pb.Run(rank=0, branches=branches, ln_below=edges)], count=count)
 
 
 def _ln_add(a: float, b: float) -> float:

@@ -1,7 +1,7 @@
 import { expect, it } from "bun:test";
 import { type Camera, layout } from "../src/core/layout";
 import { IntervalTree, ROOT } from "../src/core/tree";
-import { run } from "./build";
+import { answer } from "./build";
 
 const view = { width: 1000, height: 800 };
 const lens = { p: 0, q: 1 };
@@ -17,9 +17,9 @@ it("opens a deep node on its own: its frame asks for it and then its children, n
     } finally { frame.dispose(); }
   };
   expect(asked()).toEqual(["3000:0"]);
-  tree.insert(origin, 0, run([0.75, 0.25]));
+  tree.insert(origin, 0, answer([0.75, 0.25]));
   // Until q says how wide the children are, they reach past the view.
   expect(asked()).toEqual(["3000:1"]);
-  tree.insert(origin, 1, run([0.5, 0.5]));
+  tree.insert(origin, 1, answer([0.5, 0.5]));
   expect(asked()).toEqual(["3001:0", "3001:0"]);
 });

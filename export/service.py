@@ -89,22 +89,23 @@ class Model:
 
     def expand(
         self, measure: int, request: pb.ExpandRequest, canceled: threading.Event
-    ) -> Iterator[pb.Run]:
-        """The protocol's Expand: one run per node, computing each
+    ) -> Iterator[pb.Children]:
+        """The protocol's Expand: one message per node, computing each
         distribution the walk needs as it gets there.
 
         Raises KeyError, before yielding, when this server has not learned the
-        request's node, and ValueError for an empty window. Stops early once
-        ``canceled`` is set.
+        request's node. Stops early once ``canceled`` is set.
         """
-        node, horizon = request.node, request.horizon
+        node = request.node
         path = list(request.path.branches)
         with self.names:
-            if request.WhichOneof("target") == "window":
-                window = request.window
-                walk = self.tree.start_window(node, window.ln_top, window.ln_bottom, horizon)
-            else:
-                walk = self.tree.start_path(node, path, horizon)
+            match request.WhichOneof("read"):
+                case "path":
+                    walk = self.tree.start_path(node, path)
+                case "points":
+                    walk = self.tree.start_points(node, list(request.points.ln_below))
+                case _:
+                    walk = self.tree.start_branches(node, list(request.branches.branches))
             # A path is known ahead, so the model reads it in one pass.
             ahead = tuple(self.tree.path(node)) + tuple(path)
         started = time.perf_counter()
@@ -119,11 +120,14 @@ class Model:
                     step = self.tree.advance(walk, measure)
                 if step is None:
                     break
-                if step[0] == "run":
-                    _, used, rank, branches, ln_below, children = step
+                if step[0] == "children":
+                    _, used, runs, count = step
                     if used in recent:
                         recent.move_to_end(used)
-                    yield pb.Run(rank=rank, branches=branches, ln_below=ln_below, children=children)
+                    yield pb.Children(
+                        runs=[pb.Run(rank=rank, branches=branches, ln_below=ln_below) for rank, branches, ln_below in runs],
+                        count=count,
+                    )
                     continue
                 missing = step[1]
                 with self.names:
@@ -147,7 +151,7 @@ class Model:
                         self.tree.forget(forgotten, measure)
         elapsed = (time.perf_counter() - started) * 1000
         print(
-            f"expand m{measure} depth {len(ahead)} horizon {horizon}: {computed} computed, {elapsed:.0f} ms",
+            f"expand m{measure} depth {len(ahead)} {request.WhichOneof('read')}: {computed} computed, {elapsed:.0f} ms",
             file=sys.stderr,
         )
 
@@ -211,23 +215,22 @@ def app(
                 return _stream(
                     [_end({"code": "invalid_argument", "message": str(error)})]
                 )
-            target = request_message.WhichOneof("target")
-            window = request_message.window
-            # NaN fails both comparisons.
-            if target is None or (target == "window" and not window.ln_bottom < window.ln_top <= 0):
+            read = request_message.WhichOneof("read")
+            # NaN fails the comparison.
+            if read is None or (read == "points" and not all(point <= 0 for point in request_message.points.ln_below)):
                 return _stream(
-                    [_end({"code": "invalid_argument", "message": "an Expand needs a path or a nonempty window"})]
+                    [_end({"code": "invalid_argument", "message": "an Expand needs a path, points of mass, or branches"})]
                 )
             # The walk runs on its own thread, holding the model for its whole
-            # length, and hands each run over as it is listed. A client that
+            # length, and hands each node's children over as it places them. A client that
             # hangs up stops it at the next node.
             items: queue.Queue[bytes | None] = queue.Queue()
             canceled = threading.Event()
 
             def work() -> None:
                 try:
-                    for run in model.expand(measure, request_message, canceled):
-                        items.put(_envelope(0, run.SerializeToString()))
+                    for children in model.expand(measure, request_message, canceled):
+                        items.put(_envelope(0, children.SerializeToString()))
                     items.put(_end())
                 except KeyError as error:
                     items.put(_end({"code": "not_found", "message": error.args[0]}))

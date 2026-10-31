@@ -61,7 +61,7 @@ below a child is at most the number of children below it times its own weight:
 every edge stays exact relative to the children around it, however light they
 are. Each node is laid out from its two edges nearest the anchor, one binary
 search to the first visible child, and children thinner than a pixel join
-area-preserving bands (see `core/src/layout.rs`). The tests pin exact geometry
+bands about a pixel tall (see `core/src/layout.rs`). The tests pin exact geometry
 80 halvings deep and beside children 2^−3000 of their parent.
 
 | input | motion |
@@ -95,52 +95,63 @@ A node's children are ranked heaviest first, ties by increasing branch, and
 known in **runs** of consecutive ranks. A run carries its branches and the ln
 of the mass below each of its edges, summed from the light end so tiny masses
 survive. What lies between runs is a **gap**: its mass is known, its children
-are not. A gap is drawn reaching past any view, and so is a child whose q is
-not yet known.
+are not. A gap is left undrawn, and a child whose q is not yet known reaches
+past any view.
 
 Each server serves one measure through two Connect RPCs:
 
-- `Expand(node, path | window, horizon)` reads the tree below `node` one of
-  two ways, streaming one `Run` per node. Down a **path**, it places each
-  branch, one single-child run per node, then lists the node the path
-  reaches from its heaviest child. Down a **window**, it follows every child
-  that holds all of it, again one single-child run per node, then lists the
-  node where the window spans several children, from the child holding the
-  window's top across it. A listing runs while each child weighs at least
-  2^−horizon of the window or node. A window is ln of the mass below its two
-  edges, (0, −∞) for the whole node, so it addresses a node's deep tail as
-  exactly as its head. Every message but the last is one child, which names
-  the next node. Views read by windows: a child in view is the part of its
-  parent in view, so the server descends into it, and a gap is the part of
-  its node it covers. Flights and restores read by paths, from the deepest
-  node already placed. A window on a node the server has not learned is
-  asked again after a path from the root teaches it.
+- `Expand(node, path | points | branches)` reads the tree below `node` one of
+  three ways, streaming one `Children` message per node: the runs it places
+  there, and how many children the node has where the server knows.
+  - A **path** places each branch, one child per node. Flights and restores
+    read by paths, from the deepest node already placed.
+  - **Points**, each ln of the mass below it, place the children holding
+    them, each once; where all of them fall in one child, that child alone,
+    and the same points within it. Views read by points: a child in view is
+    sampled through its parent, so the server descends into it, and a deep
+    zoom reaches its target in one request. Ln of the mass below reaches a
+    node's deep tail as exactly as its head.
+  - **Branches** place those children of the node: how a view reads q, which
+    is per-branch metadata, for the children p placed.
+
+  Every message but the last places a single child, which names the next
+  node. A request on a node the server has not learned is asked again after
+  a path from the root teaches it.
 - `Search(text)` maps text to its complete path, using the model's tokenizer,
   and teaches the server the ids along it. The browser searches on input and
   opens the result only when it is selected. Music services return
   `unimplemented` for text search.
 
-Comparing p with q means asking both servers about the same nodes. p's ranks
-order and split heights; q is per-branch metadata, asked for down to the view's
-right edge, so any branch q has not listed is wider than the view. Listed
-branches use the same colors whether their children are known yet. Children
-thinner than a pixel merge into borderless, area-preserving bands while
-selection still resolves their individual branches.
+Comparing p with q means asking both servers about the same nodes: p's ranks
+order and split heights, and q is read by branch for the children p places.
+Placed branches use the same colors whether their children are known yet.
+
+Rendering samples rather than fetches every child. A gap is asked for by
+its visible size, two points per pixel, spread evenly through its mass: every
+child wider than half a pixel is placed exactly, and thinner ones are drawn
+with probability proportional to p. Children thinner than a pixel, with the
+gaps between them, are drawn as bands about a pixel tall, borderless
+silhouettes whose width Σ p (−ln q) / Σ p is a Monte Carlo estimate from their
+known children: exact when p = q and the band holds no gap, since children
+sorted by p have nearly equal surprisal side by side. Where gaps remain, the
+estimate's error on screen is about k σ / √n pixels, with k the horizontal
+scale, σ the spread of the band's surprisal and n its known children; a band
+off by more than a pixel asks for more points in its gaps, so horizontal zoom
+alone can ask for more samples. Selection still resolves a band's individual
+children.
 
 Layout reads only what the tree holds and lists what the view lacks as Expand
 requests; the client sends each once, a few at a time, and redraws when an
-answer changes the tree. A request is known by the ranks it lacks, both ends
-of a gap, so a gap an answer splits is asked again; one a source answers with
-nothing is not asked again until something else changes its node. A run
-may also say how many of its node's children have weight; a gap then shows
-how many branches it holds. Recordings converted from listings do not say,
-so their gaps at a node's bottom show only "…".
+answer changes the tree. A request whose answer changed nothing is not asked
+again until something else changes its node. A server may also say how many
+of a node's children have weight; a gap then shows how many branches it
+holds. Recordings converted from listings do not say.
 
-A `Snapshot` records runs per node with its complete path, and answers Expand
-through the same walk a server uses. Recorded search includes listed leaves as
+A `Snapshot` records each node's children with its complete path, and answers
+Expand through the same walk a server uses. Recorded search includes listed leaves as
 well as expanded nodes, and returns an exact match, a completion, or the
 deepest recorded prefix. Text with no recorded match shows an error.
-Recordings of listings, the previous format, convert once, without model
+Recordings of runs, the previous format, convert once, without model
 inference:
 
 ```bash
@@ -148,7 +159,7 @@ uv run scripts/migrate-snapshots.py           # all public/data/*.pb
 uv run scripts/migrate-snapshots.py tree.pb   # selected files
 ```
 
-The converter keeps originals in `public/data/.snapshot-backups/listing/`.
+The converter keeps originals in `public/data/.snapshot-backups/runs/`.
 Regenerating data is also supported.
 
 The browser saves the origin, the smallest known node covering the viewport and
@@ -180,7 +191,7 @@ node, about 24 bytes per vocabulary entry, the 32 most recent per measure) and
 Expand's walk belong to the shared Rust core, which recordings in the browser
 use too; the server computes each distribution the walk reports missing,
 reading a request's path in one pass. A walk holds the model for its whole
-length on a worker thread, sends each run as it is placed or listed, and stops
+length on a worker thread, sends each node's children as it places them, and stops
 when the client hangs up; naming a node never waits on inference. transformers models keep the KV cache of the last path they read and
 walk a path in chunks of positions, whose last bits can differ slightly
 (about 1e-5 in ln p in float32) from a position computed alone.

@@ -27,26 +27,27 @@ package natlas;
 // to chance at 64 bits.
 
 service Natlas {
-  // Reads the tree below a node one of two ways, answering one node at a
-  // time, each message a Run of that node's children:
+  // Reads the tree below a node one of three ways, answering one node at a
+  // time with the children it places there:
   //
-  // - down a path: the starting node and every node down the path, each
-  //   placing the path's next branch alone, then the node the path reaches,
-  //   listed from its heaviest child;
-  // - down a window: every node down through a child that holds all of the
-  //   window, each placing that child alone, then the node where the window
-  //   spans more than one child, listing them across it.
+  // - a path: the starting node and every node down the path, each placing
+  //   the path's next branch;
+  // - points, each ln of the mass below it: the children holding them, and
+  //   where all of them fall in one child, that child alone and the same
+  //   points within it, so a view samples its children and a deep zoom
+  //   reaches them in one request;
+  // - branches: those children of the node, for a measure read only for q.
   //
-  // So every message but the last is a single child, and the next message is
-  // that child's: id(node, its branch). A listing runs while each child
-  // weighs at least 2^-horizon of the window, or of the node; its first
-  // child always.
+  // So every message but the last places a single child, and the next
+  // message is that child's: id(node, its branch). Each child is placed
+  // once, however many points it holds; a point in a part the server does
+  // not know places nothing.
   //
-  // A server may end the stream early at any node, and ends it before a
+  // A server may end the stream early at any node, and ends a path before a
   // branch of weight zero, which has no place. It answers NOT_FOUND when it
   // has not learned the starting node, and the client names it from the
   // root with a path.
-  rpc Expand(ExpandRequest) returns (stream Run);
+  rpc Expand(ExpandRequest) returns (stream Children);
   // The sequence for a text, under the server's text mapping. The server
   // learns the ids along it, so expanding them needs no path.
   rpc Search(SearchRequest) returns (SearchResponse);
@@ -54,25 +55,35 @@ service Natlas {
 
 message ExpandRequest {
   fixed64 node = 1;
-  oneof target {
+  oneof read {
     Path path = 2;
-    Window window = 3;
+    Points points = 3;
+    Branches branches = 4;
   }
-  // In bits.
-  uint32 horizon = 4;
 }
 
-// Branches below a node; none names the node itself.
+// Branches down from a node.
 message Path {
   repeated uint32 branches = 1;
 }
 
-// A part of a node, as ln of the mass below each of its edges: (0, -inf) is
-// the whole node. As exact deep in a node's light tail as at its top. It must
-// not be empty.
-message Window {
-  double ln_top = 1;
-  double ln_bottom = 2;
+// Points of a node, each ln of the mass below it: at most 0, as exact deep
+// in a node's light tail as at its top.
+message Points {
+  repeated double ln_below = 1;
+}
+
+// Branches of one node.
+message Branches {
+  repeated uint32 branches = 1;
+}
+
+// What a source places of one node's children.
+message Children {
+  repeated Run runs = 1;
+  // How many of the node's children have weight, where the source knows:
+  // the rank its last child ends at. A node without children says 0.
+  optional uint32 count = 2;
 }
 
 // Consecutive ranks of a node's children in the measure's order: heaviest
@@ -82,12 +93,8 @@ message Run {
   repeated uint32 branches = 2;
   // ln of the mass at and below each edge, conditional on the node: edge i
   // tops rank `rank + i`, and the last bottoms the run, one more edge than
-  // branches. Summed from the light end, so tiny masses survive. A node
-  // without children answers rank 0, no branches, and the one edge -inf.
+  // branches. Summed from the light end, so tiny masses survive.
   repeated double ln_below = 3;
-  // How many of the node's children have weight, where the source knows:
-  // the rank its last child ends at.
-  optional uint32 children = 4;
 }
 
 message SearchRequest {
@@ -107,5 +114,5 @@ message Snapshot {
 message Recording {
   // Branches from the root.
   repeated uint32 path = 1;
-  Run run = 2;
+  Children children = 3;
 }

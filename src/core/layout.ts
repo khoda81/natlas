@@ -57,20 +57,18 @@ export interface Box {
   y1: number;
 }
 
-/** What a frame lacks, as the Expand request that fills it: the window of
- * ``node`` in view, as ln of the mass below its edges, listed down to
- * ``horizon``. ``target`` is the node whose children are lacking, ``node`` or
- * a child it holds; asking again finds nothing new while its lacking ranks,
- * ``from`` up to ``to`` or its end, stay the same. */
+/** How an Expand reads the tree below its node: down a path, the children
+ * holding points (each ln of the mass below it), or the children along
+ * branches. */
+export type Read = { path: Branch[] } | { points: number[] } | { branches: Branch[] };
+
+/** What a frame lacks, as the Expand request that fills it: ``read`` below
+ * ``node``, filling in ``target``, which is ``node`` or a child it holds. */
 export interface Miss {
   node: NodeId;
   target: NodeId;
   measure: number;
-  from: Rank;
-  to: Rank | null;
-  lnTop: number;
-  lnBottom: number;
-  horizon: number;
+  read: Read;
   /** Visible pixels; larger first. */
   priority: number;
 }

@@ -24,8 +24,13 @@ export interface Run {
   branches: ArrayLike<Branch>;
   /** ln of the mass at and below each edge; one more than branches. */
   lnBelow: ArrayLike<number>;
+}
+
+/** What a source places of one node's children in one answer. */
+export interface Children {
+  runs: readonly Run[];
   /** How many of the node's children have weight, where the source knows. */
-  children?: number;
+  count?: number;
 }
 
 /** A child as a lens sees it within its parent. */
@@ -117,9 +122,21 @@ export class IntervalTree {
 
   revisionOf(id: NodeId): number { return this.revisions.get(id) ?? 0; }
 
-  /** Add a run a source sent. Listeners hear only of runs that changed something. */
-  insert(id: NodeId, measure: number, { rank, branches, lnBelow, children }: Run): void {
-    if (!this.raw.insert(id, measure, rank, Uint32Array.from(branches), Float64Array.from(lnBelow), children)) return;
+  /** Add one answer for a node. Listeners hear only of answers that changed something. */
+  insert(id: NodeId, measure: number, { runs, count }: Children): void {
+    for (const run of runs) {
+      if (run.lnBelow.length !== run.branches.length + 1) throw new Error("a run needs one more edge than branches");
+    }
+    const ranks = Uint32Array.from(runs, (run) => run.rank);
+    const lengths = Uint32Array.from(runs, (run) => run.branches.length);
+    const branches = new Uint32Array(lengths.reduce((sum, length) => sum + length, 0));
+    const lnBelow = new Float64Array(branches.length + runs.length);
+    // Each run's edges follow its branches' offset, one more per run before it.
+    for (let i = 0, at = 0; i < runs.length; at += runs[i]!.branches.length, i++) {
+      branches.set(runs[i]!.branches, at);
+      lnBelow.set(runs[i]!.lnBelow, at + i);
+    }
+    if (!this.raw.insert(id, measure, ranks, lengths, branches, lnBelow, count)) return;
     this.revision++;
     this.revisions.set(id, this.revision);
     for (const listener of this.listeners) listener();

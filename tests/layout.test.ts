@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { type Camera, clamp, extent, layout, pick, reanchor, repair } from "../src/core/layout";
 import { moveDepth, scale } from "../src/ui/camera";
-import { chainTree, run } from "./build";
+import { chainTree, answer } from "./build";
 import { IntervalTree, ROOT } from "../src/core/tree";
 
 const view = { width: 1000, height: 800 };
@@ -15,13 +15,16 @@ describe("layout", () => {
     const frame = layout(tree, lens, cam, view);
     expect(pick(tree, lens, frame, cam, view, 500, 400)).toMatchObject({ box: { node: ROOT }, exact: false });
     expect(pick(tree, lens, frame, cam, view, -1, 400)).toBeNull();
-    expect(frame.misses).toMatchObject([{ node: ROOT, target: ROOT, measure: 0, from: 0, to: null, lnTop: 0, lnBottom: -Infinity }]);
+    // Two points per visible pixel, through the whole root.
+    expect(frame.misses).toMatchObject([{ node: ROOT, target: ROOT, measure: 0, priority: 800 }]);
+    const { read } = frame.misses[0]!;
+    expect("points" in read && read.points.length).toBe(1600);
     expect(frame.cover).toEqual({ node: ROOT, y: 0 });
   });
 
   it("splits heights by p in p's order and sizes widths by -ln q", () => {
     const tree = new IntervalTree(1);
-    tree.insert(ROOT, 0, run([0.5, 0.25, 0.25], [7, 3, 9]));
+    tree.insert(ROOT, 0, answer([0.5, 0.25, 0.25], [7, 3, 9]));
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };
     const near = (value: number) => expect.closeTo(value, 12);
     expect(layout(tree, lens, cam, view).boxes.map((box) => [box.branch, box.y0, box.y1, box.x1 - box.x0])).toEqual([
@@ -33,7 +36,7 @@ describe("layout", () => {
 
   it("counts the branches in a gap where the source says where the node ends", () => {
     const tree = new IntervalTree(1);
-    tree.insert(ROOT, 0, { ...run([0.5, 0.25], [4, 7]), children: 9 });
+    tree.insert(ROOT, 0, { ...answer([0.5, 0.25], [4, 7]), count: 9 });
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };
     const gap = layout(tree, lens, cam, view).boxes.find((box) => box.kind === "gap")!;
     expect([gap.rank, gap.count, gap.x1]).toEqual([2, 7, Infinity]);
@@ -97,7 +100,7 @@ describe("layout", () => {
 
   it("moves the anchor up to what p places", () => {
     const tree = chainTree([0.5, 0.5], [1, 0], 2);
-    tree.insert(ROOT, 1, run([1]));
+    tree.insert(ROOT, 1, answer([1]));
     const deep = tree.descend(ROOT, [1, 0]);
     const cam: Camera = { origin: ROOT, x: 1, k: 100, anchor: at(deep, 1), a: 0.4 };
     repair(tree, { p: 1, q: 1 }, cam);

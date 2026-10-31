@@ -1,12 +1,12 @@
 import { expect, it } from "bun:test";
 import { IntervalTree, ROOT } from "../src/core/tree";
 import { type Camera, layout, pick } from "../src/core/layout";
-import { run } from "./build";
+import { answer } from "./build";
 
 const lens = { p: 0, q: 0 };
 const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: { node: ROOT, rank: 0 }, a: 0 };
 const view = { width: 1234, height: 789 };
-const uniform = (count: number) => run(Array(count).fill(1 / count), undefined, 0, 0);
+const uniform = (count: number) => answer(Array(count).fill(1 / count), undefined, 0, 0);
 
 it("picks single children out of merged bands, and frames reuse buffers without touching live ones", () => {
   const tree = new IntervalTree(1);

@@ -8,7 +8,6 @@
 //! is or deep in its parent's tail.
 
 use std::collections::HashMap;
-use std::f64::consts::LN_2;
 
 use crate::tree::Branch;
 use crate::Result;
@@ -169,49 +168,6 @@ impl Run {
     }
 }
 
-/// A part of a node, in ln of the mass below its edges: (bottom, top].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Window {
-    top: f64,
-    bottom: f64,
-}
-
-impl Window {
-    pub const WHOLE: Window = Window {
-        top: 0.0,
-        bottom: f64::NEG_INFINITY,
-    };
-
-    pub fn new(top: f64, bottom: f64) -> Result<Self> {
-        if top <= 0.0 && bottom < top {
-            Ok(Self { top, bottom })
-        } else {
-            Err(format!("({bottom}, {top}] is no window of a node"))
-        }
-    }
-
-    pub fn top(&self) -> f64 {
-        self.top
-    }
-
-    pub fn bottom(&self) -> f64 {
-        self.bottom
-    }
-}
-
-/// What a source answers for one node of a window's descent.
-#[derive(Debug, PartialEq)]
-pub enum Step {
-    /// One child holds the window: its run, and the window within it.
-    Descend {
-        run: Run,
-        branch: Branch,
-        window: Window,
-    },
-    /// The children across the window.
-    List(Run),
-}
-
 /// One of a node's parts, in order: a known child, or a gap of unknown ones
 /// before the run at `before` (`before == runs.len()` for the node's bottom).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,14 +186,7 @@ pub struct Distribution {
 
 impl Distribution {
     pub fn new(run: Run) -> Self {
-        let rank = (run.rank..)
-            .zip(&run.branches)
-            .map(|(rank, &branch)| (branch, rank))
-            .collect();
-        Self {
-            runs: vec![run],
-            rank,
-        }
+        Self::from_runs(vec![run]).expect("one valid run is a valid distribution")
     }
 
     /// Every branch's ln weight, indexed by branch, as a measure computes it:
@@ -272,80 +221,43 @@ impl Distribution {
         &self.runs
     }
 
-    /// Add what a source said, and whether anything changed. Where it
+    /// Add what a source said of the node in one answer, and whether
+    /// anything changed: its runs, in any order, none overlapping. Where it
     /// contradicts what is known, as a source that changed or recomputed
     /// differently would, it replaces it.
-    pub fn insert(&mut self, run: Run) -> bool {
-        let Some((first, last, merged)) = self.merged(&run) else {
-            let changed = self.runs != std::slice::from_ref(&run);
-            *self = Self::new(run);
-            return changed;
-        };
-        if self.runs[first..last] == *std::slice::from_ref(&merged) {
-            return false;
-        }
-        for (at, &branch) in (merged.rank..).zip(&merged.branches) {
-            self.rank.insert(branch, at);
-        }
-        self.runs.splice(first..last, [merged]);
-        true
+    pub fn insert(&mut self, runs: Vec<Run>) -> Result<bool> {
+        let fresh = coalesce(runs)?;
+        let merged =
+            merge(&self.runs, &fresh).map_or_else(|| Self::from_runs(fresh.clone()), Ok)?;
+        let changed = merged.runs != self.runs;
+        *self = merged;
+        Ok(changed)
     }
 
-    /// The runs [first, last) the new one overlaps or touches, as one run
-    /// with it; `None` where they contradict it.
-    fn merged(&self, run: &Run) -> Option<(usize, usize, Run)> {
-        // Runs overlapping or touching the new one become one run with it.
-        let first = self.runs.partition_point(|old| old.end() < run.rank);
-        let last = self.runs.partition_point(|old| old.rank <= run.end());
-        let near = &self.runs[first..last];
-        let start = near.first().map_or(run.rank, |old| old.rank.min(run.rank));
-        let end = near
-            .last()
-            .map_or(run.end(), |old| old.end().max(run.end()));
-        let mut branches = Vec::with_capacity((end - start) as usize);
-        let mut ln_below = Vec::with_capacity((end - start) as usize + 1);
-        let mut old = near.iter().peekable();
-        for rank in start..=end {
-            while old.next_if(|old| old.end() < rank).is_some() {}
-            let known = old.peek().filter(|old| old.rank <= rank);
-            let new = (run.rank..=run.end()).contains(&rank);
-            ln_below.push(if new {
-                run.ln_below[(rank - run.rank) as usize]
-            } else {
-                known?.ln_below[(rank - known?.rank) as usize]
-            });
-            if rank == end {
-                break;
-            }
-            let was = known
-                .filter(|old| rank < old.end())
-                .map(|old| old.branches[(rank - old.rank) as usize]);
-            let branch = if rank < run.end() && rank >= run.rank {
-                let branch = run.branches[(rank - run.rank) as usize];
-                // A branch keeps its rank, and a rank its branch.
-                if was.is_some_and(|was| was != branch)
-                    || self.rank.get(&branch).is_some_and(|&at| at != rank)
-                {
-                    return None;
+    /// What one answer said of a node, as all that is known of it.
+    pub fn from_answer(runs: Vec<Run>) -> Result<Self> {
+        Self::from_runs(coalesce(runs)?)
+    }
+
+    /// Runs disjoint by rank, two neighbours with a gap between them.
+    fn from_runs(runs: Vec<Run>) -> Result<Self> {
+        let mut rank = HashMap::new();
+        for run in &runs {
+            for (at, &branch) in (run.rank..).zip(&run.branches) {
+                if rank.insert(branch, at).is_some() {
+                    return Err(format!("branch {branch} is placed twice"));
                 }
-                branch
-            } else {
-                was?
-            };
-            branches.push(branch);
+            }
         }
-        let merged = Run::new(start, branches, ln_below).ok()?;
         // A gap holds what its neighbours leave: never a negative mass.
-        let above = first.checked_sub(1).is_some_and(|before| {
-            self.runs[before].ln_below[self.runs[before].len()] < merged.ln_below[0]
-        });
-        let below = self
-            .runs
-            .get(last)
-            .is_some_and(|after| merged.ln_below[merged.len()] < after.ln_below[0]);
-        (!above && !below).then_some((first, last, merged))
+        if runs
+            .windows(2)
+            .any(|pair| pair[0].ln_below[pair[0].len()] < pair[1].ln_below[0])
+        {
+            return Err("runs overlap in mass".into());
+        }
+        Ok(Self { runs, rank })
     }
-
     pub fn rank(&self, branch: Branch) -> Option<Rank> {
         self.rank.get(&branch).copied()
     }
@@ -397,17 +309,6 @@ impl Distribution {
         self.complete() && self.runs[0].is_empty()
     }
 
-    /// Whether the run from rank 0 lists every child at least `e^ln_weight` heavy.
-    pub fn covers(&self, ln_weight: f64) -> bool {
-        match self.runs.first() {
-            Some(run) if run.rank == 0 => {
-                run.ln_below[run.len()] == f64::NEG_INFINITY
-                    || (!run.is_empty() && run.ln_p(run.len() - 1) <= ln_weight)
-            }
-            _ => false,
-        }
-    }
-
     pub fn gap_exists(&self, before: usize) -> bool {
         match before {
             0 => self.runs.first().is_none_or(|run| run.rank > 0),
@@ -451,15 +352,6 @@ impl Distribution {
             Item::Child { run, at } => Some(self.runs[run].rank + at as Rank + 1),
             Item::Gap { before } => self.runs.get(before).map(|run| run.rank),
         }
-    }
-
-    /// The heaviest a child in a gap can be: as heavy as the child above it.
-    pub fn gap_ceiling(&self, before: usize) -> f64 {
-        before
-            .checked_sub(1)
-            .map(|run| &self.runs[run])
-            .filter(|run| !run.is_empty())
-            .map_or(0.0, |run| run.ln_p(run.len() - 1))
     }
 
     /// The item after `item`, if any. Two runs always have a gap between them.
@@ -518,70 +410,156 @@ impl Distribution {
         Some(self.runs[run].slice(at, at + 1))
     }
 
-    /// The known children across `window`, from the one holding its top,
-    /// down while each weighs at least 2^-horizon of the window (the first
-    /// always), and only as far as they are known without a gap.
-    pub fn list(&self, window: Window, horizon: u32) -> Option<Run> {
-        let (run, at) = self.first_in(window)?;
-        let found = &self.runs[run];
-        let floor = ln_between(window.top, window.bottom) - f64::from(horizon) * LN_2;
-        let mut end = at + 1;
-        while end < found.len() && found.ln_below[end] > window.bottom && found.ln_p(end) >= floor {
-            end += 1;
+    /// The known children holding `points`, each ln of the mass below it,
+    /// once each and by rank, and whether every point found one: a point in
+    /// a gap holds no known child.
+    pub fn children_at(&self, points: &[f64]) -> (Vec<(usize, usize)>, bool) {
+        let mut found = Vec::with_capacity(points.len());
+        let mut all = true;
+        for &point in points {
+            match self.locate(point) {
+                Some(Item::Child { run, at })
+                    if point <= self.runs[run].ln_below[at]
+                        && self.runs[run].ln_below[at + 1] < point =>
+                {
+                    found.push((run, at));
+                }
+                _ => all = false,
+            }
         }
-        Some(found.slice(at, end))
+        found.sort_unstable();
+        found.dedup();
+        (found, all)
     }
 
-    /// The known child holding the window's top, or the first known one
-    /// below it within the window.
-    fn first_in(&self, window: Window) -> Option<(usize, usize)> {
-        let run = self
-            .runs
-            .partition_point(|run| run.ln_below[run.len()] >= window.top);
-        let found = self.runs.get(run)?;
-        if found.is_empty() || found.ln_below[0] <= window.bottom {
-            return None;
+    /// Known children as runs: those consecutive in one run joined.
+    pub fn runs_of(&self, children: &[(usize, usize)]) -> Vec<Run> {
+        let mut runs = Vec::new();
+        let mut start = 0;
+        for i in 1..=children.len() {
+            let joined = children.get(i).is_some_and(|&(run, at)| {
+                let (last_run, last_at) = children[i - 1];
+                run == last_run && at == last_at + 1
+            });
+            if !joined {
+                let (run, at) = children[start];
+                runs.push(self.runs[run].slice(at, children[i - 1].1 + 1));
+                start = i;
+            }
         }
-        Some((run, found.holding(window.top)))
+        runs
     }
 
-    /// One node of a window's descent: into the child holding all of a
-    /// window narrower than the node, or else the children across it.
-    pub fn step(&self, window: Window, horizon: u32) -> Option<Step> {
-        let (run, at) = self.first_in(window)?;
-        let found = &self.runs[run];
-        let (top, bottom) = (found.ln_below[at], found.ln_below[at + 1]);
-        let whole = window.top == 0.0 && window.bottom == f64::NEG_INFINITY;
-        if whole || top < window.top || bottom > window.bottom {
-            return self.list(window, horizon).map(Step::List);
-        }
-        // Rescale the window into the child: mass below an edge, relative to
-        // the child's own.
-        let ln_p = found.ln_p(at);
-        let within = |edge: f64| {
-            if edge >= top {
-                0.0
-            } else if edge <= bottom {
-                f64::NEG_INFINITY
-            } else {
-                (ln_between(edge, bottom) - ln_p).min(0.0)
-            }
-        };
-        let (child_top, child_bottom) = (within(window.top), within(window.bottom));
-        let window = if child_bottom < child_top {
-            Window {
-                top: child_top,
-                bottom: child_bottom,
-            }
+    /// A point of the node, as ln of the mass below it, within the child at
+    /// `(run, at)` holding it.
+    pub fn within(&self, (run, at): (usize, usize), point: f64) -> f64 {
+        let run = &self.runs[run];
+        let (top, bottom) = (run.ln_below[at], run.ln_below[at + 1]);
+        if top <= point {
+            0.0
+        } else if point <= bottom {
+            f64::NEG_INFINITY
         } else {
-            // Narrower than a float can tell apart within the child.
-            return self.list(window, horizon).map(Step::List);
+            (ln_between(point, bottom) - run.ln_p(at)).min(0.0)
+        }
+    }
+}
+
+/// One answer's runs as disjoint runs by rank, those that touch joined.
+fn coalesce(mut runs: Vec<Run>) -> Result<Vec<Run>> {
+    runs.sort_by_key(|run| run.rank);
+    let mut joined: Vec<Builder> = Vec::with_capacity(runs.len());
+    for run in &runs {
+        match joined.last_mut() {
+            Some(last) if run.rank < last.end() => {
+                return Err("an answer places a rank twice".into());
+            }
+            Some(last) if run.rank == last.end() => {
+                last.add(run, true).ok_or("an answer contradicts itself")?
+            }
+            _ => joined.push(Builder::new(run, true)),
+        }
+    }
+    joined.into_iter().map(Builder::finish).collect()
+}
+
+/// `fresh` runs over `old` ones, those that overlap or touch joined, the
+/// fresh edges kept where both have one; `None` where they contradict.
+fn merge(old: &[Run], fresh: &[Run]) -> Option<Distribution> {
+    let mut old = old.iter().peekable();
+    let mut fresh = fresh.iter().peekable();
+    let mut joined: Vec<Builder> = Vec::new();
+    loop {
+        let take_old = match (old.peek(), fresh.peek()) {
+            (Some(a), Some(b)) => a.rank <= b.rank,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
         };
-        Some(Step::Descend {
-            run: found.slice(at, at + 1),
-            branch: found.branches[at],
-            window,
-        })
+        let run = if take_old { old.next() } else { fresh.next() }.expect("peeked");
+        match joined.last_mut() {
+            Some(last) if run.rank <= last.end() => last.add(run, !take_old)?,
+            _ => joined.push(Builder::new(run, !take_old)),
+        }
+    }
+    let runs = joined
+        .into_iter()
+        .map(Builder::finish)
+        .collect::<Result<_>>()
+        .ok()?;
+    Distribution::from_runs(runs).ok()
+}
+
+/// A run being joined from others: each edge remembers whether a fresh
+/// answer gave it, so an older one never overwrites it.
+struct Builder {
+    rank: Rank,
+    branches: Vec<Branch>,
+    ln_below: Vec<f64>,
+    fresh: Vec<bool>,
+}
+
+impl Builder {
+    fn new(run: &Run, fresh: bool) -> Self {
+        Self {
+            rank: run.rank,
+            branches: run.branches.clone(),
+            ln_below: run.ln_below.clone(),
+            fresh: vec![fresh; run.ln_below.len()],
+        }
+    }
+
+    fn end(&self) -> Rank {
+        self.rank + self.branches.len() as Rank
+    }
+
+    /// Join a run starting at or before this one's end; `None` where a rank
+    /// names another branch.
+    fn add(&mut self, run: &Run, fresh: bool) -> Option<()> {
+        for (i, &edge) in run.ln_below.iter().enumerate() {
+            let at = (run.rank - self.rank) as usize + i;
+            if at < self.ln_below.len() {
+                if fresh || !self.fresh[at] {
+                    self.ln_below[at] = edge;
+                    self.fresh[at] |= fresh;
+                }
+            } else {
+                self.ln_below.push(edge);
+                self.fresh.push(fresh);
+            }
+            if let Some(&branch) = run.branches.get(i) {
+                match self.branches.get(at) {
+                    Some(&known) if known != branch => return None,
+                    Some(_) => {}
+                    None => self.branches.push(branch),
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn finish(self) -> Result<Run> {
+        Run::new(self.rank, self.branches, self.ln_below)
     }
 }
 
@@ -635,7 +613,6 @@ mod tests {
         // The lightest child keeps its own weight, far below any float of 1 − cdf.
         close(run.ln_p(4), tiny.ln() - 1.2f64.ln());
         assert_eq!(*run.ln_below().last().unwrap(), f64::NEG_INFINITY);
-        assert!(d.covers(-1000.0));
         assert!(Distribution::from_weights(&[]).unwrap().ended());
         assert!(Distribution::from_weights(&[f64::NAN]).is_err());
     }
@@ -654,27 +631,26 @@ mod tests {
             )
         };
         let mut d = Distribution::new(piece(0, 2));
-        d.insert(piece(4, 5));
+        d.insert(vec![piece(4, 5)]).unwrap();
         assert_eq!(d.runs().len(), 2);
         assert!(d.gap_exists(1) && d.gap_exists(2) && !d.gap_exists(0));
         assert_eq!(d.rank(14), Some(4));
-        close(d.gap_ceiling(1), 0.2f64.ln());
         // Touching on both sides joins all three.
-        d.insert(piece(2, 4));
+        d.insert(vec![piece(2, 4)]).unwrap();
         assert_eq!(d.runs().len(), 1);
         assert_eq!(d.runs()[0].branches(), &whole.branches()[..5]);
-        d.insert(piece(5, 7));
+        d.insert(vec![piece(5, 7)]).unwrap();
         assert_eq!(d.runs().len(), 1);
         assert!(!d.gap_exists(1));
         close(d.runs()[0].ln_p(6), 0.05f64.ln());
         // A rank that names another branch: the source changed, start over.
-        d.insert(run(3, &[99], &[0.1], 0.2));
+        d.insert(vec![run(3, &[99], &[0.1], 0.2)]).unwrap();
         assert_eq!(d.runs().len(), 1);
         assert_eq!(d.rank(10), None);
         assert_eq!(d.rank(99), Some(3));
         // So does a branch at another rank.
         let mut d = Distribution::new(piece(0, 2));
-        d.insert(run(5, &[10], &[0.05], 0.05));
+        d.insert(vec![run(5, &[10], &[0.05], 0.05)]).unwrap();
         assert_eq!(d.rank(10), Some(5));
         assert_eq!(d.runs().len(), 1);
     }
@@ -682,7 +658,7 @@ mod tests {
     #[test]
     fn items_walk_children_and_gaps_in_order() {
         let mut d = Distribution::new(run(0, &[7, 8], &[0.5, 0.25], 0.25));
-        d.insert(run(5, &[9], &[0.01], 0.02));
+        d.insert(vec![run(5, &[9], &[0.01], 0.02)]).unwrap();
         let mut items = vec![];
         let mut item = d.locate(0.0);
         while let Some(found) = item {
@@ -712,7 +688,7 @@ mod tests {
         // The node's end, as an empty run, bounds the bottom gap and counts it.
         let mut ending = Distribution::new(run(0, &[7, 8], &[0.5, 0.25], 0.25));
         assert_eq!(ending.count(), None);
-        ending.insert(Run::end_at(9));
+        ending.insert(vec![Run::end_at(9)]).unwrap();
         assert_eq!(ending.count(), Some(9));
         assert_eq!(ending.item_end(Item::Gap { before: 1 }), Some(9));
         assert_eq!(ending.next(Item::Gap { before: 1 }), None);
@@ -724,31 +700,31 @@ mod tests {
     }
 
     #[test]
-    fn windows_list_down_to_the_horizon_or_descend_into_one_child() {
-        let d = Distribution::from_weights(&[0.5f64.ln(), 0.3f64.ln(), 0.15f64.ln(), 0.05f64.ln()])
-            .unwrap();
-        let listed = d.list(Window::WHOLE, 2).unwrap();
-        assert_eq!(listed.branches(), [0, 1]);
-        assert_eq!(d.list(Window::WHOLE, 0).unwrap().branches(), [0]);
-        // Within the window only: (0.05, 0.4] starts inside branch 1.
-        let window = Window::new(0.4f64.ln(), 0.05f64.ln()).unwrap();
-        assert_eq!(d.list(window, 30).unwrap().branches(), [1, 2]);
-        assert!(matches!(d.step(window, 30), Some(Step::List(_))));
-        // (0.3, 0.45] lies in branch 1's (0.2, 0.5]: half of it, the upper half.
-        let inside = Window::new(0.45f64.ln(), 0.3f64.ln()).unwrap();
-        let Some(Step::Descend {
-            run,
-            branch,
-            window,
-        }) = d.step(inside, 30)
-        else {
-            panic!("a window inside one child descends");
-        };
-        assert_eq!((branch, run.rank(), run.branches()), (1, 1, &[1][..]));
-        close(window.top(), (0.25f64 / 0.3).ln());
-        close(window.bottom(), (0.1f64 / 0.3).ln());
-        assert!(matches!(d.step(Window::WHOLE, 30), Some(Step::List(_))));
-        assert_eq!(d.place(2).unwrap().rank(), 2);
-        assert_eq!(d.place(9), None);
+    fn points_find_the_children_holding_them_once_each() {
+        let mut d = Distribution::new(run(0, &[3, 4], &[0.5, 0.3], 0.2));
+        d.insert(vec![run(4, &[8], &[0.05], 0.05)]).unwrap();
+        // 0.9 and 0.6 lie in branch 3, 0.4 in branch 4, 0.15 in a gap, 0.07 in branch 8.
+        let points = [0.9f64, 0.6, 0.4, 0.15, 0.07].map(f64::ln);
+        let (children, all) = d.children_at(&points);
+        assert_eq!(children, [(0, 0), (0, 1), (1, 0)]);
+        assert!(!all);
+        let runs = d.runs_of(&children);
+        assert_eq!(
+            runs.iter()
+                .map(|run| (run.rank(), run.branches().to_vec()))
+                .collect::<Vec<_>>(),
+            [(0, vec![3, 4]), (4, vec![8])]
+        );
+        // 0.6 lies 0.1 into branch 3's (0.5, 1]: a fifth of it from its bottom.
+        close(d.within((0, 0), 0.6f64.ln()), 0.2f64.ln());
+        assert_eq!(d.within((0, 0), 0.0), 0.0);
+        assert_eq!(d.within((0, 0), 0.5f64.ln()), f64::NEG_INFINITY);
+        // An answer that places one rank twice is refused, and one that
+        // contradicts what is known replaces it.
+        assert!(d
+            .insert(vec![run(0, &[3], &[0.5], 0.5), run(0, &[3], &[0.5], 0.5)])
+            .is_err());
+        assert!(d.insert(vec![run(1, &[9], &[0.3], 0.2)]).unwrap());
+        assert_eq!((d.rank(3), d.rank(9)), (None, Some(1)));
     }
 }

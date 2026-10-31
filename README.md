@@ -40,14 +40,19 @@ slot otherwise, red where q under-weights it.
 ## The canvas
 
 Depth is unbounded, horizontal scale is unbounded (it is the base of the log),
-and vertically the view never leaves its **origin**'s interval. The origin is
-the root unless you open a text, which makes its node the origin: it stands as
-the root does, and nothing above it is fetched, so opening is immediate however
-long the text. The view height is coupled to depth below the origin: with the
+and the view is measured from an **origin** node, the root unless a text was
+opened without its ancestors. The view height is coupled to depth: with the
 left edge at x nats the view spans e^−x of the origin, so a node at the left
 edge keeps the same screen height however deep it is. Scrolling deeper is
 therefore also zooming in. With p ≠ q the picture depends on the origin, since
 x counts q-surprisal while the height follows p.
+
+Opening a text flies there: the servers walk its path and send each node's
+listing as they compute it, and the camera descends along the nodes placed so
+far, a bar along the top showing how far. Only the root bounds the view. Past
+any other origin, left, above or below, lies its parent, which is fetched as
+soon as the view goes there; until it arrives that space stays empty, and then
+the parent becomes the origin without moving the picture (with p = q).
 
 Absolute vertical coordinates would lose precision a few dozen nats deep, so
 the camera is anchored to a nearby slot boundary instead, and every position is
@@ -62,7 +67,7 @@ exact geometry 80 halvings deep.
 | ctrl + wheel, pinch, + − | horizontal scale, about the left edge, leaving the vertical view alone |
 | double-click | glide until a box stands like the root, its children filling the view |
 | hover | select a branch by height, then depth; empty space keeps the deepest known subtree selected |
-| top path inspector | click the displayed text to edit and search; select a result or press Enter to open it as the origin |
+| top path inspector | click the displayed text to edit and search; select a result or press Enter to fly there |
 | 0 · s · b | back to the root as origin · swap p and q · nats/bits |
 
 ## Protocol
@@ -84,13 +89,17 @@ inside the core are local and never go over the wire.
 
 Each server serves one measure through two Connect RPCs:
 
-- `Expand(node, path, horizon)` streams `Listing { branches, ln_weights,
-  ln_leftover }` batches, heaviest first, down to conditional probability
-  2^−horizon. Weights are exact natural log probabilities, the same at every
-  horizon; `ln_leftover` is the log weight of everything after the batch,
-  summed from the light end so tiny remainders survive, and −∞ once the listing
-  covers the node, as for a node with no children. Every stream prefix is a
-  valid listing. Horizon 0 lists nothing.
+- `Expand(node, path, horizon)` streams one `Listing { branches, ln_weights,
+  ln_leftover }` per node along `path` below `node`, ending with the node the
+  path names (an empty path names `node` itself). Each lists its children
+  heaviest first, down to conditional probability 2^−horizon and at least
+  through the path's next branch, so the client can place the next node; the
+  n-th message is the node n branches down. Discovery asks for one node, by its
+  parent's id and one branch; opening a text walks from the deepest node the
+  client can already place. Weights are exact natural log probabilities, the
+  same at every horizon, and `ln_leftover` is the log weight of everything not
+  listed, summed directly so tiny remainders survive: −∞ once the listing
+  covers the node, as for a node with no children.
 - `Search(text)` maps text to its complete path, using the model's tokenizer,
   and teaches the server the ids along it. The browser searches on input and
   opens the result only when it is selected. Music services return
@@ -120,9 +129,8 @@ Regenerating data is also supported.
 The browser saves the origin, the smallest known node covering the viewport and
 the camera position below it, horizontal scale and p/q measures to local
 storage. Keys include source URLs (or dropped file contents). Reload opens the
-origin at once and reaches the covering node on demand; if a recording no
-longer reaches it, the view stands at its deepest available ancestor. A server
-does not choose the initial tree or send a starting prompt.
+origin at once and walks down to the covering node. A server does not choose
+the initial tree or send a starting prompt.
 
 ## Live
 
@@ -139,13 +147,16 @@ the Connect protocol. The root is the empty text; the start-of-text token is
 internal to the model. `/manifest.json` describes the measures and
 `/labels.json` holds each token's bytes. With `bun run dev` running, the page
 finds a local server and lists it first; `?server=URL` points it elsewhere.
-Edit the text in the top path inspector and select a result to start there.
+Edit the text in the top path inspector and select a result to fly there.
 
-`export/service.py` owns the model-independent RPC handlers and the bounded
-LRU policy for complete model distributions. Both language and music servers
-store those distributions in the native Rust tree and encode responses with
-the same Rust codec as the browser. The model runs on worker threads with a
-lock protecting inference and cache updates.
+`export/service.py` owns the model-independent RPC handlers, node naming
+through the shared Rust core, and a bounded LRU of complete distributions,
+which it cuts per request on the server without sorting the vocabulary. A walk
+holds the model for its whole length on a worker thread, sends each listing as
+it is cut, and stops when the client hangs up; naming a node never waits on
+inference. transformers models keep the KV cache of the last path they read and
+walk a path in chunks of positions, whose last bits can differ slightly
+(about 1e-5 in ln p in float32) from a position computed alone.
 
 Models load in float32 by default, which is both more precise and, on a GTX
 1660 Ti, about 5× faster than float16; `--dtype` trades that for memory on
@@ -230,8 +241,9 @@ tokenizer, `context:N` (p seeing only its last N tokens) or `temperature:T`.
 
 The source is split by responsibility:
 
-- `core/`: Rust tree, cached listings and derived slots, shared wire codec,
-  anchored geometry, best-effort picking and covering-anchor queries.
+- `core/`: Rust tree, hashed node ids, cached listings and derived slots,
+  recorded-listing cuts, anchored geometry, best-effort picking and
+  covering-anchor queries.
 - `src/core/`: thin TypeScript adapters to that core, compiled to WebAssembly.
 - `src/data/`: live/recorded sources, dataset loading and completion-driven
   expansion scheduling.
@@ -261,7 +273,7 @@ For faster targeted checks after the core has been built:
 ```bash
 bun test
 cargo test --manifest-path core/Cargo.toml
-uv run tests/server_test.py   # native cache, codec, transport and migration
+uv run tests/server_test.py   # node naming, cuts, walks, transport and migration
 ```
 
 The Python tests use deterministic distributions and load no model. For manual

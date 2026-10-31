@@ -31,6 +31,7 @@ import sys
 from pathlib import Path
 
 import lm
+import numpy as np
 from natlas_export import snapshots, write
 from natwalk import Session
 
@@ -96,12 +97,12 @@ def main() -> None:
 
     def weights(measure: lm.Measure):
         def at(node_id: int) -> list[float]:
-            return measure.log_probs(root + prompt + tree.path(node_id)).exp().tolist()
+            return np.exp(measure.log_probs(root + prompt + tree.path(node_id))).tolist()
 
         return at
 
     def along(measure: lm.Measure):
-        return lambda path: measure.log_probs(root + tuple(path)).exp().tolist()
+        return lambda path: np.exp(measure.log_probs(root + tuple(path))).tolist()
 
     print(f"evaluating {', '.join(specs)} on the discovered tree …", file=sys.stderr)
     measures = lm.measures(language, specs, lambda spec: lm.open_language(spec, device, args.dtype))

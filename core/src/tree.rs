@@ -53,37 +53,6 @@ impl Listing {
         }
         Ok(())
     }
-
-    /// The branches at least 2^-horizon heavy in batches of `size`, each with
-    /// the log weight of everything after it. Remainders are summed from the
-    /// light end so that tiny ones are not lost to cancellation against 1.
-    pub fn batches(&self, horizon: u32, size: usize) -> Vec<(std::ops::Range<usize>, f64)> {
-        let threshold = -f64::from(horizon) * std::f64::consts::LN_2;
-        let end = if horizon == 0 {
-            0
-        } else {
-            self.ln_weights
-                .partition_point(|&weight| weight >= threshold)
-        };
-        if end == 0 {
-            // Nothing listed leaves the whole interval.
-            return vec![(0..0, 0.0)];
-        }
-        let mut remaining = self.leftover.ln();
-        let mut summed = self.ln_weights.len();
-        let batches = end.div_ceil(size);
-        let mut result = Vec::with_capacity(batches);
-        for i in (0..batches).rev() {
-            let stop = ((i + 1) * size).min(end);
-            while summed > stop {
-                summed -= 1;
-                remaining = ln_add(remaining, self.ln_weights[summed]);
-            }
-            result.push((i * size..stop, remaining));
-        }
-        result.reverse();
-        result
-    }
 }
 
 fn ln_add(a: f64, b: f64) -> f64 {
@@ -576,6 +545,50 @@ impl Tree {
         Ok(())
     }
 
+    /// What a source answers from this node's listing to a request at
+    /// `horizon` bits that must also place `through`: every child at least
+    /// 2^-horizon heavy, at least through `through`, and every child as heavy
+    /// as the last listed one. The leftover is summed from the light end so
+    /// tiny ones survive, and it vouches for no more than the listing does.
+    /// `None` without a listing.
+    pub fn cut(
+        &self,
+        id: NodeId,
+        measure: usize,
+        horizon: u32,
+        through: Option<Branch>,
+    ) -> Result<Option<Listing>> {
+        self.check_measure(measure)?;
+        let Some(known) = self.node(id)?.listings[measure].as_deref() else {
+            return Ok(None);
+        };
+        let weights = &known.listing.ln_weights;
+        let mut threshold = if horizon == 0 {
+            f64::INFINITY
+        } else {
+            -f64::from(horizon) * std::f64::consts::LN_2
+        };
+        if let Some(slot) = through.and_then(|branch| known.index.get(branch)) {
+            threshold = threshold.min(weights[slot]);
+        }
+        let end = weights.partition_point(|&weight| weight >= threshold);
+        let mut leftover = known.listing.leftover.ln();
+        for &weight in weights[end..].iter().rev() {
+            leftover = ln_add(leftover, weight);
+        }
+        let vouched = match end {
+            0 => f64::from(horizon),
+            _ => f64::from(horizon).max(-weights[end - 1] / std::f64::consts::LN_2),
+        };
+        Ok(Some(Listing {
+            horizon: f64::from(horizon),
+            branches: known.listing.branches[..end].to_vec(),
+            ln_weights: weights[..end].to_vec(),
+            leftover: leftover.exp(),
+            complete: vouched.min(known.listing.complete),
+        }))
+    }
+
     pub fn slots(&self, id: NodeId, lens: Lens) -> Result<Arc<Slots>> {
         self.check_measure(lens.p)?;
         self.check_measure(lens.q)?;
@@ -725,23 +738,38 @@ mod tests {
     }
 
     #[test]
-    fn batches_cut_at_the_horizon_and_carry_exact_remainders() {
+    fn cuts_list_down_to_the_horizon_and_through_a_branch() {
         let tiny = 1e-30f64;
-        let full = Listing {
-            horizon: f64::INFINITY,
-            branches: vec![4, 1, 2, 3],
-            ln_weights: vec![(1.0 - 3.0 * tiny).ln(), tiny.ln(), tiny.ln(), tiny.ln()],
-            leftover: 0.0,
-            complete: f64::INFINITY,
-        };
-        assert_eq!(full.batches(0, 2), [(0..0, 0.0)]);
-        let one = full.batches(8, 2);
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0].0, 0..1);
-        assert!((one[0].1 - (3.0 * tiny).ln()).abs() < 1e-12);
-        let all = full.batches(200, 3);
-        assert_eq!(all[0].0, 0..3);
-        assert!((all[0].1 - tiny.ln()).abs() < 1e-12);
-        assert_eq!(all[1], (3..4, f64::NEG_INFINITY));
+        let mut tree = Tree::new(1);
+        tree.set_listing(
+            0,
+            0,
+            Listing {
+                horizon: 100.0,
+                branches: vec![4, 1, 2, 3],
+                ln_weights: vec![(1.0 - 3.0 * tiny).ln(), tiny.ln(), tiny.ln(), tiny.ln()],
+                leftover: 0.0,
+                complete: 100.0,
+            },
+        )
+        .unwrap();
+        let cut = |horizon, through| tree.cut(0, 0, horizon, through).unwrap().unwrap();
+        let none = cut(0, None);
+        assert!(none.branches.is_empty());
+        assert!((none.leftover - 1.0).abs() < 1e-15);
+        assert_eq!(none.complete, 0.0);
+        let one = cut(8, None);
+        assert_eq!(one.branches, [4]);
+        assert!((one.leftover / (3.0 * tiny) - 1.0).abs() < 1e-12);
+        assert_eq!(one.complete, 8.0);
+        // Through a light branch: its ties come along, and coverage reaches it.
+        let through = cut(8, Some(2));
+        assert_eq!(through.branches, [4, 1, 2, 3]);
+        assert_eq!(through.leftover, 0.0);
+        assert_eq!(through.complete, -tiny.ln() / std::f64::consts::LN_2);
+        // A branch the listing does not have places nothing more.
+        assert_eq!(cut(8, Some(9)).branches, [4]);
+        assert!(tree.cut(0, 0, 8, None).unwrap().is_some());
+        assert!(Tree::new(1).cut(0, 0, 8, None).unwrap().is_none());
     }
 }

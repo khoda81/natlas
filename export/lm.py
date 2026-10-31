@@ -1,7 +1,8 @@
 """Language-model measures, shared by the exporter and the server.
 
 A measure is a model's next-token log-probabilities over the whole
-vocabulary, given the tokens so far. Besides the model itself, a measure spec
+vocabulary, given the tokens so far, as a float64 numpy array; walking a path
+gives them after every prefix in turn. Besides the model itself, a measure spec
 names another model sharing its tokenizer, ``context:N`` for the model seeing
 only the last N tokens, or ``temperature:T`` for the model at temperature T.
 
@@ -13,7 +14,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -22,13 +23,28 @@ import numpy as np
 import torch
 from errors import TooLong
 
-type LogProbs = Callable[[Sequence[int]], torch.Tensor]
+type LogProbs = Callable[[Sequence[int]], np.ndarray]
+# The log-probabilities after tokens[:k] for every k from start through
+# len(tokens), in order.
+type Walk = Callable[[Sequence[int], int], Iterator[np.ndarray]]
 
 
 @dataclass(frozen=True)
 class Measure:
     name: str
     log_probs: LogProbs
+    walk: Walk
+
+
+def stepwise[T](log_probs: Callable[..., T], tokens: Sequence[int], start: int, *args) -> Iterator[T]:
+    """Walk a path one prefix at a time: right for a model that reuses the
+    cache of the prefix it was last asked, where each step is one token."""
+    for end in range(start, len(tokens) + 1):
+        yield log_probs(tokens[:end], *args)
+
+
+def _numpy(log_probs: torch.Tensor) -> np.ndarray:
+    return log_probs.cpu().numpy()
 
 
 def default_device() -> str:
@@ -47,17 +63,6 @@ def load(model_id: str, device: str, dtype: str = "float32"):
     return model.to(device).eval()
 
 
-def log_probs(model, tokens: Sequence[int], device: str, temperature: float = 1.0) -> torch.Tensor:
-    """float64 log-probabilities of the next token, on ``device``.
-
-    Normalizing in float64 keeps -ln p precise where p is close to 1.
-    """
-    input_ids = torch.tensor([list(tokens)], device=device)
-    with torch.inference_mode():
-        logits = model(input_ids=input_ids, use_cache=False).logits[0, -1].to(torch.float64)
-    return torch.log_softmax(logits / temperature, dim=-1)
-
-
 class Language(Protocol):
     """A model and the tokenizer it reads."""
 
@@ -70,13 +75,21 @@ class Language(Protocol):
     eos: frozenset[int]
 
     def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor: ...
+    def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]: ...
     def encode(self, text: str) -> list[int]: ...
     def token_bytes(self) -> list[bytes]: ...
 
 
 class Transformers:
+    """A Hugging Face model. It keeps the KV cache of the last path it read, so
+    a request that shares a prefix with it feeds only the rest, and it walks a
+    path in chunks, reading every position's logits off one pass."""
+
+    # Positions per forward pass while walking: logits for this many fit easily.
+    CHUNK = 256
+
     def __init__(self, model_id: str, device: str, dtype: str = "float32", tokenizer: str | None = None):
-        from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, DynamicCache
 
         self.name = model_id
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer or model_id)
@@ -86,9 +99,51 @@ class Transformers:
         self.start = start_of_text(self.tokenizer)
         eos = self.tokenizer.eos_token_id
         self.eos = frozenset() if eos is None else frozenset({int(eos)})
+        self.new_cache = DynamicCache
+        self.cache = DynamicCache()
+        # The tokens whose keys and values the cache holds.
+        self.fed: list[int] = []
 
     def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor:
-        return log_probs(self.model, tokens, self.device, temperature)
+        return next(self.walk(tokens, len(tokens), temperature))
+
+    def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]:
+        """float64 log-probabilities after tokens[:k] for k from ``start`` on.
+
+        Normalizing in float64 keeps -ln p precise where p is close to 1.
+        Positions are computed a chunk at a time, so their last bits can
+        differ from one computed alone.
+        """
+        tokens = [int(token) for token in tokens]
+        # The distribution after tokens[:k] is the output at position k - 1,
+        # so feeding starts at ``start - 1`` at the latest.
+        shared = 0
+        for have, want in zip(self.fed, tokens[: start - 1]):
+            if have != want:
+                break
+            shared += 1
+        if shared == 0:
+            self.cache = self.new_cache()
+        elif shared < len(self.fed):
+            # A negative crop removes that many tokens, in transformers 4 and 5.
+            self.cache.crop(shared - len(self.fed))
+        self.fed = tokens[:shared]
+        with torch.inference_mode():
+            for begin in range(shared, len(tokens), self.CHUNK):
+                chunk = tokens[begin : begin + self.CHUNK]
+                try:
+                    logits = self.model(
+                        input_ids=torch.tensor([chunk], device=self.device),
+                        past_key_values=self.cache,
+                        use_cache=True,
+                    ).logits[0]
+                except Exception:
+                    # What a failed pass left in the cache is unknown.
+                    self.cache, self.fed = self.new_cache(), []
+                    raise
+                self.fed += chunk
+                for offset in range(max(0, start - 1 - begin), len(chunk)):
+                    yield torch.log_softmax(logits[offset].to(torch.float64) / temperature, dim=-1)
 
     def encode(self, text: str) -> list[int]:
         return [int(token) for token in self.tokenizer.encode(text, add_special_tokens=False)]
@@ -160,6 +215,9 @@ class LlamaCpp:
         logits = np.ctypeslib.as_array(self.llm._ctx.get_logits(), shape=(self.vocabulary,))  # noqa: SLF001
         return torch.log_softmax(torch.from_numpy(logits.astype(np.float64)) / temperature, dim=-1)
 
+    def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]:
+        return stepwise(self.log_probs, tokens, start, temperature)
+
     def encode(self, text: str) -> list[int]:
         return self.llm.tokenize(text.encode(), add_bos=False, special=False)
 
@@ -177,18 +235,29 @@ def open_language(spec: str, device: str, dtype: str = "float32", tokenizer: str
 def measures(own: Language, specs: Sequence[str], other: Callable[[str], Language]) -> list[Measure]:
     """The model itself, then one measure per spec; ``other`` opens a model a spec names."""
 
+    def of(language: Language, name: str, temperature: float = 1.0) -> Measure:
+        return Measure(
+            name,
+            lambda tokens: _numpy(language.log_probs(tokens, temperature)),
+            lambda tokens, start: map(_numpy, language.walk(tokens, start, temperature)),
+        )
+
     def measure(spec: str) -> Measure:
         kind, _, value = spec.partition(":")
         if kind == "context":
             n = int(value)
-            return Measure(f"{own.name} · last {n} tokens", lambda tokens: own.log_probs(tokens[-n:]))
+
+            def window(tokens: Sequence[int]) -> np.ndarray:
+                return _numpy(own.log_probs(tokens[-n:]))
+
+            return Measure(f"{own.name} · last {n} tokens", window, lambda tokens, start: stepwise(window, tokens, start))
         if kind == "temperature":
             t = float(value)
-            return Measure(f"{own.name} · T={t:g}", lambda tokens: own.log_probs(tokens, t))
+            return of(own, f"{own.name} · T={t:g}", t)
         language = other(spec)
-        return Measure(language.name, language.log_probs)
+        return of(language, language.name)
 
-    return [Measure(own.name, own.log_probs), *(measure(spec) for spec in specs)]
+    return [of(own, own.name), *(measure(spec) for spec in specs)]
 
 
 def start_of_text(tokenizer) -> tuple[int, ...]:

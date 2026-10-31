@@ -5,6 +5,8 @@
 import { Tree } from "./wasm";
 
 export type NodeId = number;
+/** The empty sequence; every tree's first node. */
+export const ROOT: NodeId = 0;
 /** One of a node's 2^32 branches. What it denotes is up to a reading. */
 export type Branch = number;
 
@@ -109,10 +111,17 @@ export class IntervalTree {
     return (this.raw.listing(id, measure) as Listing | null) ?? undefined;
   }
 
-  /** The listing cut at `horizon` bits, with the ln weight of the rest. */
-  cut(id: NodeId, measure: number, horizon: number): { branches: Branch[]; lnWeights: number[]; lnLeftover: number } {
-    const [branches, lnWeights, lnLeftover] = this.raw.cut(id, measure, horizon) as [Branch[], number[], number];
-    return { branches, lnWeights, lnLeftover };
+  /** What a source answers from this listing at ``horizon`` bits, placing
+   * ``through`` too, as the protocol's Expand cuts it; undefined without one. */
+  cut(id: NodeId, measure: number, horizon: number, through?: Branch): Listing | undefined {
+    return (this.raw.cut(id, measure, horizon, through) as Listing | null) ?? undefined;
+  }
+
+  /** Where the child along ``branch`` sits in ``id``; undefined if p does not list it. */
+  edge(id: NodeId, lens: Lens, branch: Branch): { slot: number; before: number; lnP: number; natsQ: number; qBound: boolean } | undefined {
+    const edge = this.raw.edge(id, lens.p, lens.q, branch);
+    if (edge.length === 0) return undefined;
+    return { slot: edge[0]!, before: edge[1]!, lnP: edge[2]!, natsQ: edge[3]!, qBound: edge[4] === 1 };
   }
 
   expanded(id: NodeId, measure: number): boolean {

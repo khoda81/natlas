@@ -2,14 +2,16 @@
 // never set directly, it follows depth through ``logView``.
 
 import { type Camera, logView } from "../core/layout";
+import { ROOT } from "../core/tree";
 
 /**
  * Move the left edge ``dx`` nats deeper, zooming vertically about view
- * fraction ``fy``. It stops at the origin's left edge, depth 0.
+ * fraction ``fy``. Only the root's left edge stops it, at depth 0: past any
+ * other origin lies its parent.
  */
 export function moveDepth(cam: Camera, dx: number, fy: number): void {
   const before = logView(cam);
-  cam.x = Math.max(0, cam.x + dx);
+  cam.x = cam.origin === ROOT ? Math.max(0, cam.x + dx) : cam.x + dx;
   cam.a = fy + (cam.a - fy) * Math.exp(before - logView(cam));
 }
 

@@ -271,8 +271,10 @@ pub struct PickResult {
     pub exact: bool,
 }
 
+/// ln of the view's height in origin heights: the view spans e^-x of the
+/// origin. Only the root bounds x, at 0.
 fn log_view(cam: Camera) -> f64 {
-    0.0f64.min(-cam.x)
+    -cam.x
 }
 
 /// w * s, where a zero weight stays zero even at an infinite scale.
@@ -866,8 +868,13 @@ pub fn reanchor(frame: &Frame) -> Option<AnchorPosition> {
     })
 }
 
-/// Keep the view inside the origin's interval, returning only the new anchor offset.
+/// Keep the view inside the root's interval, returning only the new anchor offset.
 pub fn clamp_position(tree: &Tree, lens: Lens, cam: Camera) -> Result<f64> {
+    // Only the root's interval is all there is; beyond any other origin lies
+    // its parent, unknown until fetched.
+    if cam.origin != tree.root() {
+        return Ok(cam.a);
+    }
     let Extent { top, bottom } = extent(tree, lens, cam)?;
     if top > 0.0 {
         Ok(cam.a - top)
@@ -1049,7 +1056,7 @@ mod tests {
         let tree = chain_tree(&[0.5, 0.25, 0.25], &[]);
         let cam = Camera {
             origin: 0,
-            x: -0.1,
+            x: 0.0,
             k: 100.0,
             anchor: Boundary { node: 0, slot: 0 },
             a: 0.0,
@@ -1073,7 +1080,7 @@ mod tests {
         }
         near(frame.origin_top, 0.0);
         near(frame.origin_bottom, 1.0);
-        assert_eq!(frame.cover, None);
+        assert_eq!(frame.cover.map(|cover| cover.node), Some(0));
 
         let mut thin_listing = listing(&[0.5, 0.488, 0.004, 0.004, 0.004]);
         thin_listing.leftover = 0.0;
@@ -1251,9 +1258,14 @@ mod tests {
             },
             a: 0.3,
         };
-        let a = clamp_position(&tree, LENS, cam).unwrap();
-        near(a, 0.0);
-        let cam = Camera { a, ..cam };
+        // Nothing bounds a view below the root: what lies past the origin is
+        // its parent, unknown until fetched, and stays empty.
+        assert_eq!(clamp_position(&tree, LENS, cam).unwrap(), 0.3);
+        let outside = layout(&tree, LENS, cam, VIEW, 1.0).unwrap();
+        near(outside.origin_top, 0.3);
+        near(outside.origin_bottom, 1.3);
+        assert!(outside.cover.is_none());
+        let cam = Camera { a: 0.0, ..cam };
         let frame = layout(&tree, LENS, cam, VIEW, 1.0).unwrap();
         near(frame.origin_top, 0.0);
         near(frame.origin_bottom, 1.0);

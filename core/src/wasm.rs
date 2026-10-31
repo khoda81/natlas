@@ -111,28 +111,45 @@ impl Tree {
             .map_err(js_error)
     }
 
-    /// The listing cut at `horizon`, as a recording replays it: branches,
-    /// ln weights and the ln weight of the rest.
+    /// What a recording answers from this node's listing at `horizon` bits,
+    /// placing `through` too; null without a listing.
     pub fn cut(
         &self,
         id: u32,
         measure: usize,
         horizon: u32,
+        through: Option<u32>,
     ) -> std::result::Result<JsValue, JsError> {
-        let listing = self
+        match self
             .inner
-            .listing(id, measure)
+            .cut(id, measure, horizon, through)
             .map_err(js_error)?
-            .ok_or_else(|| JsError::new("node has no listing"))?;
-        let (range, ln_remaining) = listing
-            .batches(horizon, usize::MAX)
-            .pop()
-            .expect("a cut has one batch");
-        to_js(&(
-            &listing.branches[range.clone()],
-            &listing.ln_weights[range],
-            ln_remaining,
-        ))
+        {
+            Some(listing) => to_js(&listing),
+            None => Ok(JsValue::NULL),
+        }
+    }
+
+    /// Where the child along `branch` sits in `id` under a lens, as
+    /// [slot, p mass before it, ln p, -ln q, 1 if q is only a bound]; empty
+    /// when p does not list it.
+    pub fn edge(
+        &self,
+        id: u32,
+        p: usize,
+        q: usize,
+        branch: u32,
+    ) -> std::result::Result<Vec<f64>, JsError> {
+        let slots = self.inner.slots(id, Lens { p, q }).map_err(js_error)?;
+        Ok(slots.slot_of(branch).map_or_else(Vec::new, |slot| {
+            vec![
+                slot as f64,
+                slots.prefix(slot),
+                slots.ln_p(slot),
+                slots.nats_q(slot),
+                f64::from(u8::from(slots.q_bound(slot))),
+            ]
+        }))
     }
 
     pub fn listing(&self, id: u32, measure: usize) -> std::result::Result<JsValue, JsError> {

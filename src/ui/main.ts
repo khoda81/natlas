@@ -9,14 +9,13 @@ import {
   logView,
   normalize,
   pick,
-  place,
   reanchor,
   repair,
   type Selection,
   type Viewport,
 } from "../core/layout";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "../data/source";
-import { IntervalTree, type NodeId } from "../core/tree";
+import { IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
 import { drag, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, viewKey } from "./view-state";
@@ -38,6 +37,10 @@ const KEY_SCALE = 1.25;
 const FOCUS_MS = 450;
 /** Opening a node fades the previous view out over this long. */
 const TRANSITION_MS = 320;
+/** The flight to a node closes this share of its distance every ``FLIGHT_MS``. */
+const FLIGHT_MS = 140;
+/** How deep a walk lists each node it passes, besides the next branch, in bits. */
+const WALK_HORIZON = 16;
 const SEARCH_MS = 150;
 const SAVE_MS = 200;
 const LOCAL_SERVER = "http://localhost:8421/";
@@ -52,6 +55,20 @@ interface Focus {
   fromCenter: number;
 }
 
+/**
+ * A flight down ``chain`` to its last node. The camera stays anchored at the
+ * top of ``chain[reached]``, the deepest node placed so far, whose ln p mass
+ * and right edge below the origin are ``lnMass`` and ``x1``. ``listed`` once
+ * the walks have answered; ``time`` is the last frame's.
+ */
+interface Flight {
+  chain: NodeId[];
+  reached: number;
+  lnMass: number;
+  x1: number;
+  listed: boolean;
+  time: number | null;
+}
 
 export class App {
   private readonly canvas = element<HTMLCanvasElement>("canvas");
@@ -103,6 +120,9 @@ export class App {
   /** The view before the origin last changed, fading out over the new one. */
   private transition: { image: HTMLCanvasElement; start: number } | null = null;
   private readonly reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+  /** The origin while its parent is fetched to place it. */
+  private placing: NodeId | null = null;
+  private flight: Flight | null = null;
   private readonly held = new Set<string>();
   private heldSince: number | null = null;
   private scheduled = false;
@@ -244,43 +264,33 @@ export class App {
   private cancelNavigation(): void {
     this.navigation++;
     this.restoring = false;
+    this.flight = null;
   }
 
-  /** Fetch as much of a path below ``node`` as the current source knows. */
-  private async reachPath(node: NodeId, path: readonly number[], generation: number): Promise<{ node: NodeId; complete: boolean } | null> {
-    const tree = this.tree!;
-    const expander = this.expander!;
-    const lens = { ...this.lens };
-    const current = () => tree === this.tree && generation === this.navigation;
-    for (const branch of path) {
-      if (!current()) return null;
-      const reached = await expander.reach(node, lens.p, branch);
-      if (!current()) return null;
-      if (!reached) return { node, complete: false };
-      if (lens.q !== lens.p) await expander.reach(node, lens.q, branch);
-      if (!current()) return null;
-      node = tree.child(node, branch);
-    }
-    return { node, complete: true };
+  /** Walk every measure in view from ``origin`` to ``target``; true once all placed it. */
+  private async walk(origin: NodeId, target: NodeId): Promise<boolean> {
+    const measures = [...new Set([this.lens.p, this.lens.q])];
+    const placed = await Promise.all(measures.map((measure) => this.expander!.walk(origin, target, measure, WALK_HORIZON)));
+    return placed.every(Boolean);
   }
 
-  /** Open the saved origin at once, then reach down to the saved covering node. */
+  /** Open the saved origin at once, then walk down to the saved covering node. */
   private async restore(saved: SavedView): Promise<void> {
     this.setLens({ p: saved.p, q: saved.q });
     const tree = this.tree!;
     const origin = tree.descend(tree.root, saved.origin);
+    const cover = tree.descend(origin, saved.path.slice(saved.origin.length));
     this.open(origin, saved.k);
     const generation = this.navigation;
     this.restoring = true;
     try {
-      const reached = await this.reachPath(origin, saved.path.slice(saved.origin.length), generation);
-      if (reached === null) return;
+      const placed = await this.walk(origin, cover);
+      if (tree !== this.tree || generation !== this.navigation) return;
       this.focus = null;
-      if (reached.complete) {
-        this.cam = { origin, x: saved.x, k: saved.k, anchor: { node: reached.node, slot: 0 }, a: saved.a };
+      if (placed) {
+        this.cam = { origin, x: saved.x, k: saved.k, anchor: { node: cover, slot: 0 }, a: saved.a };
       } else {
-        this.standAt(reached.node);
-        this.setStatus("The saved path is only partly available; showing its deepest known ancestor.");
+        this.setStatus("The saved path is only partly available.");
       }
       this.invalidate();
     } catch (error) {
@@ -290,26 +300,95 @@ export class App {
     }
   }
 
-  /** Put ``node``, at or below the origin, where the origin stands. */
-  private standAt(node: NodeId): void {
+  /**
+   * Past the origin's interval lies its parent, unknown until fetched: the
+   * view may go there, and finds it empty. Fetch the parent's placement of
+   * the origin; once it has it, make the parent the origin, a change of
+   * coordinates that keeps the picture: x gains the origin's own width.
+   */
+  private reachOut(frame: Frame): void {
     const tree = this.tree!;
-    const origin = this.cam.origin;
-    this.focus = null;
-    if (node === origin) {
-      this.cam = { origin, x: 0, k: this.cam.k, anchor: { node: origin, slot: 0 }, a: 0 };
-      this.showPath(origin, null);
-      this.invalidate();
+    const { origin } = this.cam;
+    const parent = tree.parent(origin);
+    if (parent === null || !(this.cam.x < 0 || frame.originTop > 0 || frame.originBottom < 1)) return;
+    const edge = tree.edge(parent, this.lens, tree.branch(origin));
+    if (edge === undefined || edge.qBound) {
+      void this.place(parent, origin);
       return;
     }
-    const parent = tree.parent(node)!;
-    const branch = tree.branch(node);
-    const { lnMass, x1 } = place(tree, this.lens, origin, node);
-    const slot = tree.slotOf(parent, this.lens, branch)!;
-    this.cam.anchor = normalize(tree, this.lens, origin, { node: parent, slot });
-    this.cam.x = rootLike(lnMass, x1);
-    this.cam.a = 0.5 - Math.exp(lnMass - logView(this.cam)) / 2;
-    this.showPath(parent, branch);
+    this.cam.x += edge.natsQ;
+    this.cam.origin = parent;
+    // The root's left edge is the start of everything.
+    if (parent === ROOT) this.cam.x = Math.max(0, this.cam.x);
     this.invalidate();
+  }
+
+  private async place(parent: NodeId, origin: NodeId): Promise<void> {
+    if (this.placing === origin) return;
+    this.placing = origin;
+    const tree = this.tree!;
+    try {
+      if (await this.walk(parent, origin) && tree === this.tree) this.invalidate();
+    } catch (error) {
+      if (tree === this.tree) this.setStatus(String(error));
+    } finally {
+      if (this.placing === origin) this.placing = null;
+    }
+  }
+
+  /**
+   * Fly to ``target`` as the walk down to it arrives: the camera follows the
+   * deepest node placed so far, standing each as the origin does, and the
+   * descent is the progress. Where no source can place the path, ``target``
+   * opens as the origin instead.
+   */
+  private fly(target: NodeId): void {
+    const tree = this.tree!;
+    const above = tree.path(this.cam.origin);
+    const origin = tree.path(target).slice(0, above.length).every((branch, i) => branch === above[i]) ? this.cam.origin : ROOT;
+    this.open(origin);
+    const chain = tree.chain(origin, target);
+    const flight: Flight = { chain, reached: 0, lnMass: 0, x1: 0, listed: false, time: null };
+    this.flight = flight;
+    void this.walk(origin, target).then((placed) => {
+      flight.listed = true;
+      if (this.flight !== flight) return;
+      if (!placed) this.open(target);
+      this.invalidate();
+    }, (error: unknown) => {
+      if (this.flight === flight) this.flight = null;
+      if (tree === this.tree) this.setStatus(String(error));
+    });
+  }
+
+  /** One frame of the flight: re-anchor down to the deepest placed node, then close in on it. */
+  private stepFlight(time: number): void {
+    const flight = this.flight!;
+    const tree = this.tree!;
+    const { chain } = flight;
+    while (flight.reached < chain.length - 1) {
+      const node = chain[flight.reached]!;
+      const edge = tree.edge(node, this.lens, tree.branch(chain[flight.reached + 1]!));
+      if (edge === undefined) break;
+      // The anchor moves from this node's top to its child's, keeping the picture.
+      this.cam.a += Math.exp(flight.lnMass - logView(this.cam)) * edge.before;
+      this.cam.anchor = { node, slot: edge.slot };
+      flight.lnMass += edge.lnP;
+      flight.x1 += edge.natsQ;
+      flight.reached++;
+    }
+    const dt = flight.time === null ? 0 : Math.min(MAX_FRAME_MS, time - flight.time);
+    flight.time = time;
+    const close = this.reducedMotion.matches ? 1 : 1 - Math.exp(-dt / FLIGHT_MS);
+    const toX = rootLike(flight.lnMass, flight.x1);
+    this.cam.x += (toX - this.cam.x) * close;
+    const height = Math.exp(flight.lnMass - logView(this.cam));
+    this.cam.a += (0.5 - height / 2 - this.cam.a) * close;
+    const arrived = flight.reached === chain.length - 1;
+    if (arrived && flight.listed && Math.abs(toX - this.cam.x) < 1e-3) {
+      this.flight = null;
+      this.showPath(chain.at(-1)!, null);
+    }
   }
 
   /**
@@ -384,6 +463,7 @@ export class App {
     const tree = this.tree;
     if (tree === null) return;
     if (this.focus) this.stepFocus(time);
+    if (this.flight) this.stepFlight(time);
     this.stepKeys(time);
     const previous = this.frame;
     const frame = this.currentFrame();
@@ -394,7 +474,8 @@ export class App {
       const camera = { ...this.cam };
       return wants(tree, this.lens, camera, this.view, this.currentFrame(camera));
     });
-    if (!this.focus) reanchor(this.cam, frame);
+    if (!this.focus && !this.flight) reanchor(this.cam, frame);
+    this.reachOut(frame);
     // Keep the input key after reanchoring. An equivalent anchor can still
     // change floating-point rounding on the next layout and its edge pixels.
     this.updateHover();
@@ -417,9 +498,18 @@ export class App {
       note: origin && { text: origin.text, sweep: origin.loading && !this.reducedMotion.matches ? time : null },
     });
     this.fadeOut(time);
+    this.drawProgress();
     this.updateReadout();
     this.saveView(frame);
-    if (this.focus || this.held.size > 0 || this.transition || origin?.loading) this.invalidate();
+    if (this.focus || this.flight || this.held.size > 0 || this.transition || origin?.loading) this.invalidate();
+  }
+
+  /** How far down its path the flight has placed, along the top of the view. */
+  private drawProgress(): void {
+    const flight = this.flight;
+    if (flight === null || flight.chain.length < 2) return;
+    this.ctx.fillStyle = this.palette.scheme.inkMuted;
+    this.ctx.fillRect(0, 0, (this.view.width * flight.reached) / (flight.chain.length - 1), 2);
   }
 
   /** What the view says while the origin has no children to draw. */
@@ -717,7 +807,7 @@ export class App {
       this.shown = "";
       this.result.hidden = true;
       this.setStatus("");
-      this.open(this.tree!.descend(this.tree!.root, path));
+      this.fly(this.tree!.descend(this.tree!.root, path));
       this.where.blur();
     } catch (error) {
       if (generation !== this.searchGeneration) return;
@@ -932,7 +1022,7 @@ export class App {
   }
 
   private saveView(frame: Frame): void {
-    if (!this.storage || this.restoring || frame.cover === null || this.dataset === null || this.tree === null) return;
+    if (!this.storage || this.restoring || this.flight || frame.cover === null || this.dataset === null || this.tree === null) return;
     if (this.saveTimer !== null) clearTimeout(this.saveTimer);
     const { origin, x, k } = this.cam;
     const { node, y } = frame.cover;

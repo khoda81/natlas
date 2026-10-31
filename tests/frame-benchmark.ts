@@ -61,7 +61,8 @@ let liveLabels: TextLabels | null = null;
 function setup(count: number, zipf: boolean, deep = false, real = false) {
   const dataset: Dataset = { id: "benchmark", name: "benchmark", title: `Frame benchmark · ${count.toLocaleString()} branches`,
     measures: zipf ? ["p", "q"] : ["p"], sources: Array.from({ length: zipf ? 2 : 1 }, () => ({
-      expand: () => new Promise(() => {}), // Four pending requests, like a busy live model.
+      // Four pending requests, like a busy live model.
+      async *expand() { await new Promise(() => {}); },
     })), labels: real ? liveLabels! : labels, searchable: true, search: async () => [0] };
   driver.setDataset(dataset);
   const weights = Array.from({ length: count }, (_, i) => zipf ? (i + 1) ** -1.15 : 1);

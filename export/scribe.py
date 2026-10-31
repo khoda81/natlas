@@ -50,7 +50,7 @@ import math
 import sys
 import wave
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -216,6 +216,9 @@ class Scribe:
             return certain
         logits = self._evaluate(window, list(written))
         return torch.log_softmax(logits[: self.vocabulary].double() / temperature, dim=-1)
+
+    def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]:
+        return lm.stepwise(self.log_probs, tokens, start, temperature)
 
     def _conditions(self, index: int) -> Any:
         conditions = self.conditions.get(index)

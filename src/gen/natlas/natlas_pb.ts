@@ -18,7 +18,8 @@ export const file_natlas_natlas: GenFile = /*@__PURE__*/
 export type ExpandRequest = Message<"natlas.ExpandRequest"> & {
   /**
    * The node `path` below the node with id `node`: usually a parent's id and
-   * one branch, so a request stays small however deep the node is.
+   * one branch, so a request stays small however deep the node is. A longer
+   * path walks down to a node the client cannot yet place.
    *
    * @generated from field: fixed64 node = 1;
    */
@@ -31,7 +32,8 @@ export type ExpandRequest = Message<"natlas.ExpandRequest"> & {
 
   /**
    * In bits. Every child of conditional weight at least 2^-horizon is
-   * listed, so every child left out is lighter. At 0 nothing is listed.
+   * listed, so every child left out is lighter. At 0 only the path's next
+   * branches are listed.
    *
    * @generated from field: uint32 horizon = 3;
    */
@@ -50,8 +52,9 @@ export const ExpandRequestSchema: GenMessage<ExpandRequest> = /*@__PURE__*/
  */
 export type Listing = Message<"natlas.Listing"> & {
   /**
-   * Parallel, heaviest first; each weight is a natural log probability
-   * conditional on the node.
+   * Parallel, heaviest first, ties by increasing branch; each weight is a
+   * natural log probability conditional on the node. Every child at least
+   * as heavy as the last listed one is listed.
    *
    * @generated from field: repeated uint32 branches = 1;
    */
@@ -63,9 +66,9 @@ export type Listing = Message<"natlas.Listing"> & {
   lnWeights: number[];
 
   /**
-   * ln of the weight of every child after these, summed from the light end:
-   * -inf once the children listed so far cover the node, as for a node with
-   * no children at all.
+   * ln of the weight of every child not listed, summed directly rather than
+   * as 1 minus the rest, so tiny remainders survive: -inf once the listed
+   * children cover the node, as for a node with no children at all.
    *
    * @generated from field: double ln_leftover = 3;
    */
@@ -170,10 +173,16 @@ export const ExpansionSchema: GenMessage<Expansion> = /*@__PURE__*/
  */
 export const Natlas: GenService<{
   /**
-   * A node's children, heaviest first, down to 2^-horizon of its weight.
-   * Every prefix of the stream is a valid listing; the client may stop
-   * reading. A server answers NOT_FOUND when it has not learned the id the
-   * request starts from, and the client names the node from the root.
+   * The children of the node the request's path names, preceded by those of
+   * every node between it and the starting node: one Listing per node, in
+   * path order, so with a path of n branches the k-th message is the node k
+   * branches down (an empty path names the starting node itself). Each lists
+   * its children heaviest first, down to 2^-horizon of its weight and at
+   * least through the path's next branch, so the client can place the next
+   * node. A server sends each listing as soon as it has it; the client may
+   * stop reading at any point. A server answers NOT_FOUND when it has
+   * not learned the id the request starts from, and the client names the
+   * node from the root.
    *
    * @generated from rpc natlas.Natlas.Expand
    */

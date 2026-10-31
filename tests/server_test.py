@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["natlas-core", "protobuf>=7.36.1", "starlette>=0.40", "httpx2>=2.0", "uvicorn>=0.30"]
+# dependencies = ["natlas-core", "numpy>=2", "protobuf>=7.36.1", "starlette>=0.40", "httpx2>=2.0", "uvicorn>=0.30"]
 # [tool.uv.sources]
 # natlas-core = { path = "../core" }
 # ///
@@ -17,10 +17,13 @@ import math
 import os
 import struct
 import sys
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "export"))
@@ -48,33 +51,22 @@ def node_id(path):
     return node
 
 
-class Values:
-    def __init__(self, values):
-        self.values = values
-
-    def sort(self, descending=True, stable=True):
-        order = sorted(
-            range(len(self.values)), key=self.values.__getitem__, reverse=descending
-        )
-        return Values([self.values[index] for index in order]), Values(order)
-
-    def cpu(self):
-        return self
-
-    def tolist(self):
-        return self.values
-
-
 class Measure:
     name = "fixture"
 
     def __init__(self, weights=(0.6, 0.25, 0.1, 0.049, 0.001)):
-        self.weights = weights
+        self.weights = np.array(weights, dtype=np.float64)
+        # Every prefix whose distribution was computed, in order.
         self.calls = []
+        # Every walk begun, as (tokens, start).
+        self.walks = []
 
-    def log_probs(self, path):
-        self.calls.append(tuple(path))
-        return Values([math.log(w) if w else -math.inf for w in self.weights])
+    def walk(self, tokens, start):
+        self.walks.append((tuple(tokens), start))
+        for end in range(start, len(tokens) + 1):
+            self.calls.append(tuple(tokens[:end]))
+            with np.errstate(divide="ignore"):
+                yield np.log(self.weights)
 
 
 def fixture():
@@ -116,68 +108,104 @@ def branches(listings):
     return [branch for listing in listings for branch in listing.branches]
 
 
+def listings(model, node, path, horizon=16, measure=0):
+    return list(model.expand(measure, node, path, horizon, threading.Event()))
+
+
 class CoreTests(unittest.TestCase):
     def test_tree_names_nodes_by_the_protocol_hash_across_threads(self):
-        tree = Tree(2)
-        node = tree.node(0, [0xFFFFFFFF, 7])
-        self.assertEqual(tree.node(0, [0xFFFFFFFF, 7]), node)
-        self.assertEqual(tree.node(node_id([0xFFFFFFFF, 7]), []), node)
-        self.assertEqual(tree.node(node_id([0xFFFFFFFF]), [7]), node)
-        with self.assertRaises(KeyError):
-            tree.node(node_id([1, 2]), [])
-        tree.set_distribution(node, 1, [3, 8], [math.log(0.75), math.log(0.25)])
+        tree = Tree()
+        nodes = tree.walk(0, [0xFFFFFFFF, 7])
+        self.assertEqual(len(nodes), 3)
+        self.assertEqual(tree.walk(0, [0xFFFFFFFF, 7]), nodes)
+        self.assertEqual(tree.walk(node_id([0xFFFFFFFF, 7]), []), nodes[2:])
         with ThreadPoolExecutor() as pool:
-            batches = pool.submit(tree.batches, node, 1, 16, 1).result()
+            found = pool.submit(tree.walk, node_id([0xFFFFFFFF]), [7]).result()
+        self.assertEqual(found, nodes[1:])
+        self.assertEqual(tree.path(nodes[2]), [0xFFFFFFFF, 7])
+        with self.assertRaises(KeyError):
+            tree.walk(node_id([1, 2]), [])
+
+    def test_cuts_reach_the_horizon_and_the_next_branch_with_an_exact_rest(self):
+        ln_weights = np.log([0.5, 1e-30, 0.3, 0.2 - 1e-30])
+        horizon = service.cut(ln_weights, 1, None)
+        self.assertEqual(list(horizon.branches), [0])
+        self.assertAlmostEqual(math.exp(horizon.ln_leftover), 0.5, places=12)
+        self.assertEqual(list(service.cut(ln_weights, 2, None).branches), [0, 2])
+        through = service.cut(ln_weights, 1, 1)
+        self.assertEqual(list(through.branches), [0, 2, 3, 1])
+        self.assertEqual(through.ln_leftover, -math.inf)
+        # The rest is summed directly: 1e-30 survives beside the heavy ones.
+        rare = service.cut(ln_weights, 3, 3)
+        self.assertEqual(list(rare.branches), [0, 2, 3])
+        self.assertAlmostEqual(rare.ln_leftover, math.log(1e-30), places=9)
+        self.assertEqual(list(service.cut(ln_weights, 0, None).branches), [])
+        # Ties with the next branch come along, by increasing branch.
+        tied = service.cut(np.log([0.2, 0.4, 0.2, 0.2]), 1, 3)
+        self.assertEqual(list(tied.branches), [1, 0, 2, 3])
+        # A branch of weight zero or past the vocabulary places nothing more.
         self.assertEqual(
-            batches,
-            [
-                ([3], [math.log(0.75)], math.log(0.25)),
-                ([8], [math.log(0.25)], -math.inf),
-            ],
+            list(service.cut(np.log([1.0, 1e-300]), 1, 1).branches), [0, 1]
         )
+        with np.errstate(divide="ignore"):
+            self.assertEqual(list(service.cut(np.log([1.0, 0.0]), 1, 1).branches), [0])
+        self.assertEqual(list(service.cut(ln_weights, 1, 9).branches), [0])
+
+    def test_a_walk_lists_every_node_through_the_next_branch_in_one_pass(self):
+        model, _ = fixture()
+        walked = listings(model, 0, [0, 1, 2], horizon=1)
         self.assertEqual(
-            tree.batches(node, 1, 1, 8), [([3], [math.log(0.75)], math.log(0.25))]
+            [list(listing.branches) for listing in walked], [[0, 1], [0, 1, 2], [0]]
         )
-        self.assertEqual(tree.path(node), [0xFFFFFFFF, 7])
-        tree.clear_listing(node, 1)
-        self.assertFalse(tree.has_listing(node, 1))
-        with self.assertRaises(ValueError):
-            tree.batches(node, 1, 16, 8)
+        measure = model.measures[0]
+        self.assertEqual(measure.walks, [((99, 0, 1, 2), 2)])
+        self.assertEqual(measure.calls, [(99, 0), (99, 0, 1), (99, 0, 1, 2)])
+        # The nodes along it are cached: naming the last by its parent
+        # computes nothing.
+        again = listings(model, node_id([0, 1]), [2], horizon=1)
+        self.assertEqual(again, walked[-1:])
+        self.assertEqual(len(measure.calls), 3)
+        root = listings(model, 0, [], horizon=4)
+        self.assertEqual([list(listing.branches) for listing in root], [[0, 1, 2]])
 
     def test_model_cache_eviction_and_reconstruction(self):
         model, _ = fixture()
         measure = model.measures[0]
         with patch.object(service, "_CACHED", 1):
-            first = model.expand(0, 0, [0], 16)
+            first = listings(model, 0, [0])
             self.assertEqual(
-                branches(model.expand(0, node_id([0]), [], 32)), branches(first)
+                listings(model, node_id([0]), [], 32)[0].branches, first[0].branches
             )
             self.assertEqual(len(measure.calls), 1)
-            model.expand(0, 0, [1], 16)
-            self.assertFalse(model.tree.has_listing(model.tree.node(0, [0]), 0))
-            self.assertEqual(model.expand(0, 0, [0], 16), first)
+            listings(model, 0, [1])
+            self.assertEqual(listings(model, 0, [0]), first)
             self.assertEqual(len(measure.calls), 3)
         self.assertEqual(measure.calls[0], (99, 0))
 
     def test_terminal_zero_horizon_and_zero_weight_branches(self):
         model, _ = fixture()
-        self.assertEqual(model.expand(0, 0, [], 0), [pb.Listing(ln_leftover=0.0)])
-        for path in [[0] * 5, [5], [0, 0xFFFFFFFF]]:
-            self.assertEqual(
-                model.expand(0, 0, path, 40), [pb.Listing(ln_leftover=-math.inf)]
-            )
-        self.assertEqual(model.measures[0].calls, [])
-        with self.assertRaises(KeyError):
-            model.expand(0, node_id([3, 3]), [], 16)
-
-    def test_weights_are_exact_and_cut_at_the_horizon(self):
-        model, _ = fixture()
-        (listing,) = model.expand(0, 0, [], 4)
-        self.assertEqual(list(listing.branches), [0, 1, 2])
+        self.assertEqual(listings(model, 0, [], 0), [pb.Listing(ln_leftover=0.0)])
+        ended = listings(model, 0, [0] * 5, 40)
+        self.assertEqual(len(ended), 5)
+        self.assertEqual(ended[-1], pb.Listing(ln_leftover=-math.inf))
+        self.assertEqual(list(ended[-2].branches), [0, 1, 2, 3, 4])
         self.assertEqual(
-            list(listing.ln_weights), [math.log(w) for w in (0.6, 0.25, 0.1)]
+            listings(model, 0, [5], 40), [pb.Listing(ln_leftover=-math.inf)]
         )
-        self.assertAlmostEqual(math.exp(listing.ln_leftover), 0.05, places=12)
+        self.assertEqual(
+            listings(model, 0, [5, 0], 40), [pb.Listing(ln_leftover=-math.inf)] * 2
+        )
+        with self.assertRaises(KeyError):
+            listings(model, node_id([3, 3]), [])
+
+    def test_a_canceled_walk_stops_at_the_next_node(self):
+        model, _ = fixture()
+        canceled = threading.Event()
+        walk = model.expand(0, 0, [0, 1, 2], 16, canceled)
+        next(walk)
+        canceled.set()
+        self.assertEqual(list(walk), [])
+        self.assertFalse(model.lock.locked())
 
 
 class TransportTests(unittest.TestCase):
@@ -204,14 +232,15 @@ class TransportTests(unittest.TestCase):
             pb.Listing.FromString(data) for flags, data in frames if not flags
         ], json.loads(frames[-1][1])
 
-    def test_nodes_are_named_by_a_known_id_and_one_branch(self):
-        listings, end = self.listings(0, [0, 1])
+    def test_a_stream_holds_one_listing_per_node_down_the_path(self):
+        listings, end = self.listings(0, [0, 1], horizon=1)
         self.assertEqual(end, {})
-        self.assertEqual(branches(listings), [0, 1, 2, 3, 4])
-        self.assertEqual(listings[-1].ln_leftover, -math.inf)
-        again, _ = self.listings(node_id([0]), [1])
-        self.assertEqual(again, listings)
-        self.assertEqual(self.model.measures[0].calls, [(99, 0, 1)])
+        self.assertEqual(
+            [list(listing.branches) for listing in listings], [[0, 1], [0]]
+        )
+        again, _ = self.listings(node_id([0]), [1], horizon=1)
+        self.assertEqual(again, listings[-1:])
+        self.assertEqual(self.model.measures[0].calls, [(99, 0), (99, 0, 1)])
         response = self.expand(
             service._envelope(0, pb.ExpandRequest(node=0).SerializeToString())
         )

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import queue
 import re
 import struct
 import sys
@@ -15,10 +16,11 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
-from typing import Any, Protocol
+from collections.abc import Callable, Iterator, Sequence
+from typing import Protocol
 
 import anyio.to_thread
+import numpy as np
 from errors import TooLong
 from google.protobuf.message import DecodeError
 from natlas import natlas_pb2 as pb
@@ -32,9 +34,13 @@ from starlette.routing import Route
 
 
 class Measure(Protocol):
+    """Next-token log-probabilities as a float64 array over the vocabulary."""
+
     name: str
 
-    def log_probs(self, tokens: Sequence[int]) -> Any: ...
+    def walk(self, tokens: Sequence[int], start: int) -> Iterator[np.ndarray]:
+        """Those after tokens[:k] for every k from ``start`` through len(tokens)."""
+        ...
 
 
 # Connect envelopes: one flags byte, a big-endian length, the message.
@@ -42,9 +48,8 @@ _COMPRESSED = 0x01
 _END_STREAM = 0x02
 _CONTENT_TYPE = "application/connect+proto"
 _PROTO_CONTENT_TYPE = "application/proto"
-# Branches per message; a listing can run to the whole vocabulary.
-_CHUNK = 4096
-# Sorted listings kept per measure, about 12 bytes per vocabulary entry each.
+# Distributions kept per measure, 8 bytes per vocabulary entry each. A walk
+# leaves the deepest nodes along it, the ones in view.
 _CACHED = 64
 
 
@@ -65,10 +70,12 @@ class Model:
         # Branches the model has; every other branch has weight zero.
         self.vocabulary = vocabulary
         self.measures = measures
-        self.tree = Tree(len(measures))
-        # LRU policy belongs to the server; cached distributions and node ids
-        # belong to the same core the browser uses.
-        self.cache: list[OrderedDict[int, None]] = [OrderedDict() for _ in measures]
+        # Node ids are the core's; each measure's distributions stay here, on
+        # the server, as arrays cut per request.
+        self.tree = Tree()
+        self.cache: list[OrderedDict[int, np.ndarray]] = [
+            OrderedDict() for _ in measures
+        ]
         # Requests run on worker threads. One forward pass at a time keeps the
         # device busy once and the cache whole; ``names`` guards the tree for
         # the moments it is read or written, so naming a node never waits on
@@ -79,59 +86,95 @@ class Model:
     def learn(self, path: Sequence[int]) -> None:
         """Learn the ids along ``path``, so requests can name them alone."""
         with self.names:
-            self.tree.node(0, list(path))
+            self.tree.walk(0, list(path))
 
     def expand(
-        self, measure: int, node: int, path: Sequence[int], horizon: int
-    ) -> list[pb.Listing]:
-        """The listing of the node ``path`` below ``node`` down to 2^-horizon.
+        self,
+        measure: int,
+        node: int,
+        path: Sequence[int],
+        horizon: int,
+        canceled: threading.Event,
+    ) -> Iterator[pb.Listing]:
+        """The listing of the node ``path`` names below ``node``, preceded by
+        every node between them, as the protocol's Expand: each down to
+        2^-horizon and through the path's next branch.
 
-        Raises KeyError when this server has not learned ``node``.
+        Raises KeyError, before yielding, when this server has not learned
+        ``node``. Stops early once ``canceled`` is set.
         """
+        with self.names:
+            nodes = self.tree.walk(node, list(path))
+            nodes = nodes[1:] if path else nodes
+            full = tuple(self.tree.path(nodes[-1]))
+        first = len(full) - len(nodes) + 1
+        # Past a branch beyond the vocabulary, every node has weight zero.
+        valid = next(
+            (i for i, branch in enumerate(full) if branch >= self.vocabulary), len(full)
+        )
         started = time.perf_counter()
-        with self.names:
-            node = self.tree.node(node, list(path))
-            path = tuple(self.tree.path(node))
-        # A branch past the vocabulary has weight zero: nothing follows it.
-        if self.ends(path) or any(branch >= self.vocabulary for branch in path):
-            return [pb.Listing(ln_leftover=-math.inf)]
-        if horizon == 0:
-            return [pb.Listing(ln_leftover=0.0)]
+        computed = 0
         with self.lock:
-            cached = node in self.cache[measure]
-            self.listing(measure, node, path)
-            with self.names:
-                batches = self.tree.batches(node, measure, horizon, _CHUNK)
-            listings = [
-                pb.Listing(branches=branches, ln_weights=ln_weights, ln_leftover=rest)
-                for branches, ln_weights, rest in batches
-            ]
-            elapsed = (time.perf_counter() - started) * 1000
-            source = "cached" if cached else "computed"
-            count = sum(len(listing.branches) for listing in listings)
-            print(
-                f"expand m{measure} depth {len(path)} horizon {horizon}: {count} branches, {source}, {elapsed:.0f} ms",
-                file=sys.stderr,
-            )
-            return listings
+            walk, walked = None, None
+            for index, node_id in enumerate(nodes):
+                if canceled.is_set():
+                    return
+                end = first + index
+                prefix = full[:end]
+                through = full[end] if end < len(full) else None
+                if end > valid or self.ends(prefix):
+                    for _ in nodes[index:]:
+                        yield pb.Listing(ln_leftover=-math.inf)
+                    return
+                if horizon == 0 and through is None:
+                    yield pb.Listing(ln_leftover=0.0)
+                    continue
+                cache = self.cache[measure]
+                ln_weights = cache.get(node_id)
+                if ln_weights is None:
+                    if walk is None or walked != end:
+                        walk = self.measures[measure].walk(
+                            self.root + full, len(self.root) + end
+                        )
+                        walked = end
+                    ln_weights = next(walk)
+                    walked += 1
+                    computed += 1
+                    cache[node_id] = ln_weights
+                    if len(cache) > _CACHED:
+                        cache.popitem(last=False)
+                else:
+                    cache.move_to_end(node_id)
+                yield cut(ln_weights, horizon, through)
+        elapsed = (time.perf_counter() - started) * 1000
+        print(
+            f"expand m{measure} depth {len(full)} walking {len(nodes)} horizon {horizon}: {computed} computed, {elapsed:.0f} ms",
+            file=sys.stderr,
+        )
 
-    def listing(self, measure: int, node: int, path: tuple[int, ...]) -> None:
-        """Cache ``node``'s complete distribution in Rust, heaviest first."""
-        cache = self.cache[measure]
-        if node in cache:
-            cache.move_to_end(node)
-            return
-        log_probs = self.measures[measure].log_probs(self.root + path)
-        # Stable, so equal weights keep increasing branch order.
-        values, order = log_probs.sort(descending=True, stable=True)
-        # Normalizing in float32 can leave a certain branch a hair above ln 1.
-        ln_weights = [min(value, 0.0) for value in values.cpu().tolist()]
-        cache[node] = None
-        evicted = cache.popitem(last=False)[0] if len(cache) > _CACHED else None
-        with self.names:
-            self.tree.set_distribution(node, measure, order.cpu().tolist(), ln_weights)
-            if evicted is not None:
-                self.tree.clear_listing(evicted, measure)
+
+def cut(ln_weights: np.ndarray, horizon: int, through: int | None) -> pb.Listing:
+    """The protocol's listing of one distribution: every branch at least
+    2^-horizon heavy and at least as heavy as ``through``, heaviest first and
+    ties by branch, with the rest summed directly rather than as 1 minus the
+    listed, so a tiny rest survives."""
+    threshold = -horizon * math.log(2) if horizon else math.inf
+    if (
+        through is not None
+        and through < len(ln_weights)
+        and ln_weights[through] > -math.inf
+    ):
+        threshold = min(threshold, ln_weights[through])
+    keep = ln_weights >= threshold
+    listed = np.flatnonzero(keep)
+    branches = listed[np.argsort(-ln_weights[listed], kind="stable")]
+    rest = ln_weights[~keep]
+    ln_leftover = float(np.logaddexp.reduce(rest)) if rest.size else -math.inf
+    return pb.Listing(
+        branches=branches.tolist(),
+        ln_weights=np.minimum(ln_weights[branches], 0.0).tolist(),
+        ln_leftover=min(ln_leftover, 0.0),
+    )
 
 
 def _envelope(flags: int, payload: bytes) -> bytes:
@@ -189,41 +232,57 @@ def app(
                 )
             try:
                 request_message = pb.ExpandRequest.FromString(body[5:])
-                listings = await anyio.to_thread.run_sync(
-                    model.expand,
-                    measure,
-                    request_message.node,
-                    request_message.path,
-                    request_message.horizon,
-                )
-            except KeyError as error:
-                return _stream([_end({"code": "not_found", "message": error.args[0]})])
             except DecodeError as error:
                 return _stream(
                     [_end({"code": "invalid_argument", "message": str(error)})]
                 )
-            except TooLong as error:
-                return _stream([_end({"code": "out_of_range", "message": str(error)})])
-            except Exception as error:
-                # Answered as Connect, inside CORS, so the page sees why.
-                traceback.print_exc()
-                return _stream(
-                    [
+            # The walk runs on its own thread, holding the model for its whole
+            # length, and hands each listing over as it is cut. A client that
+            # hangs up stops it at the next node.
+            items: queue.Queue[bytes | None] = queue.Queue()
+            canceled = threading.Event()
+
+            def work() -> None:
+                try:
+                    for listing in model.expand(
+                        measure,
+                        request_message.node,
+                        request_message.path,
+                        request_message.horizon,
+                        canceled,
+                    ):
+                        items.put(_envelope(0, listing.SerializeToString()))
+                    items.put(_end())
+                except KeyError as error:
+                    items.put(_end({"code": "not_found", "message": error.args[0]}))
+                except TooLong as error:
+                    items.put(_end({"code": "out_of_range", "message": str(error)}))
+                except Exception as error:
+                    # Answered as Connect, inside CORS, so the page sees why.
+                    traceback.print_exc()
+                    items.put(
                         _end(
                             {
                                 "code": "internal",
                                 "message": f"{type(error).__name__}: {error}",
                             }
                         )
-                    ]
-                )
+                    )
+                finally:
+                    items.put(None)
 
-            def chunks():
-                for listing in listings:
-                    yield _envelope(0, listing.SerializeToString())
-                yield _end()
+            threading.Thread(target=work, daemon=True).start()
 
-            return _stream(chunks())
+            async def chunks():
+                try:
+                    while (
+                        item := await anyio.to_thread.run_sync(items.get)
+                    ) is not None:
+                        yield item
+                finally:
+                    canceled.set()
+
+            return StreamingResponse(chunks(), media_type=_CONTENT_TYPE)
 
         return expand
 

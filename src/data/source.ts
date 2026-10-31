@@ -4,20 +4,36 @@
 import { fromBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
-import { type ExpandRequest, Natlas, SnapshotSchema } from "../gen/natlas/natlas_pb";
+import { Natlas, SnapshotSchema } from "../gen/natlas/natlas_pb";
 import { TextLabels } from "../readings/labels";
 import { type NotesFile, NoteLabels } from "../readings/notes";
 import type { Labels } from "../readings/reading";
-import { type Branch, IntervalTree, type Listing, type NodeId } from "../core/tree";
+import { type Branch, IntervalTree, type Listing, type NodeId, ROOT } from "../core/tree";
 
 /** A node's children as a source lists them; `complete` is what it vouches for. */
 export type Reply = Omit<Listing, "horizon">;
 
+/** One node's reply in a walk. */
+export interface Step {
+  node: NodeId;
+  reply: Reply;
+}
+
 export interface Source {
-  /** The children of `node` in `tree`, down to 2^-horizon. */
-  expand(tree: IntervalTree, node: NodeId, horizon: number, signal?: AbortSignal): Promise<Reply>;
+  /**
+   * The children of ``to`` and of every node between ``from`` and it, in
+   * order, as the protocol's Expand: each down to 2^-horizon and through the
+   * path's next branch. ``from`` is ``to`` itself, its parent, or an ancestor
+   * the client can already place the path through.
+   */
+  expand(tree: IntervalTree, from: NodeId, to: NodeId, horizon: number, signal?: AbortSignal): AsyncIterable<Step>;
   /** Map text to branches from the root, when this source has a text mapping. */
   search?(text: string, signal?: AbortSignal): Promise<Branch[]>;
+}
+
+/** The nodes a walk from ``from`` to ``to`` lists: those below ``from``, or ``to`` alone. */
+function walked(tree: IntervalTree, from: NodeId, to: NodeId): NodeId[] {
+  return from === to ? [to] : tree.chain(from, to).slice(1);
 }
 
 /** A recorded server. Its own tree learns the recorded nodes' ids. */
@@ -50,18 +66,14 @@ export class SnapshotSource implements Source {
     this.paths = [...paths.values()];
   }
 
-  async expand(tree: IntervalTree, node: NodeId, horizon: number): Promise<Reply> {
-    const recorded = this.recorded.raw.find(tree.hash(node));
-    if (recorded === undefined || !this.recorded.hasListing(recorded, 0)) {
-      return { branches: [], lnWeights: [], leftover: 1, complete: 0 };
+  async *expand(tree: IntervalTree, from: NodeId, to: NodeId, horizon: number): AsyncIterable<Step> {
+    const nodes = walked(tree, from, to);
+    for (const [index, node] of nodes.entries()) {
+      const next = nodes[index + 1];
+      const recorded = this.recorded.raw.find(tree.hash(node));
+      const cut = recorded === undefined ? undefined : this.recorded.cut(recorded, 0, horizon, next === undefined ? undefined : tree.branch(next));
+      yield { node, reply: cut ?? { branches: [], lnWeights: [], leftover: 1, complete: 0 } };
     }
-    const { branches, lnWeights, lnLeftover } = this.recorded.cut(recorded, 0, horizon);
-    return {
-      branches,
-      lnWeights,
-      leftover: Math.exp(lnLeftover),
-      complete: Math.min(horizon, this.recorded.complete(recorded, 0)),
-    };
   }
 
   async search(text: string): Promise<Branch[]> {
@@ -77,29 +89,33 @@ export class ConnectSource implements Source {
     this.client = createClient(Natlas, createConnectTransport({ baseUrl, useBinaryFormat: true }));
   }
 
-  /** Name the node by its parent's id, and from the root when the server has
-   * not learned that id (it restarted, or never saw the parent). */
-  async expand(tree: IntervalTree, node: NodeId, horizon: number, signal?: AbortSignal): Promise<Reply> {
-    const parent = tree.parent(node);
-    if (parent === null) return this.listing({ node: 0n, path: [], horizon }, signal);
+  /** Name the walk from ``from``'s id, and from the root when the server has
+   * not learned that id (it restarted, or never saw it). */
+  async *expand(tree: IntervalTree, from: NodeId, to: NodeId, horizon: number, signal?: AbortSignal): AsyncIterable<Step> {
+    let listed = false;
     try {
-      return await this.listing({ node: tree.hash(parent), path: [tree.branch(node)], horizon }, signal);
+      for await (const step of this.walk(tree, from, to, horizon, signal)) {
+        listed = true;
+        yield step;
+      }
     } catch (error) {
-      if (ConnectError.from(error).code !== Code.NotFound) throw error;
-      return this.listing({ node: 0n, path: tree.path(node), horizon }, signal);
+      if (listed || from === ROOT || ConnectError.from(error).code !== Code.NotFound) throw error;
+      yield* this.walk(tree, ROOT, to, horizon, signal);
     }
   }
 
-  private async listing(request: Omit<ExpandRequest, "$typeName">, signal?: AbortSignal): Promise<Reply> {
-    const branches: Branch[] = [];
-    const lnWeights: number[] = [];
-    let lnLeftover = 0;
-    for await (const batch of this.client.expand(request, { signal })) {
-      for (const branch of batch.branches) branches.push(branch);
-      for (const weight of batch.lnWeights) lnWeights.push(weight);
-      lnLeftover = batch.lnLeftover;
+  private async *walk(tree: IntervalTree, from: NodeId, to: NodeId, horizon: number, signal?: AbortSignal): AsyncIterable<Step> {
+    const nodes = walked(tree, from, to);
+    const path = from === to ? [] : nodes.map((node) => tree.branch(node));
+    let index = 0;
+    for await (const listing of this.client.expand({ node: tree.hash(from), path, horizon }, { signal })) {
+      const node = nodes[index++];
+      if (node === undefined) throw new Error("the server listed more nodes than the path holds");
+      const last = listing.lnWeights.at(-1);
+      // Every child as heavy as the last listed one is listed.
+      const complete = last === undefined ? horizon : Math.max(horizon, -last / Math.LN2);
+      yield { node, reply: { branches: listing.branches, lnWeights: listing.lnWeights, leftover: Math.exp(listing.lnLeftover), complete } };
     }
-    return { branches, lnWeights, leftover: Math.exp(lnLeftover), complete: request.horizon };
   }
 
   async search(text: string, signal?: AbortSignal): Promise<Branch[]> {
@@ -114,7 +130,6 @@ export interface DatasetEntry {
   labels?: string;
   /** Each measure is a recorded snapshot file or a live service's base URL. */
   measures: { name: string; file?: string; url?: string }[];
-  /** What the entry's paths are relative to; the static data directory by default. */
   /** What the entry's paths are relative to; the static data directory by default. */
   base?: string;
 }

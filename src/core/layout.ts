@@ -117,8 +117,9 @@ export interface LayoutOptions {
   mergePx: number;
 }
 
+/** ln of the view's height in origin heights: the view spans e^-x of the origin. */
 export function logView(cam: Camera): number {
-  return Math.min(0, -cam.x);
+  return -cam.x;
 }
 
 export function layout(

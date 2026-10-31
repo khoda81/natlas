@@ -112,7 +112,7 @@ export class Expander {
         continue;
       }
       const { signal } = this.abort;
-      void this.fetch(node, measure, ask).catch((error: unknown) => {
+      void this.fetch(this.tree.parent(node) ?? node, node, measure, ask).catch((error: unknown) => {
         if (!signal.aborted) {
           this.failed.set(key, performance.now());
           this.onError(error);
@@ -136,13 +136,41 @@ export class Expander {
       if (this.tree.complete(node, measure) < covered) return false;
       if (covered >= MAX_HORIZON) return false;
       const horizon = Math.min(MAX_HORIZON, Math.max(16, 2 * Math.max(0, covered)));
-      await this.fetch(node, measure, horizon);
+      await this.fetch(this.tree.parent(node) ?? node, node, measure, horizon);
     }
     return true;
   }
 
-  private fetch(node: NodeId, measure: number, horizon: number): Promise<void> {
-    const key = `${node}:${measure}`;
+  /**
+   * List every node from ``origin`` down to ``target`` through the branch
+   * toward ``target``, and ``target`` down to ``horizon``, asking only for
+   * what is missing: one walk from the deepest node already placed. True
+   * once all of it is listed; false where the source has nothing more.
+   */
+  async walk(origin: NodeId, target: NodeId, measure: number, horizon: number): Promise<boolean> {
+    const lens = { p: measure, q: measure };
+    const chain = this.tree.chain(origin, target);
+    let first = 0;
+    while (first < chain.length - 1 && this.tree.slotOf(chain[first]!, lens, this.tree.branch(chain[first + 1]!)) !== undefined) first++;
+    const lacking = chain[first]!;
+    if (first === chain.length - 1 && this.tree.horizon(target, measure) >= horizon) return true;
+    // A recording that vouches for less than it was asked has no more to say.
+    if (this.tree.hasListing(lacking, measure) && this.tree.complete(lacking, measure) < this.tree.horizon(lacking, measure)) return false;
+    const from = this.tree.parent(lacking);
+    if (from === null && lacking !== target) {
+      // Nothing names the root's listing through a branch; widen it instead.
+      if (!(await this.reach(lacking, measure, this.tree.branch(chain[1]!)))) return false;
+      return this.walk(origin, target, measure, horizon);
+    }
+    await this.fetch(from ?? lacking, target, measure, horizon);
+    return chain.every((node, index) => index === chain.length - 1
+      ? this.tree.hasListing(node, measure)
+      : this.tree.slotOf(node, lens, this.tree.branch(chain[index + 1]!)) !== undefined);
+  }
+
+  /** Fetch the listings of the walk from ``from`` to ``to``, keyed by ``to``. */
+  private fetch(from: NodeId, to: NodeId, measure: number, horizon: number): Promise<void> {
+    const key = `${to}:${measure}`;
     const pending = this.pending.get(key);
     if (pending !== undefined) return pending;
     const { signal } = this.abort;
@@ -151,10 +179,12 @@ export class Expander {
       else this.active++;
       try {
         signal.throwIfAborted();
-        const reply = await this.sources[measure]!.expand(this.tree, node, horizon, signal);
-        signal.throwIfAborted();
-        if (horizon < this.tree.horizon(node, measure)) return;
-        this.tree.setListing(node, measure, { ...reply, horizon });
+        for await (const { node, reply } of this.sources[measure]!.expand(this.tree, from, to, horizon, signal)) {
+          signal.throwIfAborted();
+          // A listing through a light branch covers more than was asked.
+          const covered = Math.max(horizon, reply.complete);
+          if (covered >= this.tree.horizon(node, measure)) this.tree.setListing(node, measure, { ...reply, horizon: covered });
+        }
         this.failed.delete(key);
       } finally {
         const next = this.waiting.shift();

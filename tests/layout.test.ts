@@ -50,7 +50,7 @@ describe("layout", () => {
 
   it("partitions the root interval by p and sizes widths by -ln q", () => {
     const tree = chainTree([0.5, 0.25, 0.25], []);
-    const cam: Camera = { origin: 0, x: -0.1, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
+    const cam: Camera = { origin: 0, x: 0, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
     const frame = layout(tree, lens, cam, view);
     const near = (value: number) => expect.closeTo(value, 12);
     const spans = frame.boxes.map((box) => [box.slot, box.y0, box.y1, box.x1 - box.x0]);
@@ -107,12 +107,15 @@ describe("layout", () => {
     expect(cam.a).toBeCloseTo(0.3, 15);
   });
 
-  it("stops at the origin's left edge", () => {
+  it("stops only at the root's left edge: past any other origin lies its parent", () => {
     const cam: Camera = { origin: 0, x: 0.5, k: 100, anchor: { node: 0, slot: 0 }, a: 0 };
     moveDepth(cam, -2, 0.5);
     expect(cam.x).toBe(0);
-    moveDepth(cam, -1, 0.5);
-    expect(cam.x).toBe(0);
+    const deeper: Camera = { ...cam, origin: 3, x: 0.5, a: 0 };
+    moveDepth(deeper, -2, 0.5);
+    expect(deeper.x).toBe(-1.5);
+    // The view keeps zooming out with depth there: it spans e^1.5 origins.
+    expect(deeper.a).toBeCloseTo(0.5 - 0.5 * Math.exp(-2), 12);
   });
 
   it("scales horizontally without moving anything vertically", () => {

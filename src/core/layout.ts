@@ -47,8 +47,9 @@ export interface Box {
   count: number;
   kind: BoxKind;
   branch: Branch | null;
+  /** Conditional probabilities; p-weighted geometric means for a band. */
   p: number;
-  /** NaN while unknown. */
+  /** NaN while unknown; like p, a representative child weight for a band. */
   q: number;
   lnMass: number;
   x0: number;
@@ -122,7 +123,7 @@ export interface Selection {
 }
 
 export interface LayoutOptions {
-  /** Children thinner than this many pixels join a band. */
+  /** Children thinner than this many CSS pixels join a band; 1 / DPR is one physical pixel. */
   mergePx: number;
 }
 

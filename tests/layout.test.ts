@@ -9,6 +9,37 @@ const lens = { p: 0, q: 0 };
 const at = (node: bigint, rank = 0) => ({ node, rank });
 
 describe("layout", () => {
+  it("keeps children separate when their height exceeds one physical pixel", () => {
+    const tree = chainTree([0.997, 0.0015, 0.0009, 0.0006], []);
+    const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };
+    const low = layout(tree, lens, cam, view, { mergePx: 1 });
+    const high = layout(tree, lens, cam, view, { mergePx: 1 / 2 });
+    // At 800 CSS pixels high, the last two children are 0.72 and 0.48 CSS
+    // pixels tall. Only the latter is still subpixel on a 2× display.
+    expect(low.boxes.find(box => box.rank === 2)).toMatchObject({ kind: "merged", count: 2 });
+    expect(high.boxes.find(box => box.rank === 2)).toMatchObject({ kind: "leaf", branch: 2 });
+    expect(high.boxes.find(box => box.rank === 3)).toMatchObject({ kind: "merged", count: 1 });
+    for (const frame of [low, high]) {
+      expect(pick(tree, lens, frame, cam, view, 100, 799.8)?.box.branch).toBe(3);
+      frame.dispose();
+    }
+  });
+
+  it("colors a band by its children's mean log ratio and keeps its mass in lnMass", () => {
+    const tree = new IntervalTree(2);
+    const p = [0.5, 0.488, 0.006, 0.004, 0.002];
+    const q = [0.5, 0.48, 0.004, 0.008, 0.008];
+    tree.insert(ROOT, 0, answer(p));
+    tree.insert(ROOT, 1, answer(q));
+    const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };
+    const frame = layout(tree, { p: 0, q: 1 }, cam, view, { mergePx: 10 });
+    const expected = p.slice(2).reduce((sum, value, i) => sum + value * Math.log(value / q[i + 2]!), 0) / 0.012;
+    const band = frame.boxes.find(box => box.kind === "merged")!;
+    expect(Math.log(band.p / band.q)).toBeCloseTo(expected, 10);
+    expect(Math.exp(band.lnMass)).toBeCloseTo(0.012, 12);
+    frame.dispose();
+  });
+
   it("keeps the origin selectable before anything arrives, and asks for it", () => {
     const tree = new IntervalTree(1);
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };

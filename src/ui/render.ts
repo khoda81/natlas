@@ -80,6 +80,12 @@ export function screenRect(box: Box, cam: Camera, view: Viewport): ScreenRect {
   };
 }
 
+/** The physical pixel containing each exact edge, expressed in CSS pixels. */
+function pixelRect(rect: ScreenRect, scale: number): ScreenRect {
+  const pixel = (at: number) => Math.floor(at * scale) / scale;
+  return { x0: pixel(rect.x0), x1: pixel(rect.x1), y0: pixel(rect.y0), y1: pixel(rect.y1) };
+}
+
 export function draw(
   ctx: CanvasRenderingContext2D,
   frame: Frame,
@@ -101,35 +107,48 @@ export function draw(
   ctx.textBaseline = "middle";
 
   const labels: { box: Box; rect: ScreenRect; glyph: Glyph; ink: string; grows: boolean }[] = [];
+  const borders: ScreenRect[] = [];
   let visible = false;
-  for (const box of frame.boxes) {
+  for (let i = 0; i < frame.boxes.length; i++) {
+    const box = frame.boxes[i]!;
     const rect = screenRect(box, cam, view);
     const width = rect.x1 - rect.x0;
     const height = rect.y1 - rect.y0;
     if (width <= 0 || height <= 0) continue;
     visible = true;
 
+    if (box.kind === "merged") {
+      const start = i;
+      // Only touching siblings share a silhouette. An unknown interval,
+      // a visible child, or another node must retain its own boundary.
+      // Touching runs coalesce, so neighbouring bands share one stored
+      // edge and touch exactly.
+      while (i + 1 < frame.boxes.length) {
+        const next = frame.boxes[i + 1]!;
+        if (next.kind !== "merged" || next.node !== box.node || next.x0 !== box.x0
+          || next.y0 !== frame.boxes[i]!.y1) break;
+        i++;
+      }
+      tail(ctx, frame.boxes, start, i, cam, view, equal, ramp, scale);
+      continue;
+    }
+
     // A gap with no estimate yet is unknown, as the background already says:
     // only its label shows. One with an estimate is drawn as a silhouette.
     let ink = scheme.inkMuted;
     if (box.kind !== "gap" || Number.isFinite(box.x1)) {
-      // With p = q, a child's q is its p, and a silhouette's is its typical
-      // child's weight, where its p is the whole silhouette's mass.
+      // With p = q, a gap's q estimates a typical child's weight.
       const level = ramp.level(rampPosition(equal ? box.q : box.p, box.q, equal));
       ink = ramp.ink[level]!;
       ctx.fillStyle = ramp.fill[level]!;
-      const bordered = box.kind !== "merged" && box.kind !== "gap" && GAP_MIN <= width && GAP_MIN <= height;
-      ctx.fillRect(
-        rect.x0,
-        rect.y0,
-        bordered && GAP_MIN <= width ? width - 1 : width,
-        bordered && GAP_MIN <= height ? height - 1 : height,
-      );
+      const bordered = box.kind !== "gap" && GAP_MIN <= width && GAP_MIN <= height;
+      const pixels = pixelRect(rect, scale);
+      ctx.fillRect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0, pixels.y1 - pixels.y0);
+      if (bordered) borders.push(pixels);
     }
 
     if (
-      box.kind === "merged"
-      || height <= LABEL_MIN_HEIGHT
+      height <= LABEL_MIN_HEIGHT
       || width <= LABEL_MIN_WIDTH
       || box.count === 0
     ) {
@@ -143,6 +162,16 @@ export function draw(
       ink,
       grows: box.branch !== null
     });
+  }
+
+  // A separator occupies the pixel containing the exact boundary, including
+  // when the boundary falls exactly on the grid. Draw after every fill so
+  // the next sibling or its silhouette cannot paint over that pixel.
+  const pixel = 1 / scale;
+  ctx.fillStyle = scheme.surface;
+  for (const rect of borders) {
+    ctx.fillRect(rect.x1, rect.y0, pixel, rect.y1 - rect.y0 + pixel);
+    ctx.fillRect(rect.x0, rect.y1, rect.x1 - rect.x0, pixel);
   }
 
   // A label's size follows its whole box, never the viewport. Within its box,
@@ -181,6 +210,59 @@ export function draw(
 
   outline(ctx, frame, cam, view, state, scheme.ink);
   ruler(ctx, cam, view, state.units, palette);
+}
+
+/** Paint a dense sibling tail once. Separate antialiased rectangles let the
+ * background leak through their shared edges. A single contour has only an
+ * outside edge; a vertical gradient carries each band's own color without
+ * adding interior coverage edges or rounding its probability geometry. */
+function tail(
+  ctx: CanvasRenderingContext2D,
+  boxes: readonly Box[],
+  start: number,
+  end: number,
+  cam: Camera,
+  view: Viewport,
+  equal: boolean,
+  ramp: Palette["sequential"],
+  scale: number,
+): void {
+  const first = screenRect(boxes[start]!, cam, view);
+  const bottom = screenRect(boxes[end]!, cam, view).y1;
+  // Meet ordinary boxes on their physical-pixel edges. Inside the tail,
+  // keep the measured contour and color boundaries at full precision.
+  const edges = pixelRect({ ...first, y1: bottom }, scale);
+  if (edges.y1 <= edges.y0) return;
+  const fill = (box: Box) => ramp.fill[ramp.level(rampPosition(box.p, box.q, equal))]!;
+  const initial = fill(boxes[start]!);
+  let previous = initial;
+  let gradient: CanvasGradient | null = null;
+  ctx.beginPath();
+  ctx.moveTo(edges.x0, edges.y0);
+  for (let i = start; i <= end; i++) {
+    const box = boxes[i]!;
+    const rect = screenRect(box, cam, view);
+    ctx.lineTo(rect.x1, i === start ? edges.y0 : Math.min(rect.y0, edges.y1));
+    ctx.lineTo(rect.x1, i === end ? edges.y1 : Math.min(rect.y1, edges.y1));
+    const color = fill(box);
+    if (color !== previous) {
+      if (gradient === null) {
+        gradient = ctx.createLinearGradient(0, first.y0, 0, bottom);
+        gradient.addColorStop(0, initial);
+      }
+      // Paired stops preserve the measured band colors. Interpolating only
+      // the tail's first and last colors would invent values in between.
+      const at = (rect.y0 - first.y0) / (bottom - first.y0);
+      gradient.addColorStop(at, previous);
+      gradient.addColorStop(at, color);
+      previous = color;
+    }
+  }
+  ctx.lineTo(edges.x0, edges.y1);
+  ctx.closePath();
+  if (gradient !== null) gradient.addColorStop(1, previous);
+  ctx.fillStyle = gradient ?? initial;
+  ctx.fill();
 }
 
 /** What a gap or the origin says of itself: how many children it holds, where known. */
@@ -257,21 +339,23 @@ function outline(
   ink: string,
 ): void {
   if (state.hover === null) return;
+  const scale = ctx.getTransform().a;
+  const pixel = 1 / scale;
   ctx.strokeStyle = ink;
-  ctx.lineWidth = 1;
+  ctx.lineWidth = pixel;
   ctx.globalAlpha = 0.35;
   for (const box of frame.boxes) {
     if (box.kind === "merged" || !state.ancestors.has(childKey(box.node, box.rank))) continue;
-    const rect = screenRect(box, cam, view);
-    ctx.strokeRect(rect.x0 + 0.5, rect.y0 + 0.5, rect.x1 - rect.x0 - 2, rect.y1 - rect.y0 - 2);
+    const rect = pixelRect(screenRect(box, cam, view), scale);
+    ctx.strokeRect(rect.x0 + pixel / 2, rect.y0 + pixel / 2, rect.x1 - rect.x0, rect.y1 - rect.y0);
   }
   ctx.globalAlpha = 1;
   // A gap has no box to outline; the inspector still describes it.
   if (state.hover.box.kind === "gap") return;
-  ctx.lineWidth = 2;
-  if (!state.hover.exact) ctx.setLineDash([5, 3]);
-  const rect = screenRect(state.hover.box, cam, view);
-  ctx.strokeRect(rect.x0 + 1, rect.y0 + 1, Math.max(0, rect.x1 - rect.x0 - 3), Math.max(0, rect.y1 - rect.y0 - 3));
+  ctx.lineWidth = 2 * pixel;
+  if (!state.hover.exact) ctx.setLineDash([5 * pixel, 3 * pixel]);
+  const rect = pixelRect(screenRect(state.hover.box, cam, view), scale);
+  ctx.strokeRect(rect.x0 + pixel, rect.y0 + pixel, Math.max(0, rect.x1 - rect.x0 - pixel), Math.max(0, rect.y1 - rect.y0 - pixel));
   ctx.setLineDash([]);
 }
 

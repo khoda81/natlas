@@ -83,8 +83,9 @@ pub struct LayoutBox {
     pub kind: BoxKind,
     /// The child's branch; none for a gap or a merged band.
     pub branch: Option<Branch>,
+    /// Conditional probabilities; p-weighted geometric means for a band.
     pub p: f64,
-    /// NaN while unknown.
+    /// NaN while unknown; like p, a representative child weight for a band.
     pub q: f64,
     pub ln_mass: f64,
     pub x0: f64,
@@ -669,6 +670,7 @@ impl Layout<'_> {
         let height = |item: Item| placed.y(d.item_bottom(item)) - placed.y(d.item_top(item));
         let target = placed.ln_below(placed.y(d.item_top(start)) + self.merge);
         let (mut ln_known, mut ln_area) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut ln_ratio = 0.0;
         let (mut count, mut least, mut most) = (0usize, f64::INFINITY, f64::NEG_INFINITY);
         let mut gaps = Vec::new();
         let mut last = start;
@@ -699,13 +701,14 @@ impl Layout<'_> {
                         most = most.max(-r.ln_p(end));
                     } else {
                         let n = end + 1 - at;
-                        let (mut mass, mut area) = (0.0, 0.0);
+                        let (mut mass, mut area, mut ratio) = (0.0, 0.0, 0.0);
                         for sample in 0..SAMPLES.min(n) {
                             let i = at + sample * n / SAMPLES.min(n);
                             let nats = self.tree.nats_q(node, self.lens, r.branch(i), r.ln_p(i))?;
                             if nats.is_finite() {
                                 let p = (r.ln_p(i) - r.ln_p(at)).exp();
                                 (mass, area) = (mass + p, area + p * nats);
+                                ratio += p * (r.ln_p(i) + nats);
                                 (least, most, count) = (least.min(nats), most.max(nats), count + 1);
                             } else {
                                 wants.branches.push(r.branch(i));
@@ -713,6 +716,7 @@ impl Layout<'_> {
                         }
                         if 0.0 < mass {
                             ln_known = ln_add(ln_known, ln_mass);
+                            ln_ratio += (ratio / mass - ln_ratio) * (ln_mass - ln_known).exp();
                             ln_area = ln_add(ln_area, ln_mass + (area / mass).ln());
                         }
                     }
@@ -755,7 +759,10 @@ impl Layout<'_> {
             count: count as u32,
             kind: BoxKind::Merged,
             branch: None,
-            p: ln_p.exp(),
+            // q already represents a typical child, not the whole band.
+            // Use the same p-weighted geometric mean for p so ln(p/q)
+            // is the children's mean log ratio, independent of grouping.
+            p: (ln_ratio - nats).exp(),
             q: (-nats).exp(),
             ln_mass: placed.ln_mass + ln_p,
             x0: placed.x,
@@ -1100,7 +1107,7 @@ mod tests {
             .find(|b| b.kind == BoxKind::Merged)
             .expect("the light children merge");
         let area: f64 = weights_[2..].iter().map(|w| -w * w.ln()).sum();
-        assert!((band.p * (band.x1 - band.x0) - area).abs() < 1e-12);
+        assert!((band.ln_mass.exp() * (band.x1 - band.x0) - area).abs() < 1e-12);
         assert_eq!(band.count, 3);
         let hit = pick(
             &tree,
@@ -1115,6 +1122,71 @@ mod tests {
         .unwrap();
         assert_eq!(hit.r#box.branch, Some(2));
         assert!(hit.exact);
+    }
+
+    #[test]
+    fn bands_color_by_their_childrens_mean_log_ratio() {
+        let p = [0.5, 0.488, 0.006, 0.004, 0.002];
+        let q = [0.5, 0.48, 0.004, 0.008, 0.008];
+        let mut tree = Tree::new(2);
+        tree.set(ROOT, 0, weights(&p)).unwrap();
+        tree.set(ROOT, 1, weights(&q)).unwrap();
+        let lens = Lens { p: 0, q: 1 };
+        let camera = cam(ROOT, 0.0, top(ROOT), 0.0);
+        let frame = layout(&tree, lens, camera, VIEW, 10.0).unwrap();
+        let band = frame
+            .boxes
+            .iter()
+            .find(|b| b.kind == BoxKind::Merged)
+            .unwrap();
+        let expected = p[2..]
+            .iter()
+            .zip(&q[2..])
+            .map(|(p, q)| p * (p / q).ln())
+            .sum::<f64>()
+            / p[2..].iter().sum::<f64>();
+        near((band.p / band.q).ln(), expected);
+
+        // Identical measures must stay neutral at every grouping size.
+        tree.set(ROOT, 1, weights(&p)).unwrap();
+        for merge in [1.0, 10.0, 100.0] {
+            let frame = layout(&tree, lens, camera, VIEW, merge).unwrap();
+            for band in frame.boxes.iter().filter(|b| b.kind == BoxKind::Merged) {
+                near((band.p / band.q).ln(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn touching_bands_share_their_edge_exactly_across_runs() {
+        // One heavy child, then thin known children alternating with
+        // one-child gaps: every band boundary is a run's or a gap's edge.
+        // The renderer joins touching bands by comparing edges exactly.
+        let w = 1.25e-5;
+        let mut runs = vec![Run::new(0, vec![0], vec![0.0, 0.01f64.ln()]).unwrap()];
+        for i in 0..400u32 {
+            let below = 0.01 - 2.0 * f64::from(i) * w;
+            runs.push(
+                Run::new(
+                    1 + 2 * i,
+                    vec![1 + 2 * i],
+                    vec![below.ln(), (below - w).ln()],
+                )
+                .unwrap(),
+            );
+        }
+        let mut tree = Tree::new(1);
+        tree.insert(ROOT, 0, runs).unwrap();
+        let frame = layout(&tree, LENS, cam(ROOT, 0.0, top(ROOT), 0.0), VIEW, 1.0).unwrap();
+        let bands: Vec<_> = frame
+            .boxes
+            .iter()
+            .filter(|b| b.kind == BoxKind::Merged)
+            .collect();
+        assert!(2 < bands.len());
+        for pair in bands.windows(2) {
+            assert_eq!(pair[1].y0, pair[0].y1);
+        }
     }
 
     #[test]
@@ -1208,7 +1280,11 @@ mod tests {
         let run = Run::new(0, vec![4, 7], vec![0.0, 0.5f64.ln(), 0.25f64.ln()]).unwrap();
         uncounted.insert(ROOT, 0, vec![run]).unwrap();
         let frame_ = layout(&uncounted, LENS, cam(ROOT, 0.0, top(ROOT), 0.0), VIEW, 1.0).unwrap();
-        let gap_ = frame_.boxes.iter().find(|b| b.kind == BoxKind::Gap).unwrap();
+        let gap_ = frame_
+            .boxes
+            .iter()
+            .find(|b| b.kind == BoxKind::Gap)
+            .unwrap();
         near(gap_.x1 - gap_.x0, 4f64.ln());
         // The gap is sampled in proportion to its 200 visible pixels, all
         // of its points inside it; both children are asked for by points in

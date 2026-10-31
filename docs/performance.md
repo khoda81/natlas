@@ -36,6 +36,16 @@ Immutable paths and glyphs are cached, and the inspector and top path panel
 reuse DOM nodes. Text widths are memoized at the original font size, with a
 bounded cache and invalidation on display-scale changes.
 
+## Check rendered pixels
+
+Run `bun scripts/check-rendering.ts` after building the core, then open its
+URL. It checks actual Canvas pixels at DPR 1, 1.25, 1.5, and 2: uniform,
+varying and gapped tails at fractional offsets, neutral p/q colors, and
+separators occupying exactly the physical pixel containing each boundary.
+The report is saved to `/tmp/natlas-rendering-tests.json`. These checks use
+the target browser's rasterizer; TypeScript and Rust unit tests alone cannot
+detect antialiasing seams.
+
 ## Reproduce the browser benchmark
 
 ```bash

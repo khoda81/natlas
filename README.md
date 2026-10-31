@@ -60,9 +60,13 @@ ln of the mass below it, and since children rank heaviest first, the mass
 below a child is at most the number of children below it times its own weight:
 every edge stays exact relative to the children around it, however light they
 are. Each node is laid out from its two edges nearest the anchor, one binary
-search to the first visible child, and children thinner than a pixel join
-bands about a pixel tall (see `core/src/layout.rs`). The tests pin exact geometry
-80 halvings deep and beside children 2^−3000 of their parent.
+search to the first visible child, and children thinner than a physical pixel
+join bands about a physical pixel tall (see `core/src/layout.rs`). Touching
+bands draw as one silhouette with their individual colors, so internal
+antialiased edges cannot show through as stripes. Ordinary boxes align to the
+physical pixel grid; a separator occupies the pixel containing its exact
+boundary. The tests pin exact geometry 80 halvings deep and beside children
+2^−3000 of their parent.
 
 | input | motion |
 |---|---|
@@ -127,18 +131,22 @@ order and split heights, and q is read by branch for the children p places.
 Placed branches use the same colors whether their children are known yet.
 
 Rendering samples rather than fetches every child. A gap is asked for by
-its visible size, two points per pixel, spread evenly through its mass: every
-child wider than half a pixel is placed exactly, and thinner ones are drawn
-with probability proportional to p. Children thinner than a pixel, with the
-gaps between them, are drawn as bands about a pixel tall, borderless
-silhouettes whose width Σ p (−ln q) / Σ p is a Monte Carlo estimate from their
-known children: exact when p = q and the band holds no gap, since children
-sorted by p have nearly equal surprisal side by side. Where gaps remain, the
-estimate's error on screen is about k σ / √n pixels, with k the horizontal
-scale, σ the spread of the band's surprisal and n its known children; a band
-off by more than a pixel asks for more points in its gaps, so horizontal zoom
-alone can ask for more samples. Selection still resolves a band's individual
-children.
+its visible size, two points per CSS pixel, spread evenly through its mass:
+every child wider than half a CSS pixel is placed exactly, and thinner ones
+are drawn with probability proportional to p. Children thinner than a
+physical pixel, with the gaps between them, are drawn as bands about a
+physical pixel tall, borderless silhouettes whose width Σ p (−ln q) / Σ p is
+a Monte Carlo estimate from their known children: exact when p = q and the
+band holds no gap, since children sorted by p have nearly equal surprisal
+side by side. Where gaps remain, the estimate's error on screen is about
+k σ / √n pixels, with k the horizontal scale, σ the spread of the band's
+surprisal and n its known children; a band off by more than a pixel asks for
+more points in its gaps, so horizontal zoom alone can ask for more samples.
+Touching sibling bands share one contour, filled with a vertical gradient
+whose stops retain each band's color. Both of a band's conditional weights
+are p-weighted geometric means, so its comparison color shows the children's
+mean ln(p/q), while its total path mass is stored separately. Selection
+still resolves a band's individual children.
 
 Layout reads only what the tree holds and lists what the view lacks as Expand
 requests; the client sends each once, a few at a time, and redraws when an

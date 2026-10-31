@@ -107,6 +107,7 @@ export class App {
   private lens: Lens = { p: 0, q: 0 };
   private cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: { node: ROOT, rank: 0 }, a: 0 };
   private view: Viewport = { width: 1, height: 1 };
+  private pixelRatio = 1;
   private frame: Frame | null = null;
   private geometry: { frame: Frame; key: string } | null = null;
   private units: Units = NATS;
@@ -136,6 +137,7 @@ export class App {
     // ResizeObserver runs after animation callbacks, before paint. Draw in the
     // same animation callback as resizing so no cleared bitmap is presented.
     new ResizeObserver(() => this.invalidate()).observe(this.canvas);
+    this.watchPixelRatio();
     matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
       this.palette = Palette.current();
       this.updateLegend();
@@ -437,8 +439,17 @@ export class App {
     this.invalidate();
   }
 
+  /** A monitor's scale can change without changing the canvas's CSS size. */
+  private watchPixelRatio(): void {
+    matchMedia(`(resolution: ${devicePixelRatio || 1}dppx)`).addEventListener("change", () => {
+      this.watchPixelRatio();
+      this.invalidate();
+    }, { once: true });
+  }
+
   private resize(): void {
     const ratio = devicePixelRatio || 1;
+    this.pixelRatio = ratio;
     const { clientWidth: width, clientHeight: height } = this.canvas;
     if (width !== this.view.width || Math.max(1, height - RULER_HEIGHT) !== this.view.height || this.windowHeight !== window.innerHeight) this.whereHeight = null;
     this.windowHeight = window.innerHeight;
@@ -547,7 +558,7 @@ export class App {
 
   private geometryKey(camera = this.cam): string {
     const { origin, x, k, a, anchor } = camera;
-    return `${this.tree!.revision}:${this.lens.p}:${this.lens.q}:${origin}:${x}:${k}:${anchor.node}:${anchor.rank}:${a}:${this.view.width}:${this.view.height}`;
+    return `${this.tree!.revision}:${this.lens.p}:${this.lens.q}:${origin}:${x}:${k}:${anchor.node}:${anchor.rank}:${a}:${this.view.width}:${this.view.height}:${this.pixelRatio}`;
   }
 
   /** Also shared with the completion-driven fetch pump between paint frames. */
@@ -558,7 +569,7 @@ export class App {
     clamp(this.tree!, this.lens, camera);
     const repaired = this.geometryKey(camera);
     if (this.geometry?.key === repaired) return this.geometry.frame;
-    const frame = layout(this.tree!, this.lens, camera, this.view);
+    const frame = layout(this.tree!, this.lens, camera, this.view, { mergePx: 1 / this.pixelRatio });
     if (this.geometry?.frame !== this.frame) this.geometry?.frame.dispose();
     this.geometry = { frame, key: repaired };
     return frame;

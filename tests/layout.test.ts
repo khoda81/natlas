@@ -20,7 +20,7 @@ describe("layout", () => {
     expect(high.boxes.find(box => box.rank === 2)).toMatchObject({ kind: "leaf", branch: 2 });
     expect(high.boxes.find(box => box.rank === 3)).toMatchObject({ kind: "merged", count: 1 });
     for (const frame of [low, high]) {
-      expect(pick(tree, lens, frame, cam, view, 100, 799.8)?.box.branch).toBe(3);
+      expect(pick(tree, lens, frame, cam, view, 100, 799.8, 1)?.box.branch).toBe(3);
       frame.dispose();
     }
   });
@@ -44,8 +44,8 @@ describe("layout", () => {
     const tree = new IntervalTree(1);
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: at(ROOT), a: 0 };
     const frame = layout(tree, lens, cam, view);
-    expect(pick(tree, lens, frame, cam, view, 500, 400)).toMatchObject({ box: { node: ROOT }, exact: false });
-    expect(pick(tree, lens, frame, cam, view, -1, 400)).toBeNull();
+    expect(pick(tree, lens, frame, cam, view, 500, 400, 1)).toMatchObject({ box: { node: ROOT }, exact: false });
+    expect(pick(tree, lens, frame, cam, view, -1, 400, 1)).toBeNull();
     // Two points per visible pixel, through the whole root.
     expect(frame.misses).toMatchObject([{ node: ROOT, target: ROOT, measure: 0, priority: 800 }]);
     const { read } = frame.misses[0]!;
@@ -77,7 +77,7 @@ describe("layout", () => {
   it("selects the containing known branch where its continuation is unknown", () => {
     const tree = chainTree([0.5, 0.5], []);
     const cam: Camera = { origin: ROOT, x: 2, k: 100, anchor: at(ROOT), a: 0 };
-    const hit = pick(tree, lens, layout(tree, lens, cam, view), cam, view, 500, 400)!;
+    const hit = pick(tree, lens, layout(tree, lens, cam, view), cam, view, 500, 400, 1)!;
     expect(hit.exact).toBe(false);
     expect(hit.box.branch).toBe(0);
   });

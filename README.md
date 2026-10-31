@@ -63,10 +63,11 @@ are. Each node is laid out from its two edges nearest the anchor, one binary
 search to the first visible child, and children thinner than a physical pixel
 join bands about a physical pixel tall (see `core/src/layout.rs`). Touching
 bands draw as one silhouette with their individual colors, so internal
-antialiased edges cannot show through as stripes. Ordinary boxes align to the
-physical pixel grid; a separator occupies the pixel containing its exact
-boundary. The tests pin exact geometry 80 halvings deep and beside children
-2^−3000 of their parent.
+antialiased edges cannot show through as stripes. A physical pixel shows, and
+the pointer over it selects, the box holding the pixel's top-left corner, so
+hovering a box a pixel or two tall never selects its neighbour; a separator
+is its box's last row and column of pixels. The tests pin exact geometry 80
+halvings deep and beside children 2^−3000 of their parent.
 
 | input | motion |
 |---|---|
@@ -146,7 +147,9 @@ Touching sibling bands share one contour, filled with a vertical gradient
 whose stops retain each band's color. Both of a band's conditional weights
 are p-weighted geometric means, so its comparison color shows the children's
 mean ln(p/q), while its total path mass is stored separately. Selection
-still resolves a band's individual children.
+still resolves a band's individual children: on a band's pixel, the pointer
+selects the known child the pixel holds rather than a gap between children,
+and the highlight outlines the rows of the silhouette that child touches.
 
 Layout reads only what the tree holds and lists what the view lacks as Expand
 requests; the client sends each once, a few at a time, and redraws when an

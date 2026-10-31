@@ -7,7 +7,6 @@ cached distributions and the hashed node ids shared with every client.
 from __future__ import annotations
 
 import json
-import math
 import queue
 import re
 import struct

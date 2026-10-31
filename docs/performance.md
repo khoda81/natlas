@@ -40,8 +40,9 @@ bounded cache and invalidation on display-scale changes.
 
 Run `bun scripts/check-rendering.ts` after building the core, then open its
 URL. It checks actual Canvas pixels at DPR 1, 1.25, 1.5, and 2: uniform,
-varying and gapped tails at fractional offsets, neutral p/q colors, and
-separators occupying exactly the physical pixel containing each boundary.
+varying and gapped tails at fractional offsets, neutral p/q colors,
+separators occupying exactly their box's last physical pixel, and thin
+children showing on each pixel the box a pointer over it selects.
 The report is saved to `/tmp/natlas-rendering-tests.json`. These checks use
 the target browser's rasterizer; TypeScript and Rust unit tests alone cannot
 detect antialiasing seams.

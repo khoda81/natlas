@@ -954,8 +954,10 @@ pub fn reanchor(frame: &Frame) -> Option<AnchorPosition> {
         })
 }
 
-/// The box under a screen point: a child, however thin and merged, found by
-/// walking down from the origin through the nodes the frame laid out.
+/// The box a pixel shows, `pixel_px` square with its top-left corner at
+/// `(x_px, y_px)`: a child, however thin and merged, found by walking down
+/// from the origin through the nodes the frame laid out.
+#[allow(clippy::too_many_arguments)]
 pub fn pick(
     tree: &Tree,
     lens: Lens,
@@ -964,6 +966,7 @@ pub fn pick(
     view: Viewport,
     x_px: f64,
     y_px: f64,
+    pixel_px: f64,
 ) -> Result<Option<PickResult>> {
     if !(0.0..view.width).contains(&x_px) || !(0.0..view.height).contains(&y_px) {
         return Ok(None);
@@ -999,6 +1002,7 @@ pub fn pick(
         let Some(item) = d.locate(placed.ln_below(y)) else {
             return Ok(Some(origin));
         };
+        let item = band_child(frame, node, placed, d, item, y, y + pixel_px / view.height);
         let b = item_box(tree, lens, node, placed, d, item)?;
         let Some(branch) = b.branch.filter(|_| x >= b.x1) else {
             let exact = b.branch.is_some();
@@ -1012,6 +1016,42 @@ pub fn pick(
             }));
         }
         node = child;
+    }
+}
+
+/// Bands draw thin children and the gaps between them as one silhouette,
+/// so on a pixel of one, from `y` to `bottom`, the known child the pixel
+/// holds is selected rather than the gap at its corner, whichever touching
+/// band draws it. A gap drawn as its own box keeps its pixels: the child
+/// after it starts on the next one.
+fn band_child(
+    frame: &Frame,
+    node: NodeId,
+    placed: &Placed,
+    d: &Distribution,
+    item: Item,
+    y: f64,
+    bottom: f64,
+) -> Item {
+    let banded = |y: f64| {
+        frame
+            .boxes
+            .iter()
+            .any(|b| b.node == node && b.kind == BoxKind::Merged && b.y0 <= y && y < b.y1)
+    };
+    if !matches!(item, Item::Gap { .. }) || !banded(y) {
+        return item;
+    }
+    match d.next(item) {
+        Some(next @ Item::Child { .. }) => {
+            let top = placed.y(d.item_top(next));
+            if top < bottom && banded(top) {
+                next
+            } else {
+                item
+            }
+        }
+        _ => item,
     }
 }
 
@@ -1117,6 +1157,7 @@ mod tests {
             VIEW,
             100.0,
             0.991 * VIEW.height,
+            1.0,
         )
         .unwrap()
         .unwrap();
@@ -1187,6 +1228,67 @@ mod tests {
         for pair in bands.windows(2) {
             assert_eq!(pair[1].y0, pair[0].y1);
         }
+    }
+
+    #[test]
+    fn a_band_pixel_selects_a_known_child_it_holds_over_a_gap() {
+        // Known children alternate with one-child gaps, about 40 a pixel.
+        let w = 1.25e-5;
+        let mut runs = vec![Run::new(0, vec![0], vec![0.0, 0.01f64.ln()]).unwrap()];
+        for i in 0..400u32 {
+            let below = 0.01 - 2.0 * f64::from(i) * w;
+            runs.push(
+                Run::new(
+                    1 + 2 * i,
+                    vec![1 + 2 * i],
+                    vec![below.ln(), (below - w).ln()],
+                )
+                .unwrap(),
+            );
+        }
+        let mut tree = Tree::new(1);
+        tree.insert(ROOT, 0, runs).unwrap();
+        // Off the grid, so pixel corners fall inside items.
+        let camera = cam(ROOT, 0.0, top(ROOT), 0.37 / VIEW.height);
+        let frame = layout(&tree, LENS, camera, VIEW, 1.0).unwrap();
+        let selected = |y_px: f64, pixel_px: f64| {
+            let hit = pick(&tree, LENS, &frame, camera, VIEW, 100.0, y_px, pixel_px);
+            hit.unwrap().unwrap().r#box.branch
+        };
+        let rows = frame
+            .boxes
+            .iter()
+            .filter(|b| b.kind == BoxKind::Merged)
+            .flat_map(|b| (b.y0 * VIEW.height).ceil() as u32..(b.y1 * VIEW.height).ceil() as u32)
+            .filter(|&row| f64::from(row) < VIEW.height);
+        let mut corners_in_gaps = 0;
+        for row in rows {
+            let y_px = f64::from(row);
+            assert!(selected(y_px, 1.0).is_some(), "row {row} selects a gap");
+            corners_in_gaps += usize::from(selected(y_px, 1e-9).is_none());
+        }
+        assert!(0 < corners_in_gaps);
+    }
+
+    #[test]
+    fn a_gap_drawn_as_its_own_box_keeps_its_pixels() {
+        // The gap ends half a pixel into row 600, where the child after it
+        // starts; that child's pixels start at row 601.
+        let below = 1.0 - 600.5 / VIEW.height;
+        let runs = vec![
+            Run::new(0, vec![0], vec![0.0, 0.5f64.ln()]).unwrap(),
+            Run::new(5, vec![5], vec![below.ln(), (below - 0.1).ln()]).unwrap(),
+        ];
+        let mut tree = Tree::new(1);
+        tree.insert(ROOT, 0, runs).unwrap();
+        let camera = cam(ROOT, 0.0, top(ROOT), 0.0);
+        let frame = layout(&tree, LENS, camera, VIEW, 1.0).unwrap();
+        let selected = |y_px: f64| {
+            let hit = pick(&tree, LENS, &frame, camera, VIEW, 100.0, y_px, 1.0);
+            hit.unwrap().unwrap().r#box.kind
+        };
+        assert_eq!(selected(600.0), BoxKind::Gap);
+        assert_eq!(selected(601.0), BoxKind::Leaf);
     }
 
     #[test]
@@ -1379,12 +1481,12 @@ mod tests {
         let camera = cam(ROOT, 0.0, top(ROOT), 0.0);
         let frame = layout(&empty, LENS, camera, VIEW, 1.0).unwrap();
         assert_eq!(frame.misses.len(), 1);
-        let hit = pick(&empty, LENS, &frame, camera, VIEW, 500.0, 400.0)
+        let hit = pick(&empty, LENS, &frame, camera, VIEW, 500.0, 400.0, 1.0)
             .unwrap()
             .unwrap();
         assert_eq!((hit.r#box.node, hit.exact), (ROOT, false));
         assert_eq!(
-            pick(&empty, LENS, &frame, camera, VIEW, -1.0, 400.0).unwrap(),
+            pick(&empty, LENS, &frame, camera, VIEW, -1.0, 400.0, 1.0).unwrap(),
             None
         );
     }

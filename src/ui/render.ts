@@ -80,10 +80,22 @@ export function screenRect(box: Box, cam: Camera, view: Viewport): ScreenRect {
   };
 }
 
-/** The physical pixel containing each exact edge, expressed in CSS pixels. */
+// A physical pixel shows, and the pointer over it selects, the box holding
+// the pixel's top-left corner. Picking gives a box its top and left edges but
+// not its bottom and right ones, so drawn edges round up to the grid and a
+// pointer rounds down to its pixel's corner. Picking at the exact pointer
+// would select a neighbour over part of a thin box's pixel, and flicker as
+// the pointer moves within it.
+
+/** The physical pixels a box shows on, expressed in CSS pixels. */
 function pixelRect(rect: ScreenRect, scale: number): ScreenRect {
-  const pixel = (at: number) => Math.floor(at * scale) / scale;
-  return { x0: pixel(rect.x0), x1: pixel(rect.x1), y0: pixel(rect.y0), y1: pixel(rect.y1) };
+  const edge = (at: number) => Math.ceil(at * scale) / scale;
+  return { x0: edge(rect.x0), x1: edge(rect.x1), y0: edge(rect.y0), y1: edge(rect.y1) };
+}
+
+/** The top-left corner of the physical pixel holding a CSS coordinate. */
+export function pixelCorner(at: number, scale: number): number {
+  return Math.floor(at * scale) / scale;
 }
 
 export function draw(
@@ -107,7 +119,6 @@ export function draw(
   ctx.textBaseline = "middle";
 
   const labels: { box: Box; rect: ScreenRect; glyph: Glyph; ink: string; grows: boolean }[] = [];
-  const borders: ScreenRect[] = [];
   let visible = false;
   for (let i = 0; i < frame.boxes.length; i++) {
     const box = frame.boxes[i]!;
@@ -119,16 +130,7 @@ export function draw(
 
     if (box.kind === "merged") {
       const start = i;
-      // Only touching siblings share a silhouette. An unknown interval,
-      // a visible child, or another node must retain its own boundary.
-      // Touching runs coalesce, so neighbouring bands share one stored
-      // edge and touch exactly.
-      while (i + 1 < frame.boxes.length) {
-        const next = frame.boxes[i + 1]!;
-        if (next.kind !== "merged" || next.node !== box.node || next.x0 !== box.x0
-          || next.y0 !== frame.boxes[i]!.y1) break;
-        i++;
-      }
+      while (i + 1 < frame.boxes.length && joined(frame.boxes[i]!, frame.boxes[i + 1]!)) i++;
       tail(ctx, frame.boxes, start, i, cam, view, equal, ramp, scale);
       continue;
     }
@@ -141,10 +143,11 @@ export function draw(
       const level = ramp.level(rampPosition(equal ? box.q : box.p, box.q, equal));
       ink = ramp.ink[level]!;
       ctx.fillStyle = ramp.fill[level]!;
-      const bordered = box.kind !== "gap" && GAP_MIN <= width && GAP_MIN <= height;
+      // A separator is the box's own last column and row of pixels, left
+      // as the background. No other box shows on them.
+      const separator = box.kind !== "gap" && GAP_MIN <= width && GAP_MIN <= height ? 1 / scale : 0;
       const pixels = pixelRect(rect, scale);
-      ctx.fillRect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0, pixels.y1 - pixels.y0);
-      if (bordered) borders.push(pixels);
+      ctx.fillRect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0 - separator, pixels.y1 - pixels.y0 - separator);
     }
 
     if (
@@ -162,16 +165,6 @@ export function draw(
       ink,
       grows: box.branch !== null
     });
-  }
-
-  // A separator occupies the pixel containing the exact boundary, including
-  // when the boundary falls exactly on the grid. Draw after every fill so
-  // the next sibling or its silhouette cannot paint over that pixel.
-  const pixel = 1 / scale;
-  ctx.fillStyle = scheme.surface;
-  for (const rect of borders) {
-    ctx.fillRect(rect.x1, rect.y0, pixel, rect.y1 - rect.y0 + pixel);
-    ctx.fillRect(rect.x0, rect.y1, rect.x1 - rect.x0, pixel);
   }
 
   // A label's size follows its whole box, never the viewport. Within its box,
@@ -210,6 +203,15 @@ export function draw(
 
   outline(ctx, frame, cam, view, state, scheme.ink);
   ruler(ctx, cam, view, state.units, palette);
+}
+
+/** Whether ``below`` continues the band silhouette ``above`` ends: only
+ * touching sibling bands share one. An unknown interval, a visible child, or
+ * another node keeps its own boundary. Touching runs coalesce, so
+ * neighbouring bands share one stored edge and touch exactly. */
+function joined(above: Box, below: Box): boolean {
+  return above.kind === "merged" && below.kind === "merged" && above.node === below.node
+    && above.x0 === below.x0 && above.y1 === below.y0;
 }
 
 /** Paint a dense sibling tail once. Separate antialiased rectangles let the
@@ -347,15 +349,34 @@ function outline(
   for (const box of frame.boxes) {
     if (box.kind === "merged" || !state.ancestors.has(childKey(box.node, box.rank))) continue;
     const rect = pixelRect(screenRect(box, cam, view), scale);
-    ctx.strokeRect(rect.x0 + pixel / 2, rect.y0 + pixel / 2, rect.x1 - rect.x0, rect.y1 - rect.y0);
+    ctx.strokeRect(rect.x0 + pixel / 2, rect.y0 + pixel / 2, Math.max(0, rect.x1 - rect.x0 - pixel), Math.max(0, rect.y1 - rect.y0 - pixel));
   }
   ctx.globalAlpha = 1;
   // A gap has no box to outline; the inspector still describes it.
-  if (state.hover.box.kind === "gap") return;
+  const box = state.hover.box;
+  if (box.kind === "gap") return;
   ctx.lineWidth = 2 * pixel;
   if (!state.hover.exact) ctx.setLineDash([5 * pixel, 3 * pixel]);
-  const rect = pixelRect(screenRect(state.hover.box, cam, view), scale);
-  ctx.strokeRect(rect.x0 + pixel, rect.y0 + pixel, Math.max(0, rect.x1 - rect.x0 - pixel), Math.max(0, rect.y1 - rect.y0 - pixel));
+  // Outline where the frame draws the branch: its own box, or the rows it
+  // touches of the band silhouette holding it. Without a box, the origin.
+  const boxes = frame.boxes;
+  const at = boxes.findIndex(b => b.node === box.node
+    && (b.kind === "merged" ? b.y0 <= box.y0 && box.y1 <= b.y1 : b.rank === box.rank));
+  const exact = screenRect(box, cam, view);
+  const own = pixelRect(exact, scale);
+  let rect = own;
+  if (at !== -1) {
+    let [first, last] = [at, at];
+    while (0 < first && joined(boxes[first - 1]!, boxes[first]!)) first--;
+    while (last + 1 < boxes.length && joined(boxes[last]!, boxes[last + 1]!)) last++;
+    const drawn = pixelRect({
+      ...screenRect(boxes[at]!, cam, view),
+      y0: screenRect(boxes[first]!, cam, view).y0,
+      y1: screenRect(boxes[last]!, cam, view).y1,
+    }, scale);
+    rect = { ...drawn, y0: Math.max(drawn.y0, pixelCorner(exact.y0, scale)), y1: Math.min(drawn.y1, own.y1) };
+  }
+  ctx.strokeRect(rect.x0 + pixel, rect.y0 + pixel, Math.max(0, rect.x1 - rect.x0 - 2 * pixel), Math.max(0, rect.y1 - rect.y0 - 2 * pixel));
   ctx.setLineDash([]);
 }
 

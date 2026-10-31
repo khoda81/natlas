@@ -19,7 +19,7 @@ import type { Glyph, Reading } from "../readings/reading";
 import { drag, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, viewKey } from "./view-state";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
-import { BITS, draw, NATS, RULER_HEIGHT, childKey, type Units } from "./render";
+import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
 const KEY_DEPTH_SPEED = 300;
@@ -616,7 +616,9 @@ export class App {
       this.invalidate();
     });
     canvas.addEventListener("dblclick", (event) => {
-      const selection = this.frame ? pick(this.tree!, this.lens, this.frame, this.cam, this.view, event.offsetX, event.offsetY) : null;
+      const x = pixelCorner(event.offsetX, this.pixelRatio);
+      const y = pixelCorner(event.offsetY, this.pixelRatio);
+      const selection = this.frame ? pick(this.tree!, this.lens, this.frame, this.cam, this.view, x, y, 1 / this.pixelRatio) : null;
       if (selection) this.startFocus(selection.box);
     });
   }
@@ -860,17 +862,21 @@ export class App {
 
   // Selection and readouts.
 
+  /** The corner of the physical pixel under the pointer, which selects what that pixel shows. */
   private pointerPosition(): { x: number; y: number } | null {
     if (this.pointer === null) return null;
     const rect = this.canvas.getBoundingClientRect();
-    return { x: this.pointer.x - rect.left, y: this.pointer.y - rect.top };
+    return {
+      x: pixelCorner(this.pointer.x - rect.left, this.pixelRatio),
+      y: pixelCorner(this.pointer.y - rect.top, this.pixelRatio),
+    };
   }
 
   private updateHover(): void {
     const pointer = this.pointerPosition();
     if (pointer && !this.dragging && this.frame) {
       if (this.lastPick?.frame !== this.frame || this.lastPick.x !== pointer.x || this.lastPick.y !== pointer.y) {
-        this.lastPick = { frame: this.frame, x: pointer.x, y: pointer.y, selection: pick(this.tree!, this.lens, this.frame, this.cam, this.view, pointer.x, pointer.y) };
+        this.lastPick = { frame: this.frame, x: pointer.x, y: pointer.y, selection: pick(this.tree!, this.lens, this.frame, this.cam, this.view, pointer.x, pointer.y, 1 / this.pixelRatio) };
       }
       this.hover = this.lastPick.selection;
     } else this.hover = null;

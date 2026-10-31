@@ -164,7 +164,8 @@ export function clamp(tree: IntervalTree, lens: Lens, cam: Camera): void {
   cam.a = clampPosition(tree.raw, lens.p, lens.q, cam);
 }
 
-/** The child under a screen point, however thin, found in the frame drawn with ``cam``. */
-export function pick(tree: IntervalTree, lens: Lens, frame: Frame, cam: Camera, view: Viewport, x: number, y: number): Selection | null {
-  return frame.raw.pick(tree.raw, lens.p, lens.q, cam, view, x, y) as Selection | null;
+/** The child a pixel ``pixel`` CSS pixels square, with its top-left corner at
+ * ``x``, ``y``, shows, however thin, found in the frame drawn with ``cam``. */
+export function pick(tree: IntervalTree, lens: Lens, frame: Frame, cam: Camera, view: Viewport, x: number, y: number, pixel: number): Selection | null {
+  return frame.raw.pick(tree.raw, lens.p, lens.q, cam, view, x, y, pixel) as Selection | null;
 }

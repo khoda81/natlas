@@ -16,7 +16,7 @@ it("picks single children out of merged bands, and frames reuse buffers without 
   expect(frame.boxes.every((box) => box.kind === "merged")).toBe(true);
   expect(frame.boxes.length).toBeLessThanOrEqual(view.height);
   const y = (74999.5 / 150000) * view.height;
-  const picked = pick(tree, lens, frame, cam, view, 100, y)!;
+  const picked = pick(tree, lens, frame, cam, view, 100, y, 1)!;
   expect(picked.box.branch).toBe(74999);
   expect(picked.exact).toBe(true);
   const boxes = frame.boxes.map((box) => ({ ...box }));

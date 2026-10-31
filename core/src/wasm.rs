@@ -306,6 +306,7 @@ impl LayoutFrame {
         view: JsValue,
         x_px: f64,
         y_px: f64,
+        pixel_px: f64,
     ) -> std::result::Result<JsValue, JsError> {
         let camera: Camera = from_js(camera)?;
         let view: Viewport = from_js(view)?;
@@ -317,6 +318,7 @@ impl LayoutFrame {
             view,
             x_px,
             y_px,
+            pixel_px,
         )
         .map_err(js_error)?;
         to_js(&picked)

@@ -109,28 +109,37 @@ export function draw(
     if (width <= 0 || height <= 0) continue;
     visible = true;
 
-    let fill: string;
-    let ink: string;
-    if (box.kind === "gap") {
-      fill = scheme.gap;
-      ink = palette.gapInk;
-    } else {
+    // A gap is unknown, as the background already says: only its label shows.
+    let ink = scheme.inkMuted;
+    if (box.kind !== "gap") {
       const level = ramp.level(rampPosition(box.p, box.q, equal));
-      fill = ramp.fill[level]!;
       ink = ramp.ink[level]!;
+      ctx.fillStyle = ramp.fill[level]!;
+      const bordered = box.kind !== "merged" && GAP_MIN <= width && GAP_MIN <= height;
+      ctx.fillRect(
+        rect.x0,
+        rect.y0,
+        bordered && GAP_MIN <= width ? width - 1 : width,
+        bordered && GAP_MIN <= height ? height - 1 : height,
+      );
     }
-    ctx.fillStyle = fill;
-    const bordered = box.kind !== "merged" && box.kind !== "gap" && width >= GAP_MIN && height >= GAP_MIN;
-    ctx.fillRect(
-      rect.x0,
-      rect.y0,
-      bordered && width >= GAP_MIN ? width - 1 : width,
-      bordered && height >= GAP_MIN ? height - 1 : height,
-    );
 
-    if (box.kind !== "merged" && height >= LABEL_MIN_HEIGHT && width >= LABEL_MIN_WIDTH) {
-      labels.push({ box, rect, glyph: box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box), ink, grows: box.branch !== null });
+    if (
+      box.kind === "merged"
+      || height <= LABEL_MIN_HEIGHT
+      || width <= LABEL_MIN_WIDTH
+      || box.count === 0
+    ) {
+      continue;
     }
+
+    labels.push({
+      box,
+      rect,
+      glyph: box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box),
+      ink,
+      grows: box.branch !== null
+    });
   }
 
   // A label's size follows its whole box, never the viewport. Within its box,
@@ -254,6 +263,8 @@ function outline(
     ctx.strokeRect(rect.x0 + 0.5, rect.y0 + 0.5, rect.x1 - rect.x0 - 2, rect.y1 - rect.y0 - 2);
   }
   ctx.globalAlpha = 1;
+  // A gap has no box to outline; the inspector still describes it.
+  if (state.hover.box.kind === "gap") return;
   ctx.lineWidth = 2;
   if (!state.hover.exact) ctx.setLineDash([5, 3]);
   const rect = screenRect(state.hover.box, cam, view);

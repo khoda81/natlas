@@ -2,6 +2,7 @@
 // window being written, can be scrolled, zoomed and resized, names its notes,
 // and plays them alone or over the recording.
 
+import { durationTicks, layoutTicks, type DurationStep } from "@qbar/qbar";
 import { clock, DRUM_PROGRAM, pitchName, tint } from "./music";
 import type { Hit, Note, NoteLabels, Transcript } from "./notes";
 
@@ -19,6 +20,13 @@ const HEIGHT_KEY = "natlas.roll.height";
 /** The least pitch range shown, so a few notes do not fill the roll. */
 const MIN_PITCHES = 25;
 const MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+/** Milliseconds into the recording. */
+const TIME_SCALE = durationTicks();
+/** Time gridlines fade in over this much room to their neighbours of the same step. */
+const TIME_LINES = { from: 24, to: 48 };
+/** Time labels show from this much room, which holds ten characters. They
+ * never fade: translucent text reads as blurred. */
+const TIME_LABEL_SPACING = 64;
 
 interface Geometry {
   width: number;
@@ -203,8 +211,9 @@ export class ScorePanel {
         const plot = geometry.right - GUTTER;
         if (event.ctrlKey || event.metaKey) {
           // Zoom time about the pointer, or about the view's end while following.
-          const total = this.labels.file.windows * this.labels.span;
-          const span = Math.min(total, Math.max(this.labels.file.frameRate / 2, view.span * Math.exp(dy * 0.01)));
+          // A span that reached 0 or Infinity could never be scaled back.
+          const span = view.span * Math.exp(dy * 0.01);
+          if (!(Number.isFinite(span) && 0 < span)) return;
           const fixed = this.follow ? 1 : Math.min(1, Math.max(0, (event.offsetX - GUTTER) / plot));
           view.start = Math.max(0, view.start + (view.span - span) * fixed);
           view.span = span;
@@ -332,23 +341,39 @@ export class ScorePanel {
       }
     }
 
-    // Time: a tick every so many seconds, a stronger line at each window.
-    const seconds = view.span / frameRate;
-    const step = niceStep(seconds / Math.max(1, plot / 90));
-    const digits = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
+    // Time: lines and labels fading in with their room, a stronger line at each window.
     const offset = labels.file.at ?? 0;
-    const first = Math.ceil((offset + view.start / frameRate) / step) * step;
-    for (let at = first; at <= offset + (view.start + view.span) / frameRate + 1e-9; at += step) {
-      const px = Math.round(x((at - offset) * frameRate)) + 0.5;
+    const ticks = plot < 1 ? [] : layoutTicks({
+      quantile: (p) => 1000 * (offset + (view.start + p * view.span) / frameRate),
+      scale: TIME_SCALE,
+      width: plot,
+      minSpacing: TIME_LINES.from,
+    });
+    // Where the next label may start.
+    let free = GUTTER;
+    for (const { value, step, position, spacing } of ticks) {
+      const px = Math.round(GUTTER + position) + 0.5;
+      ctx.globalAlpha = fade(spacing, TIME_LINES);
       ctx.fillStyle = rule;
       ctx.fillRect(px - 0.5, top, 1, below - top);
-      ctx.fillStyle = muted;
-      const text = clock(at, digits);
+      // Labelled ticks are those of steps at least TIME_LABEL_SPACING wide,
+      // and steps nest, so centred labels clear each other. Only a label
+      // pushed inside the ends can run into its neighbour.
+      if (spacing < TIME_LABEL_SPACING) continue;
+      const text = clock(value / 1000, digits(step));
       const textWidth = ctx.measureText(text).width;
-      ctx.fillText(text, Math.min(right - textWidth, Math.max(GUTTER, px - textWidth / 2)), height - AXIS / 2);
+      // Glyphs off the physical pixel grid blur.
+      const left = Math.floor(Math.min(right - textWidth, Math.max(GUTTER, px - textWidth / 2)) * ratio) / ratio;
+      if (left < free) continue;
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = muted;
+      ctx.fillText(text, left, height - AXIS / 2);
+      free = left + textWidth + 8;
     }
+    ctx.globalAlpha = 1;
     const { span } = labels;
-    for (let index = Math.ceil(view.start / span); index * span <= view.start + view.span; index++) {
+    const lastWindow = Math.min(labels.file.windows, Math.floor((view.start + view.span) / span));
+    for (let index = Math.ceil(view.start / span); index <= lastWindow; index++) {
       ctx.fillStyle = muted;
       ctx.globalAlpha = 0.7;
       ctx.fillRect(Math.round(x(index * span)) - 1, top, 2, below - top);
@@ -363,7 +388,9 @@ export class ScorePanel {
     if (x(now) < right) {
       ctx.fillStyle = chip;
       ctx.globalAlpha = 0.6;
-      ctx.fillRect(x(now), top, right - x(now), below - top);
+      // Far-off coordinates lose precision and can stall rasterizing.
+      const from = Math.max(0, x(now));
+      ctx.fillRect(from, top, right - from, below - top);
       ctx.globalAlpha = 1;
     }
     ctx.save();
@@ -385,13 +412,17 @@ export class ScorePanel {
         gradient.addColorStop(1, "transparent");
         ctx.fillStyle = gradient;
       } else ctx.fillStyle = color;
+      // Far-off coordinates lose precision and can stall rasterizing; the
+      // clip hides the rounded ends pulled in to just outside the plot.
+      const shown0 = Math.max(GUTTER - 8, x0);
+      const shown1 = Math.min(right + 8, x1);
       ctx.beginPath();
-      ctx.roundRect(x0, y0, x1 - x0, h, Math.min(3, h / 2));
+      ctx.roundRect(shown0, y0, shown1 - shown0, h, Math.min(3, h / 2));
       ctx.fill();
       if (note.carried) {
         // Sounding from before the first window.
         ctx.fillStyle = ink;
-        ctx.fillRect(x0, y0, 2, h);
+        ctx.fillRect(shown0, y0, 2, h);
       }
       if (transcript.touched.has(note)) {
         ctx.strokeStyle = ink;
@@ -533,10 +564,15 @@ function storeHeight(height: number): void {
   }
 }
 
-function niceStep(raw: number): number {
-  const power = 10 ** Math.floor(Math.log10(raw));
-  for (const multiple of [1, 2, 5, 10]) if (multiple * power >= raw) return multiple * power;
-  return 10 * power;
+/** The decimals of seconds a step resolves. */
+function digits(step: DurationStep): number {
+  return step.unit === "millisecond" ? 3 - Math.floor(Math.log10(step.count)) : 0;
+}
+
+/** Opacity rising smoothly from 0 at ``from`` pixels of room to 1 at ``to``. */
+function fade(spacing: number, { from, to }: { from: number; to: number }): number {
+  const t = Math.min(1, Math.max(0, (spacing - from) / (to - from)));
+  return t * t * (3 - 2 * t);
 }
 
 let noise: AudioBuffer | null = null;

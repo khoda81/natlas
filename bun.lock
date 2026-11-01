@@ -8,6 +8,7 @@
         "@bufbuild/protobuf": "2.16.0",
         "@connectrpc/connect": "2.2.0",
         "@connectrpc/connect-web": "2.2.0",
+        "@qbar/qbar": "0.2.0",
       },
       "devDependencies": {
         "@bufbuild/protoc-gen-es": "2.16.0",
@@ -26,6 +27,8 @@
     "@connectrpc/connect": ["@connectrpc/connect@2.2.0", "", { "peerDependencies": { "@bufbuild/protobuf": "^2.7.0" } }, "sha512-M63OQ1ZFcPUm85CuewJ9G9CMV8LjzGR9935xOnXNQGSazAbwMb3x2W7vXBYM1zqrP7XFD8uxp/dUAhirclgwnQ=="],
 
     "@connectrpc/connect-web": ["@connectrpc/connect-web@2.2.0", "", { "peerDependencies": { "@bufbuild/protobuf": "^2.7.0", "@connectrpc/connect": "2.2.0" } }, "sha512-uuBUcBTYfb/r1o98LzCCZk1H90yx0vmZ5m21dpw/q4EUwsKwkCDGI8H0aEdjcZld+Q2jJ5A5ADvPqfb6lzQ/sg=="],
+
+    "@qbar/qbar": ["@qbar/qbar@0.2.0", "", {}, "sha512-tL8lCqH0P0j9GK+QhB4w64Bi1TwD4YGBJeugFldsPU8NQeE52c6+EuU6i1aS6Koukm6yPHC8+gsyl6d4Tl1phQ=="],
 
     "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
 

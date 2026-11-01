@@ -1,5 +1,6 @@
 // Canvas 2D drawing of one laid-out frame.
 
+import { decimalTicks, layoutTicks } from "@qbar/qbar";
 import { type Palette, rampPosition } from "./color";
 import type { Box, Camera, Frame, Lens, Selection, Viewport } from "../core/layout";
 import type { NodeId } from "../core/tree";
@@ -41,6 +42,11 @@ const MARK_WIDTH = 0.8;
 const MARK_GAP = 0.3;
 const MORE: Glyph = { text: "…" };
 export const RULER_HEIGHT = 22;
+const RULER_SCALE = decimalTicks();
+/** Ruler marks fade in over this much room to their neighbours of the same step. */
+const RULER_MARKS = { from: 16, to: 32 };
+/** Labels fade in over this much room; the least holds ten characters. */
+const RULER_LABELS = { from: 80, to: 120 };
 /** One sweep of the loading band across the view. */
 const SWEEP_MS = 1400;
 // Canvas coordinates far outside the view lose precision and can stall rasterizing.
@@ -385,18 +391,6 @@ function within(value: number, low: number, high: number): number {
   return Math.max(low, Math.min(high, value));
 }
 
-function niceStep(raw: number): number {
-  const power = 10 ** Math.floor(Math.log10(raw));
-  for (const multiple of [1, 2, 5, 10]) if (multiple * power >= raw) return multiple * power;
-  return 10 * power;
-}
-
-function format(value: number, step: number): string {
-  const decimals = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
-  if (decimals > 12 || Math.abs(value) >= 1e12) return value.toExponential(3);
-  return value.toFixed(decimals);
-}
-
 /** A message across the view; while ``time`` is given, a band sweeps behind it. */
 function drawNote(ctx: CanvasRenderingContext2D, view: Viewport, palette: Palette, text: string, time: number | null): void {
   const { scheme } = palette;
@@ -426,33 +420,50 @@ export function rulerCaption(units: Units): string {
 
 function ruler(ctx: CanvasRenderingContext2D, cam: Camera, view: Viewport, units: Units, palette: Palette): void {
   const { scheme } = palette;
-  const pxPerUnit = cam.k * units.nats;
-  const step = niceStep(80 / pxPerUnit);
   const top = view.height;
   ctx.fillStyle = scheme.surface;
   ctx.fillRect(0, top, view.width, RULER_HEIGHT);
-  ctx.fillStyle = scheme.inkMuted;
-  ctx.strokeStyle = scheme.inkMuted;
-  ctx.lineWidth = 1;
-  ctx.textBaseline = "middle";
   // The units switch shows the caption in this font, 8px from the right
   // edge (style.css); ticks stop short of it.
-  const captionLeft = view.width - 8 - measure(ctx, rulerCaption(units));
-  const first = Math.ceil(cam.x / units.nats / step);
-  const last = Math.floor((cam.x + view.width / cam.k) / units.nats / step);
-  ctx.beginPath();
-  // A bounded tick count also works when adjacent integer indices are no
-  // longer distinguishable at an extreme, but finite, horizontal scale.
-  for (let tick = 0; tick <= Math.ceil(view.width / 80) + 1; tick++) {
-    const i = first + tick;
-    if (!Number.isFinite(i) || i > last || !Number.isFinite(step) || step <= 0) break;
-    const value = i * step;
-    const x = Math.round((value * units.nats - cam.x) * cam.k) + 0.5;
-    const text = format(value, step);
-    if (x + 3 + measure(ctx, text) > captionLeft - 12) break;
+  const end = Math.floor(view.width - 8 - measure(ctx, rulerCaption(units)) - 12);
+  if (end < 1) return;
+  const ticks = layoutTicks({
+    quantile: (p) => (cam.x + (p * end) / cam.k) / units.nats,
+    scale: RULER_SCALE,
+    width: end,
+    minSpacing: RULER_MARKS.from,
+  });
+  ctx.strokeStyle = scheme.inkMuted;
+  ctx.fillStyle = scheme.inkMuted;
+  ctx.lineWidth = 1;
+  ctx.textBaseline = "middle";
+  // Where the next label may start.
+  let free = 0;
+  for (const { value, step, position, spacing } of ticks) {
+    const x = Math.round(position) + 0.5;
+    ctx.globalAlpha = fade(spacing, RULER_MARKS);
+    ctx.beginPath();
     ctx.moveTo(x, top);
     ctx.lineTo(x, top + 5);
-    ctx.fillText(text, x + 3, top + 12);
+    ctx.stroke();
+    // Labelled ticks are those of steps at least RULER_LABELS.from wide,
+    // and steps nest, so centred labels clear each other. Only a label
+    // pushed inside the ends can run into its neighbour.
+    if (spacing < RULER_LABELS.from) continue;
+    const label = RULER_SCALE.format(value, step);
+    const width = measure(ctx, label);
+    // Glyphs off the physical pixel grid blur.
+    const left = pixelCorner(within(x - width / 2, 0, end - width), ctx.getTransform().a);
+    if (left < free || end < left + width) continue;
+    ctx.globalAlpha = fade(spacing, RULER_LABELS);
+    ctx.fillText(label, left, top + 13);
+    free = left + width + 8;
   }
-  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+/** Opacity rising smoothly from 0 at ``from`` pixels of room to 1 at ``to``. */
+function fade(spacing: number, { from, to }: { from: number; to: number }): number {
+  const t = within((spacing - from) / (to - from), 0, 1);
+  return t * t * (3 - 2 * t);
 }

@@ -3,7 +3,7 @@
 // and plays them alone or over the recording.
 
 import { durationTicks, layoutTicks, type DurationStep } from "@qbar/qbar";
-import { clock, DRUM_PROGRAM, pitchName, tint } from "./music";
+import { clock, DRUM_PROGRAM, pitchName, pitchTicks, tint } from "./music";
 import type { Hit, Note, NoteLabels, Transcript } from "./notes";
 
 type Playing = "notes" | "audio" | "both";
@@ -13,7 +13,8 @@ const AXIS = 16;
 const DRUM_LANE = 16;
 /** Rows never get thinner than this; past it the roll scrolls. */
 const MIN_ROW = 12;
-/** Rows this tall name every pitch, and the notes in them. */
+/** Pitch names need this many pixels: down the gutter, to the next name of
+ * their tier; on notes, the row's height. */
 const NAMED_ROW = 11;
 const HEIGHT = 260;
 const HEIGHT_KEY = "natlas.roll.height";
@@ -36,10 +37,8 @@ interface Geometry {
   right: number;
   lane: number;
   row: number;
-  /** The highest pitch whose row is in view. */
+  /** The pitch whose row's top edge is at ``top``; fractional while locked. */
   high: number;
-  /** Rows in view. */
-  rows: number;
 }
 
 export class ScorePanel {
@@ -50,14 +49,18 @@ export class ScorePanel {
   private readonly legend = document.createElement("span");
   private readonly time = document.createElement("span");
   private readonly followButton = document.createElement("button");
+  private readonly pitchButton = document.createElement("button");
   private readonly buttons = new Map<Playing, HTMLButtonElement>();
   private transcript: Transcript | null = null;
   /** Pitches seen: the range only grows, so the roll holds still between hovers. */
   private low = Infinity;
   private high = -Infinity;
   private drums = false;
-  /** The highest pitch in view, or null to center the range. */
+  /** While following pitches, the highest in view, or null to center the range. */
   private topPitch: number | null = null;
+  /** The pitch view as scrolled and scaled by hand, or null to follow: fit
+   * the pitches seen and keep the last touched note in view. */
+  private pitchLock: { high: number; row: number } | null = null;
   /** What the roll shows, in shift steps from the first window's start. */
   private view: { start: number; span: number };
   /** While following, the view ends where the window being written does. */
@@ -91,9 +94,14 @@ export class ScorePanel {
     this.followButton.textContent = "⇥ follow";
     this.followButton.title = "keep the window being written in view (double-click the roll)";
     this.followButton.addEventListener("click", () => this.setFollow(true));
+    this.pitchButton.type = "button";
+    this.pitchButton.textContent = "↕ follow";
+    this.pitchButton.title = "fit the pitches and keep the notes being written in view (double-click the roll)";
+    this.pitchButton.classList.add("on");
+    this.pitchButton.addEventListener("click", () => this.followPitch());
     this.legend.className = "score-legend";
     this.time.className = "score-time";
-    bar.append(this.followButton, this.legend, this.time);
+    bar.append(this.followButton, this.pitchButton, this.legend, this.time);
 
     this.frame.className = "score-frame";
     this.frame.style.height = `${storedHeight()}px`;
@@ -122,11 +130,12 @@ export class ScorePanel {
     }
     this.updateBar();
     // Bring what the last event touched into view.
-    const geometry = this.geometry();
-    for (const item of transcript.touched) {
-      if (!("program" in item)) continue;
-      if (item.pitch > geometry.high || item.pitch <= geometry.high - geometry.rows) {
-        this.topPitch = item.pitch + Math.floor(geometry.rows / 2);
+    if (this.pitchLock === null) {
+      const { top, bottom, row, high } = this.geometry();
+      const rows = Math.floor((bottom - top) / row);
+      for (const item of transcript.touched) {
+        if (!("program" in item)) continue;
+        if (item.pitch > high || item.pitch <= high - rows) this.topPitch = item.pitch + Math.floor(rows / 2);
       }
     }
     this.draw();
@@ -142,6 +151,21 @@ export class ScorePanel {
     this.follow = follow;
     this.followButton.classList.toggle("on", follow);
     this.draw();
+  }
+
+  private followPitch(): void {
+    this.pitchLock = null;
+    this.pitchButton.classList.add("on");
+    this.draw();
+  }
+
+  /** The pitch view, locked where following has it if not yet locked. */
+  private lockPitch(geometry: Geometry): { high: number; row: number } {
+    if (this.pitchLock === null) {
+      this.pitchLock = { high: geometry.high, row: geometry.row };
+      this.pitchButton.classList.remove("on");
+    }
+    return this.pitchLock;
   }
 
   private updateBar(): void {
@@ -175,15 +199,16 @@ export class ScorePanel {
     const lane = this.drums ? DRUM_LANE : 0;
     const top = 2;
     const bottom = Math.max(top + MIN_ROW, height - AXIS - lane);
+    const right = width - 6;
+    if (this.pitchLock !== null) return { width, height, top, bottom, right, lane, ...this.pitchLock };
     const { low, high } = this.range();
     const span = high - low + 1;
     const row = Math.max(MIN_ROW, (bottom - top) / span);
     const rows = Math.max(1, Math.floor((bottom - top) / row));
     const center = Math.round((low + high + rows) / 2);
-    // Scrolling moves by fractions of a row; the roll starts at a whole one.
     const wanted = Math.min(high, Math.max(low + rows - 1, this.topPitch ?? center));
     if (this.topPitch !== null) this.topPitch = wanted;
-    return { width, height, top, bottom, right: width - 6, lane, row, high: Math.round(wanted), rows };
+    return { width, height, top, bottom, right, lane, row, high: wanted };
   }
 
   /** The view, following the window being written when asked to. */
@@ -217,6 +242,15 @@ export class ScorePanel {
           const fixed = this.follow ? 1 : Math.min(1, Math.max(0, (event.offsetX - GUTTER) / plot));
           view.start = Math.max(0, view.start + (view.span - span) * fixed);
           view.span = span;
+        } else if (event.altKey) {
+          // Scale pitches about the pointer.
+          const lock = this.lockPitch(geometry);
+          // A row that reached 0 or Infinity could never be scaled back.
+          const row = lock.row * Math.exp(-(dy || dx) * 0.01);
+          if (!(Number.isFinite(row) && 0 < row)) return;
+          const fixed = event.offsetY - geometry.top;
+          lock.high += fixed / row - fixed / lock.row;
+          lock.row = row;
         } else if (event.shiftKey || Math.abs(dx) > Math.abs(dy)) {
           this.panTime(((event.shiftKey ? dy || dx : dx) / plot) * view.span);
         } else this.scrollPitch(-dy / geometry.row, geometry);
@@ -254,7 +288,10 @@ export class ScorePanel {
     canvas.addEventListener("pointerleave", () => {
       this.tip.hidden = true;
     });
-    canvas.addEventListener("dblclick", () => this.setFollow(true));
+    canvas.addEventListener("dblclick", () => {
+      this.followPitch();
+      this.setFollow(true);
+    });
   }
 
   private panTime(by: number): void {
@@ -265,7 +302,7 @@ export class ScorePanel {
   }
 
   private scrollPitch(by: number, geometry: Geometry): void {
-    this.topPitch = (this.topPitch ?? geometry.high) + by;
+    this.lockPitch(geometry).high += by;
   }
 
   private updateTip(x: number, y: number): void {
@@ -293,7 +330,7 @@ export class ScorePanel {
     const transcript = this.transcript;
     if (transcript === null || !this.root.isConnected) return;
     const geometry = this.geometry();
-    const { width, height, top, bottom, right, lane, row, high, rows } = geometry;
+    const { width, height, top, bottom, right, lane, row, high } = geometry;
     const ratio = devicePixelRatio || 1;
     if (this.canvas.width !== Math.round(width * ratio)) this.canvas.width = Math.round(width * ratio);
     if (this.canvas.height !== Math.round(height * ratio)) this.canvas.height = Math.round(height * ratio);
@@ -315,7 +352,9 @@ export class ScorePanel {
     const plot = right - GUTTER;
     const x = (tick: number) => GUTTER + ((tick - view.start) / view.span) * plot;
     const y = (pitch: number) => top + (high - pitch) * row;
-    const low = high - rows + 1;
+    // The pitches with rows in view, partly or whole.
+    const highest = Math.min(127, Math.ceil(high));
+    const lowest = Math.max(0, Math.floor(high - (bottom - top) / row) + 1);
     const now = transcript.now;
     const below = bottom + lane;
     this.boxes = [];
@@ -324,8 +363,12 @@ export class ScorePanel {
     ctx.font = `10px ${MONO}`;
     ctx.textBaseline = "middle";
 
-    // Black keys' rows shaded; pitches named down the gutter.
-    for (let pitch = high; pitch >= low; pitch--) {
+    // Black keys' rows shaded, octaves ruled.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(GUTTER, top, plot, bottom - top);
+    ctx.clip();
+    for (let pitch = highest; pitch >= lowest; pitch--) {
       const at = y(pitch);
       if ([1, 3, 6, 8, 10].includes(pitch % 12)) {
         ctx.fillStyle = chip;
@@ -335,10 +378,18 @@ export class ScorePanel {
         ctx.fillStyle = rule;
         ctx.fillRect(GUTTER, at + row - 0.5, plot, 1);
       }
-      if (row >= NAMED_ROW || pitch % 12 === 0) {
-        ctx.fillStyle = pitch % 12 === 0 ? ink : muted;
-        ctx.fillText(pitchName(pitch), 3, at + row / 2);
-      }
+    }
+    ctx.restore();
+    // Pitches named down the gutter at their rows' middles, those with room.
+    const extent = bottom - top;
+    for (const { value, step, position } of layoutTicks({
+      quantile: (q) => high + 0.5 - ((1 - q) * extent) / row,
+      scale: pitchTicks,
+      width: extent,
+      minSpacing: NAMED_ROW,
+    })) {
+      ctx.fillStyle = step === 0 ? ink : muted;
+      ctx.fillText(pitchName(value), 3, Math.round((bottom - position) * ratio) / ratio);
     }
 
     // Time: lines and labels fading in with their room, a stronger line at each window.
@@ -399,7 +450,7 @@ export class ScorePanel {
     ctx.clip();
     for (const note of transcript.notes) {
       const end = note.end ?? now;
-      if (end < view.start || note.start > view.start + view.span || note.pitch > high || note.pitch < low) continue;
+      if (end < view.start || note.start > view.start + view.span || note.pitch > highest || note.pitch < lowest) continue;
       const x0 = x(note.start);
       const x1 = Math.max(x0 + 3, x(end));
       const y0 = y(note.pitch) + 0.5;

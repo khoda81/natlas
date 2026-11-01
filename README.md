@@ -268,7 +268,10 @@ the recording for a shift, a stop for an EOS. The panel above the canvas
 becomes a piano roll of the path, following the window being written: the
 hovered event's notes are outlined and a cursor marks the time written so
 far. Drag its corner to make it taller; wheel or drag to scroll pitches and
-time, ctrl + wheel to zoom time, double-click to follow again. Hovering a
+time, ctrl + wheel to zoom time, alt + wheel to zoom pitches. Scrolling or
+zooming either stops following it, so the view holds still; ⇥ and ↕ follow,
+or a double-click, follow again. Pitches are named as they have room, C
+first, then G, E, the rest of C major and the black keys. Hovering a
 note names it. Space plays the transcription in view, shift + space plays it
 over the recording (`/audio.wav`).
 

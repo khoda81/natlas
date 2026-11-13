@@ -461,12 +461,16 @@ export class App {
   private resize(): void {
     const ratio = devicePixelRatio || 1;
     this.pixelRatio = ratio;
-    const { clientWidth: width, clientHeight: height } = this.canvas;
-    if (width !== this.view.width || Math.max(1, height - RULER_HEIGHT) !== this.view.height || this.windowHeight !== window.innerHeight) this.whereHeight = null;
+    const { clientWidth, clientHeight } = this.canvas;
+    // At least a pixel each way, even before the page is laid out: the home
+    // scale is the width over a number of nats, and a scale of zero is no
+    // scale at all.
+    const view = { width: Math.max(1, clientWidth), height: Math.max(1, clientHeight - RULER_HEIGHT) };
+    if (view.width !== this.view.width || view.height !== this.view.height || this.windowHeight !== window.innerHeight) this.whereHeight = null;
     this.windowHeight = window.innerHeight;
-    this.view = { width, height: Math.max(1, height - RULER_HEIGHT) };
-    const pixelWidth = Math.round(width * ratio);
-    const pixelHeight = Math.round(height * ratio);
+    this.view = view;
+    const pixelWidth = Math.round(clientWidth * ratio);
+    const pixelHeight = Math.round(clientHeight * ratio);
     if (this.canvas.width !== pixelWidth) this.canvas.width = pixelWidth;
     if (this.canvas.height !== pixelHeight) this.canvas.height = pixelHeight;
     this.ctx.setTransform(ratio, 0, 0, ratio, 0, 0);

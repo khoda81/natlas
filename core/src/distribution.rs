@@ -8,6 +8,8 @@
 //! is or deep in its parent's tail.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::OnceLock;
 
 use crate::point::Point;
 use crate::tree::Branch;
@@ -41,7 +43,7 @@ pub fn ln_between(top: f64, bottom: f64) -> f64 {
 }
 
 /// Consecutive ranks from `rank`: their branches and every edge between them.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Run {
     rank: Rank,
     branches: Vec<Branch>,
@@ -50,13 +52,23 @@ pub struct Run {
     ln_below: Vec<f64>,
     /// ln Σ p (−ln p) over the run's children from each edge to the run's
     /// end, accumulated from the light end: a merged band's area-preserving
-    /// width without visiting its children.
-    ln_surprisal_below: Vec<f64>,
+    /// width without visiting its children. Derived from `ln_below` when
+    /// first read: only layout reads it, and a server, which builds a run
+    /// of its whole vocabulary per node, never does (a third of the cost).
+    ln_surprisal_below: OnceLock<Vec<f64>>,
+}
+
+/// Runs are what they place: the derived sums are not compared.
+impl PartialEq for Run {
+    fn eq(&self, other: &Self) -> bool {
+        (self.rank, &self.branches, &self.ln_below) == (other.rank, &other.branches, &other.ln_below)
+    }
 }
 
 impl Run {
     /// Validates what a source sent: one edge more than branches, never
-    /// increasing, never above the node's whole mass, no branch twice.
+    /// increasing, never above the node's whole mass. A branch placed twice
+    /// is refused where the run joins a distribution.
     pub fn new(rank: Rank, branches: Vec<Branch>, ln_below: Vec<f64>) -> Result<Self> {
         if ln_below.len() != branches.len() + 1 {
             return Err(format!(
@@ -77,26 +89,29 @@ impl Run {
         {
             return Err("a run's edges must never increase".into());
         }
-        let mut seen = std::collections::HashSet::with_capacity(branches.len());
-        if let Some(branch) = branches.iter().find(|&&branch| !seen.insert(branch)) {
-            return Err(format!("branch {branch} is listed twice"));
-        }
-        let mut ln_surprisal_below = vec![f64::NEG_INFINITY; ln_below.len()];
-        for i in (0..branches.len()).rev() {
-            let ln_p = ln_between(ln_below[i], ln_below[i + 1]);
-            // p (−ln p) is zero both at p = 0 and at p = 1.
-            let ln_surprisal = if ln_p < 0.0 && ln_p > f64::NEG_INFINITY {
-                ln_p + (-ln_p).ln()
-            } else {
-                f64::NEG_INFINITY
-            };
-            ln_surprisal_below[i] = ln_add(ln_surprisal_below[i + 1], ln_surprisal);
-        }
         Ok(Self {
             rank,
             branches,
             ln_below,
-            ln_surprisal_below,
+            ln_surprisal_below: OnceLock::new(),
+        })
+    }
+
+    fn ln_surprisal_below(&self) -> &[f64] {
+        self.ln_surprisal_below.get_or_init(|| {
+            let ln_below = &self.ln_below;
+            let mut sums = vec![f64::NEG_INFINITY; ln_below.len()];
+            for i in (0..self.branches.len()).rev() {
+                let ln_p = ln_between(ln_below[i], ln_below[i + 1]);
+                // p (−ln p) is zero both at p = 0 and at p = 1.
+                let ln_surprisal = if ln_p < 0.0 && ln_p > f64::NEG_INFINITY {
+                    ln_p + (-ln_p).ln()
+                } else {
+                    f64::NEG_INFINITY
+                };
+                sums[i] = ln_add(sums[i + 1], ln_surprisal);
+            }
+            sums
         })
     }
 
@@ -146,7 +161,8 @@ impl Run {
 
     /// ln Σ p (−ln p) over children [from, to).
     pub fn ln_surprisal(&self, from: usize, to: usize) -> f64 {
-        ln_between(self.ln_surprisal_below[from], self.ln_surprisal_below[to])
+        let sums = self.ln_surprisal_below();
+        ln_between(sums[from], sums[to])
     }
 
     /// The child holding `ln_below`: the first whose bottom edge is under it.
@@ -162,15 +178,11 @@ impl Run {
 
     /// Children [from, to) as a run of their own.
     fn slice(&self, from: usize, to: usize) -> Run {
-        let end = self.ln_surprisal_below[to];
         Self {
             rank: self.rank + from as Rank,
             branches: self.branches[from..to].to_vec(),
             ln_below: self.ln_below[from..=to].to_vec(),
-            ln_surprisal_below: self.ln_surprisal_below[from..=to]
-                .iter()
-                .map(|&below| ln_between(below, end))
-                .collect(),
+            ln_surprisal_below: OnceLock::new(),
         }
     }
 }
@@ -188,7 +200,30 @@ pub enum Item {
 pub struct Distribution {
     /// Disjoint, by rank; two neighbours always have a gap between them.
     runs: Vec<Run>,
-    rank: HashMap<Branch, Rank>,
+    rank: Ranks,
+}
+
+/// Each known child's rank by its branch.
+type Ranks = HashMap<Branch, Rank, BuildHasherDefault<BranchHasher>>;
+
+/// Branches come from the node's own source, mostly small and dense: one
+/// multiply spreads them across the table's bits at a fraction of SipHash's
+/// cost, which a server pays for its whole vocabulary on every node.
+#[derive(Default)]
+struct BranchHasher(u64);
+
+impl Hasher for BranchHasher {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only branches are hashed")
+    }
+
+    fn write_u32(&mut self, branch: u32) {
+        self.0 = u64::from(branch).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl Distribution {
@@ -203,17 +238,18 @@ impl Distribution {
         if ln_weights.iter().any(|weight| weight.is_nan()) {
             return Err("a weight is not a number".into());
         }
-        let mut order: Vec<Branch> = (0..ln_weights.len() as Branch)
-            .filter(|&branch| ln_weights[branch as usize] > f64::NEG_INFINITY)
+        // Each weight beside its branch: sorting them together reads memory
+        // in order rather than looking every weight up.
+        let mut order: Vec<(f64, Branch)> = ln_weights
+            .iter()
+            .copied()
+            .zip(0..)
+            .filter(|&(weight, _)| weight > f64::NEG_INFINITY)
             .collect();
-        order.sort_unstable_by(|&a, &b| {
-            ln_weights[b as usize]
-                .total_cmp(&ln_weights[a as usize])
-                .then(a.cmp(&b))
-        });
+        order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         let mut ln_below = vec![f64::NEG_INFINITY; order.len() + 1];
         for i in (0..order.len()).rev() {
-            ln_below[i] = ln_add(ln_below[i + 1], ln_weights[order[i] as usize]);
+            ln_below[i] = ln_add(ln_below[i + 1], order[i].0);
         }
         let total = ln_below[0];
         if total.is_finite() {
@@ -221,7 +257,8 @@ impl Distribution {
                 *edge = (*edge - total).min(0.0);
             }
         }
-        Ok(Self::new(Run::new(0, order, ln_below)?))
+        let branches = order.into_iter().map(|(_, branch)| branch).collect();
+        Ok(Self::new(Run::new(0, branches, ln_below)?))
     }
 
     pub fn runs(&self) -> &[Run] {
@@ -248,7 +285,10 @@ impl Distribution {
 
     /// Runs disjoint by rank, two neighbours with a gap between them.
     fn from_runs(runs: Vec<Run>) -> Result<Self> {
-        let mut rank = HashMap::new();
+        let mut rank = Ranks::with_capacity_and_hasher(
+            runs.iter().map(Run::len).sum(),
+            Default::default(),
+        );
         for run in &runs {
             for (at, &branch) in (run.rank..).zip(&run.branches) {
                 if rank.insert(branch, at).is_some() {
@@ -605,7 +645,9 @@ mod tests {
     #[test]
     fn runs_are_validated_where_they_arrive() {
         assert!(Run::new(0, vec![1], vec![0.0]).is_err());
-        assert!(Run::new(0, vec![1, 1], vec![0.0, -1.0, -2.0]).is_err());
+        // A branch twice is refused where the run joins the node.
+        let twice = Run::new(0, vec![1, 1], vec![0.0, -1.0, -2.0]).unwrap();
+        assert!(Distribution::from_answer(vec![twice]).is_err());
         assert!(Run::new(0, vec![1, 2], vec![0.0, -2.0, -1.0]).is_err());
         assert!(Run::new(0, vec![1], vec![0.5, -1.0]).is_err());
         assert!(Run::new(0, vec![1], vec![f64::NAN, -1.0]).is_err());

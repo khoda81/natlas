@@ -60,17 +60,20 @@ impl PythonTree {
     }
 
     /// Set the node's children under `measure` from every branch's ln weight,
-    /// a float64 buffer indexed by branch, as a measure computes them.
+    /// a float64 buffer indexed by branch, as a measure computes them. The
+    /// children are sorted without the GIL, and before the tree is borrowed.
     fn set(
-        &mut self,
+        slf: &Bound<'_, Self>,
         node: u64,
         measure: usize,
         ln_weights: PyBuffer<f64>,
-        py: Python<'_>,
     ) -> PyResult<()> {
+        let py = slf.py();
         let weights = ln_weights.to_vec(py)?;
-        let distribution = Distribution::from_weights(&weights).map_err(error)?;
-        self.inner.set(node, measure, distribution).map_err(error)
+        let distribution = py
+            .detach(|| Distribution::from_weights(&weights))
+            .map_err(error)?;
+        slf.borrow_mut().inner.set(node, measure, distribution).map_err(error)
     }
 
     fn forget(&mut self, node: u64, measure: usize) -> PyResult<()> {

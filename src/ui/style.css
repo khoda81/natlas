@@ -181,7 +181,7 @@ input:hover {
 
 .inspect {
   position: fixed;
-  left: 8px;
+  right: 8px;
   bottom: 30px;
   max-width: min(560px, calc(100vw - 16px));
   padding: 8px 10px;
@@ -190,6 +190,9 @@ input:hover {
   border: 1px solid var(--rule);
   border-radius: 8px;
   box-shadow: var(--shadow);
+  /* A readout of what the pointer is over: the pointer passes through to
+     the canvas, which would otherwise lose it and hide the readout. */
+  pointer-events: none;
 }
 
 .search-result {
@@ -224,9 +227,9 @@ input:hover {
   border-color: var(--accent);
 }
 
-.inspect.right {
-  left: auto;
-  right: 8px;
+.inspect.left {
+  left: 8px;
+  right: auto;
 }
 
 .path {

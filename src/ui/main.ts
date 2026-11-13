@@ -918,16 +918,29 @@ export class App {
       }
       this.hover = this.lastPick.selection;
     } else this.hover = null;
-    if (pointer !== null) {
-      const covered = pointer.x < this.view.width * 0.45 && pointer.y > this.view.height * 0.55;
-      this.inspect.classList.toggle("right", covered);
-    }
+    this.avoidPointer();
     this.updateInspect();
     if (this.hover) {
       const { box, exact } = this.hover;
       const more = !exact || box.branch === null ? " …" : undefined;
       this.showPath(box.node, box.branch, more);
     }
+  }
+
+  /**
+   * Move the inspector to the other bottom corner while it covers the
+   * pointer, unless it would cover it there too. Read before this frame
+   * writes to the page, so it lays nothing out.
+   */
+  private avoidPointer(): void {
+    if (this.pointer === null || this.inspect.hidden) return;
+    const { x, y } = this.pointer;
+    const { left, right, top, bottom } = this.inspect.getBoundingClientRect();
+    if (!(top <= y && y < bottom)) return;
+    // The corners mirror each other: the same margin from either side.
+    const width = document.documentElement.clientWidth;
+    const covers = (from: number, to: number) => from <= x && x < to;
+    if (covers(left, right) && !covers(width - right, width - left)) this.inspect.classList.toggle("left");
   }
 
   /** Show the selected path until another box is hovered; ``more`` marks unknown continuation. */

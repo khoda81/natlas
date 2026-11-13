@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use crate::point::Point;
 use crate::tree::Branch;
 use crate::Result;
 
@@ -422,23 +423,43 @@ impl Distribution {
         Some(self.runs[run].slice(at, at + 1))
     }
 
-    /// The known children holding `points`, each ln of the mass below it,
-    /// once each and by rank, and whether every point found one: a point in
-    /// a gap holds no known child.
-    pub fn children_at(&self, points: &[f64]) -> (Vec<(usize, usize)>, bool) {
-        let mut found = Vec::with_capacity(points.len());
-        let mut all = true;
-        for &point in points {
-            match self.locate(point) {
-                Some(Item::Child { run, at })
-                    if point <= self.runs[run].ln_below[at]
-                        && self.runs[run].ln_below[at + 1] < point =>
-                {
-                    found.push((run, at));
-                }
-                _ => all = false,
-            }
+    /// An item's edges as a point is measured from them: the node's top is
+    /// its whole mass, even where its first child starts a rounding error
+    /// below.
+    pub fn item_edges(&self, item: Item) -> (f64, f64) {
+        let top = match self.item_rank(item) {
+            0 => 0.0,
+            _ => self.item_top(item),
+        };
+        (top, self.item_bottom(item))
+    }
+
+    /// The known child holding a point, however deep the point is told.
+    pub fn child_at(&self, point: &Point) -> Option<(usize, usize)> {
+        let holds = |item: Item| {
+            let (top, bottom) = self.item_edges(item);
+            point.within(top, bottom)
+        };
+        // Where a float of the point finds it, most of the time; exactly
+        // where the point is too near an edge for that.
+        let item = self
+            .locate(point.ln_below())
+            .filter(|&item| holds(item))
+            .or_else(|| self.locate_by(|edge| point.below(edge)))?;
+        match item {
+            Item::Child { run, at } if holds(item) => Some((run, at)),
+            _ => None,
         }
+    }
+
+    /// The known children holding `points`, once each and by rank, and
+    /// whether every point found one: a point in a gap holds no known child.
+    pub fn children_at(&self, points: &[Point]) -> (Vec<(usize, usize)>, bool) {
+        let mut found: Vec<_> = points
+            .iter()
+            .filter_map(|point| self.child_at(point))
+            .collect();
+        let all = found.len() == points.len();
         found.sort_unstable();
         found.dedup();
         (found, all)
@@ -460,20 +481,6 @@ impl Distribution {
             }
         }
         runs
-    }
-
-    /// A point of the node, as ln of the mass below it, within the child at
-    /// `(run, at)` holding it.
-    pub fn within(&self, (run, at): (usize, usize), point: f64) -> f64 {
-        let run = &self.runs[run];
-        let (top, bottom) = (run.ln_below[at], run.ln_below[at + 1]);
-        if top <= point {
-            0.0
-        } else if point <= bottom {
-            f64::NEG_INFINITY
-        } else {
-            (ln_between(point, bottom) - run.ln_p(at)).min(0.0)
-        }
     }
 }
 
@@ -716,7 +723,8 @@ mod tests {
         let mut d = Distribution::new(run(0, &[3, 4], &[0.5, 0.3], 0.2));
         d.insert(vec![run(4, &[8], &[0.05], 0.05)]).unwrap();
         // 0.9 and 0.6 lie in branch 3, 0.4 in branch 4, 0.15 in a gap, 0.07 in branch 8.
-        let points = [0.9f64, 0.6, 0.4, 0.15, 0.07].map(f64::ln);
+        let points = [0.9f64, 0.6, 0.4, 0.15, 0.07]
+            .map(|below| Point::off(below.ln(), true, 0.0, 0.0).unwrap());
         let (children, all) = d.children_at(&points);
         assert_eq!(children, [(0, 0), (0, 1), (1, 0)]);
         assert!(!all);
@@ -727,10 +735,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0, vec![3, 4]), (4, vec![8])]
         );
-        // 0.6 lies 0.1 into branch 3's (0.5, 1]: a fifth of it from its bottom.
-        close(d.within((0, 0), 0.6f64.ln()), 0.2f64.ln());
-        assert_eq!(d.within((0, 0), 0.0), 0.0);
-        assert_eq!(d.within((0, 0), 0.5f64.ln()), f64::NEG_INFINITY);
+        // A point 2^-800 above branch 4's top is branch 3's, and the edge
+        // itself branch 4's: no float of a mass tells them apart.
+        let edge = 0.5f64.ln();
+        let over = Point::off(edge, false, 1.0, -800.0 * std::f64::consts::LN_2).unwrap();
+        assert_eq!(d.child_at(&over), Some((0, 0)));
+        assert_eq!(
+            d.child_at(&Point::off(edge, true, 0.0, 0.0).unwrap()),
+            Some((0, 1))
+        );
         // An answer that places one rank twice is refused, and one that
         // contradicts what is known replaces it.
         assert!(d

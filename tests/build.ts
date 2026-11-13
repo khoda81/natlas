@@ -24,6 +24,11 @@ export function digits(fraction: number): Uint8Array {
   return Uint8Array.from(digits);
 }
 
+/** The points with these masses below them, each a part of its own. */
+export function at(...below: number[]): { top: Uint8Array; lnMass: number; count: number }[] {
+  return below.map((mass) => ({ top: digits(1 - mass), lnMass: -Infinity, count: 1 }));
+}
+
 /** An answer placing those children, as one run. */
 export function answer(...args: Parameters<typeof run>): Children & { runs: ReturnType<typeof run>[] } {
   return { runs: [run(...args)] };

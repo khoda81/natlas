@@ -117,12 +117,16 @@ Each server serves one measure through two Connect RPCs:
   - The **path** places each branch, one child per node. Alone, it names the
     node it reaches without reading it: flights and restores read by paths,
     from the deepest node already placed.
-  - **Points**, each ln of the mass below it, place the children holding
-    them, each once; where all of them fall in one child, that child alone,
-    and the same points within it. Views read by points: a child the tree
-    knows only as its parent's branch is sampled down that branch, and a
-    deep zoom reaches its target in one request. Ln of the mass below
-    reaches a node's deep tail as exactly as its head.
+  - **Points** place the children holding them, each once; where all of them
+    fall in one child, that child alone, and the same points within it. They
+    are sampled from **parts** of the node: a part is its top, as base-256
+    digits of the fraction of the node's mass above it, ln of its mass, and
+    how many points to spread evenly through it. Digits tell a top exactly
+    however deep in the node, or in its light tail, the part is, so a view
+    far smaller than any float of the node's mass resolves is still sampled
+    where it is. Views read by points: a child the tree knows only as its
+    parent's branch is sampled down that branch, and a deep zoom reaches its
+    target in one request.
   - **Branches** place those children of the node: how a view reads q, which
     is per-branch metadata, for the children p placed.
 

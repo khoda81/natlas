@@ -114,7 +114,7 @@ export class ConnectSource implements Source {
     const read = within === undefined
       ? { case: undefined }
       : "points" in within
-        ? { case: "points" as const, value: { lnBelow: within.points } }
+        ? { case: "points" as const, value: { parts: within.points } }
         : { case: "branches" as const, value: { branches: within.branches } };
     return named(tree, request, this.client.expand({ node, path, within: read }, { signal }));
   }

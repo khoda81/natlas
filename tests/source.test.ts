@@ -6,7 +6,8 @@ import type { Miss } from "../src/core/layout";
 import { IntervalTree, ROOT } from "../src/core/tree";
 import { ChildrenSchema, ExpandRequestSchema, SnapshotSchema } from "../src/gen/natlas/natlas_pb";
 import { TextLabels } from "../src/readings/labels";
-import { answer, run } from "./build";
+import { answer, at, run } from "./build";
+import type { Part } from "../src/core/layout";
 
 const weights = [0.5, 0.2, 0.1, 0.05, 0.01];
 
@@ -23,7 +24,7 @@ async function steps(source: Source, tree: IntervalTree, request: ExpandRequest)
 }
 
 /** Reads of the node itself. */
-const points = (points: number[]) => ({ path: [], within: { points } });
+const points = (points: Part[]) => ({ path: [], within: { points } });
 const branches = (branches: number[]) => ({ path: [], within: { branches } });
 
 /** The branches a step places, in rank order. */
@@ -35,7 +36,7 @@ describe("SnapshotSource", () => {
     const tree = new IntervalTree(1);
     // 0.9 and 0.6 lie in branch 0's (0.5, 1], 0.4 in branch 1's (0.3, 0.5],
     // and 0.05 in the unrecorded rest.
-    const [step] = await steps(source, tree, { node: ROOT, ...points([0.9, 0.6, 0.4, 0.05].map(Math.log)) });
+    const [step] = await steps(source, tree, { node: ROOT, ...points(at(0.9, 0.6, 0.4, 0.05)) });
     expect(placed(step)).toEqual([0, 1]);
     expect(step!.runs).toHaveLength(1);
   });
@@ -46,9 +47,9 @@ describe("SnapshotSource", () => {
     const walk = await steps(source, tree, { node: ROOT, path: [1, 4, 0, 2] });
     expect(walk.map(({ node }) => tree.path(node))).toEqual([[], [1], [1, 4]]);
     expect(walk.map(placed)).toEqual([[1], [4], [0]]);
-    expect(await steps(source, tree, { node: tree.descend(ROOT, [9, 9]), ...points([-1]) })).toEqual([]);
+    expect(await steps(source, tree, { node: tree.descend(ROOT, [9, 9]), ...points(at(0.4)) })).toEqual([]);
     // Down a path and then points: the path's branch, then the node it reaches.
-    const both = await steps(source, tree, { node: ROOT, path: [1], within: { points: [0.9, 0.4].map(Math.log) } });
+    const both = await steps(source, tree, { node: ROOT, path: [1], within: { points: at(0.9, 0.4) } });
     expect(both.map(({ node }) => tree.path(node))).toEqual([[], [1]]);
     expect(both.map(placed)).toEqual([[1], [0, 1]]);
   });
@@ -56,7 +57,7 @@ describe("SnapshotSource", () => {
   it("descends where all the points fall in one child, and reads branches alone", async () => {
     const source = snapshot(TextLabels.none(), [[], [0]]);
     const tree = new IntervalTree(1);
-    const walk = await steps(source, tree, { node: ROOT, ...points([0.9, 0.6].map(Math.log)) });
+    const walk = await steps(source, tree, { node: ROOT, ...points(at(0.9, 0.6)) });
     expect(walk.map(({ node }) => tree.path(node))).toEqual([[], [0]]);
     expect(placed(walk[0])).toEqual([0]);
     const [listed] = await steps(source, tree, { node: ROOT, ...branches([4, 2, 9]) });
@@ -109,7 +110,7 @@ describe("ConnectSource", () => {
       expect(walk.map(({ node }) => tree.path(node))).toEqual([[], [5], [5, 6]]);
       // Points on a node the server has not learned: down its path from the root, then the points.
       const other = tree.descend(ROOT, [9]);
-      const sampled = await steps(source, tree, { node: other, ...points([-1]) });
+      const sampled = await steps(source, tree, { node: other, ...points(at(0.4)) });
       expect(sampled.map(({ node }) => tree.path(node))).toEqual([[], [9]]);
       expect(requests).toEqual(["deep path 7", "root path 5,6,7", "deep points", "root path 9 points"]);
     } finally {
@@ -130,7 +131,7 @@ function counting(answer: (request: ExpandRequest) => Step[] | Promise<Step[]>):
   };
 }
 
-const rootMiss: Miss = { node: ROOT, measure: 0, read: points([-0.5]), priority: 1 };
+const rootMiss: Miss = { node: ROOT, measure: 0, read: points(at(0.6)), priority: 1 };
 
 describe("Expander", () => {
   it("asks once for what a view lacks, and not again for what a source could not give", async () => {
@@ -169,7 +170,7 @@ describe("Expander", () => {
       : [{ node: ROOT, runs: [run([0.5, 0.5])] }]);
     const expander = new Expander(tree, [source], 1);
     try {
-      const down: Miss = { ...rootMiss, read: { path: [1], within: { points: [Math.log(0.25)] } } };
+      const down: Miss = { ...rootMiss, read: { path: [1], within: { points: at(0.25) } } };
       expander.request(() => tree.has(ROOT, 0) ? [down] : [rootMiss]);
       await waitUntil(() => tree.has(child, 0));
       expect(source.requests).toEqual([{ node: ROOT, ...rootMiss.read }, { node: ROOT, ...down.read }]);

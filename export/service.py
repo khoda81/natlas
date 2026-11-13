@@ -7,6 +7,7 @@ cached distributions and the hashed node ids shared with every client.
 from __future__ import annotations
 
 import json
+import math
 import queue
 import re
 import struct
@@ -100,7 +101,8 @@ class Model:
         with self.names:
             match request.WhichOneof("within"):
                 case "points":
-                    walk = self.tree.start(node, path, points=list(request.points.ln_below))
+                    parts = [(part.top, part.ln_mass, part.count) for part in request.points.parts]
+                    walk = self.tree.start(node, path, parts=parts)
                 case "branches":
                     walk = self.tree.start(node, path, branches=list(request.branches.branches))
                 case _:
@@ -214,10 +216,9 @@ def app(
                 return _stream(
                     [_end({"code": "invalid_argument", "message": str(error)})]
                 )
-            # NaN fails the comparison.
-            if not all(point <= 0 for point in request_message.points.ln_below):
+            if any(math.isnan(part.ln_mass) for part in request_message.points.parts):
                 return _stream(
-                    [_end({"code": "invalid_argument", "message": "points are ln of the mass below them, at most 0"})]
+                    [_end({"code": "invalid_argument", "message": "a part's ln mass is not a number"})]
                 )
             # The walk runs on its own thread, holding the model for its whole
             # length, and hands each node's children over as it places them. A client that

@@ -18,8 +18,8 @@ step per drawn box: children at least a pixel tall, bands about a pixel tall,
 and gaps. A band's width is estimated from its known children: over a known
 run, from a per-run suffix sum of p (−ln p) when p = q, and from a few of its
 children otherwise, so a frame never visits the children hidden inside a
-band. What the view lacks is asked for as points to sample, at most 4096 per
-request. Picking walks down from the
+band. What the view lacks is asked for as parts to sample: a top, a mass and
+a count each, so a request stays a few bytes per gap. Picking walks down from the
 origin through the laid-out nodes to the one child under the point.
 
 The UI and the fetch pump share geometry only when the tree revision, lens,

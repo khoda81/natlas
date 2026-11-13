@@ -66,9 +66,18 @@ export interface Box {
   y1: number;
 }
 
+/** ``count`` points of a node, evenly through the part of it from ``top``
+ * (the fraction of its mass above the part, as digits in base 256) down
+ * e^``lnMass`` of its mass. A part of no mass is its top alone. */
+export interface Part {
+  top: Uint8Array;
+  lnMass: number;
+  count: number;
+}
+
 /** What an Expand reads of the node its path ends at: the children holding
- * points (each ln of the mass below it), or the children along branches. */
-export type Within = { points: number[] } | { branches: Branch[] };
+ * the points of parts of it, or the children along branches. */
+export type Within = { points: Part[] } | { branches: Branch[] };
 
 /** How an Expand reads the tree below its node: down a path, placing each of
  * its branches, and then within the node it ends at. Without ``within`` that

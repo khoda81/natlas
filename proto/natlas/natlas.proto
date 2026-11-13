@@ -33,10 +33,10 @@ service Natlas {
   //
   // - down the path: the starting node and every node along it, each
   //   placing the path's next branch;
-  // - then, at its end, either points, each ln of the mass below it: the
-  //   children holding them, and where all of them fall in one child, that
-  //   child alone and the same points within it, so a view samples its
-  //   children and a deep zoom reaches them in one request;
+  // - then, at its end, either points, sampled evenly through parts of the
+  //   node: the children holding them, and where all of them fall in one
+  //   child, that child alone and the same points within it, so a view
+  //   samples its children and a deep zoom reaches them in one request;
   // - or branches: those children of the node, for a measure read only for
   //   q;
   // - or nothing: the path's last branch names the node it reaches, which
@@ -68,10 +68,21 @@ message ExpandRequest {
   }
 }
 
-// Points of a node, each ln of the mass below it: at most 0, as exact deep
-// in a node's light tail as at its top.
+// Points of a node, sampled from parts of it.
 message Points {
-  repeated double ln_below = 1;
+  repeated Part parts = 1;
+}
+
+// `count` points evenly through the part of a node from `top` down
+// e^ln_mass of its mass, each in the middle of its share. A part of no mass
+// (ln_mass −∞) is its top alone; points past the node's bottom are none.
+message Part {
+  // The fraction of the node's mass above the part, as digits in base 256,
+  // most significant first: exact however deep in the node, or in its light
+  // tail, the part is.
+  bytes top = 1;
+  double ln_mass = 2;
+  uint32 count = 3;
 }
 
 // Branches of one node.

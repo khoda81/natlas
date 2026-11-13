@@ -154,6 +154,21 @@ fn above(ln_below: f64) -> Dyadic {
     }
 }
 
+/// The fraction `distance` · e^`ln_unit` down, or up, from another, where
+/// that is a point of the node.
+fn shifted(from: &Dyadic, down: bool, distance: f64, ln_unit: f64) -> Option<Point> {
+    let by = Dyadic::from_f64(distance).mul(&Dyadic::exp(ln_unit));
+    let moved = if down {
+        from.add(&by)
+    } else {
+        match from.distance(&by) {
+            (Ordering::Less, _) => return None,
+            (_, moved) => moved,
+        }
+    };
+    (moved.cmp(&Dyadic::one()) == Ordering::Less).then_some(Point(moved))
+}
+
 /// A point of a node: the fraction of its mass above it, in [0, 1).
 #[derive(Clone, Debug)]
 pub struct Point(Dyadic);
@@ -217,16 +232,18 @@ impl Point {
     /// The point `distance` · e^`ln_unit` of the node's mass further down,
     /// or up; exact. None where that leaves the node.
     pub fn moved(&self, down: bool, distance: f64, ln_unit: f64) -> Option<Point> {
-        let by = Dyadic::from_f64(distance).mul(&Dyadic::exp(ln_unit));
-        let moved = if down {
-            self.0.add(&by)
-        } else {
-            match self.0.distance(&by) {
-                (Ordering::Less, _) => return None,
-                (_, moved) => moved,
-            }
-        };
-        (moved.cmp(&Dyadic::one()) == Ordering::Less).then_some(Point(moved))
+        shifted(&self.0, down, distance, ln_unit)
+    }
+
+    /// The point that far down, or up, from an edge; exact. An edge itself
+    /// is the point no distance from it: the top of the child under it.
+    pub fn off(ln_below: f64, down: bool, distance: f64, ln_unit: f64) -> Option<Point> {
+        shifted(&above(ln_below), down, distance, ln_unit)
+    }
+
+    /// ln of the mass below the point, as near as a float tells.
+    pub fn ln_below(&self) -> f64 {
+        Dyadic::one().distance(&self.0).1.ln()
     }
 
     /// Rounded down to `bits` bits.
@@ -283,6 +300,20 @@ mod tests {
             (true, 0.75f64.ln())
         );
         assert!(Point::new(&[]).within(0.0, f64::NEG_INFINITY));
+        // From an edge: the edge itself, and a point off it either way.
+        assert_eq!(Point::off(half, true, 0.0, 0.0).unwrap().digits(), [0x80]);
+        let above = Point::off(half, false, 1.0, -800.0 * LN_2).unwrap();
+        let (edge_under, ln) = above.to(half);
+        assert!(edge_under);
+        assert!((ln - -800.0 * LN_2).abs() < 1e-9);
+        assert!((above.ln_below() - half).abs() < 1e-15);
+        assert!(Point::off(f64::NEG_INFINITY, true, 0.0, 0.0).is_none());
+        assert_eq!(
+            Point::off(f64::NEG_INFINITY, false, 0.5, 0.0)
+                .unwrap()
+                .digits(),
+            [0x80]
+        );
     }
 
     #[test]

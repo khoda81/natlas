@@ -5,7 +5,7 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::distribution::Distribution;
-use crate::tree::{Advance, Read, Tree, Walk, Within};
+use crate::tree::{Advance, Part, Read, Tree, Walk, Within};
 
 fn error(message: String) -> PyErr {
     PyValueError::new_err(message)
@@ -78,23 +78,29 @@ impl PythonTree {
     }
 
     /// Begin an Expand down `path` below `node`, then for the children of
-    /// the node it ends at holding `points`, each ln of the mass below it,
-    /// or for those along `branches`. An unknown node raises KeyError; a
-    /// point above 0, or both points and branches, ValueError.
-    #[pyo3(signature = (node, path, points=None, branches=None))]
+    /// the node it ends at holding the points of `parts`, each (top digits,
+    /// ln mass, count), or for those along `branches`. An unknown node
+    /// raises KeyError; a mass that is no number, or both parts and
+    /// branches, ValueError.
+    #[pyo3(signature = (node, path, parts=None, branches=None))]
     fn start(
         &self,
         node: u64,
         path: Vec<u32>,
-        points: Option<Vec<f64>>,
+        parts: Option<Vec<(Vec<u8>, f64, u32)>>,
         branches: Option<Vec<u32>>,
     ) -> PyResult<PythonWalk> {
         self.known(node)?;
-        let within = match (points, branches) {
+        let part = |(top, ln_mass, count)| Part {
+            top,
+            ln_mass,
+            count,
+        };
+        let within = match (parts, branches) {
             (Some(_), Some(_)) => {
                 return Err(error("an Expand reads points or branches, not both".into()))
             }
-            (Some(points), None) => Some(Within::Points(points)),
+            (Some(parts), None) => Some(Within::Points(parts.into_iter().map(part).collect())),
             (None, Some(branches)) => Some(Within::Branches(branches)),
             (None, None) => None,
         };

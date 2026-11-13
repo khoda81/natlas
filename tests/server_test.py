@@ -104,11 +104,26 @@ def messages(body):
     return result
 
 
+def at(*below):
+    """The points with these masses below them, each a part of its own."""
+
+    def digits(fraction):
+        digits = bytearray()
+        while 0 < fraction:
+            fraction *= 256
+            digits.append(int(fraction))
+            fraction -= int(fraction)
+        return bytes(digits)
+
+    return [(digits(1 - mass), -math.inf, 1) for mass in below]
+
+
 def request(node, path=None, points=None, branches=None):
-    """Expand down ``path``, then at ``points`` or along ``branches``."""
+    """Expand down ``path``, then at the points of parts or along ``branches``."""
     within = {}
     if points is not None:
-        within = {"points": pb.Points(ln_below=points)}
+        parts = [pb.Part(top=top, ln_mass=ln_mass, count=count) for top, ln_mass, count in points]
+        within = {"points": pb.Points(parts=parts)}
     elif branches is not None:
         within = {"branches": pb.Branches(branches=branches)}
     return pb.ExpandRequest(node=node, path=path or [], **within)
@@ -138,7 +153,7 @@ class CoreTests(unittest.TestCase):
 
     def test_a_walk_places_what_the_core_holds_and_asks_for_what_it_lacks(self):
         tree = Tree(1)
-        walk = tree.start(0, [], points=[math.log(0.9), math.log(0.4)])
+        walk = tree.start(0, [], parts=at(0.9, 0.4))
         self.assertEqual(tree.advance(walk, 0), ("missing", 0))
         with np.errstate(divide="ignore"):
             tree.set(0, 0, np.log([0.2, 0.5, 0.0, 0.3]))
@@ -149,9 +164,14 @@ class CoreTests(unittest.TestCase):
         self.assertAlmostEqual(math.exp(ln_below[-1]), 0.2, places=12)
         self.assertIsNone(tree.advance(walk, 0))
         with self.assertRaises(ValueError):
-            tree.start(0, [], points=[0.5])
+            tree.start(0, [], parts=[(b"", math.nan, 1)])
         with self.assertRaises(ValueError):
-            tree.start(0, [], points=[-1.0], branches=[1])
+            tree.start(0, [], parts=at(0.4), branches=[1])
+        # Four points evenly through the lower half: 0.5625 and 0.6875 down
+        # in branch 3, 0.8125 and 0.9375 in the lightest, 0.
+        walk = tree.start(0, [], parts=[(b"\x80", math.log(0.5), 4)])
+        _, _, ((rank, branches, _),), _ = tree.advance(walk, 0)
+        self.assertEqual((rank, branches), (1, [3, 0]))
         # Nothing to read is nothing to compute.
         self.assertIsNone(tree.advance(tree.start(0, []), 0))
 
@@ -173,11 +193,11 @@ class ModelTests(unittest.TestCase):
     def test_points_place_the_children_holding_them_or_descend_into_one(self):
         model, _ = fixture()
         # 0.9 lies in branch 0's (0.4, 1], 0.3 in branch 1's (0.15, 0.4].
-        (root,) = answers(model, 0, points=[math.log(0.9), math.log(0.3)])
+        (root,) = answers(model, 0, points=at(0.9, 0.3))
         self.assertEqual((placed(root), root.count), ([[0, 1]], 5))
         # 0.9 and 0.5 both lie in branch 0: the points descend into it,
         # where they fall 0.83 and 0.17 of the way up, in its branches 0 and 1.
-        descent = answers(model, 0, points=[math.log(0.9), math.log(0.5)])
+        descent = answers(model, 0, points=at(0.9, 0.5))
         self.assertEqual([placed(children) for children in descent], [[[0]], [[0, 1]]])
         self.assertEqual(model.measures[0].calls[-1], (99, 0))
         (branches,) = answers(model, 0, branches=[4, 1, 7])
@@ -185,7 +205,7 @@ class ModelTests(unittest.TestCase):
         # Down a path and then points, in one request: the path's branch,
         # then the children of the node it reaches.
         calls = len(model.measures[0].calls)
-        both = answers(model, 0, [0], points=[math.log(0.9), math.log(0.3)])
+        both = answers(model, 0, [0], points=at(0.9, 0.3))
         self.assertEqual([placed(children) for children in both], [[[0]], [[0, 1]]])
         self.assertEqual(len(model.measures[0].calls), calls)
 
@@ -200,7 +220,7 @@ class ModelTests(unittest.TestCase):
     def test_ended_and_weightless_branches(self):
         model, _ = fixture()
         self.assertEqual(len(answers(model, 0, [0] * 5)), 5)
-        ended = answers(model, node_id([0] * 5), points=[-1.0])
+        ended = answers(model, node_id([0] * 5), points=at(0.4))
         self.assertEqual(ended, [pb.Children(count=0)])
         # Branch 5 is past the vocabulary: nothing places it.
         self.assertEqual(answers(model, 0, [5]), [])
@@ -286,12 +306,12 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
 
     def test_invalid_requests_return_protocol_errors(self):
-        positive = request(0, points=[0.5]).SerializeToString()
+        unmeasured = request(0, points=[(b"", math.nan, 1)]).SerializeToString()
         for body in [
             b"",
             b"\x00\x00\x00\x00\x04\x80",
             service._envelope(0, b"\x80"),
-            service._envelope(0, positive),
+            service._envelope(0, unmeasured),
         ]:
             frames = messages(self.expand(body).content)
             self.assertEqual(

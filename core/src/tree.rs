@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::distribution::{ln_between, Distribution, Rank, Run, MAX_DESCENT};
+use crate::distribution::{ln_between, Distribution, Item, Rank, Run, MAX_DESCENT};
+use crate::point::Point;
 use crate::Result;
 
 /// A node's id, hashed from its branches by [`child_hash`] and shared by every
@@ -310,9 +311,9 @@ impl Read {
         Self { path, within: None }
     }
 
-    /// The children of the node holding these points.
-    pub fn points(points: Vec<f64>) -> Self {
-        Within::Points(points).into()
+    /// The children of the node holding the points sampled from these parts.
+    pub fn points(parts: Vec<Part>) -> Self {
+        Within::Points(parts).into()
     }
 
     /// These children of the node.
@@ -335,11 +336,48 @@ impl From<Within> for Read {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Within {
-    /// The children holding these points, each ln of the mass below it, and
-    /// down through a child holding all of them.
-    Points(Vec<f64>),
+    /// The children holding the points sampled from these parts, and down
+    /// through a child holding all of them.
+    Points(Vec<Part>),
     /// These children of the node.
     Branches(Vec<Branch>),
+}
+
+/// `count` points of a node, evenly through the part of it from `top` down
+/// e^`ln_mass` of its mass, each in the middle of its share. The top is
+/// exact at any depth; a part of no mass is its top alone.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Part {
+    /// The fraction of the node's mass above the part, in base 256.
+    #[serde(with = "bytes")]
+    pub top: Vec<u8>,
+    pub ln_mass: f64,
+    pub count: u32,
+}
+
+impl Part {
+    /// Its points that are the node's: a part may reach past its bottom.
+    fn points(&self) -> impl Iterator<Item = Point> + '_ {
+        let top = Point::new(&self.top);
+        (0..self.count).filter_map(move |i| {
+            let share = (f64::from(i) + 0.5) / f64::from(self.count);
+            top.moved(true, share, self.ln_mass)
+        })
+    }
+}
+
+/// Digits cross to JavaScript as a Uint8Array.
+pub(crate) mod bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(digits: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(digits)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        Vec::deserialize(deserializer)
+    }
 }
 
 /// One request of the protocol's Expand walked through a tree, one node at a
@@ -348,11 +386,20 @@ pub enum Within {
 #[derive(Debug)]
 pub struct Walk {
     node: NodeId,
-    read: Read,
+    path: Vec<Branch>,
     /// Branches of the path placed so far.
     at: usize,
+    within: Option<Reading>,
     descended: usize,
     done: bool,
+}
+
+/// What a walk reads of the node its path ends at, as it goes: the points
+/// themselves, in the node the walk has descended to.
+#[derive(Debug)]
+enum Reading {
+    Points(Vec<Point>),
+    Branches(Vec<Branch>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -366,17 +413,25 @@ pub enum Advance {
 }
 
 impl Walk {
-    /// A read below `node`; points must be ln masses, at most 0.
-    pub fn new(node: NodeId, read: Read) -> Result<Self> {
-        if let Some(Within::Points(points)) = &read.within {
-            if points.iter().any(|point| point.is_nan() || 0.0 < *point) {
-                return Err("points must be ln masses below edges".into());
+    /// A read below `node`; a part's mass must be a number.
+    pub fn new(node: NodeId, Read { path, within }: Read) -> Result<Self> {
+        let within = match within {
+            Some(Within::Points(parts)) => {
+                if parts.iter().any(|part| part.ln_mass.is_nan()) {
+                    return Err("a part's ln mass is not a number".into());
+                }
+                Some(Reading::Points(
+                    parts.iter().flat_map(Part::points).collect(),
+                ))
             }
-        }
+            Some(Within::Branches(branches)) => Some(Reading::Branches(branches)),
+            None => None,
+        };
         Ok(Self {
             node,
-            read,
+            path,
             at: 0,
+            within,
             descended: 0,
             done: false,
         })
@@ -387,10 +442,9 @@ impl Walk {
             return Ok(Advance::Done);
         }
         let node = self.node;
-        let Read { path, within } = &mut self.read;
         // The path walked, its last branch named this node: it is read only
         // for what is asked within it.
-        let step = match (path.get(self.at), within) {
+        let step = match (self.path.get(self.at), &mut self.within) {
             (Some(&branch), _) => Ok(branch),
             (None, Some(within)) => Err(within),
             (None, None) => {
@@ -412,10 +466,10 @@ impl Walk {
                     return Ok(Advance::Done);
                 };
                 self.at += 1;
-                let more = self.at < self.read.path.len() || self.read.within.is_some();
+                let more = self.at < self.path.len() || self.within.is_some();
                 (vec![run], Some(branch), more)
             }
-            Err(Within::Branches(branches)) => {
+            Err(Reading::Branches(branches)) => {
                 let mut children: Vec<_> = branches
                     .iter()
                     .filter_map(|&branch| distribution.locate_rank(distribution.rank(branch)?))
@@ -424,14 +478,18 @@ impl Walk {
                 children.dedup();
                 (distribution.runs_of(&children), None, false)
             }
-            Err(Within::Points(points)) => {
+            Err(Reading::Points(points)) => {
                 let (children, all) = distribution.children_at(points);
                 let runs = distribution.runs_of(&children);
                 match (children.as_slice(), all) {
-                    ([child], true) if self.descended < MAX_DESCENT => {
+                    (&[(run, at)], true) if self.descended < MAX_DESCENT => {
                         self.descended += 1;
+                        // The same points as the child's own, told as
+                        // finely as they were.
+                        let child = Item::Child { run, at };
+                        let (top, bottom) = distribution.item_edges(child);
                         for point in points.iter_mut() {
-                            *point = distribution.within(*child, *point);
+                            *point = point.into_child(top, bottom, 0);
                         }
                         let branch = runs[0].branch(0);
                         (runs, Some(branch), true)
@@ -454,6 +512,16 @@ mod tests {
 
     fn weights(weights: &[f64]) -> Distribution {
         Distribution::from_weights(&weights.iter().map(|w| w.ln()).collect::<Vec<_>>()).unwrap()
+    }
+
+    /// The points with these masses below them, each a part of its own.
+    fn at(below: &[f64]) -> Vec<Part> {
+        let part = |below: &f64| Part {
+            top: Point::off(below.ln(), true, 0.0, 0.0).unwrap().digits(),
+            ln_mass: f64::NEG_INFINITY,
+            count: 1,
+        };
+        below.iter().map(part).collect()
     }
 
     #[test]
@@ -519,13 +587,13 @@ mod tests {
 
         // Points across two children list both; points all inside branch 0
         // (0.4, 1] descend into it, rescaled.
-        let mut walk = Walk::new(ROOT, Read::points(vec![0.9f64.ln(), 0.2f64.ln()])).unwrap();
+        let mut walk = Walk::new(ROOT, Read::points(at(&[0.9, 0.2]))).unwrap();
         let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
             panic!("the root lists the children at the points");
         };
         assert_eq!(runs[0].branches(), [0, 1]);
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
-        let mut walk = Walk::new(ROOT, Read::points(vec![0.9f64.ln(), 0.5f64.ln()])).unwrap();
+        let mut walk = Walk::new(ROOT, Read::points(at(&[0.9, 0.5]))).unwrap();
         assert!(matches!(
             walk.advance(&mut tree, 0).unwrap(),
             Advance::Children(ROOT, _, _)
@@ -541,14 +609,29 @@ mod tests {
             panic!("the root lists the branches it has");
         };
         assert_eq!(runs[0].branches(), [1, 2]);
-        assert!(Walk::new(ROOT, Read::points(vec![0.5])).is_err());
+        let part = |ln_mass| Part {
+            top: vec![0x80],
+            ln_mass,
+            count: 4,
+        };
+        assert!(Walk::new(ROOT, Read::points(vec![part(f64::NAN)])).is_err());
+        // Four points evenly through the lower half of the root, where all
+        // three branches have a part; a part reaching past the node's bottom
+        // has only its points above it, here 0.625 and 0.875.
+        for (ln_mass, placed) in [(0.5f64.ln(), &[0, 1, 2][..]), (0.0, &[1][..])] {
+            let mut walk = Walk::new(ROOT, Read::points(vec![part(ln_mass)])).unwrap();
+            let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
+                panic!("the root lists the children the part's points fall in");
+            };
+            assert_eq!(runs[0].branches(), placed);
+        }
 
         // A path and then points: the path's branch is placed, and the node
         // it reaches is sampled in its own coordinates.
         tree.set(child, 0, weights(&[0.5, 0.5])).unwrap();
         let read = Read {
             path: vec![2],
-            within: Some(Within::Points(vec![0.9f64.ln(), 0.2f64.ln()])),
+            within: Some(Within::Points(at(&[0.9, 0.2]))),
         };
         let mut walk = Walk::new(ROOT, read).unwrap();
         let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
@@ -568,7 +651,7 @@ mod tests {
         // says it has no children.
         tree.set(child, 0, Distribution::from_weights(&[]).unwrap())
             .unwrap();
-        let mut walk = Walk::new(child, Read::points(vec![-1.0])).unwrap();
+        let mut walk = Walk::new(child, Read::points(at(&[0.4]))).unwrap();
         assert_eq!(
             walk.advance(&mut tree, 0).unwrap(),
             Advance::Children(child, vec![], Some(0))

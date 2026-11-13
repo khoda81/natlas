@@ -234,10 +234,15 @@ Models load in float32 by default, which is both more precise and, on a GTX
 larger models.
 
 `--p` also takes a `.gguf` file, which llama.cpp runs with every layer on the
-GPU (`--gpu-layers`, and `--n-ctx` for the deepest path it can hold).
-llama-cpp-python is built for CUDA on first run, which takes a while. A
-request that shares a prefix with the previous one reuses its KV cache, so
-walking down a path costs one token per step.
+GPU (`--gpu-layers`, and `--n-ctx` for the KV cache's cells: the deepest
+path it can hold, and what paths it keeps beside it). llama-cpp-python is
+built for CUDA on first run, which takes a while. The KV cache holds one
+sequence per path read, up to llama.cpp's 256, sharing the cells of their
+common prefixes. A request reads on from the sequence it shares the most
+with, or branches off into a sequence of its own, so walking down a path
+costs one token per step, and walks down different branches take turns
+without reading each other's tokens again. The least recently read
+sequences give way when the cells run out.
 
 ```bash
 uv run serve.py \

@@ -158,25 +158,28 @@ class Transformers:
 
 class LlamaCpp:
     """A GGUF model run by llama.cpp, its layers on the GPU as far as ``gpu_layers``
-    says (-1 for all). Requests that share a prefix with the last one reuse
-    its cache, so walking down a path costs a token per step. Every token
-    is evaluated alone, so a node's log-probabilities depend on its path only."""
+    says (-1 for all). Requests that share a prefix with one read before reuse
+    its cache, so walking down a path costs a token per step, and walks down
+    different branches take turns without reading each other's tokens again.
+    Every token is evaluated alone."""
 
     def __init__(self, path: Path, context: int = 8192, gpu_layers: int = -1):
         from llama_cpp import Llama
 
         self.name = path.stem
+        self.context = context
         try:
-            # The model, and the context and batch its unsteered reader uses.
+            # The model. Its own context holds nothing: readers have theirs.
             self.llm = Llama(
                 str(path),
-                n_ctx=context,
+                n_ctx=_UNUSED_CONTEXT,
                 n_gpu_layers=gpu_layers,
                 # With no layers on the GPU, keep the KV cache off it too.
                 offload_kqv=gpu_layers != 0,
                 logits_all=False,
                 verbose=False,
             )
+            context = self.new_context()
         except ValueError as error:
             # llama.cpp says why only in its own log, and a full GPU is the usual reason.
             raise RuntimeError(
@@ -192,24 +195,35 @@ class LlamaCpp:
             raise ValueError(f"{path} has no start- or end-of-text token to begin a text with")
         self.start = (bos if bos >= 0 else eos,)
         self.eos = frozenset({eos} if eos >= 0 else ())
-        self.reader = _Reader(self.llm._ctx, self.llm._batch, self.vocabulary)  # noqa: SLF001
+        self.reader = _Reader(context, self.vocabulary)
+
+    def new_context(self):
+        """A context of ``context`` tokens shared by as many sequences as
+        llama.cpp holds: they share the cells of their common prefixes."""
+        import llama_cpp
+        from llama_cpp._internals import LlamaContext
+
+        params = type(self.llm.context_params).from_buffer_copy(self.llm.context_params)
+        params.n_ctx = self.context
+        params.n_seq_max = llama_cpp.llama_max_parallel_sequences()
+        params.kv_unified = True
+        return LlamaContext(model=self.llm._model, params=params, verbose=False)  # noqa: SLF001
 
     def controlled(self, vector: Path) -> LlamaCpp:
         """The same weights read through a context of its own, with the control
         vector in ``vector`` added to the residual stream after its layers."""
         import llama_cpp
-        from llama_cpp._internals import LlamaBatch, LlamaContext
 
         llm = self.llm
         layers, width = llama_cpp.llama_model_n_layer(llm._model.model), llm._model.n_embd()  # noqa: SLF001
         directions = control_vector(vector, layers, width)
-        context = LlamaContext(model=llm._model, params=llm.context_params, verbose=False)  # noqa: SLF001
+        context = self.new_context()
         data = directions.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         if llama_cpp.llama_set_adapter_cvec(context.ctx, data, directions.size, width, 1, layers - 1):
             raise RuntimeError(f"llama.cpp refused the control vector in {vector}")
         steered = copy.copy(self)
         steered.name = f"{self.name} · {vector.stem}"
-        steered.reader = _Reader(context, LlamaBatch(n_tokens=1, embd=0, n_seq_max=1, verbose=False), self.vocabulary)
+        steered.reader = _Reader(context, self.vocabulary)
         return steered
 
     def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor:
@@ -227,48 +241,117 @@ class LlamaCpp:
         return [self.llm.detokenize([token], special=True) for token in range(self.vocabulary)]
 
 
-class _Reader:
-    """A llama.cpp context and the tokens its memory holds."""
+# Tokens of context llama-cpp-python's own Llama keeps, which nothing here
+# reads from: as few as llama.cpp allows.
+_UNUSED_CONTEXT = 256
 
-    def __init__(self, context, batch, vocabulary: int):
+
+class _Reader:
+    """A llama.cpp context and the tokens each of its sequences holds.
+
+    Sequences share the cells of their common prefix. A request reading on
+    from a sequence's tokens extends it; one that branches off copies the
+    shared prefix into another sequence, at no cost, and reads only its own
+    tokens there, so the walk it branched from keeps its place. The least
+    recently read sequences give way when the context runs out of cells.
+    """
+
+    def __init__(self, context, vocabulary: int):
+        from llama_cpp import llama_max_parallel_sequences
+        from llama_cpp._internals import LlamaBatch
+
         self.context = context
-        self.batch = batch
+        self.batch = LlamaBatch(n_tokens=1, embd=0, n_seq_max=1, verbose=False)
         self.vocabulary = vocabulary
-        self.fed: list[int] = []
+        self.sequences = llama_max_parallel_sequences()
+        # Tokens by sequence, the least recently read first.
+        self.fed: dict[int, list[int]] = {}
+        # The sequence and length the logits on hand are the last position of.
+        self.last: tuple[int, int] | None = None
 
     def logits(self, tokens: list[int]) -> np.ndarray:
-        """The logits after ``tokens``, which the context then holds."""
+        """The logits after ``tokens``."""
         import llama_cpp
 
         if self.context.n_ctx() < len(tokens):
             raise TooLong(f"{len(tokens)} tokens, but the context holds {self.context.n_ctx()}")
-        shared = 0
-        for have, want in zip(self.fed, tokens):
-            if have != want:
-                break
-            shared += 1
-        # The logits on hand are the last fed position's.
-        if not shared == len(tokens) == len(self.fed):
-            keep = min(shared, len(tokens) - 1)
-            if not llama_cpp.llama_memory_seq_rm(self.context.memory, 0, keep, -1):
-                # A recurrent layer's state cannot be cut back to a prefix.
-                self.context.kv_cache_clear()
-                keep = 0
-            self.fed = tokens[:keep]
-            try:
-                # One token at a time: llama.cpp's kernels round a batch
-                # differently, so a node's numbers would hang on what was
-                # asked before it.
-                for token in tokens[keep:]:
-                    self.batch.set_batch([token], n_past=len(self.fed), logits_all=False)
-                    self.context.decode(self.batch)
-                    self.fed.append(token)
-            except Exception:
-                # What a failed batch left in the memory is unknown.
-                self.context.kv_cache_clear()
-                self.fed = []
-                raise
+        memory = self.context.memory
+        best, shared = None, 0
+        for sequence, fed in self.fed.items():
+            common = _common(fed, tokens)
+            if best is None or shared < common:
+                best, shared = sequence, common
+        # The logits wanted are those of the last token read.
+        keep = min(shared, len(tokens) - 1)
+        # Read on from the sequence, or its logits on hand are the ones.
+        on_hand = self.last == (best, len(tokens)) and shared == len(tokens)
+        if best is not None and (keep == len(self.fed[best]) or on_hand):
+            sequence = best
+        else:
+            free = next((sequence for sequence in range(self.sequences) if sequence not in self.fed), None)
+            sequence = free if free is not None else next(iter(self.fed))
+            if sequence == best:
+                # The one sequence there is: cut it back.
+                if not llama_cpp.llama_memory_seq_rm(memory, sequence, keep, -1):
+                    # A recurrent layer's state cannot be cut back to a prefix.
+                    self.clear()
+                    keep = 0
+            else:
+                llama_cpp.llama_memory_seq_rm(memory, sequence, -1, -1)
+                if best is not None and 0 < keep:
+                    llama_cpp.llama_memory_seq_cp(memory, best, sequence, 0, keep)
+                else:
+                    keep = 0
+            self.fed[sequence] = tokens[:keep]
+        fed = self.fed.pop(sequence)
+        self.fed[sequence] = fed
+        try:
+            # One token at a time: llama.cpp's kernels round a batch
+            # differently, so a node's numbers would hang on what was
+            # asked before it.
+            for token in tokens[len(fed) :]:
+                self.decode(sequence, token, len(fed))
+                fed.append(token)
+                self.last = (sequence, len(fed))
+        except Exception:
+            # What a failed batch left in the memory is unknown.
+            self.clear()
+            raise
         return np.ctypeslib.as_array(self.context.get_logits(), shape=(self.vocabulary,))
+
+    def decode(self, sequence: int, token: int, position: int) -> None:
+        """Read ``token`` at ``position`` of ``sequence``, freeing the least
+        recently read other sequences while the context has no room."""
+        import llama_cpp
+
+        batch = self.batch.batch
+        batch.n_tokens = 1
+        batch.token[0], batch.pos[0], batch.n_seq_id[0], batch.logits[0] = token, position, 1, True
+        batch.seq_id[0][0] = sequence
+        while (code := llama_cpp.llama_decode(self.context.ctx, batch)) == 1:
+            # 1: no room for the token's cells.
+            other = next((other for other in self.fed if other != sequence), None)
+            if other is None:
+                break
+            llama_cpp.llama_memory_seq_rm(self.context.memory, other, -1, -1)
+            del self.fed[other]
+        if code != 0:
+            raise RuntimeError(f"llama_decode returned {code}")
+
+    def clear(self) -> None:
+        self.context.kv_cache_clear()
+        self.fed.clear()
+        self.last = None
+
+
+def _common(have: Sequence[int], want: Sequence[int]) -> int:
+    """How many tokens two token lists share from their start."""
+    shared = 0
+    for a, b in zip(have, want):
+        if a != b:
+            break
+        shared += 1
+    return shared
 
 
 def control_vector(path: Path, layers: int, width: int) -> np.ndarray:

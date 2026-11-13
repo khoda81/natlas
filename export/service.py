@@ -48,10 +48,10 @@ _COMPRESSED = 0x01
 _END_STREAM = 0x02
 _CONTENT_TYPE = "application/connect+proto"
 _PROTO_CONTENT_TYPE = "application/proto"
-# Distributions kept per measure. The core keeps each sorted, about 24 bytes
-# per vocabulary entry. A walk leaves the deepest nodes along it, the ones in
-# view.
-_CACHED = 128
+# Memory for distributions a server keeps by default, across its measures.
+# The core keeps each sorted, 24 to 28 bytes per vocabulary entry: some 250
+# nodes of a 150k vocabulary, 900 of a 50k one.
+CACHE = 1 << 30
 
 
 class Turns:
@@ -101,6 +101,7 @@ class Model:
         ends: Callable[[tuple[int, ...]], bool],
         vocabulary: int,
         measures: list[Measure],
+        cache: int = CACHE,
     ):
         # What the model reads before the root's children: a start-of-text token.
         self.root = root
@@ -110,9 +111,13 @@ class Model:
         self.vocabulary = vocabulary
         self.measures = measures
         # Node ids, distributions and Expand's walk are the core's; this keeps
-        # only which distributions to forget first.
+        # only which distributions to forget first: the least recently read,
+        # once those kept, by (node, measure), hold more than ``cache`` bytes.
+        # A walk leaves the deepest nodes along it, the ones in view.
         self.tree = Tree(len(measures))
-        self.recent: list[OrderedDict[int, None]] = [OrderedDict() for _ in measures]
+        self.cache = cache
+        self.recent: OrderedDict[tuple[int, int], int] = OrderedDict()
+        self.held = 0
         # Requests run on worker threads. One forward pass at a time keeps the
         # device busy once and the cache whole; ``names`` guards the tree and
         # which distributions to forget for the moments they are read or
@@ -150,7 +155,7 @@ class Model:
             ahead = tuple(self.tree.path(node)) + tuple(path)
         started = time.perf_counter()
         computed = 0
-        recent = self.recent[measure]
+        recent = self.recent
         # The model is taken at the walk's first forward pass, so a walk of
         # distributions already held answers at once, however long another's
         # passes run. It is handed on after a pass whenever another walk
@@ -163,8 +168,8 @@ class Model:
             while not canceled.is_set():
                 with self.names:
                     step = self.tree.advance(walk, measure)
-                    if step is not None and step[0] == "children" and step[1] in recent:
-                        recent.move_to_end(step[1])
+                    if step is not None and step[0] == "children" and (step[1], measure) in recent:
+                        recent.move_to_end((step[1], measure))
                 if step is None:
                     break
                 if step[0] == "children":
@@ -195,11 +200,14 @@ class Model:
                     at += 1
                     computed += 1
                 with self.names:
-                    self.tree.set(missing, measure, np.ascontiguousarray(ln_weights, dtype=np.float64))
-                    recent[missing] = None
-                    if len(recent) > _CACHED:
-                        forgotten, _ = recent.popitem(last=False)
-                        self.tree.forget(forgotten, measure)
+                    size = self.tree.set(missing, measure, np.ascontiguousarray(ln_weights, dtype=np.float64))
+                    recent[missing, measure] = size
+                    self.held += size
+                    # The one just computed stays, however large.
+                    while self.cache < self.held and 1 < len(recent):
+                        (forgotten, of), size = recent.popitem(last=False)
+                        self.tree.forget(forgotten, of)
+                        self.held -= size
                 # After a pass, never before: two walks handing it over
                 # before theirs would pass it back and forth forever. And
                 # after storing it, so a walk waiting for the same node

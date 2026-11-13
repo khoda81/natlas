@@ -97,6 +97,14 @@ impl Run {
         })
     }
 
+    fn bytes(&self) -> usize {
+        use std::mem::size_of;
+        let sums = self.ln_surprisal_below.get().map_or(0, Vec::capacity);
+        size_of::<Self>()
+            + self.branches.capacity() * size_of::<Branch>()
+            + (self.ln_below.capacity() + sums) * size_of::<f64>()
+    }
+
     fn ln_surprisal_below(&self) -> &[f64] {
         self.ln_surprisal_below.get_or_init(|| {
             let ln_below = &self.ln_below;
@@ -338,6 +346,17 @@ impl Distribution {
     /// Whether every child is known.
     pub fn complete(&self) -> bool {
         (0..=self.runs.len()).all(|before| !self.gap_exists(before))
+    }
+
+    /// About the bytes of memory this holds: a server keeps distributions
+    /// within a budget of them.
+    pub fn bytes(&self) -> usize {
+        use std::mem::size_of;
+        let runs: usize = self.runs.iter().map(Run::bytes).sum();
+        // A hash table's slots, each a branch and rank and a control byte,
+        // with one slot in eight left empty.
+        let slots = self.rank.capacity() * 8 / 7;
+        size_of::<Self>() + runs + slots * (size_of::<(Branch, Rank)>() + 1)
     }
 
     /// A known edge: rank 0's is the node's top, the whole mass, even where

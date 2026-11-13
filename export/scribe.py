@@ -66,7 +66,7 @@ from muscriptor.tokenizer.mt3 import (
     instrument_group_from_names,
     resolve_instrument_names,
 )
-from service import Model, _slug, app
+from service import CACHE, Model, _slug, app
 
 SAMPLE_RATE = 16_000
 WINDOW_SECONDS = 5
@@ -349,6 +349,7 @@ def main() -> None:
     parser.add_argument("--device", default=lm.default_device())
     parser.add_argument("--max-events", type=int, default=MAX_EVENTS, help="per window, counting its prologue and EOS")
     parser.add_argument("--slots", type=int, default=2, help="KV caches per measure, each holding one window")
+    parser.add_argument("--cache", type=float, default=CACHE / 2**30, help=f"GiB of memory for the distributions it keeps, default {CACHE / 2**30:g}")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8421)
     args = parser.parse_args()
@@ -400,7 +401,7 @@ def main() -> None:
             "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
         }
     ]
-    model = Model(own.start, windows.ends, own.vocabulary, measures)
+    model = Model(own.start, windows.ends, own.vocabulary, measures, round(args.cache * 2**30))
     files = {
         "labels.json": (labels_file(models[args.p], windows), "application/json"),
         "audio.wav": (wav_file(recording), "audio/wav"),

@@ -22,7 +22,6 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 
@@ -227,13 +226,25 @@ class ModelTests(unittest.TestCase):
         self.assertEqual([placed(children) for children in both], [[[0]], [[0, 1]]])
         self.assertEqual(len(model.measures[0].calls), calls)
 
-    def test_eviction_forgets_the_oldest_and_recomputes_it_alike(self):
+    def test_eviction_forgets_the_least_recently_read_and_recomputes_it_alike(self):
         model, _ = fixture()
         measure = model.measures[0]
-        with patch.object(service, "_CACHED", 1):
-            first = answers(model, 0, [0, 1])
-            self.assertEqual(answers(model, 0, [0, 1]), first)
+        # Room for none but the one just computed.
+        model.cache = 1
+        first = answers(model, 0, [0, 1])
+        self.assertEqual(answers(model, 0, [0, 1]), first)
         self.assertEqual(measure.calls.count((99,)), 2)
+        # Room for two, shared by the measures: the root under measure 1
+        # takes the place of the root under measure 0, read before its child.
+        model, _ = fixture()
+        answers(model, 0, [0, 1])
+        model.cache = model.held
+        answers(model, 0, [0], measure=1)
+        self.assertEqual(
+            [model.tree.has(node, of) for node, of in [(0, 0), (node_id([0]), 0), (0, 1)]],
+            [False, True, True],
+        )
+        self.assertLessEqual(model.held, model.cache)
 
     def test_ended_and_weightless_branches(self):
         model, _ = fixture()

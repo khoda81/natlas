@@ -39,7 +39,7 @@ import sys
 import lm
 import uvicorn
 from natlas_codec import labels_json
-from service import Model, _slug, app
+from service import CACHE, Model, _slug, app
 
 
 def main() -> None:
@@ -56,6 +56,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=lm.DTYPES, default="float32")
     parser.add_argument("--n-ctx", type=int, default=8192, help="llama.cpp: tokens of context, the deepest node")
     parser.add_argument("--gpu-layers", type=int, default=-1, help="llama.cpp: layers on the GPU, -1 for all")
+    parser.add_argument("--cache", type=float, default=CACHE / 2**30, help=f"GiB of memory for the distributions it keeps, default {CACHE / 2**30:g}")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8421)
     args = parser.parse_args()
@@ -78,7 +79,13 @@ def main() -> None:
             "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
         }
     ]
-    model = Model(language.start, lambda path: bool(path) and path[-1] in language.eos, language.vocabulary, measures)
+    model = Model(
+        language.start,
+        lambda path: bool(path) and path[-1] in language.eos,
+        language.vocabulary,
+        measures,
+        round(args.cache * 2**30),
+    )
     files = {"labels.json": (labels.encode(), "application/json")}
     uvicorn.run(
         app(model, manifest, files, search=language.encode), host=args.host, port=args.port, access_log=False

@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import traceback
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator, Sequence
 from typing import Protocol
 
@@ -54,6 +54,44 @@ _PROTO_CONTENT_TYPE = "application/proto"
 _CACHED = 128
 
 
+class Turns:
+    """A lock taken in the order it was asked for, which says whether anyone
+    waits: a holder can hand it on and take it again behind them."""
+
+    def __init__(self):
+        self._changed = threading.Condition()
+        self._waiting: deque[object] = deque()
+        self._held = False
+
+    def acquire(self) -> None:
+        with self._changed:
+            ticket = object()
+            self._waiting.append(ticket)
+            self._changed.wait_for(lambda: not self._held and self._waiting[0] is ticket)
+            self._waiting.popleft()
+            self._held = True
+
+    def release(self) -> None:
+        with self._changed:
+            assert self._held, "released a lock nobody holds"
+            self._held = False
+            self._changed.notify_all()
+
+    def wanted(self) -> bool:
+        with self._changed:
+            return bool(self._waiting)
+
+    def locked(self) -> bool:
+        with self._changed:
+            return self._held
+
+    def __enter__(self) -> None:
+        self.acquire()
+
+    def __exit__(self, *_) -> None:
+        self.release()
+
+
 class Model:
     """The integer-sequence distribution under each measure, computed on demand."""
 
@@ -80,7 +118,7 @@ class Model:
         # which distributions to forget for the moments they are read or
         # written, so naming a node and reading one already held never wait
         # on inference. It is taken inside ``lock``, never the other way round.
-        self.lock = threading.Lock()
+        self.lock = Turns()
         self.names = threading.Lock()
 
     def learn(self, path: Sequence[int]) -> None:
@@ -113,9 +151,10 @@ class Model:
         started = time.perf_counter()
         computed = 0
         recent = self.recent[measure]
-        # The model is taken at the walk's first forward pass and held to its
-        # end: a walk of distributions already held answers at once, however
-        # long another's passes run.
+        # The model is taken at the walk's first forward pass, so a walk of
+        # distributions already held answers at once, however long another's
+        # passes run. It is handed on after a pass whenever another walk
+        # waits for it: a long path costs others one pass each, not all of it.
         held = False
         try:
             # A model walk along ``along``, yielding the distribution after
@@ -138,7 +177,9 @@ class Model:
                 if not held:
                     self.lock.acquire()
                     held = True
-                    # Another walk may have computed it while this one waited.
+                    # Another walk may have computed it while this one waited,
+                    # and its passes moved the model's caches elsewhere.
+                    reading = None
                     continue
                 missing = step[1]
                 with self.names:
@@ -159,6 +200,13 @@ class Model:
                     if len(recent) > _CACHED:
                         forgotten, _ = recent.popitem(last=False)
                         self.tree.forget(forgotten, measure)
+                # After a pass, never before: two walks handing it over
+                # before theirs would pass it back and forth forever. And
+                # after storing it, so a walk waiting for the same node
+                # finds it rather than computing it again.
+                if self.lock.wanted():
+                    self.lock.release()
+                    held = False
         finally:
             if held:
                 self.lock.release()
@@ -232,9 +280,9 @@ def app(
                 return _stream(
                     [_end({"code": "invalid_argument", "message": "a part's ln mass is not a number"})]
                 )
-            # The walk runs on its own thread, holding the model for its whole
-            # length, and hands each node's children over as it places them. A client that
-            # hangs up stops it at the next node.
+            # The walk runs on its own thread and hands each node's children
+            # over as it places them. A client that hangs up stops it at the
+            # next node.
             items: queue.Queue[bytes | None] = queue.Queue()
             canceled = threading.Event()
 

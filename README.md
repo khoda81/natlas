@@ -214,9 +214,12 @@ forward passes. Node naming, the distributions themselves (sorted once per
 node, about 24 bytes per vocabulary entry, the 32 most recent per measure) and
 Expand's walk belong to the shared Rust core, which recordings in the browser
 use too; the server computes each distribution the walk reports missing,
-reading a request's path in one pass. A walk holds the model for its whole
-length on a worker thread, sends each node's children as it places them, and stops
-when the client hangs up; naming a node never waits on inference. transformers models keep the KV cache of the last path they read and
+reading a request's path in one pass. A walk runs on a worker thread, sends
+each node's children as it places them, and stops when the client hangs up.
+It takes the model only for forward passes, so naming a node or reading what
+the server holds never waits on inference, and before each pass it hands the
+model to any walk waiting for it: a long path delays others by a pass, not
+by its length. transformers models keep the KV cache of the last path they read and
 walk a path in chunks of positions, whose last bits can differ slightly
 (about 1e-5 in ln p in float32) from a position computed alone.
 

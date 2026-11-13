@@ -18,6 +18,7 @@ import os
 import struct
 import sys
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -189,6 +190,23 @@ class ModelTests(unittest.TestCase):
         # computes nothing.
         self.assertEqual(answers(model, node_id([0, 1]), [2]), walked[2:])
         self.assertEqual(len(measure.calls), 3)
+
+    def test_a_walk_hands_the_model_to_one_waiting_after_its_pass(self):
+        model, _ = fixture()
+        measure = model.measures[0]
+        long = model.expand(0, request(0, [0, 1, 2]), threading.Event())
+        next(long)
+        self.assertTrue(model.lock.locked())
+        with ThreadPoolExecutor() as pool:
+            other = pool.submit(answers, model, 0, [3, 0])
+            while not model.lock.wanted():
+                time.sleep(0.001)
+            self.assertEqual(len(list(long)), 2)
+            self.assertEqual(len(other.result(timeout=5)), 2)
+        self.assertEqual(measure.calls, [(99,), (99, 0), (99, 3), (99, 0, 1)])
+        # The long walk read on from where the other left the model.
+        self.assertEqual(measure.walks, [((99, 0, 1, 2), 1), ((99, 3, 0), 2), ((99, 0, 1, 2), 3)])
+        self.assertFalse(model.lock.locked())
 
     def test_points_place_the_children_holding_them_or_descend_into_one(self):
         model, _ = fixture()

@@ -117,8 +117,9 @@ Each server serves one measure through two Connect RPCs:
   - The **path** places each branch, one child per node. Alone, it names the
     node it reaches without reading it: flights and restores read by paths,
     from the deepest node already placed.
-  - **Points** place the children holding them, each once; where all of them
-    fall in one child, that child alone, and the same points within it. They
+  - **Points** place the children holding them, each once; where several
+    points all fall in one child, that child alone, and the same points
+    within it. One point is its child alone. They
     are sampled from **parts** of the node: a part is its top, as base-256
     digits of the fraction of the node's mass above it, ln of its mass, and
     how many points to spread evenly through it. Digits tell a top exactly

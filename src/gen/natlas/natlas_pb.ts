@@ -280,9 +280,10 @@ export const Natlas: GenService<{
    * - down the path: the starting node and every node along it, each
    *   placing the path's next branch;
    * - then, at its end, either points, sampled evenly through parts of the
-   *   node: the children holding them, and where all of them fall in one
-   *   child, that child alone and the same points within it, so a view
-   *   samples its children and a deep zoom reaches them in one request;
+   *   node: the children holding them, and where several points all fall in
+   *   one child, that child alone and the same points within it, so a view
+   *   samples its children and a deep zoom reaches them in one request. One
+   *   point is its child alone;
    * - or branches: those children of the node, for a measure read only for
    *   q;
    * - or nothing: the path's last branch names the node it reaches, which

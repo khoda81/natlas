@@ -173,6 +173,12 @@ fn shifted(from: &Dyadic, down: bool, distance: f64, ln_unit: f64) -> Option<Poi
 #[derive(Clone, Debug)]
 pub struct Point(Dyadic);
 
+impl PartialEq for Point {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.cmp(&other.0) == Ordering::Equal
+    }
+}
+
 impl Point {
     /// The point whose fraction has these base-256 digits.
     pub fn new(digits: &[u8]) -> Self {

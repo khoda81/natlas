@@ -481,7 +481,10 @@ impl Walk {
             Err(Reading::Points(points)) => {
                 let (children, all) = distribution.children_at(points);
                 let runs = distribution.runs_of(&children);
-                match (children.as_slice(), all) {
+                // Into a child holding them all, to tell them apart there:
+                // one point is told already, and its child is all it asks.
+                let apart = points.iter().any(|point| *point != points[0]);
+                match (children.as_slice(), all && apart) {
                     (&[(run, at)], true) if self.descended < MAX_DESCENT => {
                         self.descended += 1;
                         // The same points as the child's own, told as
@@ -602,6 +605,14 @@ mod tests {
             walk.advance(&mut tree, 0).unwrap(),
             Advance::Missing(child_hash(ROOT, 0))
         );
+
+        // One point is its child alone: nothing below it is asked for.
+        let mut walk = Walk::new(ROOT, Read::points(at(&[0.9]))).unwrap();
+        assert!(matches!(
+            walk.advance(&mut tree, 0).unwrap(),
+            Advance::Children(ROOT, _, _)
+        ));
+        assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
 
         // Branches list just those children; a weightless one is left out.
         let mut walk = Walk::new(ROOT, Read::branches(vec![1, 2, 7])).unwrap();

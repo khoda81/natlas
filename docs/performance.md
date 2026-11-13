@@ -8,8 +8,10 @@ paint, compositing, input, and other work.
 ## Frame ownership and invalidation
 
 Rust lays out the frame and keeps it. JavaScript receives a packed numeric
-array of visible rectangles and the requests the view lacks; picking and
-reanchoring query the retained frame and the tree directly.
+array of visible rectangles and the requests the view lacks; picking queries
+the retained frame and the tree directly. Naming the camera's point costs
+big-number arithmetic in the length of its digits: about a millisecond a
+frame for a point remembered 1000 nodes deep while zoomed out to the root.
 
 A node's layout costs one binary search to the first visible child, then one
 step per drawn box: children at least a pixel tall, bands about a pixel tall,

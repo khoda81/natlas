@@ -217,7 +217,7 @@ pub fn layout_frame(
     let view: Viewport = from_js(view)?;
     let frame = tree.frames.borrow_mut().pop().unwrap_or_default();
     Ok(LayoutFrame {
-        inner: layout::layout_into(&tree.inner, Lens { p, q }, camera, view, merge_px, frame)
+        inner: layout::layout_into(&tree.inner, Lens { p, q }, &camera, view, merge_px, frame)
             .map_err(js_error)?,
         pool: Rc::clone(&tree.frames),
     })
@@ -288,14 +288,6 @@ impl LayoutFrame {
         self.inner.origin_bottom
     }
 
-    pub fn cover(&self) -> std::result::Result<JsValue, JsError> {
-        to_js(&self.inner.cover)
-    }
-
-    pub fn reanchor(&self) -> std::result::Result<JsValue, JsError> {
-        to_js(&layout::reanchor(&self.inner))
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn pick(
         &self,
@@ -314,7 +306,7 @@ impl LayoutFrame {
             &tree.inner,
             Lens { p, q },
             &self.inner,
-            camera,
+            &camera,
             view,
             x_px,
             y_px,
@@ -325,16 +317,30 @@ impl LayoutFrame {
     }
 }
 
-/// The camera's anchor, or the deepest edge above it that p still places.
+/// The camera's point under the name that keeps the view exact.
 #[wasm_bindgen]
-pub fn repair(
+pub fn settle(
     tree: &Tree,
     p: usize,
     q: usize,
     camera: JsValue,
 ) -> std::result::Result<JsValue, JsError> {
     let camera: Camera = from_js(camera)?;
-    to_js(&layout::repair(&tree.inner, Lens { p, q }, camera).map_err(js_error)?)
+    to_js(&layout::settle(&tree.inner, Lens { p, q }, &camera).map_err(js_error)?)
+}
+
+/// The camera's point moved to what the view shows `fy` view heights down,
+/// and where it then is.
+#[wasm_bindgen]
+pub fn aim(
+    tree: &Tree,
+    p: usize,
+    q: usize,
+    camera: JsValue,
+    fy: f64,
+) -> std::result::Result<JsValue, JsError> {
+    let camera: Camera = from_js(camera)?;
+    to_js(&layout::aim(&tree.inner, Lens { p, q }, &camera, fy).map_err(js_error)?)
 }
 
 #[wasm_bindgen]
@@ -345,7 +351,7 @@ pub fn extent(
     camera: JsValue,
 ) -> std::result::Result<JsValue, JsError> {
     let camera: Camera = from_js(camera)?;
-    to_js(&layout::extent(&tree.inner, Lens { p, q }, camera).map_err(js_error)?)
+    to_js(&layout::extent(&tree.inner, Lens { p, q }, &camera).map_err(js_error)?)
 }
 
 /// Return the clamped camera `a`; the input camera is not mutated.
@@ -357,5 +363,5 @@ pub fn clamp_position(
     camera: JsValue,
 ) -> std::result::Result<f64, JsError> {
     let camera: Camera = from_js(camera)?;
-    layout::clamp_position(&tree.inner, Lens { p, q }, camera).map_err(js_error)
+    layout::clamp_position(&tree.inner, Lens { p, q }, &camera).map_err(js_error)
 }

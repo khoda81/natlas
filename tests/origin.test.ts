@@ -1,5 +1,5 @@
 import { expect, it } from "bun:test";
-import { type Camera, layout } from "../src/core/layout";
+import { type Camera, layout, top } from "../src/core/layout";
 import { IntervalTree, ROOT } from "../src/core/tree";
 import { answer } from "./build";
 
@@ -9,7 +9,7 @@ const lens = { p: 0, q: 1 };
 it("opens a deep node on its own: its frame asks for it and then its children, never an ancestor", () => {
   const tree = new IntervalTree(2);
   const origin = tree.descend(ROOT, Array.from({ length: 3000 }, (_, i) => i % 7));
-  const cam: Camera = { origin, x: 0, k: 100, anchor: { node: origin, rank: 0 }, a: 0 };
+  const cam: Camera = { origin, x: 0, k: 100, anchor: top(), a: 0 };
   const asked = () => {
     const frame = layout(tree, lens, cam, view);
     try {

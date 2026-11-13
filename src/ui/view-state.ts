@@ -1,10 +1,10 @@
-/** A portable camera position: the origin and the covering node as branches
- * from the root, the covering node's position in view heights, and x from
- * the origin. */
+import type { Anchor } from "../core/layout";
+
+/** A portable camera: the origin as branches from the root, the point below
+ * it, where the point is in the view, and x from the origin. */
 export interface SavedView {
   origin: number[];
-  /** Extends `origin`. */
-  path: number[];
+  anchor: Anchor;
   x: number;
   k: number;
   a: number;
@@ -13,27 +13,36 @@ export interface SavedView {
 }
 
 const isPath = (path: unknown): path is number[] =>
-  Array.isArray(path) && path.every((branch) => Number.isInteger(branch) && branch >= 0 && branch <= 0xffffffff);
+  Array.isArray(path) && path.every((branch) => Number.isInteger(branch) && 0 <= branch && branch <= 0xffffffff);
+
+/** The anchor's digits are written in hex, two characters each. */
+export function serializeView({ anchor, ...view }: SavedView): string {
+  const digits = Array.from(anchor.digits, (digit) => digit.toString(16).padStart(2, "0")).join("");
+  return JSON.stringify({ ...view, path: anchor.path, digits });
+}
 
 export function parseView(raw: string, measures: number): SavedView | null {
   try {
-    const value = JSON.parse(raw) as Partial<SavedView> | null;
+    const value = JSON.parse(raw) as Partial<Omit<SavedView, "anchor"> & { path: number[]; digits: string }> | null;
+    const { origin, path, digits, x, k, a, p, q } = value ?? {};
+    const isMeasure = (measure: unknown): measure is number =>
+      typeof measure === "number" && Number.isInteger(measure) && 0 <= measure && measure < measures;
     if (
-      value === null ||
-      !isPath(value.origin) || !isPath(value.path) ||
-      value.origin.length > value.path.length || !value.origin.every((branch, i) => branch === value.path![i]) ||
-      typeof value.x !== "number" || !Number.isFinite(value.x) || value.x < 0 ||
-      typeof value.k !== "number" || !Number.isFinite(value.k) || value.k <= 0 ||
-      typeof value.a !== "number" || !Number.isFinite(value.a) ||
-      typeof value.p !== "number" || !Number.isInteger(value.p) || value.p < 0 || value.p >= measures ||
-      typeof value.q !== "number" || !Number.isInteger(value.q) || value.q < 0 || value.q >= measures
+      !isPath(origin) || !isPath(path) ||
+      typeof digits !== "string" || !/^([0-9a-f]{2})*$/.test(digits) ||
+      // Only the root's left edge stops a view: past any other origin lies its parent.
+      typeof x !== "number" || !Number.isFinite(x) || (origin.length === 0 && x < 0) ||
+      typeof k !== "number" || !Number.isFinite(k) || k <= 0 ||
+      typeof a !== "number" || !Number.isFinite(a) ||
+      !isMeasure(p) || !isMeasure(q)
     ) return null;
-    return value as SavedView;
+    const bytes = Uint8Array.from(digits.match(/../g) ?? [], (digit) => parseInt(digit, 16));
+    return { origin, anchor: { path, digits: bytes }, x, k, a, p, q };
   } catch {
     return null;
   }
 }
 
 export function viewKey(dataset: string): string {
-  return `natlas.view:3:${encodeURIComponent(dataset)}`;
+  return `natlas.view:4:${encodeURIComponent(dataset)}`;
 }

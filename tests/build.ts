@@ -17,6 +17,13 @@ export function run(weights: number[], branches = weights.map((_, i) => i), rank
   return { rank, branches, lnBelow };
 }
 
+/** An anchor's digits for the point ``fraction`` of a node's mass below its top: exact for any float. */
+export function digits(fraction: number): Uint8Array {
+  const digits = [];
+  for (let rest = fraction; 0 < rest; rest = (rest * 256) % 1) digits.push(Math.floor(rest * 256));
+  return Uint8Array.from(digits);
+}
+
 /** An answer placing those children, as one run. */
 export function answer(...args: Parameters<typeof run>): Children & { runs: ReturnType<typeof run>[] } {
   return { runs: [run(...args)] };

@@ -3,20 +3,28 @@
 // at the UI edge.
 
 import {
+  aim as aimAnchor,
   clampPosition,
   extent as measureExtent,
   layout as layoutFrame,
-  repair as repairAnchor,
+  settle as settleAnchor,
   type LayoutFrame,
 } from "./wasm";
 import type { Branch, IntervalTree, Lens, NodeId, Rank } from "./tree";
 
 export type { Lens } from "./tree";
 
-/** The top edge of a node's child at ``rank``; rank 0 is the node's top. */
-export interface Edge {
-  node: NodeId;
-  rank: Rank;
+/** A point at or below a camera's origin: the node ``path`` leads to from the
+ * origin, and the fraction of that node's p mass above the point, as digits
+ * in base 256. No digits is the node's top. A value: never changed in place. */
+export interface Anchor {
+  readonly path: readonly Branch[];
+  readonly digits: Uint8Array;
+}
+
+/** The top of the node ``path`` leads to from the origin. */
+export function top(path: readonly Branch[] = []): Anchor {
+  return { path, digits: new Uint8Array() };
 }
 
 export interface Camera {
@@ -26,8 +34,8 @@ export interface Camera {
   origin: NodeId;
   x: number;
   k: number;
-  /** A known edge at or below the origin, ``a`` view heights below the view's top. */
-  anchor: Edge;
+  /** A point of the origin, ``a`` view heights below the view's top. */
+  anchor: Anchor;
   a: number;
 }
 
@@ -80,7 +88,6 @@ const boxBuffers: Box[][] = [];
 /** Rust owns the full frame. Only visible rectangles and requests cross the Wasm boundary. */
 export class Frame {
   readonly boxes: Box[];
-  readonly cover: { node: NodeId; y: number } | null;
   private missesCache?: Miss[];
   private disposed = false;
 
@@ -97,7 +104,6 @@ export class Frame {
       b.x0 = packed[i + 7]!; b.x1 = packed[i + 8]!; b.y0 = packed[i + 9]!; b.y1 = packed[i + 10]!;
     }
     this.boxes.length = packed.length / 11;
-    this.cover = raw.cover() as Frame["cover"];
   }
 
   get misses(): Miss[] {
@@ -142,22 +148,25 @@ export function layout(
   return new Frame(layoutFrame(tree.raw, lens.p, lens.q, cam, view, options.mergePx ?? 1));
 }
 
-/** Move the anchor up to the deepest edge p still places: a lens or a replaced distribution can take one away. */
-export function repair(tree: IntervalTree, lens: Lens, cam: Camera): void {
-  cam.anchor = repairAnchor(tree.raw, lens.p, lens.q, cam) as Edge;
+/** Name the camera's point by the deepest node that holds it and covers the
+ * view, where p still places its path: nothing on screen moves, and the same
+ * view of the same tree always gets the same name. */
+export function settle(tree: IntervalTree, lens: Lens, cam: Camera): void {
+  cam.anchor = settleAnchor(tree.raw, lens.p, lens.q, cam) as Anchor;
+}
+
+/** Move the camera's point to what the view shows ``fy`` view heights down, so
+ * a zoom about ``fy`` changes depth alone and zooming back returns exactly.
+ * Nothing on screen moves. */
+export function aim(tree: IntervalTree, lens: Lens, cam: Camera, fy: number): void {
+  const aimed = aimAnchor(tree.raw, lens.p, lens.q, cam, fy) as { anchor: Anchor; a: number };
+  cam.anchor = aimed.anchor;
+  cam.a = aimed.a;
 }
 
 /** The origin's interval edges in view heights. */
 export function extent(tree: IntervalTree, lens: Lens, cam: Camera): { top: number; bottom: number } {
   return measureExtent(tree.raw, lens.p, lens.q, cam) as { top: number; bottom: number };
-}
-
-export function reanchor(cam: Camera, frame: Frame): void {
-  const position = frame.raw.reanchor() as { anchor: Edge; a: number } | null;
-  if (position !== null) {
-    cam.anchor = position.anchor;
-    cam.a = position.a;
-  }
 }
 
 export function clamp(tree: IntervalTree, lens: Lens, cam: Camera): void {

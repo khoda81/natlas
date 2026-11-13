@@ -1,10 +1,11 @@
 // One explicit initialization for both the browser bundle and Bun's test runner.
 import init, {
+  aim,
   clampPosition,
   extent,
   layout,
   LayoutFrame,
-  repair,
+  settle,
   Tree,
 } from "./generated/natlas_core";
 
@@ -14,10 +15,11 @@ const wasm = typeof document === "undefined"
 await init({ module_or_path: wasm });
 
 export {
+  aim,
   clampPosition,
   extent,
   layout,
   LayoutFrame,
-  repair,
+  settle,
   Tree,
 };

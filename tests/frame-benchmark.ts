@@ -2,9 +2,9 @@
 // Served by scripts/bench-frames.ts; synthetic sources never contact a model.
 import { App } from "../src/ui/main";
 import { TextLabels } from "../src/readings/labels";
-import type { Camera, Frame, Viewport } from "../src/core/layout";
+import { type Camera, type Frame, top, type Viewport } from "../src/core/layout";
 import type { IntervalTree, Lens } from "../src/core/tree";
-import { run } from "./build";
+import { digits, run } from "./build";
 import type { Dataset } from "../src/data/source";
 import type { Expander } from "../src/data/expand";
 
@@ -84,8 +84,9 @@ function setup(count: number, zipf: boolean, deep = false, real = false) {
       node = driver.tree.child(node, depth % 3);
       driver.tree.insert(node, 0, { runs: [run([0.6, 0.3, 0.1])] });
     }
-    driver.cam = { origin: 0n, x: 125, k: 140, anchor: { node, rank: 1 }, a: 0.4 };
-  } else driver.cam = { origin: 0n, x: 0, k: 100, anchor: { node: 0n, rank: 0 }, a: 0 };
+    const path = Array.from({ length: 80 }, (_, depth) => depth % 3);
+    driver.cam = { origin: 0n, x: 125, k: 140, anchor: { path, digits: digits(0.6) }, a: 0.4 };
+  } else driver.cam = { origin: 0n, x: 0, k: 100, anchor: top(), a: 0 };
   driver.resize();
   const rect = canvas.getBoundingClientRect();
   driver.pointer = { x: rect.left + driver.view.width * 0.7, y: rect.top + driver.view.height * 0.43 };

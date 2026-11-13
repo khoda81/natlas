@@ -1,5 +1,6 @@
 import { Expander } from "../data/expand";
 import {
+  aim,
   type Box,
   type Camera,
   clamp,
@@ -8,16 +9,16 @@ import {
   layout,
   logView,
   pick,
-  reanchor,
-  repair,
   type Selection,
+  settle,
+  top,
   type Viewport,
 } from "../core/layout";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "../data/source";
 import { IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
-import { drag, moveDepth, panVertical, scale } from "./camera";
-import { parseView, type SavedView, viewKey } from "./view-state";
+import { moveDepth, panVertical, scale } from "./camera";
+import { parseView, type SavedView, serializeView, viewKey } from "./view-state";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
 import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, rulerCaption, type Units } from "./render";
 
@@ -54,7 +55,7 @@ interface Focus {
 }
 
 /**
- * A flight down ``chain`` to its last node. The camera stays anchored at the
+ * A flight down ``chain`` to its last node. The camera's point stays the
  * top of ``chain[reached]``, the deepest node placed so far, whose ln p mass
  * and right edge below the origin are ``lnMass`` and ``x1``. ``listed`` once
  * the walks have answered; ``time`` is the last frame's.
@@ -106,7 +107,7 @@ export class App {
   private dataset: Dataset | null = null;
   private reading: Reading | null = null;
   private lens: Lens = { p: 0, q: 0 };
-  private cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: { node: ROOT, rank: 0 }, a: 0 };
+  private cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
   private view: Viewport = { width: 1, height: 1 };
   private pixelRatio = 1;
   private frame: Frame | null = null;
@@ -279,21 +280,25 @@ export class App {
     return placed.every(Boolean);
   }
 
-  /** Open the saved origin at once, then walk down to the saved covering node. */
+  /**
+   * Open the node the saved view was in at once: it covered the view, so its
+   * children are what the view shows. The saved view itself follows once the
+   * walk down from its origin has placed that node.
+   */
   private async restore(saved: SavedView): Promise<void> {
     this.setLens({ p: saved.p, q: saved.q });
     const tree = this.tree!;
     const origin = tree.descend(tree.root, saved.origin);
-    const cover = tree.descend(origin, saved.path.slice(saved.origin.length));
-    this.open(origin, saved.k);
+    const node = tree.descend(origin, saved.anchor.path);
+    this.open(node, saved.k);
     const generation = this.navigation;
     this.restoring = true;
     try {
-      const placed = await this.walk(origin, cover);
+      const placed = await this.walk(origin, node);
       if (tree !== this.tree || generation !== this.navigation) return;
       this.focus = null;
       if (placed) {
-        this.cam = { origin, x: saved.x, k: saved.k, anchor: { node: cover, rank: 0 }, a: saved.a };
+        this.cam = { origin, x: saved.x, k: saved.k, anchor: saved.anchor, a: saved.a };
       } else {
         this.setStatus("The saved path is only partly available.");
       }
@@ -322,6 +327,7 @@ export class App {
       return;
     }
     this.cam.x += edge.natsQ;
+    this.cam.anchor = { path: [tree.branch(origin), ...this.cam.anchor.path], digits: this.cam.anchor.digits };
     this.cam.origin = parent;
     // The root's left edge is the start of everything.
     if (parent === ROOT) this.cam.x = Math.max(0, this.cam.x);
@@ -366,22 +372,23 @@ export class App {
     });
   }
 
-  /** One frame of the flight: re-anchor down to the deepest placed node, then close in on it. */
+  /** One frame of the flight: move the point down to the deepest placed node, then close in on it. */
   private stepFlight(time: number): void {
     const flight = this.flight!;
     const tree = this.tree!;
     const { chain } = flight;
+    const from = flight.reached;
     while (flight.reached < chain.length - 1) {
       const node = chain[flight.reached]!;
       const edge = tree.entry(node, this.lens, tree.branch(chain[flight.reached + 1]!));
       if (edge === undefined || !Number.isFinite(edge.natsQ)) break;
-      // The anchor moves from this node's top to its child's, keeping the picture.
+      // The point moves from this node's top to its child's, keeping the picture.
       this.cam.a += Math.exp(flight.lnMass - logView(this.cam)) * edge.before;
-      this.cam.anchor = { node, rank: edge.rank };
       flight.lnMass += edge.lnP;
       flight.x1 += edge.natsQ;
       flight.reached++;
     }
+    if (from < flight.reached) this.cam.anchor = top(chain.slice(1, flight.reached + 1).map((node) => tree.branch(node)));
     const dt = flight.time === null ? 0 : Math.min(MAX_FRAME_MS, time - flight.time);
     flight.time = time;
     const close = this.reducedMotion.matches ? 1 : 1 - Math.exp(-dt / FLIGHT_MS);
@@ -412,7 +419,7 @@ export class App {
       this.transition = { image, start: performance.now() };
     }
     this.focus = null;
-    this.cam = { origin: node, x: 0, k, anchor: { node, rank: 0 }, a: 0 };
+    this.cam = { origin: node, x: 0, k, anchor: top(), a: 0 };
     if (this.dataset?.searchable) this.showPath(node, null);
     this.invalidate();
   }
@@ -421,6 +428,8 @@ export class App {
     this.cancelNavigation();
     this.focus = null;
     this.result.hidden = true;
+    // Digits are fractions of p's mass: under another p only the path holds.
+    if (lens.p !== this.lens.p) this.cam.anchor = top(this.cam.anchor.path);
     this.lens = lens;
     this.pSelect.value = String(lens.p);
     this.qSelect.value = String(lens.q);
@@ -435,7 +444,7 @@ export class App {
     this.cancelNavigation();
     const { width, height } = this.view;
     const k = width / Math.log(Math.max(8, height / 4));
-    this.cam = { origin: ROOT, x: 0, k, anchor: { node: ROOT, rank: 0 }, a: 0 };
+    this.cam = { origin: ROOT, x: 0, k, anchor: top(), a: 0 };
     this.focus = null;
     this.transition = null;
     this.invalidate();
@@ -487,10 +496,7 @@ export class App {
       if (tree !== this.tree) return [];
       return this.currentFrame({ ...this.cam }).misses;
     });
-    if (!this.focus && !this.flight) reanchor(this.cam, frame);
     this.reachOut(frame);
-    // Keep the input key after reanchoring. An equivalent anchor can still
-    // change floating-point rounding on the next layout and its edge pixels.
     this.updateHover();
     const ancestors = new Set<string>();
     if (this.hover) {
@@ -513,7 +519,7 @@ export class App {
     this.fadeOut(time);
     this.drawProgress();
     this.updateReadout();
-    this.saveView(frame);
+    this.saveView();
     if (this.focus || this.flight || this.held.size > 0 || this.transition || origin?.loading) this.invalidate();
   }
 
@@ -560,21 +566,37 @@ export class App {
 
   private geometryKey(camera = this.cam): string {
     const { origin, x, k, a, anchor } = camera;
-    return `${this.tree!.revision}:${this.lens.p}:${this.lens.q}:${origin}:${x}:${k}:${anchor.node}:${anchor.rank}:${a}:${this.view.width}:${this.view.height}:${this.pixelRatio}`;
+    return `${this.tree!.revision}:${this.lens.p}:${this.lens.q}:${origin}:${x}:${k}:${anchor.path}:${anchor.digits}:${a}:${this.view.width}:${this.view.height}:${this.pixelRatio}`;
   }
 
   /** Also shared with the completion-driven fetch pump between paint frames. */
   private currentFrame(camera = this.cam): Frame {
     const key = this.geometryKey(camera);
     if (this.geometry?.key === key) return this.geometry.frame;
-    repair(this.tree!, this.lens, camera);
+    settle(this.tree!, this.lens, camera);
     clamp(this.tree!, this.lens, camera);
-    const repaired = this.geometryKey(camera);
-    if (this.geometry?.key === repaired) return this.geometry.frame;
+    const settled = this.geometryKey(camera);
+    if (this.geometry?.key === settled) return this.geometry.frame;
     const frame = layout(this.tree!, this.lens, camera, this.view, { mergePx: 1 / this.pixelRatio });
     if (this.geometry?.frame !== this.frame) this.geometry?.frame.dispose();
-    this.geometry = { frame, key: repaired };
+    this.geometry = { frame, key: settled };
     return frame;
+  }
+
+  // Motions. The point follows them: a zoom's fixed point becomes the point
+  // itself, so depth alone changes and zooming back returns exactly; a pan
+  // keeps the point in view, where it tells positions exactly.
+
+  private zoom(dx: number, fy: number): void {
+    if (this.tree === null) return;
+    aim(this.tree, this.lens, this.cam, fy);
+    moveDepth(this.cam, dx, fy);
+  }
+
+  private pan(dy: number): void {
+    if (this.tree === null) return;
+    panVertical(this.cam, dy);
+    aim(this.tree, this.lens, this.cam, Math.min(1, Math.max(0, this.cam.a)));
   }
 
   // Pointer and wheel.
@@ -595,7 +617,9 @@ export class App {
       this.pointer = { x: event.clientX, y: event.clientY };
       const grab = this.dragging;
       if (grab && grab.id === event.pointerId) {
-        drag(this.cam, event.offsetX - grab.x, event.offsetY - grab.y, this.view.height, event.offsetY / this.view.height);
+        // Content follows the pointer, zooming about its height.
+        this.pan((event.offsetY - grab.y) / this.view.height);
+        this.zoom(-(event.offsetX - grab.x) / this.cam.k, event.offsetY / this.view.height);
         grab.x = event.offsetX;
         grab.y = event.offsetY;
       }
@@ -634,8 +658,8 @@ export class App {
     const fy = event.offsetY / this.view.height;
     this.focus = null;
     if (event.ctrlKey || event.metaKey) scale(this.cam, Math.exp(-dy * 0.01));
-    else if (event.shiftKey) panVertical(this.cam, -(dy || dx) / this.view.height);
-    else moveDepth(this.cam, (dx - dy) / this.cam.k, fy);
+    else if (event.shiftKey) this.pan(-(dy || dx) / this.view.height);
+    else this.zoom((dx - dy) / this.cam.k, fy);
     this.invalidate();
   }
 
@@ -652,8 +676,8 @@ export class App {
       depth += ARROWS[key]!.depth;
       pan += ARROWS[key]!.pan;
     }
-    if (depth !== 0) moveDepth(this.cam, (depth * KEY_DEPTH_SPEED * dt) / this.cam.k, 0.5);
-    if (pan !== 0) panVertical(this.cam, pan * KEY_PAN_SPEED * dt);
+    if (depth !== 0) this.zoom((depth * KEY_DEPTH_SPEED * dt) / this.cam.k, 0.5);
+    if (pan !== 0) this.pan(pan * KEY_PAN_SPEED * dt);
   }
 
   private bindKeys(): void {
@@ -838,9 +862,18 @@ export class App {
   // Focus animation.
 
   private startFocus(box: Box): void {
-    if (this.tree === null) return;
-    this.cam.anchor = { node: box.node, rank: box.rank };
-    this.cam.a = box.y0;
+    const tree = this.tree;
+    if (tree === null) return;
+    // The point becomes the box's top: a child's by name, a gap's or a
+    // band's, which have none, by where it is drawn.
+    if (box.branch === null) {
+      aim(tree, this.lens, this.cam, box.y0);
+      if (this.cam.a !== box.y0) return;
+    } else {
+      const path = tree.chain(this.cam.origin, box.node).slice(1).map((node) => tree.branch(node));
+      this.cam.anchor = top([...path, box.branch]);
+      this.cam.a = box.y0;
+    }
     this.focus = {
       box,
       start: performance.now(),
@@ -1028,7 +1061,8 @@ export class App {
       : "Color is ln(p/q) per slot: red where q under-weights it. Area is cross-entropy.";
   }
 
-  // Remember the deepest anchor that covers the screen, not a server-chosen prompt.
+  // Remember the camera as it is: its point is named by the deepest node
+  // covering the view, which a reload opens first.
 
   private readView(dataset: Dataset): SavedView | null {
     if (!this.storage) return null;
@@ -1042,14 +1076,13 @@ export class App {
     }
   }
 
-  private saveView(frame: Frame): void {
-    if (!this.storage || this.restoring || this.flight || frame.cover === null || this.dataset === null || this.tree === null) return;
+  private saveView(): void {
+    if (!this.storage || this.restoring || this.flight || this.dataset === null || this.tree === null) return;
     if (this.saveTimer !== null) clearTimeout(this.saveTimer);
-    const { origin, x, k } = this.cam;
-    const { node, y } = frame.cover;
+    const { origin, x, k, anchor, a } = this.cam;
     this.pendingView = {
       id: this.dataset.id,
-      view: { origin: this.tree.path(origin), path: this.tree.path(node), x, k, a: y, ...this.lens },
+      view: { origin: this.tree.path(origin), anchor, x, k, a, ...this.lens },
     };
     this.saveTimer = window.setTimeout(() => this.flushView(), SAVE_MS);
   }
@@ -1061,7 +1094,7 @@ export class App {
     this.pendingView = null;
     if (!this.storage || pending === null) return;
     try {
-      localStorage.setItem(viewKey(pending.id), JSON.stringify(pending.view));
+      localStorage.setItem(viewKey(pending.id), serializeView(pending.view));
     } catch (error) {
       this.storage = false;
       console.warn("Could not save the natlas view", error);

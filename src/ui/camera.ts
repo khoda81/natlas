@@ -28,9 +28,3 @@ export function scale(cam: Camera, factor: number): void {
   const k = cam.k * factor;
   if (Number.isFinite(k) && k > 0) cam.k = k;
 }
-
-/** Drag: content follows the pointer by (dx, dy) px, zooming about its y. */
-export function drag(cam: Camera, dx: number, dy: number, height: number, fy: number): void {
-  panVertical(cam, dy / height);
-  moveDepth(cam, -dx / cam.k, fy);
-}

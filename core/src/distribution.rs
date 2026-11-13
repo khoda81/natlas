@@ -150,7 +150,13 @@ impl Run {
 
     /// The child holding `ln_below`: the first whose bottom edge is under it.
     pub fn holding(&self, ln_below: f64) -> usize {
-        self.ln_below[1..].partition_point(|&edge| edge >= ln_below)
+        self.holding_by(|edge| edge >= ln_below)
+    }
+
+    /// The child holding a point, told by which edges it is `below`, itself
+    /// included: the first whose bottom edge it is not.
+    fn holding_by(&self, below: impl Fn(f64) -> bool) -> usize {
+        self.ln_below[1..].partition_point(|&edge| below(edge))
     }
 
     /// Children [from, to) as a run of their own.
@@ -384,16 +390,22 @@ impl Distribution {
     /// The item holding `ln_below`: the first whose bottom edge is under it.
     /// Above every item, it is the first; below every one, there is none.
     pub fn locate(&self, ln_below: f64) -> Option<Item> {
+        self.locate_by(|edge| edge >= ln_below)
+    }
+
+    /// The item holding a point, told by which edges it is `below`, itself
+    /// included: a point a float cannot hold finds its item as exactly.
+    pub fn locate_by(&self, below: impl Fn(f64) -> bool) -> Option<Item> {
         let run = self
             .runs
-            .partition_point(|run| run.ln_below[run.len()] >= ln_below);
+            .partition_point(|run| below(run.ln_below[run.len()]));
         let Some(found) = self.runs.get(run) else {
             return self.gap_exists(run).then_some(Item::Gap { before: run });
         };
-        if found.ln_below[0] >= ln_below && !found.is_empty() {
+        if below(found.ln_below[0]) && !found.is_empty() {
             Some(Item::Child {
                 run,
-                at: found.holding(ln_below),
+                at: found.holding_by(below),
             })
         } else if self.gap_exists(run) {
             Some(Item::Gap { before: run })

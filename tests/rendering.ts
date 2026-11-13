@@ -1,14 +1,14 @@
 // Real Canvas pixel checks, served by scripts/check-rendering.ts.
-import { layout, pick, type Box, type Frame } from "../src/core/layout";
+import { layout, pick, top, type Box, type Frame } from "../src/core/layout";
 import { IntervalTree, ROOT } from "../src/core/tree";
 import { Palette, rampPosition } from "../src/ui/color";
 import { draw, NATS, RULER_HEIGHT } from "../src/ui/render";
-import { answer, run } from "./build";
+import { answer, digits, run } from "./build";
 
 const view = { width: 270, height: 340 };
 const palette = Palette.current();
 const state = { hover: null, ancestors: new Set<string>(), units: NATS, glyph: () => ({ text: "" }), note: null };
-const cam = (phase = 0) => ({ origin: ROOT, x: 0, k: 23, anchor: { node: ROOT, rank: 0 }, a: phase / view.height });
+const cam = (phase = 0) => ({ origin: ROOT, x: 0, k: 23, anchor: top(), a: phase / view.height });
 const rgb = (color: string) => color.startsWith("#")
   ? color.slice(1).match(/../g)!.map(c => Number.parseInt(c, 16))
   : color.match(/\d+/g)!.map(Number);
@@ -104,7 +104,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
   // Thin children between a bordered one and the background: each physical
   // row must show the box the pointer over it selects.
   for (const phase of [0, 0.2, 0.61, 0.99]) {
-    const camera = { ...cam(), anchor: { node: ROOT, rank: 2 }, a: 0.5 + phase / dpr / view.height };
+    const camera = { ...cam(), anchor: { path: [], digits: digits(0.99) }, a: 0.5 + phase / dpr / view.height };
     const frame = layout(thin, comparison, camera, view, { mergePx: 1 / dpr });
     const ctx = canvas(dpr).getContext("2d")!;
     draw(ctx, frame, camera, view, comparison, palette, state);

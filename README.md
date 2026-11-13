@@ -55,11 +55,16 @@ soon as the view goes there; until it arrives that space stays empty, and then
 the parent becomes the origin without moving the picture (with p = q).
 
 Absolute vertical coordinates would lose precision a few dozen nats deep, so
-the camera is anchored to a nearby child's edge instead. An edge is stored as
+the camera places one point instead: a path of branches below the origin, down
+to the deepest node that covers the view, and base-256 digits for the fraction
+of that node's p mass above the point (see `core/src/point.rs`). Zooming aims
+the point at what is under the pointer and then changes depth alone, and going
+up a node keeps every digit, so zooming out and back in returns to the very
+same place. An edge is stored as
 ln of the mass below it, and since children rank heaviest first, the mass
 below a child is at most the number of children below it times its own weight:
 every edge stays exact relative to the children around it, however light they
-are. Each node is laid out from its two edges nearest the anchor, one binary
+are. Each node is laid out from its two edges nearest the point, one binary
 search to the first visible child, and children thinner than a physical pixel
 join bands about a physical pixel tall (see `core/src/layout.rs`). Touching
 bands draw as one silhouette with their individual colors, so internal
@@ -173,10 +178,11 @@ uv run scripts/migrate-snapshots.py tree.pb   # selected files
 The converter keeps originals in `public/data/.snapshot-backups/runs/`.
 Regenerating data is also supported.
 
-The browser saves the origin, the smallest known node covering the viewport and
-the camera position below it, horizontal scale and p/q measures to local
+The browser saves the origin, the camera's point below it (its path and
+digits), its place in the view, horizontal scale and p/q measures to local
 storage. Keys include source URLs (or dropped file contents). Reload opens the
-origin at once and walks down to the covering node. A server does not choose
+node the point's path leads to at once, and shows the saved view once the walk
+down from the origin has placed it. A server does not choose
 the initial tree or send a starting prompt.
 
 ## Live

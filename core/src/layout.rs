@@ -2,16 +2,21 @@
 //! and reach −ln q to the right. A frame lays out what a camera sees, says
 //! what it lacks, and answers picks.
 //!
-//! Positions never come from absolute coordinates: each laid-out node keeps
-//! two of its own edges placed exactly in the view and measures everything
-//! from the nearer one, so a branch 2^-4096 of its parent sits as exactly
-//! beside the anchor as a heavy one.
+//! Positions never come from absolute coordinates. The camera places one
+//! point, named by a path of branches below its origin and digits within the
+//! node they lead to, and each laid-out node keeps two of its own edges
+//! placed exactly in the view and measures everything from the nearer one:
+//! a branch 2^-4096 of its parent sits as exactly beside the point as a
+//! heavy one.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use std::f64::consts::LN_2;
+
 use crate::distribution::{ln_add, ln_between, Distribution, Item, Rank};
+use crate::point::Point;
 use crate::tree::{child_hash, node_id, Branch, Lens, NodeId, Read, Tree};
 use crate::Result;
 
@@ -28,16 +33,36 @@ const MAX_BAND_SAMPLES: usize = 64;
 const MAX_POINTS: usize = 4096;
 /// Known children of a run a band reads q from, when q is another measure.
 const SAMPLES: usize = 4;
+/// View heights within which a node's edge is at the view's.
+const FIT: f64 = 1e-12;
 
-/// The top edge of a node's child at `rank`; rank 0 is the node's top.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Edge {
-    #[serde(with = "node_id")]
-    pub node: NodeId,
-    pub rank: Rank,
+/// A point at or below a camera's origin: the node `path` leads to from the
+/// origin, and the fraction of that node's p mass above the point, as digits
+/// in base 256. No digits is the node's top.
+///
+/// One point has many such names, a branch of its path standing for the
+/// digits that pick that child; [`settle`] chooses among them.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Anchor {
+    pub path: Vec<Branch>,
+    #[serde(with = "bytes")]
+    pub digits: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+/// Digits cross to JavaScript as a Uint8Array.
+mod bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(digits: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(digits)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        Vec::deserialize(deserializer)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Camera {
     /// The node the view is measured from, standing as the root does: x is
     /// q-surprisal from its children's left edge and the view spans e^-x of
@@ -46,8 +71,8 @@ pub struct Camera {
     pub origin: NodeId,
     pub x: f64,
     pub k: f64,
-    /// A known edge on a node at or below the origin...
-    pub anchor: Edge,
+    /// A point of the origin...
+    pub anchor: Anchor,
     /// ...this many view heights below the top of the view.
     pub a: f64,
 }
@@ -110,27 +135,15 @@ pub struct Miss {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-pub struct EdgePosition {
-    pub edge: Edge,
-    pub y: f64,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Cover {
-    #[serde(with = "node_id")]
-    pub node: NodeId,
-    pub y: f64,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Extent {
     pub top: f64,
     pub bottom: f64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-pub struct AnchorPosition {
-    pub anchor: Edge,
+/// A camera's point named anew, and where it is in the view.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Aim {
+    pub anchor: Anchor,
     pub a: f64,
 }
 
@@ -153,26 +166,33 @@ pub struct Placed {
     ln_scale: f64,
     /// Where the node's children start, in nats right of the origin's.
     x: f64,
-    /// Below the origin.
-    depth: usize,
 }
 
 impl Placed {
-    /// The view height of an edge, measured from the placed edge nearer to it.
+    /// The view height of an edge, measured from the placed edge that
+    /// tells it best: a height rounds as the larger of the placed edge's own
+    /// height and the distance from it, so an edge in view is measured from
+    /// the one near it, never from one a great many views away.
     fn y(&self, ln_below: f64) -> f64 {
-        let (edge, y) = if ln_below >= self.top.0 {
-            self.top
-        } else if ln_below <= self.bottom.0
-            || ln_between(self.top.0, ln_below) > ln_between(ln_below, self.bottom.0)
-        {
-            self.bottom
-        } else {
-            self.top
+        let ln_far = |edge: f64| {
+            self.ln_scale
+                + if ln_below <= edge {
+                    ln_between(edge, ln_below)
+                } else {
+                    ln_between(ln_below, edge)
+                }
         };
+        let (top, bottom) = (ln_far(self.top.0), ln_far(self.bottom.0));
+        let ((edge, y), ln_far) =
+            if top.max(self.top.1.abs().ln()) <= bottom.max(self.bottom.1.abs().ln()) {
+                (self.top, top)
+            } else {
+                (self.bottom, bottom)
+            };
         if ln_below <= edge {
-            y + (self.ln_scale + ln_between(edge, ln_below)).exp()
+            y + ln_far.exp()
         } else {
-            y - (self.ln_scale + ln_between(ln_below, edge)).exp()
+            y - ln_far.exp()
         }
     }
 
@@ -209,7 +229,6 @@ impl Placed {
             ln_mass: self.ln_mass + ln_p,
             ln_scale: self.ln_scale + ln_p,
             x,
-            depth: self.depth + 1,
         }
     }
 }
@@ -220,12 +239,8 @@ pub struct Frame {
     /// Every node laid out, for picking.
     pub placed: HashMap<NodeId, Placed>,
     pub misses: Vec<Miss>,
-    /// Known edges in view, for re-anchoring.
-    pub edges: Vec<EdgePosition>,
     pub origin_top: f64,
     pub origin_bottom: f64,
-    /// Deepest node covering the view whose children start at or left of it.
-    pub cover: Option<Cover>,
 }
 
 impl Frame {
@@ -234,10 +249,8 @@ impl Frame {
         self.boxes.clear();
         self.placed.clear();
         self.misses.clear();
-        self.edges.clear();
         self.origin_top = 0.0;
         self.origin_bottom = 0.0;
-        self.cover = None;
     }
 }
 
@@ -356,6 +369,12 @@ impl Wants {
         let total = masses
             .iter()
             .fold(f64::NEG_INFINITY, |sum, &mass| ln_add(sum, mass));
+        // A view too small for a float of the node's mass to tell its top
+        // from its bottom holds one point a request can name.
+        if total == f64::NEG_INFINITY || total.is_nan() {
+            self.points.extend(gaps.first().map(|&(top, _)| top));
+            return;
+        }
         let (mut gap, mut before) = (0, 0.0);
         for i in 0..n {
             let at = (i as f64 + 0.5) / n as f64;
@@ -375,122 +394,179 @@ impl Wants {
 }
 
 struct ChainEntry {
+    branch: Branch,
     rank: Rank,
     ln_p: f64,
     nats_q: f64,
 }
 
-/// The nodes from the origin to the anchor, each one's entry in its parent,
-/// and where each is placed: the anchor at its edge, every ancestor at its
-/// chain child's edges.
+/// The nodes down a path from an origin, as far as p places its branches:
+/// each one's entry in its parent and edges there, and its ln p mass and
+/// q-surprisal below the origin.
+struct Steps {
+    nodes: Vec<NodeId>,
+    entries: Vec<ChainEntry>,
+    edges: Vec<(f64, f64)>,
+    ln_masses: Vec<f64>,
+    xs: Vec<f64>,
+}
+
+fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Steps> {
+    let mut steps = Steps {
+        nodes: vec![origin],
+        entries: Vec::with_capacity(path.len()),
+        edges: Vec::with_capacity(path.len()),
+        ln_masses: vec![0.0],
+        xs: vec![0.0],
+    };
+    for (i, &branch) in path.iter().enumerate() {
+        let node = steps.nodes[i];
+        let Some(p) = tree.distribution(node, lens.p)? else {
+            break;
+        };
+        let Some(rank) = p.rank(branch) else {
+            break;
+        };
+        let (top, bottom) = (p.edge(rank), p.edge(rank + 1));
+        let (top, bottom) = (top.expect("ranked"), bottom.expect("ranked"));
+        let ln_p = ln_between(top, bottom);
+        let nats_q = tree.nats_q(node, lens, branch, ln_p)?;
+        steps.nodes.push(child_hash(node, branch));
+        steps.entries.push(ChainEntry {
+            branch,
+            rank,
+            ln_p,
+            nats_q,
+        });
+        steps.edges.push((top, bottom));
+        steps.ln_masses.push(steps.ln_masses[i] + ln_p);
+        steps.xs.push(steps.xs[i] + nats_q);
+    }
+    Ok(steps)
+}
+
+/// An item's edges as a point is measured from them: the node's top is
+/// its whole mass, even where its first child starts a rounding error below.
+fn edges(d: &Distribution, item: Item) -> (f64, f64) {
+    let top = match d.item_rank(item) {
+        0 => 0.0,
+        _ => d.item_top(item),
+    };
+    (top, d.item_bottom(item))
+}
+
+/// The known edges nearest a point of a node, above and below it: those of
+/// the item holding it, or the node's own.
+fn around(d: Option<&Distribution>, point: &Point) -> (f64, f64) {
+    d.and_then(|d| Some(edges(d, d.locate_by(|edge| point.below(edge))?)))
+        .filter(|&(top, bottom)| point.within(top, bottom))
+        .unwrap_or((0.0, f64::NEG_INFINITY))
+}
+
+/// The known child of a node holding a point, and its edges.
+fn held(d: Option<&Distribution>, point: &Point) -> Option<(Branch, f64, f64)> {
+    let d = d?;
+    let item = d.locate_by(|edge| point.below(edge))?;
+    let Item::Child { run, at } = item else {
+        return None;
+    };
+    let (top, bottom) = edges(d, item);
+    point
+        .within(top, bottom)
+        .then(|| (d.runs()[run].branch(at), top, bottom))
+}
+
+/// Bits that tell a point of a node e^`ln_scale` view heights tall to
+/// 2^-64 of a view height.
+fn precision(ln_scale: f64) -> u64 {
+    (64.0 + ln_scale / LN_2).ceil().max(0.0) as u64
+}
+
+/// The nodes from the origin down the anchor's path, each one's entry in its
+/// parent, where each is placed and its own extent in view heights: the
+/// anchor's node around its point, every ancestor at its chain child's edges.
 struct Chain {
     nodes: Vec<NodeId>,
     entries: Vec<ChainEntry>,
     placed: Vec<Placed>,
+    spans: Vec<(f64, f64)>,
 }
 
-fn place_chain(tree: &Tree, lens: Lens, cam: Camera) -> Result<Chain> {
-    let lambda = -cam.x;
-    let nodes = tree.chain(cam.origin, cam.anchor.node)?;
-    let mut entries = Vec::with_capacity(nodes.len());
-    let mut edges = Vec::with_capacity(nodes.len());
-    let (mut ln_masses, mut xs) = (vec![0.0], vec![0.0]);
-    for pair in nodes.windows(2) {
-        let branch = tree.branch(pair[1])?.expect("a child has a branch");
-        let p = tree.distribution(pair[0], lens.p)?;
-        let rank = p.and_then(|p| p.rank(branch)).ok_or_else(|| {
-            format!(
-                "node {:#018x} is not placed under measure {}",
-                pair[1], lens.p
-            )
-        })?;
-        let p = p.expect("a ranked branch has a distribution");
-        let (top, bottom) = (p.edge(rank), p.edge(rank + 1));
-        let (top, bottom) = (top.expect("ranked"), bottom.expect("ranked"));
-        let ln_p = ln_between(top, bottom);
-        let nats_q = tree.nats_q(pair[0], lens, branch, ln_p)?;
-        ln_masses.push(ln_masses.last().expect("origin") + ln_p);
-        xs.push(xs.last().expect("origin") + nats_q);
-        entries.push(ChainEntry { rank, ln_p, nats_q });
-        edges.push((top, bottom));
+fn place_chain(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Chain> {
+    let Steps {
+        nodes,
+        entries,
+        edges,
+        ln_masses,
+        xs,
+    } = steps(tree, lens, cam.origin, &cam.anchor.path)?;
+    let depth = cam.anchor.path.len();
+    if entries.len() < depth {
+        return Err(format!(
+            "node {:#018x} does not place branch {} under measure {}",
+            nodes[entries.len()],
+            cam.anchor.path[entries.len()],
+            lens.p
+        ));
     }
-    let depth = nodes.len() - 1;
-    let anchor = match cam.anchor.rank {
-        0 => Some(0.0),
-        rank => tree
-            .distribution(cam.anchor.node, lens.p)?
-            .and_then(|d| d.edge(rank)),
-    }
-    .ok_or("the anchor's edge is unknown")?;
+    let point = Point::new(&cam.anchor.digits);
+    let ln_scale = ln_masses[depth] + cam.x;
+    let y = |edge: f64| {
+        let (under, ln_mass) = point.to(edge);
+        let far = (ln_scale + ln_mass).exp();
+        if under {
+            cam.a + far
+        } else {
+            cam.a - far
+        }
+    };
+    let (top, bottom) = around(tree.distribution(nodes[depth], lens.p)?, &point);
     let mut placed = vec![
         Placed {
-            top: (anchor, cam.a),
-            bottom: (anchor, cam.a),
+            top: (top, y(top)),
+            bottom: (bottom, y(bottom)),
             ln_mass: ln_masses[depth],
-            ln_scale: ln_masses[depth] - lambda,
+            ln_scale,
             x: xs[depth],
-            depth,
         };
         nodes.len()
     ];
+    let mut spans = vec![(y(0.0), y(f64::NEG_INFINITY)); nodes.len()];
     for i in (0..depth).rev() {
         let (top, bottom) = edges[i];
-        let (y0, y1) = placed[i + 1].span();
+        let (y0, y1) = spans[i + 1];
         placed[i] = Placed {
             top: (top, y0),
             bottom: (bottom, y1),
             ln_mass: ln_masses[i],
-            ln_scale: ln_masses[i] - lambda,
+            ln_scale: ln_masses[i] + cam.x,
             x: xs[i],
-            depth: i,
         };
+        spans[i] = placed[i].span();
     }
     Ok(Chain {
         nodes,
         entries,
         placed,
+        spans,
     })
 }
 
 struct Layout<'a> {
     tree: &'a Tree,
     lens: Lens,
-    cam: Camera,
+    cam: &'a Camera,
     view: Viewport,
     right: f64,
     /// A child shorter than this, in view heights, joins a band.
     merge: f64,
     frame: Frame,
-    cover_depth: Option<usize>,
 }
 
 impl Layout<'_> {
     fn push(&mut self, b: LayoutBox) {
         if b.x1 > self.cam.x && b.x0 < self.right && b.y1 > 0.0 && b.y0 < 1.0 {
             self.frame.boxes.push(b);
-        }
-    }
-
-    fn edge(&mut self, node: NodeId, rank: Rank, y: f64) {
-        if (0.0..=1.0).contains(&y) {
-            self.frame.edges.push(EdgePosition {
-                edge: Edge { node, rank },
-                y,
-            });
-        }
-    }
-
-    fn cover(&mut self, node: NodeId, y0: f64, y1: f64, x: f64, depth: usize) {
-        if y0 <= 1e-12
-            && y1 >= 1.0 - 1e-12
-            && x <= self.cam.x + 1e-12
-            && self.cover_depth.is_none_or(|deepest| depth > deepest)
-        {
-            self.cover_depth = Some(depth);
-            self.frame.cover = Some(Cover {
-                node,
-                y: y0.min(0.0),
-            });
         }
     }
 
@@ -542,12 +618,15 @@ impl Layout<'_> {
             self.emit(node, wants);
             return Ok(());
         };
-        let mut item = d.locate(view.0);
+        // From the first item that ends in the view to the last that starts
+        // in it, told by view height: a view too small for any float of the
+        // node's mass to tell its top from its bottom still has both.
+        let mut item = d.locate_by(|edge| placed.y(edge) <= 0.0);
         while let Some(found) = item {
-            if d.item_top(found) <= view.1 {
+            let (y0, y1) = (placed.y(d.item_top(found)), placed.y(d.item_bottom(found)));
+            if 1.0 <= y0 {
                 break;
             }
-            let (y0, y1) = (placed.y(d.item_top(found)), placed.y(d.item_bottom(found)));
             let chain = matches!(found, Item::Child { .. }) && skip == Some(d.item_rank(found));
             item = if chain {
                 d.next(found)
@@ -585,17 +664,12 @@ impl Layout<'_> {
         (b.y0, b.y1) = (y0, y1);
         let branch = b.branch.expect("a child has a branch");
         let id = child_hash(node, branch);
-        let (rank, x1, kind) = (b.rank, b.x1, b.kind);
+        let (x1, kind) = (b.x1, b.kind);
         let (top, bottom) = (d.item_top(item), d.item_bottom(item));
         if b.q.is_nan() {
             wants.branches.push(branch);
         }
-        self.edge(node, rank, y0);
-        self.edge(node, rank + 1, y1);
         self.push(b);
-        if tree.contains(id) {
-            self.cover(id, y0, y1, x1, placed.depth + 1);
-        }
         if self.right <= x1 {
             return Ok(());
         }
@@ -635,11 +709,7 @@ impl Layout<'_> {
         wants: &mut Wants,
     ) -> Result<()> {
         let b = item_box(self.tree, self.lens, node, placed, d, item)?;
-        let (rank, y0, y1) = (b.rank, b.y0, b.y1);
-        self.edge(node, rank, y0);
-        if let Some(end) = d.item_end(item) {
-            self.edge(node, end, y1);
-        }
+        let (y0, y1) = (b.y0, b.y1);
         self.push(b);
         let px = self.px(y0, y1);
         if MIN_PX <= px {
@@ -738,10 +808,6 @@ impl Layout<'_> {
         }
         let (top, bottom) = (d.item_top(start), d.item_bottom(last));
         let (y0, y1) = (placed.y(top), placed.y(bottom));
-        self.edge(node, d.item_rank(start), y0);
-        if let Some(end) = d.item_end(last) {
-            self.edge(node, end, y1);
-        }
         let px = self.px(y0, y1);
         if ln_known == f64::NEG_INFINITY {
             // Nothing known to draw: ask for a child or two.
@@ -795,7 +861,7 @@ impl Layout<'_> {
 pub fn layout(
     tree: &Tree,
     lens: Lens,
-    cam: Camera,
+    cam: &Camera,
     view: Viewport,
     merge_px: f64,
 ) -> Result<Frame> {
@@ -805,7 +871,7 @@ pub fn layout(
 pub(crate) fn layout_into(
     tree: &Tree,
     lens: Lens,
-    cam: Camera,
+    cam: &Camera,
     view: Viewport,
     merge_px: f64,
     mut frame: Frame,
@@ -815,11 +881,12 @@ pub(crate) fn layout_into(
         nodes,
         entries,
         placed,
+        spans,
     } = place_chain(tree, lens, cam)?;
     for (&node, &placed) in nodes.iter().zip(&placed) {
         frame.placed.insert(node, placed);
     }
-    (frame.origin_top, frame.origin_bottom) = placed[0].span();
+    (frame.origin_top, frame.origin_bottom) = spans[0];
     let mut context = Layout {
         tree,
         lens,
@@ -828,38 +895,30 @@ pub(crate) fn layout_into(
         right: cam.x + view.width / cam.k,
         merge: merge_px / view.height,
         frame,
-        cover_depth: None,
     };
     // The chain's own branches need q to place its deeper nodes.
     for (i, entry) in entries.iter().enumerate() {
         if entry.nats_q.is_infinite() {
-            let branch = tree.branch(nodes[i + 1])?.expect("a child has a branch");
             context.frame.misses.push(Miss {
                 node: nodes[i],
                 target: nodes[i],
                 measure: lens.q,
-                read: Read::Branches(vec![branch]),
+                read: Read::Branches(vec![entry.branch]),
                 priority: view.height,
             });
         }
     }
     let depth = nodes.len() - 1;
-    let anchor = placed[depth];
-    context.edge(cam.anchor.node, cam.anchor.rank, cam.a);
-    context.lay(nodes[depth], anchor, None)?;
-    let (y0, y1) = anchor.span();
-    context.cover(nodes[depth], y0, y1, anchor.x, depth);
+    context.lay(nodes[depth], placed[depth], None)?;
     for i in (0..depth).rev() {
         let (own, child, entry) = (placed[i], placed[i + 1], &entries[i]);
-        let (y0, y1) = child.span();
-        context.edge(nodes[i], entry.rank, y0);
-        context.edge(nodes[i], entry.rank + 1, y1);
+        let (y0, y1) = spans[i + 1];
         context.push(LayoutBox {
             node: nodes[i],
             rank: entry.rank,
             count: 1,
             kind: BoxKind::Node,
-            branch: tree.branch(nodes[i + 1])?,
+            branch: Some(entry.branch),
             p: entry.ln_p.exp(),
             q: if entry.nats_q.is_finite() {
                 (-entry.nats_q).exp()
@@ -873,10 +932,9 @@ pub(crate) fn layout_into(
             y1,
         });
         context.lay(nodes[i], own, Some(entry.rank))?;
-        let (top, bottom) = own.span();
-        context.cover(nodes[i], top, bottom, own.x, i);
         // Covering the view with its own box left of it, this node hides
         // every remaining ancestor's other children.
+        let (top, bottom) = spans[i];
         if top <= 0.0 && bottom >= 1.0 && own.x <= cam.x {
             break;
         }
@@ -885,13 +943,13 @@ pub(crate) fn layout_into(
 }
 
 /// The origin's edges in view heights.
-pub fn extent(tree: &Tree, lens: Lens, cam: Camera) -> Result<Extent> {
-    let (top, bottom) = place_chain(tree, lens, cam)?.placed[0].span();
+pub fn extent(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Extent> {
+    let (top, bottom) = place_chain(tree, lens, cam)?.spans[0];
     Ok(Extent { top, bottom })
 }
 
 /// Keep the view inside the root's interval, returning only the new anchor offset.
-pub fn clamp_position(tree: &Tree, lens: Lens, cam: Camera) -> Result<f64> {
+pub fn clamp_position(tree: &Tree, lens: Lens, cam: &Camera) -> Result<f64> {
     // Only the root's interval is all there is; beyond any other origin lies
     // its parent, unknown until fetched.
     if cam.origin != crate::tree::ROOT {
@@ -907,51 +965,82 @@ pub fn clamp_position(tree: &Tree, lens: Lens, cam: Camera) -> Result<f64> {
     })
 }
 
-/// The camera's anchor, or the deepest edge above it that p still places:
-/// a lens or a replaced distribution can take an edge away.
-pub fn repair(tree: &Tree, lens: Lens, cam: Camera) -> Result<Edge> {
-    let Ok(chain) = tree.chain(cam.origin, cam.anchor.node) else {
-        return Ok(Edge {
-            node: cam.origin,
-            rank: 0,
-        });
-    };
-    for pair in chain.windows(2) {
-        let branch = tree.branch(pair[1])?.expect("a child has a branch");
-        let placed = tree
-            .distribution(pair[0], lens.p)?
-            .is_some_and(|p| p.rank(branch).is_some());
-        if !placed {
-            return Ok(Edge {
-                node: pair[0],
-                rank: 0,
-            });
-        }
-    }
-    let known = cam.anchor.rank == 0
-        || tree
-            .distribution(cam.anchor.node, lens.p)?
-            .is_some_and(|p| p.edge(cam.anchor.rank).is_some());
-    Ok(if known {
-        cam.anchor
+/// The camera's point under the name that keeps the view exact: its path
+/// down to the deepest node that both holds the point and covers the view,
+/// its digits within that node. Nothing on screen moves.
+///
+/// The name follows from the view and the tree alone. Going up a node is
+/// exact and keeps every digit, so a view that zooms out and back in on a
+/// point it has not re-aimed returns to the very same anchor. Where p no
+/// longer places a branch of the path, as after a lens or a replaced
+/// distribution, the path ends there, at that node's top.
+pub fn settle(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Anchor> {
+    let steps = steps(tree, lens, cam.origin, &cam.anchor.path)?;
+    let mut path = cam.anchor.path[..steps.entries.len()].to_vec();
+    let mut point = if path.len() == cam.anchor.path.len() {
+        Point::new(&cam.anchor.digits)
     } else {
-        Edge {
-            node: cam.anchor.node,
-            rank: 0,
+        Point::new(&[])
+    };
+    // Whether the part of a node between two of its edges covers the view,
+    // the node e^ln_scale view heights tall. A node that fits the view
+    // covers it, whichever way its edges round.
+    let covers = |point: &Point, ln_scale: f64, top: f64, bottom: f64| {
+        let ((_, above), (_, under)) = (point.to(top), point.to(bottom));
+        cam.a - (ln_scale + above).exp() <= FIT && 1.0 - FIT <= cam.a + (ln_scale + under).exp()
+    };
+    while let Some(&(top, bottom)) = path.len().checked_sub(1).map(|i| &steps.edges[i]) {
+        let ln_scale = steps.ln_masses[path.len()] + cam.x;
+        if covers(&point, ln_scale, 0.0, f64::NEG_INFINITY) {
+            break;
         }
+        point = point.out_of_child(top, bottom);
+        path.pop();
+    }
+    let mut node = steps.nodes[path.len()];
+    let mut ln_scale = steps.ln_masses[path.len()] + cam.x;
+    while let Some((branch, top, bottom)) = held(tree.distribution(node, lens.p)?, &point) {
+        if !covers(&point, ln_scale, top, bottom) {
+            break;
+        }
+        ln_scale += ln_between(top, bottom);
+        point = point.into_child(top, bottom, precision(ln_scale));
+        path.push(branch);
+        node = child_hash(node, branch);
+    }
+    Ok(Anchor {
+        path,
+        digits: point.digits(),
     })
 }
 
-/// Re-anchor at the in-view edge nearest the view's center.
-pub fn reanchor(frame: &Frame) -> Option<AnchorPosition> {
-    frame
-        .edges
-        .iter()
-        .min_by(|a, b| (a.y - 0.5).abs().total_cmp(&(b.y - 0.5).abs()))
-        .map(|best| AnchorPosition {
-            anchor: best.edge,
-            a: best.y,
-        })
+/// The camera's point moved to what the view shows `fy` view heights down,
+/// to 2^-64 of a view height, under its settled name: the point a zoom about
+/// `fy` then leaves where it is, so only depth changes. Unchanged where the
+/// point is there already, or where the origin does not reach that far.
+pub fn aim(tree: &Tree, lens: Lens, cam: &Camera, fy: f64) -> Result<Aim> {
+    let same = Aim {
+        anchor: cam.anchor.clone(),
+        a: cam.a,
+    };
+    let by = fy - cam.a;
+    if by == 0.0 || !by.is_finite() {
+        return Ok(same);
+    }
+    let Anchor { path, digits } = settle(tree, lens, cam)?;
+    let steps = steps(tree, lens, cam.origin, &path)?;
+    let ln_scale = steps.ln_masses[path.len()] + cam.x;
+    if !ln_scale.is_finite() {
+        return Ok(same);
+    }
+    let moved = Point::new(&digits).moved(0.0 < by, by.abs(), -ln_scale);
+    Ok(moved.map_or(same, |point| Aim {
+        anchor: Anchor {
+            path,
+            digits: point.floor(precision(ln_scale)).digits(),
+        },
+        a: fy,
+    }))
 }
 
 /// The box a pixel shows, `pixel_px` square with its top-left corner at
@@ -962,7 +1051,7 @@ pub fn pick(
     tree: &Tree,
     lens: Lens,
     frame: &Frame,
-    cam: Camera,
+    cam: &Camera,
     view: Viewport,
     x_px: f64,
     y_px: f64,
@@ -999,7 +1088,7 @@ pub fn pick(
         else {
             return Ok(Some(origin));
         };
-        let Some(item) = d.locate(placed.ln_below(y)) else {
+        let Some(item) = d.locate_by(|edge| placed.y(edge) <= y) else {
             return Ok(Some(origin));
         };
         let item = band_child(frame, node, placed, d, item, y, y + pixel_px / view.height);
@@ -1072,7 +1161,7 @@ mod tests {
         Distribution::from_weights(&weights.iter().map(|w| w.ln()).collect::<Vec<_>>()).unwrap()
     }
 
-    fn cam(origin: NodeId, x: f64, anchor: Edge, a: f64) -> Camera {
+    fn cam(origin: NodeId, x: f64, anchor: Anchor, a: f64) -> Camera {
         Camera {
             origin,
             x,
@@ -1082,8 +1171,16 @@ mod tests {
         }
     }
 
-    fn top(node: NodeId) -> Edge {
-        Edge { node, rank: 0 }
+    /// The top of the node `path` leads to.
+    fn top(path: &[Branch]) -> Anchor {
+        at(path, &[])
+    }
+
+    fn at(path: &[Branch], digits: &[u8]) -> Anchor {
+        Anchor {
+            path: path.to_vec(),
+            digits: digits.to_vec(),
+        }
     }
 
     fn near(actual: f64, expected: f64) {
@@ -1108,7 +1205,7 @@ mod tests {
     #[test]
     fn heights_split_by_p_in_p_order_and_widths_follow_q() {
         let (tree, _) = chain_tree(&[0.25, 0.5, 0.25], &[]);
-        let frame = layout(&tree, LENS, cam(ROOT, 0.0, top(ROOT), 0.0), VIEW, 1.0).unwrap();
+        let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let spans: Vec<_> = frame
             .boxes
             .iter()
@@ -1127,7 +1224,7 @@ mod tests {
         tree.set(ROOT, 0, weights(&[0.25, 0.75])).unwrap();
         tree.set(ROOT, 1, weights(&[0.5, 0.5])).unwrap();
         let lens = Lens { p: 0, q: 1 };
-        let frame = layout(&tree, lens, cam(ROOT, 0.0, top(ROOT), 0.0), VIEW, 1.0).unwrap();
+        let frame = layout(&tree, lens, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         // p's order: branch 1 first; q sets both widths alike.
         assert_eq!(frame.boxes[0].branch, Some(1));
         near(frame.boxes[0].y1, 0.75);
@@ -1139,8 +1236,8 @@ mod tests {
     fn thin_children_merge_into_bands_that_keep_their_area_and_pick_apart() {
         let weights_ = [0.5, 0.488, 0.006, 0.004, 0.002];
         let (tree, _) = chain_tree(&weights_, &[]);
-        let camera = cam(ROOT, 0.0, top(ROOT), 0.0);
-        let frame = layout(&tree, LENS, camera, VIEW, 10.0).unwrap();
+        let camera = cam(ROOT, 0.0, top(&[]), 0.0);
+        let frame = layout(&tree, LENS, &camera, VIEW, 10.0).unwrap();
         let band = frame
             .boxes
             .iter()
@@ -1153,7 +1250,7 @@ mod tests {
             &tree,
             LENS,
             &frame,
-            camera,
+            &camera,
             VIEW,
             100.0,
             0.991 * VIEW.height,
@@ -1173,8 +1270,8 @@ mod tests {
         tree.set(ROOT, 0, weights(&p)).unwrap();
         tree.set(ROOT, 1, weights(&q)).unwrap();
         let lens = Lens { p: 0, q: 1 };
-        let camera = cam(ROOT, 0.0, top(ROOT), 0.0);
-        let frame = layout(&tree, lens, camera, VIEW, 10.0).unwrap();
+        let camera = cam(ROOT, 0.0, top(&[]), 0.0);
+        let frame = layout(&tree, lens, &camera, VIEW, 10.0).unwrap();
         let band = frame
             .boxes
             .iter()
@@ -1191,7 +1288,7 @@ mod tests {
         // Identical measures must stay neutral at every grouping size.
         tree.set(ROOT, 1, weights(&p)).unwrap();
         for merge in [1.0, 10.0, 100.0] {
-            let frame = layout(&tree, lens, camera, VIEW, merge).unwrap();
+            let frame = layout(&tree, lens, &camera, VIEW, merge).unwrap();
             for band in frame.boxes.iter().filter(|b| b.kind == BoxKind::Merged) {
                 near((band.p / band.q).ln(), 0.0);
             }
@@ -1218,7 +1315,7 @@ mod tests {
         }
         let mut tree = Tree::new(1);
         tree.insert(ROOT, 0, runs).unwrap();
-        let frame = layout(&tree, LENS, cam(ROOT, 0.0, top(ROOT), 0.0), VIEW, 1.0).unwrap();
+        let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let bands: Vec<_> = frame
             .boxes
             .iter()
@@ -1249,10 +1346,10 @@ mod tests {
         let mut tree = Tree::new(1);
         tree.insert(ROOT, 0, runs).unwrap();
         // Off the grid, so pixel corners fall inside items.
-        let camera = cam(ROOT, 0.0, top(ROOT), 0.37 / VIEW.height);
-        let frame = layout(&tree, LENS, camera, VIEW, 1.0).unwrap();
+        let camera = cam(ROOT, 0.0, top(&[]), 0.37 / VIEW.height);
+        let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let selected = |y_px: f64, pixel_px: f64| {
-            let hit = pick(&tree, LENS, &frame, camera, VIEW, 100.0, y_px, pixel_px);
+            let hit = pick(&tree, LENS, &frame, &camera, VIEW, 100.0, y_px, pixel_px);
             hit.unwrap().unwrap().r#box.branch
         };
         let rows = frame
@@ -1281,10 +1378,10 @@ mod tests {
         ];
         let mut tree = Tree::new(1);
         tree.insert(ROOT, 0, runs).unwrap();
-        let camera = cam(ROOT, 0.0, top(ROOT), 0.0);
-        let frame = layout(&tree, LENS, camera, VIEW, 1.0).unwrap();
+        let camera = cam(ROOT, 0.0, top(&[]), 0.0);
+        let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let selected = |y_px: f64| {
-            let hit = pick(&tree, LENS, &frame, camera, VIEW, 100.0, y_px, 1.0);
+            let hit = pick(&tree, LENS, &frame, &camera, VIEW, 100.0, y_px, 1.0);
             hit.unwrap().unwrap().r#box.kind
         };
         assert_eq!(selected(600.0), BoxKind::Gap);
@@ -1296,24 +1393,17 @@ mod tests {
         // 80 halvings put the deepest node 2^-80 of the root tall.
         let path: Vec<Branch> = (0..80).map(|i| i % 2).collect();
         let (tree, deepest) = chain_tree(&[0.5, 0.5], &path);
-        let camera = cam(
-            ROOT,
-            80.0 * LN_2,
-            Edge {
-                node: deepest,
-                rank: 1,
-            },
-            0.5,
-        );
-        let frame = layout(&tree, LENS, camera, VIEW, 1.0).unwrap();
+        // Half way down the deepest node, in the middle of the view.
+        let camera = cam(ROOT, 80.0 * LN_2, at(&path, &[0x80]), 0.5);
+        let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let mut children: Vec<_> = frame.boxes.iter().filter(|b| b.node == deepest).collect();
         children.sort_by_key(|b| b.rank);
         assert_eq!(children.len(), 2);
         near(children[0].y0, 0.0);
         near(children[0].y1, 0.5);
         near(children[1].y1, 1.0);
-        // The deepest node fills the view, its children starting at its left edge.
-        assert_eq!(frame.cover.map(|c| c.node), Some(deepest));
+        // The deepest node fills the view: no better name for the point.
+        assert_eq!(settle(&tree, LENS, &camera).unwrap(), camera.anchor);
     }
 
     #[test]
@@ -1337,16 +1427,11 @@ mod tests {
         .unwrap();
         // The view is the tail itself: x = 3000 bits is where children
         // 2^-3000 of the root fill it.
-        let camera = cam(
-            ROOT,
-            -tiny - 3f64.ln(),
-            Edge {
-                node: ROOT,
-                rank: 1,
-            },
-            0.0,
-        );
-        let frame = layout(&tree, LENS, camera, VIEW, 1.0).unwrap();
+        // The top of the first of them, 3 · 2^-3000 above the root's bottom.
+        let mut digits = vec![0xff; 374];
+        digits.extend([0xfd]);
+        let camera = cam(ROOT, -tiny - 3f64.ln(), at(&[], &digits), 0.0);
+        let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let ys: Vec<_> = frame
             .boxes
             .iter()
@@ -1367,7 +1452,7 @@ mod tests {
         // 1000: a quarter of its mass in 998 unknown children.
         let run = Run::new(0, vec![4, 7], vec![0.0, 0.5f64.ln(), 0.25f64.ln()]).unwrap();
         tree.insert(ROOT, 0, vec![run, Run::end_at(1000)]).unwrap();
-        let frame = layout(&tree, LENS, cam(ROOT, 0.0, top(ROOT), 0.0), VIEW, 1.0).unwrap();
+        let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let gap = frame
             .boxes
             .iter()
@@ -1381,7 +1466,7 @@ mod tests {
         let mut uncounted = Tree::new(1);
         let run = Run::new(0, vec![4, 7], vec![0.0, 0.5f64.ln(), 0.25f64.ln()]).unwrap();
         uncounted.insert(ROOT, 0, vec![run]).unwrap();
-        let frame_ = layout(&uncounted, LENS, cam(ROOT, 0.0, top(ROOT), 0.0), VIEW, 1.0).unwrap();
+        let frame_ = layout(&uncounted, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let gap_ = frame_
             .boxes
             .iter()
@@ -1424,7 +1509,7 @@ mod tests {
             })
             .collect();
         tree.insert(ROOT, 0, samples).unwrap();
-        let frame = layout(&tree, LENS, cam(ROOT, 0.0, top(ROOT), 0.0), VIEW, 1.0).unwrap();
+        let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let bands = frame
             .boxes
             .iter()
@@ -1438,14 +1523,29 @@ mod tests {
     }
 
     #[test]
-    fn reanchoring_moves_nothing_and_repair_falls_back_to_what_p_places() {
+    fn a_view_no_float_of_a_node_resolves_asks_for_the_one_point_it_holds() {
+        // The top of a child whose children are unknown, 2^-80 of it in view.
+        let mut tree = Tree::new(1);
+        tree.set(ROOT, 0, weights(&[0.5, 0.5])).unwrap();
+        let camera = cam(ROOT, 81.0 * LN_2, top(&[1]), 0.0);
+        let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
+        let [miss] = &frame.misses[..] else {
+            panic!("the child is asked for once");
+        };
+        assert_eq!(miss.read, Read::Points(vec![0.0]));
+    }
+
+    #[test]
+    fn settling_moves_nothing_and_falls_back_to_what_p_places() {
         let path: Vec<Branch> = (0..30).map(|i| (i * 7) % 3).collect();
-        let (tree, deepest) = chain_tree(&[0.6, 0.3, 0.1], &path);
-        let mut camera = cam(ROOT, 12.3, top(deepest), 0.41);
-        let before = layout(&tree, LENS, camera, VIEW, 1.0).unwrap();
-        let moved = reanchor(&before).unwrap();
-        (camera.anchor, camera.a) = (moved.anchor, moved.a);
-        let after = layout(&tree, LENS, camera, VIEW, 1.0).unwrap();
+        let (tree, _) = chain_tree(&[0.6, 0.3, 0.1], &path);
+        // A view a few nodes up the path from the point's own.
+        let mut camera = cam(ROOT, 12.3, at(&path, &[0x51, 0x07]), 0.41);
+        let before = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
+        camera.anchor = settle(&tree, LENS, &camera).unwrap();
+        assert!(camera.anchor.path.len() < path.len());
+        assert_eq!(camera.anchor.path, path[..camera.anchor.path.len()]);
+        let after = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let key = |b: &LayoutBox| (b.node, b.rank, b.kind);
         let positions: HashMap<_, _> = before.boxes.iter().map(|b| (key(b), b.y0)).collect();
         let mut shared = 0;
@@ -1456,37 +1556,136 @@ mod tests {
             }
         }
         assert!(shared > 0);
+        // Settled, it stays as it is.
+        assert_eq!(settle(&tree, LENS, &camera).unwrap(), camera.anchor);
 
         let mut tree = Tree::new(2);
         tree.set(ROOT, 0, weights(&[0.5, 0.5])).unwrap();
         tree.set(ROOT, 1, weights(&[1.0])).unwrap();
-        let child = tree.child(ROOT, 1).unwrap();
-        let lost = cam(ROOT, 1.0, top(child), 0.4);
-        assert_eq!(repair(&tree, Lens { p: 1, q: 1 }, lost).unwrap(), top(ROOT));
-        assert_eq!(repair(&tree, LENS, lost).unwrap(), top(child));
+        let lost = cam(ROOT, 1.0, at(&[1], &[0x40]), 0.1);
+        assert_eq!(settle(&tree, Lens { p: 1, q: 1 }, &lost).unwrap(), top(&[]));
+        assert_eq!(settle(&tree, LENS, &lost).unwrap(), lost.anchor);
+        assert!(layout(&tree, Lens { p: 1, q: 1 }, &lost, VIEW, 1.0).is_err());
+    }
+
+    #[test]
+    fn zooming_out_and_back_in_returns_to_the_same_anchor() {
+        let path: Vec<Branch> = (0..200).map(|i| (i * 7) % 3).collect();
+        let (tree, _) = chain_tree(&[0.6, 0.3, 0.1], &path);
+        // A point 150 nodes down, at a depth where its node about fills the
+        // view, and views of it from there out to the root in 400 steps.
+        let depth: f64 = path[..150]
+            .iter()
+            .map(|&branch| -[0.6f64, 0.3, 0.1][branch as usize].ln())
+            .sum();
+        let mut camera = cam(ROOT, depth, at(&path[..150], &[0x51, 0x07]), 0.37);
+        let zoom = |camera: &mut Camera, out: bool| {
+            let mut names = Vec::new();
+            for step in 0..=400 {
+                camera.x = depth * f64::from(if out { 400 - step } else { step }) / 400.0;
+                camera.anchor = settle(&tree, LENS, camera).unwrap();
+                // The point is where a zoom about it aims already.
+                assert_eq!(
+                    aim(&tree, LENS, camera, 0.37).unwrap().anchor,
+                    camera.anchor
+                );
+                names.push(camera.anchor.clone());
+            }
+            names
+        };
+        camera.anchor = settle(&tree, LENS, &camera).unwrap();
+        let deep = camera.anchor.clone();
+        assert!(100 < deep.path.len());
+        // Out to the root, every digit kept, and in again: every name on the
+        // way matches the one the same view had on the way out.
+        let mut out = zoom(&mut camera, true);
+        assert_eq!(camera.anchor.path, [] as [Branch; 0]);
+        assert!(20 < camera.anchor.digits.len());
+        out.reverse();
+        assert_eq!(zoom(&mut camera, false), out);
+        assert_eq!(camera.anchor, deep);
+
+        // Aiming elsewhere keeps the picture and drops what the view cannot show.
+        camera.x = 20.0;
+        camera.anchor = settle(&tree, LENS, &camera).unwrap();
+        let before = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
+        let aimed = aim(&tree, LENS, &camera, 0.6).unwrap();
+        (camera.anchor, camera.a) = (aimed.anchor, aimed.a);
+        assert!(camera.anchor.digits.len() < 16);
+        let after = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
+        assert_eq!(before.boxes.len(), after.boxes.len());
+        for (b, a) in before.boxes.iter().zip(&after.boxes) {
+            assert_eq!((b.node, b.rank), (a.node, a.rank));
+            assert!((b.y0 - a.y0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn a_view_across_an_edge_is_exact_on_both_sides_at_any_depth() {
+        // The root halves; above the edge between its children the path
+        // follows each node's last child, below it each node's first.
+        let mut tree = Tree::new(1);
+        tree.set(ROOT, 0, weights(&[0.5, 0.5])).unwrap();
+        let mut ends = Vec::new();
+        for side in [1, 0] {
+            let mut node = tree.child(ROOT, 1 - side).unwrap();
+            for _ in 0..80 {
+                tree.set(node, 0, weights(&[0.5, 0.5])).unwrap();
+                node = tree.child(node, side).unwrap();
+            }
+            tree.set(node, 0, weights(&[0.5, 0.5])).unwrap();
+            ends.push((node, side));
+        }
+        // The edge across the middle of a view √2 the height of the
+        // children 2^-82 of the root that meet at it.
+        let mut camera = cam(ROOT, 81.5 * LN_2, at(&[], &[0x80]), 0.5);
+        camera.anchor = settle(&tree, LENS, &camera).unwrap();
+        // No child of the root covers the view: the point stays the root's.
+        assert_eq!(camera.anchor, at(&[], &[0x80]));
+        let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
+        let height = 0.5f64.sqrt();
+        for ((node, side), y0) in ends.into_iter().zip([0.5 - height, 0.5]) {
+            let b = frame
+                .boxes
+                .iter()
+                .find(|b| b.node == node && b.branch == Some(side))
+                .expect("the child beside the edge is in view");
+            near(b.y0, y0);
+            near(b.y1, y0 + height);
+        }
+        // A point 2^-90 of the root off the edge is a point of one side,
+        // named by the deepest node there that covers the view.
+        let mut digits = vec![0x80; 1];
+        digits.extend([0; 10]);
+        digits.push(0x40);
+        camera.anchor = at(&[], &digits);
+        camera.x = 100.0 * LN_2;
+        camera.anchor = settle(&tree, LENS, &camera).unwrap();
+        assert_eq!(camera.anchor.path.len(), 82);
+        assert_eq!(camera.anchor.path[0], 1);
     }
 
     #[test]
     fn the_view_clamps_inside_the_root_and_picks_beyond_it_find_the_origin() {
-        let (tree, child) = chain_tree(&[0.5, 0.5], &[0]);
-        let camera = cam(ROOT, 0.5, top(child), 0.4);
-        let a = clamp_position(&tree, LENS, camera).unwrap();
+        let (tree, _) = chain_tree(&[0.5, 0.5], &[0]);
+        let camera = cam(ROOT, 0.5, top(&[0]), 0.4);
+        let a = clamp_position(&tree, LENS, &camera).unwrap();
         near(a, 0.0);
         near(
-            extent(&tree, LENS, Camera { a, ..camera }).unwrap().top,
+            extent(&tree, LENS, &Camera { a, ..camera }).unwrap().top,
             0.0,
         );
 
         let empty = Tree::new(1);
-        let camera = cam(ROOT, 0.0, top(ROOT), 0.0);
-        let frame = layout(&empty, LENS, camera, VIEW, 1.0).unwrap();
+        let camera = cam(ROOT, 0.0, top(&[]), 0.0);
+        let frame = layout(&empty, LENS, &camera, VIEW, 1.0).unwrap();
         assert_eq!(frame.misses.len(), 1);
-        let hit = pick(&empty, LENS, &frame, camera, VIEW, 500.0, 400.0, 1.0)
+        let hit = pick(&empty, LENS, &frame, &camera, VIEW, 500.0, 400.0, 1.0)
             .unwrap()
             .unwrap();
         assert_eq!((hit.r#box.node, hit.exact), (ROOT, false));
         assert_eq!(
-            pick(&empty, LENS, &frame, camera, VIEW, -1.0, 400.0, 1.0).unwrap(),
+            pick(&empty, LENS, &frame, &camera, VIEW, -1.0, 400.0, 1.0).unwrap(),
             None
         );
     }

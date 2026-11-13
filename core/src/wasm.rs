@@ -34,7 +34,7 @@ struct Message<'a> {
 #[serde(rename_all = "camelCase")]
 struct RunMessage<'a> {
     rank: u32,
-    branches: &'a [u32],
+    branches: std::borrow::Cow<'a, [u32]>,
     ln_below: std::borrow::Cow<'a, [f64]>,
 }
 

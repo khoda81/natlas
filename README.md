@@ -213,9 +213,11 @@ Edit the text in the top path inspector and select a result to fly there.
 
 `export/service.py` owns the model-independent RPC handlers and the model's
 forward passes. Node naming, the distributions themselves (sorted once per
-node, 13 bytes per vocabulary entry: each child's ln weight as an f32, the
-precision of a model's logits, and every 8th edge, the rest summed from those
-when read; the most recently read within `--cache` GiB, 1 by default) and
+node and packed in about 4 bytes per vocabulary entry: branches at the
+vocabulary's width, and ln weights as f32s, the precision of a model's
+logits, each told by its step below the one before, with every 16th edge;
+the rest are summed from those when read. The most recently read are kept
+within `--cache` GiB, 1 by default) and
 Expand's walk belong to the shared Rust core, which recordings in the browser
 use too; the server computes each distribution the walk reports missing,
 reading a request's path in one pass. A walk runs on a worker thread, sends

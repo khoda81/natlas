@@ -1,6 +1,7 @@
 //! Integer-sequence distributions, independent of the renderer and transport.
 pub mod distribution;
 pub mod layout;
+mod packed;
 pub mod point;
 pub mod tree;
 

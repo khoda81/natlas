@@ -470,9 +470,11 @@ impl Walk {
                 (vec![run], Some(branch), more)
             }
             Err(Reading::Branches(branches)) => {
-                let mut children: Vec<_> = branches
-                    .iter()
-                    .filter_map(|&branch| distribution.locate_rank(distribution.rank(branch)?))
+                // Their ranks in one pass: a packed node has no table of them.
+                let mut children: Vec<_> = distribution
+                    .ranks(branches)
+                    .into_iter()
+                    .filter_map(|rank| distribution.locate_rank(rank?))
                     .collect();
                 children.sort_unstable();
                 children.dedup();
@@ -578,7 +580,10 @@ mod tests {
         let Advance::Children(ROOT, runs, Some(3)) = walk.advance(&mut tree, 0).unwrap() else {
             panic!("the root places branch 2");
         };
-        assert_eq!((runs[0].rank(), runs[0].branches()), (2, &[2][..]));
+        assert_eq!(
+            (runs[0].rank(), runs[0].branches().as_ref()),
+            (2, [2].as_slice())
+        );
         let child = child_hash(ROOT, 2);
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Missing(child));
         tree.set(child, 0, weights(&[0.5, 0.5])).unwrap();
@@ -594,7 +599,7 @@ mod tests {
         let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
             panic!("the root lists the children at the points");
         };
-        assert_eq!(runs[0].branches(), [0, 1]);
+        assert_eq!(runs[0].branches().as_ref(), [0, 1]);
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
         let mut walk = Walk::new(ROOT, Read::points(at(&[0.9, 0.5]))).unwrap();
         assert!(matches!(
@@ -619,7 +624,7 @@ mod tests {
         let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
             panic!("the root lists the branches it has");
         };
-        assert_eq!(runs[0].branches(), [1, 2]);
+        assert_eq!(runs[0].branches().as_ref(), [1, 2]);
         let part = |ln_mass| Part {
             top: vec![0x80],
             ln_mass,
@@ -648,11 +653,11 @@ mod tests {
         let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
             panic!("the root places the path's branch");
         };
-        assert_eq!(runs[0].branches(), [2]);
+        assert_eq!(runs[0].branches().as_ref(), [2]);
         let Advance::Children(node, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
             panic!("the node the path reaches lists the children at the points");
         };
-        assert_eq!((node, runs[0].branches()), (child, &[0, 1][..]));
+        assert_eq!((node, runs[0].branches().as_ref()), (child, &[0, 1][..]));
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
         // Nothing to read is nothing to compute.
         let mut walk = Walk::new(child_hash(ROOT, 9), Read::default()).unwrap();

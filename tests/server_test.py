@@ -161,7 +161,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual((kind, node, count), ("children", 0, 3))
         ((rank, branches, ln_below),) = runs
         self.assertEqual((rank, branches), (0, [1, 3]))
-        self.assertAlmostEqual(math.exp(ln_below[-1]), 0.2, places=12)
+        # A measure's weights are kept as f32s.
+        self.assertAlmostEqual(math.exp(ln_below[-1]), 0.2, places=7)
         self.assertIsNone(tree.advance(walk, 0))
         with self.assertRaises(ValueError):
             tree.start(0, [], parts=[(b"", math.nan, 1)])

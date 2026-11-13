@@ -514,7 +514,7 @@ mod tests {
     use super::*;
 
     fn weights(weights: &[f64]) -> Distribution {
-        Distribution::from_weights(&weights.iter().map(|w| w.ln()).collect::<Vec<_>>()).unwrap()
+        Distribution::exact(weights)
     }
 
     /// The points with these masses below them, each a part of its own.

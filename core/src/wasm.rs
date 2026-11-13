@@ -35,7 +35,7 @@ struct Message<'a> {
 struct RunMessage<'a> {
     rank: u32,
     branches: &'a [u32],
-    ln_below: &'a [f64],
+    ln_below: std::borrow::Cow<'a, [f64]>,
 }
 
 /// The integer-sequence tree, its distributions and their geometry, owned by

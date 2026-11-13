@@ -7,6 +7,7 @@
 //! every child's extent precise relative to its own weight, however light it
 //! is or deep in its parent's tail.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::OnceLock;
@@ -49,20 +50,91 @@ pub struct Run {
     branches: Vec<Branch>,
     /// ln of the mass at and below each edge: edge i tops rank `rank + i`,
     /// and the last one bottoms the run.
-    ln_below: Vec<f64>,
+    edges: Edges,
     /// ln Σ p (−ln p) over the run's children from each edge to the run's
     /// end, accumulated from the light end: a merged band's area-preserving
-    /// width without visiting its children. Derived from `ln_below` when
-    /// first read: only layout reads it, and a server, which builds a run
-    /// of its whole vocabulary per node, never does (a third of the cost).
+    /// width without visiting its children. Derived when first read: only
+    /// layout reads it, and a server, which builds a run of its whole
+    /// vocabulary per node, never does.
     ln_surprisal_below: OnceLock<Vec<f64>>,
 }
 
 /// Runs are what they place: the derived sums are not compared.
 impl PartialEq for Run {
     fn eq(&self, other: &Self) -> bool {
-        (self.rank, &self.branches, &self.ln_below)
-            == (other.rank, &other.branches, &other.ln_below)
+        (self.rank, &self.branches, &self.edges) == (other.rank, &other.branches, &other.edges)
+    }
+}
+
+/// A measure's run keeps every `KEPT`th edge and sums any other from the
+/// nearest kept one below it. Measured on a 152k vocabulary, a read of 1600
+/// points takes 2.4 ms with 8 (1.5 ms keeping every edge), 3.5 ms with 16 and
+/// 5.9 ms with 32, for 13, 12.5 and 12.25 bytes per child.
+const KEPT: usize = 8;
+
+/// A run's edges.
+#[derive(Clone, Debug, PartialEq)]
+enum Edges {
+    /// Every edge, as a source sent them.
+    Exact(Vec<f64>),
+    /// A measure's own children: each one's ln weight as an f32, the
+    /// precision a model computes its logits in (about 1e-15 nats of KL
+    /// divergence from f64 on Qwen3-4B), and the sums of those weights from
+    /// the light end up to ranks 0, `KEPT`, 2 `KEPT`, …; the first is the
+    /// total. Edge i is the sum up to i less the total, summed from the
+    /// kept one below it just as the kept ones were: every edge is exact
+    /// for these weights, and the top is 0.
+    Weights {
+        ln_weights: Vec<f32>,
+        kept: Vec<f64>,
+    },
+}
+
+impl Edges {
+    /// ln of the weight from `at` to the end, before the total is taken off.
+    fn sum_below(ln_weights: &[f32], kept: &[f64], at: usize) -> f64 {
+        let block = at.div_ceil(KEPT);
+        let (mut sum, from) = match kept.get(block) {
+            Some(&sum) => (sum, block * KEPT),
+            None => (f64::NEG_INFINITY, ln_weights.len()),
+        };
+        for weight in ln_weights[at..from].iter().rev() {
+            sum = ln_add(sum, f64::from(*weight));
+        }
+        sum
+    }
+
+    fn edge(&self, at: usize) -> f64 {
+        match self {
+            Self::Exact(edges) => edges[at],
+            Self::Weights { ln_weights, kept } => Self::sum_below(ln_weights, kept, at) - kept[0],
+        }
+    }
+
+    /// Edges `from` through `to`, summed once.
+    fn range(&self, from: usize, to: usize) -> Cow<'_, [f64]> {
+        match self {
+            Self::Exact(edges) => Cow::Borrowed(&edges[from..=to]),
+            Self::Weights { ln_weights, kept } => {
+                let mut sum = Self::sum_below(ln_weights, kept, to);
+                let mut edges = vec![sum - kept[0]; to - from + 1];
+                for at in (from..to).rev() {
+                    sum = ln_add(sum, f64::from(ln_weights[at]));
+                    edges[at - from] = sum - kept[0];
+                }
+                Cow::Owned(edges)
+            }
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        use std::mem::size_of;
+        match self {
+            Self::Exact(edges) => edges.capacity() * size_of::<f64>(),
+            Self::Weights { ln_weights, kept } => {
+                ln_weights.capacity() * size_of::<f32>() + kept.capacity() * size_of::<f64>()
+            }
+        }
     }
 }
 
@@ -93,9 +165,29 @@ impl Run {
         Ok(Self {
             rank,
             branches,
-            ln_below,
+            edges: Edges::Exact(ln_below),
             ln_surprisal_below: OnceLock::new(),
         })
+    }
+
+    /// A measure's children from rank 0, at least one: their branches and
+    /// ln weights, heaviest first.
+    fn weights(branches: Vec<Branch>, ln_weights: Vec<f32>) -> Self {
+        assert!(!branches.is_empty() && branches.len() == ln_weights.len());
+        let mut kept = vec![0.0; ln_weights.len().div_ceil(KEPT)];
+        let mut sum = f64::NEG_INFINITY;
+        for (at, weight) in ln_weights.iter().enumerate().rev() {
+            sum = ln_add(sum, f64::from(*weight));
+            if at % KEPT == 0 {
+                kept[at / KEPT] = sum;
+            }
+        }
+        Self {
+            rank: 0,
+            branches,
+            edges: Edges::Weights { ln_weights, kept },
+            ln_surprisal_below: OnceLock::new(),
+        }
     }
 
     fn bytes(&self) -> usize {
@@ -103,15 +195,15 @@ impl Run {
         let sums = self.ln_surprisal_below.get().map_or(0, Vec::capacity);
         size_of::<Self>()
             + self.branches.capacity() * size_of::<Branch>()
-            + (self.ln_below.capacity() + sums) * size_of::<f64>()
+            + self.edges.bytes()
+            + sums * size_of::<f64>()
     }
 
     fn ln_surprisal_below(&self) -> &[f64] {
         self.ln_surprisal_below.get_or_init(|| {
-            let ln_below = &self.ln_below;
-            let mut sums = vec![f64::NEG_INFINITY; ln_below.len()];
-            for i in (0..self.branches.len()).rev() {
-                let ln_p = ln_between(ln_below[i], ln_below[i + 1]);
+            let mut sums = vec![f64::NEG_INFINITY; self.len() + 1];
+            for i in (0..self.len()).rev() {
+                let ln_p = self.ln_p(i);
                 // p (−ln p) is zero both at p = 0 and at p = 1.
                 let ln_surprisal = if ln_p < 0.0 && ln_p > f64::NEG_INFINITY {
                     ln_p + (-ln_p).ln()
@@ -151,8 +243,9 @@ impl Run {
         &self.branches
     }
 
-    pub fn ln_below(&self) -> &[f64] {
-        &self.ln_below
+    /// Every edge, top to bottom.
+    pub fn ln_below(&self) -> Cow<'_, [f64]> {
+        self.edges.range(0, self.len())
     }
 
     pub fn branch(&self, at: usize) -> Branch {
@@ -161,11 +254,14 @@ impl Run {
 
     /// The top edge of the child at `at`; `at == len` is the run's bottom.
     pub fn edge(&self, at: usize) -> f64 {
-        self.ln_below[at]
+        self.edges.edge(at)
     }
 
     pub fn ln_p(&self, at: usize) -> f64 {
-        ln_between(self.ln_below[at], self.ln_below[at + 1])
+        match &self.edges {
+            Edges::Exact(edges) => ln_between(edges[at], edges[at + 1]),
+            Edges::Weights { ln_weights, kept } => f64::from(ln_weights[at]) - kept[0],
+        }
     }
 
     /// ln Σ p (−ln p) over children [from, to).
@@ -182,7 +278,31 @@ impl Run {
     /// The child holding a point, told by which edges it is `below`, itself
     /// included: the first whose bottom edge it is not.
     fn holding_by(&self, below: impl Fn(f64) -> bool) -> usize {
-        self.ln_below[1..].partition_point(|&edge| below(edge))
+        match &self.edges {
+            Edges::Exact(edges) => edges[1..].partition_point(|&edge| below(edge)),
+            Edges::Weights { .. } => {
+                // The kept edges under the top, and the bottom: the first
+                // the point is not below, then the edges summed above it.
+                let len = self.len();
+                let blocks = len.div_ceil(KEPT);
+                let at = |block: usize| (block * KEPT).min(len);
+                let (mut low, mut high) = (0, blocks);
+                while low < high {
+                    let middle = (low + high) / 2;
+                    if below(self.edge(at(middle + 1))) {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                if low == blocks {
+                    return len;
+                }
+                let (from, to) = (at(low), at(low + 1));
+                let edges = self.edges.range(from, to);
+                from + edges[1..].partition_point(|&edge| below(edge))
+            }
+        }
     }
 
     /// Children [from, to) as a run of their own.
@@ -190,7 +310,7 @@ impl Run {
         Self {
             rank: self.rank + from as Rank,
             branches: self.branches[from..to].to_vec(),
-            ln_below: self.ln_below[from..=to].to_vec(),
+            edges: Edges::Exact(self.edges.range(from, to).into_owned()),
             ln_surprisal_below: OnceLock::new(),
         }
     }
@@ -279,35 +399,55 @@ impl Distribution {
         if ln_weights.iter().any(|weight| weight.is_nan()) {
             return Err("a weight is not a number".into());
         }
+        // Kept as f32, and so ranked as f32: ties among them by branch.
         // Each weight beside its branch: sorting them together reads memory
         // in order rather than looking every weight up.
-        let mut order: Vec<(f64, Branch)> = ln_weights
+        let mut order: Vec<(f32, Branch)> = ln_weights
             .iter()
-            .copied()
             .zip(0..)
-            .filter(|&(weight, _)| weight > f64::NEG_INFINITY)
+            .map(|(&weight, branch)| (weight as f32, branch))
+            .filter(|&(weight, _)| weight > f32::NEG_INFINITY)
             .collect();
-        order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        let mut ln_below = vec![f64::NEG_INFINITY; order.len() + 1];
-        for i in (0..order.len()).rev() {
-            ln_below[i] = ln_add(ln_below[i + 1], order[i].0);
+        if order.iter().any(|(weight, _)| weight.is_infinite()) {
+            return Err("a weight is past what an f32 holds".into());
         }
-        let total = ln_below[0];
-        if total.is_finite() {
-            for edge in &mut ln_below {
-                *edge = (*edge - total).min(0.0);
-            }
+        order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        if order.is_empty() {
+            return Ok(Self::new(Run::end_at(0)));
         }
         let mut ranks = vec![NO_RANK; ln_weights.len()];
         for (rank, &(_, branch)) in (0..).zip(&order) {
             ranks[branch as usize] = rank;
         }
-        let branches = order.into_iter().map(|(_, branch)| branch).collect();
+        let (weights, branches) = order.into_iter().unzip();
         // One run of distinct branches: nothing for `from_runs` to check.
         Ok(Self {
-            runs: vec![Run::new(0, branches, ln_below)?],
+            runs: vec![Run::weights(branches, weights)],
             rank: Ranks::Dense(ranks),
         })
+    }
+
+    /// Weights by branch, exact in f64 where a measure's keep f32: tests of
+    /// geometry rather than of what a server keeps.
+    #[cfg(test)]
+    pub(crate) fn exact(weights: &[f64]) -> Self {
+        let mut order: Vec<Branch> = (0..weights.len() as Branch)
+            .filter(|&branch| 0.0 < weights[branch as usize])
+            .collect();
+        order.sort_by(|&a, &b| {
+            weights[b as usize]
+                .total_cmp(&weights[a as usize])
+                .then(a.cmp(&b))
+        });
+        let mut ln_below = vec![f64::NEG_INFINITY; order.len() + 1];
+        for i in (0..order.len()).rev() {
+            ln_below[i] = ln_add(ln_below[i + 1], weights[order[i] as usize].ln());
+        }
+        let total = ln_below[0];
+        for edge in &mut ln_below {
+            *edge = (*edge - total).min(0.0);
+        }
+        Self::new(Run::new(0, order, ln_below).unwrap())
     }
 
     pub fn runs(&self) -> &[Run] {
@@ -346,7 +486,7 @@ impl Distribution {
         // A gap holds what its neighbours leave: never a negative mass.
         if runs
             .windows(2)
-            .any(|pair| pair[0].ln_below[pair[0].len()] < pair[1].ln_below[0])
+            .any(|pair| pair[0].edge(pair[0].len()) < pair[1].edge(0))
         {
             return Err("runs overlap in mass".into());
         }
@@ -382,7 +522,7 @@ impl Distribution {
     /// rank its last child ends at.
     pub fn count(&self) -> Option<Rank> {
         let last = self.runs.last().expect("a distribution has a run");
-        (last.ln_below[last.len()] == f64::NEG_INFINITY).then(|| last.end())
+        (last.edge(last.len()) == f64::NEG_INFINITY).then(|| last.end())
     }
 
     /// Whether every child is known.
@@ -406,7 +546,7 @@ impl Distribution {
         }
         let run = self.runs.partition_point(|run| run.end() < rank);
         let found = self.runs.get(run)?;
-        (found.rank <= rank).then(|| found.ln_below[(rank - found.rank) as usize])
+        (found.rank <= rank).then(|| found.edge((rank - found.rank) as usize))
     }
 
     /// Whether the node has no children at all.
@@ -418,7 +558,8 @@ impl Distribution {
         match before {
             0 => self.runs.first().is_none_or(|run| run.rank > 0),
             _ if before == self.runs.len() => {
-                self.runs[before - 1].ln_below.last() != Some(&f64::NEG_INFINITY)
+                let run = &self.runs[before - 1];
+                run.edge(run.len()) != f64::NEG_INFINITY
             }
             _ => self.runs[before - 1].end() < self.runs[before].rank,
         }
@@ -426,19 +567,22 @@ impl Distribution {
 
     pub fn item_top(&self, item: Item) -> f64 {
         match item {
-            Item::Child { run, at } => self.runs[run].ln_below[at],
+            Item::Child { run, at } => self.runs[run].edge(at),
             Item::Gap { before: 0 } => 0.0,
-            Item::Gap { before } => *self.runs[before - 1].ln_below.last().expect("edges"),
+            Item::Gap { before } => {
+                let run = &self.runs[before - 1];
+                run.edge(run.len())
+            }
         }
     }
 
     pub fn item_bottom(&self, item: Item) -> f64 {
         match item {
-            Item::Child { run, at } => self.runs[run].ln_below[at + 1],
+            Item::Child { run, at } => self.runs[run].edge(at + 1),
             Item::Gap { before } => self
                 .runs
                 .get(before)
-                .map_or(f64::NEG_INFINITY, |run| run.ln_below[0]),
+                .map_or(f64::NEG_INFINITY, |run| run.edge(0)),
         }
     }
 
@@ -495,13 +639,11 @@ impl Distribution {
     /// The item holding a point, told by which edges it is `below`, itself
     /// included: a point a float cannot hold finds its item as exactly.
     pub fn locate_by(&self, below: impl Fn(f64) -> bool) -> Option<Item> {
-        let run = self
-            .runs
-            .partition_point(|run| below(run.ln_below[run.len()]));
+        let run = self.runs.partition_point(|run| below(run.edge(run.len())));
         let Some(found) = self.runs.get(run) else {
             return self.gap_exists(run).then_some(Item::Gap { before: run });
         };
-        if below(found.ln_below[0]) && !found.is_empty() {
+        if below(found.edge(0)) && !found.is_empty() {
             Some(Item::Child {
                 run,
                 at: found.holding_by(below),
@@ -641,8 +783,8 @@ impl Builder {
         Self {
             rank: run.rank,
             branches: run.branches.clone(),
-            ln_below: run.ln_below.clone(),
-            fresh: vec![fresh; run.ln_below.len()],
+            ln_below: run.ln_below().into_owned(),
+            fresh: vec![fresh; run.len() + 1],
         }
     }
 
@@ -653,7 +795,7 @@ impl Builder {
     /// Join a run starting at or before this one's end; `None` where a rank
     /// names another branch.
     fn add(&mut self, run: &Run, fresh: bool) -> Option<()> {
-        for (i, &edge) in run.ln_below.iter().enumerate() {
+        for (i, &edge) in run.ln_below().iter().enumerate() {
             let at = (run.rank - self.rank) as usize + i;
             if at < self.ln_below.len() {
                 if fresh || !self.fresh[at] {
@@ -714,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn weights_rank_heaviest_first_and_keep_tiny_children_exact() {
+    fn weights_rank_heaviest_first_and_keep_tiny_children_as_f32s() {
         let tiny = 1e-300f64;
         let d = Distribution::from_weights(&[
             0.2f64.ln(),
@@ -729,13 +871,53 @@ mod tests {
         assert_eq!(run.branches(), [1, 3, 0, 5, 4]);
         // Every branch's rank, none for a weightless one or one past them.
         let ranks: Vec<_> = (0..7).map(|branch| d.rank(branch)).collect();
-        assert_eq!(ranks, [Some(2), Some(0), None, Some(1), Some(4), Some(3), None]);
-        close(run.ln_p(0), (0.5f64 / 1.2).ln());
+        assert_eq!(
+            ranks,
+            [Some(2), Some(0), None, Some(1), Some(4), Some(3), None]
+        );
+        // Each child's ln weight to an f32's precision.
+        let near = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() <= 1e-7 * expected.abs(),
+                "{actual} is not {expected}"
+            );
+        };
+        near(run.ln_p(0), (0.5f64 / 1.2).ln());
         // The lightest child keeps its own weight, far below any float of 1 − cdf.
-        close(run.ln_p(4), tiny.ln() - 1.2f64.ln());
+        near(run.ln_p(4), tiny.ln() - 1.2f64.ln());
         assert_eq!(*run.ln_below().last().unwrap(), f64::NEG_INFINITY);
         assert!(Distribution::from_weights(&[]).unwrap().ended());
         assert!(Distribution::from_weights(&[f64::NAN]).is_err());
+    }
+
+    #[test]
+    fn kept_edges_sum_to_the_same_edges_as_summing_them_all() {
+        // Edges summed from the kept ones are those of one pass over every
+        // weight, and points find the same children among them.
+        let weights: Vec<f64> = (0..1000)
+            .map(|i| -(f64::from(i % 97) * 0.37 + f64::from(i) * 0.01))
+            .collect();
+        let d = Distribution::from_weights(&weights).unwrap();
+        let run = &d.runs()[0];
+        let mut sorted: Vec<f32> = weights.iter().map(|&w| w as f32).collect();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let mut all = vec![f64::NEG_INFINITY; sorted.len() + 1];
+        for i in (0..sorted.len()).rev() {
+            all[i] = ln_add(all[i + 1], f64::from(sorted[i]));
+        }
+        let total = all[0];
+        let all: Vec<f64> = all.iter().map(|edge| edge - total).collect();
+        assert_eq!(&run.ln_below()[..], &all[..]);
+        assert_eq!((0..=1000).map(|at| run.edge(at)).collect::<Vec<_>>(), all);
+        for i in 0..4000u32 {
+            let ln_below = all[(i / 4) as usize] - 1e-9 * f64::from(i % 3);
+            assert_eq!(
+                run.holding(ln_below),
+                all[1..].partition_point(|&edge| edge >= ln_below)
+            );
+        }
+        assert_eq!(run.holding(1.0), 0);
+        assert_eq!(run.holding(f64::NEG_INFINITY), 1000);
     }
 
     #[test]

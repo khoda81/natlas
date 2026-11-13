@@ -1206,7 +1206,7 @@ mod tests {
     const LENS: Lens = Lens { p: 0, q: 0 };
 
     fn weights(weights: &[f64]) -> Distribution {
-        Distribution::from_weights(&weights.iter().map(|w| w.ln()).collect::<Vec<_>>()).unwrap()
+        Distribution::exact(weights)
     }
 
     fn cam(origin: NodeId, x: f64, anchor: Anchor, a: f64) -> Camera {

@@ -5,7 +5,7 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::distribution::Distribution;
-use crate::tree::{Advance, Read, Tree, Walk};
+use crate::tree::{Advance, Read, Tree, Walk, Within};
 
 fn error(message: String) -> PyErr {
     PyValueError::new_err(message)
@@ -77,21 +77,30 @@ impl PythonTree {
         self.inner.forget(node, measure).map_err(error)
     }
 
-    /// Begin an Expand down `path` below `node`. An unknown node raises
-    /// KeyError.
-    fn start_path(&self, node: u64, path: Vec<u32>) -> PyResult<PythonWalk> {
-        self.start(node, Read::Path(path))
-    }
-
-    /// Begin an Expand for the children of `node` holding `points`, each ln
-    /// of the mass below it. A point above 0 raises ValueError.
-    fn start_points(&self, node: u64, points: Vec<f64>) -> PyResult<PythonWalk> {
-        self.start(node, Read::Points(points))
-    }
-
-    /// Begin an Expand for the children of `node` along `branches`.
-    fn start_branches(&self, node: u64, branches: Vec<u32>) -> PyResult<PythonWalk> {
-        self.start(node, Read::Branches(branches))
+    /// Begin an Expand down `path` below `node`, then for the children of
+    /// the node it ends at holding `points`, each ln of the mass below it,
+    /// or for those along `branches`. An unknown node raises KeyError; a
+    /// point above 0, or both points and branches, ValueError.
+    #[pyo3(signature = (node, path, points=None, branches=None))]
+    fn start(
+        &self,
+        node: u64,
+        path: Vec<u32>,
+        points: Option<Vec<f64>>,
+        branches: Option<Vec<u32>>,
+    ) -> PyResult<PythonWalk> {
+        self.known(node)?;
+        let within = match (points, branches) {
+            (Some(_), Some(_)) => {
+                return Err(error("an Expand reads points or branches, not both".into()))
+            }
+            (Some(points), None) => Some(Within::Points(points)),
+            (None, Some(branches)) => Some(Within::Branches(branches)),
+            (None, None) => None,
+        };
+        Ok(PythonWalk {
+            inner: Walk::new(node, Read { path, within }).map_err(error)?,
+        })
     }
 
     /// The walk's next message as ("children", node, runs, children): runs
@@ -132,13 +141,6 @@ impl PythonTree {
 }
 
 impl PythonTree {
-    fn start(&self, node: u64, read: Read) -> PyResult<PythonWalk> {
-        self.known(node)?;
-        Ok(PythonWalk {
-            inner: Walk::new(node, read).map_err(error)?,
-        })
-    }
-
     fn known(&self, node: u64) -> PyResult<()> {
         if self.inner.contains(node) {
             Ok(())

@@ -110,23 +110,25 @@ past any view.
 
 Each server serves one measure through two Connect RPCs:
 
-- `Expand(node, path | points | branches)` reads the tree below `node` one of
-  three ways, streaming one `Children` message per node: the runs it places
-  there, and how many children the node has where the server knows.
-  - A **path** places each branch, one child per node. Flights and restores
-    read by paths, from the deepest node already placed.
+- `Expand(node, path, points | branches)` reads the tree at an address below
+  `node`: down a path of branches, then within the node the path ends at. It
+  streams one `Children` message per node: the runs it places there, and how
+  many children the node has where the server knows.
+  - The **path** places each branch, one child per node. Alone, it names the
+    node it reaches without reading it: flights and restores read by paths,
+    from the deepest node already placed.
   - **Points**, each ln of the mass below it, place the children holding
     them, each once; where all of them fall in one child, that child alone,
-    and the same points within it. Views read by points: a child in view is
-    sampled through its parent, so the server descends into it, and a deep
-    zoom reaches its target in one request. Ln of the mass below reaches a
-    node's deep tail as exactly as its head.
+    and the same points within it. Views read by points: a child the tree
+    knows only as its parent's branch is sampled down that branch, and a
+    deep zoom reaches its target in one request. Ln of the mass below
+    reaches a node's deep tail as exactly as its head.
   - **Branches** place those children of the node: how a view reads q, which
     is per-branch metadata, for the children p placed.
 
   Every message but the last places a single child, which names the next
-  node. A request on a node the server has not learned is asked again after
-  a path from the root teaches it.
+  node. A request on a node the server has not learned is asked again from
+  the root, down the node's own path first.
 - `Search(text)` maps text to its complete path, using the model's tokenizer,
   and teaches the server the ids along it. The browser searches on input and
   opens the result only when it is selected. Music services return

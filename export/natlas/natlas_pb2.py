@@ -24,33 +24,31 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13natlas/natlas.proto\x12\x06natlas\"\x8b\x01\n\rExpandRequest\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x1c\n\x04path\x18\x02 \x01(\x0b\x32\x0c.natlas.PathH\x00\x12 \n\x06points\x18\x03 \x01(\x0b\x32\x0e.natlas.PointsH\x00\x12$\n\x08\x62ranches\x18\x04 \x01(\x0b\x32\x10.natlas.BranchesH\x00\x42\x06\n\x04read\"\x18\n\x04Path\x12\x10\n\x08\x62ranches\x18\x01 \x03(\r\"\x1a\n\x06Points\x12\x10\n\x08ln_below\x18\x01 \x03(\x01\"\x1c\n\x08\x42ranches\x12\x10\n\x08\x62ranches\x18\x01 \x03(\r\"C\n\x08\x43hildren\x12\x19\n\x04runs\x18\x01 \x03(\x0b\x32\x0b.natlas.Run\x12\x12\n\x05\x63ount\x18\x02 \x01(\rH\x00\x88\x01\x01\x42\x08\n\x06_count\"7\n\x03Run\x12\x0c\n\x04rank\x18\x01 \x01(\r\x12\x10\n\x08\x62ranches\x18\x02 \x03(\r\x12\x10\n\x08ln_below\x18\x03 \x03(\x01\"\x1d\n\rSearchRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\"\x1e\n\x0eSearchResponse\x12\x0c\n\x04path\x18\x01 \x03(\r\"1\n\x08Snapshot\x12%\n\nrecordings\x18\x02 \x03(\x0b\x32\x11.natlas.Recording\"=\n\tRecording\x12\x0c\n\x04path\x18\x01 \x03(\r\x12\"\n\x08\x63hildren\x18\x03 \x01(\x0b\x32\x10.natlas.Children2v\n\x06Natlas\x12\x33\n\x06\x45xpand\x12\x15.natlas.ExpandRequest\x1a\x10.natlas.Children0\x01\x12\x37\n\x06Search\x12\x15.natlas.SearchRequest\x1a\x16.natlas.SearchResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13natlas/natlas.proto\x12\x06natlas\"}\n\rExpandRequest\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x0c\n\x04path\x18\x02 \x03(\r\x12 \n\x06points\x18\x03 \x01(\x0b\x32\x0e.natlas.PointsH\x00\x12$\n\x08\x62ranches\x18\x04 \x01(\x0b\x32\x10.natlas.BranchesH\x00\x42\x08\n\x06within\"\x1a\n\x06Points\x12\x10\n\x08ln_below\x18\x01 \x03(\x01\"\x1c\n\x08\x42ranches\x12\x10\n\x08\x62ranches\x18\x01 \x03(\r\"C\n\x08\x43hildren\x12\x19\n\x04runs\x18\x01 \x03(\x0b\x32\x0b.natlas.Run\x12\x12\n\x05\x63ount\x18\x02 \x01(\rH\x00\x88\x01\x01\x42\x08\n\x06_count\"7\n\x03Run\x12\x0c\n\x04rank\x18\x01 \x01(\r\x12\x10\n\x08\x62ranches\x18\x02 \x03(\r\x12\x10\n\x08ln_below\x18\x03 \x03(\x01\"\x1d\n\rSearchRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\"\x1e\n\x0eSearchResponse\x12\x0c\n\x04path\x18\x01 \x03(\r\"1\n\x08Snapshot\x12%\n\nrecordings\x18\x02 \x03(\x0b\x32\x11.natlas.Recording\"=\n\tRecording\x12\x0c\n\x04path\x18\x01 \x03(\r\x12\"\n\x08\x63hildren\x18\x03 \x01(\x0b\x32\x10.natlas.Children2v\n\x06Natlas\x12\x33\n\x06\x45xpand\x12\x15.natlas.ExpandRequest\x1a\x10.natlas.Children0\x01\x12\x37\n\x06Search\x12\x15.natlas.SearchRequest\x1a\x16.natlas.SearchResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'natlas.natlas_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_EXPANDREQUEST']._serialized_start=32
-  _globals['_EXPANDREQUEST']._serialized_end=171
-  _globals['_PATH']._serialized_start=173
-  _globals['_PATH']._serialized_end=197
-  _globals['_POINTS']._serialized_start=199
-  _globals['_POINTS']._serialized_end=225
-  _globals['_BRANCHES']._serialized_start=227
-  _globals['_BRANCHES']._serialized_end=255
-  _globals['_CHILDREN']._serialized_start=257
-  _globals['_CHILDREN']._serialized_end=324
-  _globals['_RUN']._serialized_start=326
-  _globals['_RUN']._serialized_end=381
-  _globals['_SEARCHREQUEST']._serialized_start=383
-  _globals['_SEARCHREQUEST']._serialized_end=412
-  _globals['_SEARCHRESPONSE']._serialized_start=414
-  _globals['_SEARCHRESPONSE']._serialized_end=444
-  _globals['_SNAPSHOT']._serialized_start=446
-  _globals['_SNAPSHOT']._serialized_end=495
-  _globals['_RECORDING']._serialized_start=497
-  _globals['_RECORDING']._serialized_end=558
-  _globals['_NATLAS']._serialized_start=560
-  _globals['_NATLAS']._serialized_end=678
+  _globals['_EXPANDREQUEST']._serialized_start=31
+  _globals['_EXPANDREQUEST']._serialized_end=156
+  _globals['_POINTS']._serialized_start=158
+  _globals['_POINTS']._serialized_end=184
+  _globals['_BRANCHES']._serialized_start=186
+  _globals['_BRANCHES']._serialized_end=214
+  _globals['_CHILDREN']._serialized_start=216
+  _globals['_CHILDREN']._serialized_end=283
+  _globals['_RUN']._serialized_start=285
+  _globals['_RUN']._serialized_end=340
+  _globals['_SEARCHREQUEST']._serialized_start=342
+  _globals['_SEARCHREQUEST']._serialized_end=371
+  _globals['_SEARCHRESPONSE']._serialized_start=373
+  _globals['_SEARCHRESPONSE']._serialized_end=403
+  _globals['_SNAPSHOT']._serialized_start=405
+  _globals['_SNAPSHOT']._serialized_end=454
+  _globals['_RECORDING']._serialized_start=456
+  _globals['_RECORDING']._serialized_end=517
+  _globals['_NATLAS']._serialized_start=519
+  _globals['_NATLAS']._serialized_end=637
 # @@protoc_insertion_point(module_scope)

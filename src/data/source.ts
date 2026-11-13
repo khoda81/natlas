@@ -29,7 +29,7 @@ export interface Source {
 /** Name each message's node in ``tree``: the start, then the child along the
  * path's next branch, or the single child the points descend into. */
 async function* named(tree: IntervalTree, request: ExpandRequest, answers: AsyncIterable<Children> | Iterable<Children>): AsyncIterable<Step> {
-  const path = "path" in request ? request.path : [];
+  const { path } = request;
   let current = request.node;
   let next: Branch | undefined;
   let depth = 0;
@@ -94,8 +94,8 @@ export class ConnectSource implements Source {
   }
 
   /** Name the request from its node's id. Where the server has not learned
-   * that id (it restarted, or never saw it), a path from the root names it,
-   * and any other read is asked again once the path has. */
+   * that id (it restarted, or never saw it), the same read from the root,
+   * down the node's own path first, names it. */
   async *expand(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step> {
     let answered = false;
     try {
@@ -105,23 +105,18 @@ export class ConnectSource implements Source {
       }
     } catch (error) {
       if (answered || request.node === ROOT || ConnectError.from(error).code !== Code.NotFound) throw error;
-      const path = tree.path(request.node);
-      if ("path" in request) {
-        yield* this.ask(tree, { node: ROOT, path: [...path, ...request.path] }, signal);
-      } else {
-        yield* this.ask(tree, { node: ROOT, path }, signal);
-        yield* this.ask(tree, request, signal);
-      }
+      yield* this.ask(tree, { ...request, node: ROOT, path: [...tree.path(request.node), ...request.path] }, signal);
     }
   }
 
   private ask(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step> {
-    const read = "path" in request
-      ? { case: "path" as const, value: { branches: request.path } }
-      : "points" in request
-        ? { case: "points" as const, value: { lnBelow: request.points } }
-        : { case: "branches" as const, value: { branches: request.branches } };
-    return named(tree, request, this.client.expand({ node: request.node, read }, { signal }));
+    const { node, path, within } = request;
+    const read = within === undefined
+      ? { case: undefined }
+      : "points" in within
+        ? { case: "points" as const, value: { lnBelow: within.points } }
+        : { case: "branches" as const, value: { branches: within.branches } };
+    return named(tree, request, this.client.expand({ node, path, within: read }, { signal }));
   }
 
   async search(text: string, signal?: AbortSignal): Promise<Branch[]> {

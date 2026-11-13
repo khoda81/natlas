@@ -46,9 +46,9 @@ describe("layout", () => {
     expect(pick(tree, lens, frame, cam, view, 500, 400, 1)).toMatchObject({ box: { node: ROOT }, exact: false });
     expect(pick(tree, lens, frame, cam, view, -1, 400, 1)).toBeNull();
     // Two points per visible pixel, through the whole root.
-    expect(frame.misses).toMatchObject([{ node: ROOT, target: ROOT, measure: 0, priority: 800 }]);
-    const { read } = frame.misses[0]!;
-    expect("points" in read && read.points.length).toBe(1600);
+    expect(frame.misses).toMatchObject([{ node: ROOT, measure: 0, read: { path: [] }, priority: 800 }]);
+    const { within } = frame.misses[0]!.read;
+    expect(within !== undefined && "points" in within && within.points.length).toBe(1600);
   });
 
   it("splits heights by p in p's order and sizes widths by -ln q", () => {

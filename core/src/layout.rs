@@ -17,7 +17,7 @@ use std::f64::consts::LN_2;
 
 use crate::distribution::{ln_add, ln_between, Distribution, Item, Rank};
 use crate::point::Point;
-use crate::tree::{child_hash, node_id, Branch, Lens, NodeId, Read, Tree};
+use crate::tree::{child_hash, node_id, Branch, Lens, NodeId, Read, Tree, Within};
 use crate::Result;
 
 /// Shorter than this many pixels, unknown children are not asked for.
@@ -120,14 +120,13 @@ pub struct LayoutBox {
 }
 
 /// What a frame lacks, as the Expand request that fills it: `read` below
-/// `node`, filling in `target`, which is `node` or a child it holds.
+/// `node`, a node the tree holds. A child the tree only knows as its
+/// parent's branch is read down that branch.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Miss {
     #[serde(with = "node_id")]
     pub node: NodeId,
-    #[serde(with = "node_id")]
-    pub target: NodeId,
     pub measure: usize,
     pub read: Read,
     /// Visible pixels; larger first.
@@ -575,17 +574,33 @@ impl Layout<'_> {
         (y1.min(1.0) - y0.max(0.0)).max(0.0) * self.view.height
     }
 
-    /// Ask for what a node lacks: its points, at most MAX_POINTS of them
-    /// evenly kept, and q for its branches.
-    fn emit(&mut self, node: NodeId, mut wants: Wants) {
+    /// Ask for a node whose children are unknown, down `path` from `node`:
+    /// points through its part in view.
+    fn unknown(&mut self, node: NodeId, path: Vec<Branch>, placed: &Placed) {
+        let (y0, y1) = placed.span();
+        let px = self.px(y0, y1);
+        let mut wants = Wants::default();
+        if MIN_PX <= px {
+            let view = (placed.ln_below(0.0), placed.ln_below(1.0));
+            wants.sample(&[view], (px * SAMPLES_PER_PX).ceil() as usize);
+            wants.px = px;
+        }
+        self.emit(node, path, wants);
+    }
+
+    /// Ask for what the node down `path` from `node` lacks: its points, at
+    /// most MAX_POINTS of them evenly kept, and q for its branches.
+    fn emit(&mut self, node: NodeId, path: Vec<Branch>, mut wants: Wants) {
         if !wants.points.is_empty() {
             let stride = wants.points.len().div_ceil(MAX_POINTS);
             let points = wants.points.iter().step_by(stride).copied().collect();
             self.frame.misses.push(Miss {
                 node,
-                target: node,
                 measure: self.lens.p,
-                read: Read::Points(points),
+                read: Read {
+                    path: path.clone(),
+                    within: Some(Within::Points(points)),
+                },
                 priority: wants.px,
             });
         }
@@ -594,9 +609,11 @@ impl Layout<'_> {
             wants.branches.dedup();
             self.frame.misses.push(Miss {
                 node,
-                target: node,
                 measure: self.lens.q,
-                read: Read::Branches(wants.branches),
+                read: Read {
+                    path,
+                    within: Some(Within::Branches(wants.branches)),
+                },
                 priority: wants.px.max(1.0),
             });
         }
@@ -609,13 +626,7 @@ impl Layout<'_> {
         let view = (placed.ln_below(0.0), placed.ln_below(1.0));
         let mut wants = Wants::default();
         let Some(d) = tree.distribution(node, self.lens.p)? else {
-            let (y0, y1) = placed.span();
-            let px = self.px(y0, y1);
-            if MIN_PX <= px {
-                wants.sample(&[view], (px * SAMPLES_PER_PX).ceil() as usize);
-                wants.px = px;
-            }
-            self.emit(node, wants);
+            self.unknown(node, Vec::new(), &placed);
             return Ok(());
         };
         // From the first item that ends in the view to the last that starts
@@ -633,7 +644,7 @@ impl Layout<'_> {
             } else if self.merge <= y1 - y0 {
                 match found {
                     Item::Child { .. } => {
-                        self.child(node, &placed, d, found, (y0, y1), view, &mut wants)?
+                        self.child(node, &placed, d, found, (y0, y1), &mut wants)?
                     }
                     Item::Gap { .. } => self.gap(node, &placed, d, found, view, &mut wants)?,
                 }
@@ -642,7 +653,7 @@ impl Layout<'_> {
                 self.band(node, &placed, d, found, skip, &mut wants)?
             };
         }
-        self.emit(node, wants);
+        self.emit(node, Vec::new(), wants);
         Ok(())
     }
 
@@ -655,7 +666,6 @@ impl Layout<'_> {
         d: &Distribution,
         item: Item,
         (y0, y1): (f64, f64),
-        view: (f64, f64),
         wants: &mut Wants,
     ) -> Result<()> {
         let tree = self.tree;
@@ -677,23 +687,9 @@ impl Layout<'_> {
         if kind == BoxKind::Node {
             return self.lay(id, child, None);
         }
-        // Points in its part in view, on the parent, which the source has
-        // already reached: they all fall in the child, so it descends there.
-        let px = self.px(y0, y1);
-        if MIN_PX <= px {
-            let mut points = Wants::default();
-            points.sample(
-                &[(top.min(view.0), bottom.max(view.1))],
-                (px * SAMPLES_PER_PX).ceil() as usize,
-            );
-            self.frame.misses.push(Miss {
-                node,
-                target: id,
-                measure: self.lens.p,
-                read: Read::Points(points.points),
-                priority: px,
-            });
-        }
+        // The tree may know this child only as its parent's branch: it is
+        // read down that branch from the parent.
+        self.unknown(node, vec![branch], &child);
         Ok(())
     }
 
@@ -901,9 +897,8 @@ pub(crate) fn layout_into(
         if entry.nats_q.is_infinite() {
             context.frame.misses.push(Miss {
                 node: nodes[i],
-                target: nodes[i],
                 measure: lens.q,
-                read: Read::Branches(vec![entry.branch]),
+                read: Read::branches(vec![entry.branch]),
                 priority: view.height,
             });
         }
@@ -1474,25 +1469,26 @@ mod tests {
             .unwrap();
         near(gap_.x1 - gap_.x0, 4f64.ln());
         // The gap is sampled in proportion to its 200 visible pixels, all
-        // of its points inside it; both children are asked for by points in
-        // their parts of the root, which descend into them.
-        let points = |target| match &frame
+        // of its points inside it; both children are asked for down their
+        // branches from the root, by points through all of each.
+        let points = |path: &[Branch]| match &frame
             .misses
             .iter()
-            .find(|m| m.target == target)
+            .find(|m| m.node == ROOT && m.read.path == path)
             .unwrap()
             .read
+            .within
         {
-            Read::Points(points) => points.clone(),
-            read => panic!("{read:?} is no sampling"),
+            Some(Within::Points(points)) => points.clone(),
+            within => panic!("{within:?} is no sampling"),
         };
-        let gap_points = points(ROOT);
+        let gap_points = points(&[]);
         assert_eq!(gap_points.len(), 400);
         assert!(gap_points.iter().all(|&point| point < 0.25f64.ln()));
-        let child = points(child_hash(ROOT, 4));
-        assert!(child
-            .iter()
-            .all(|&point| 0.5f64.ln() < point && point <= 0.0));
+        let child = points(&[4]);
+        assert_eq!(child.len(), 800);
+        assert!(child.iter().all(|&point| point <= 0.0));
+        assert!(child[0] > 0.999f64.ln() && child[799] < 0.002f64.ln());
 
         // An answer of four samples splits the gap into thin gaps: the bands
         // across them draw a silhouette from the samples, and ask for more
@@ -1532,7 +1528,7 @@ mod tests {
         let [miss] = &frame.misses[..] else {
             panic!("the child is asked for once");
         };
-        assert_eq!(miss.read, Read::Points(vec![0.0]));
+        assert_eq!(miss.read, Read::points(vec![0.0]));
     }
 
     #[test]

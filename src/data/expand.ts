@@ -3,14 +3,17 @@
 // sources for them, a few at a time, and the tree's change notifications
 // redraw whatever depended on them.
 
-import type { Miss } from "../core/layout";
+import type { Miss, Read } from "../core/layout";
 import type { IntervalTree, NodeId } from "../core/tree";
 import type { ExpandRequest, Source } from "./source";
 
 const RETRY_MS = 2000;
 
+/** How a read reads the node it ends at. */
+const kind = ({ within }: Read) => within === undefined ? "path" : "points" in within ? "points" : "branches";
+
 export class Expander {
-  /** Requests in flight, by target, measure and how they read. */
+  /** Requests in flight, by the node they read down to, measure and how they read it. */
   private readonly pending = new Map<string, Promise<void>>();
   /** Answered requests, with their target's revision before the answer:
    * while it stays the same, the answer changed nothing, and asking again
@@ -75,8 +78,8 @@ export class Expander {
     let retry = Infinity;
     for (const miss of this.demand().sort((a, b) => b.priority - a.priority)) {
       if (this.pending.size >= this.limit) break;
-      const { target } = miss;
-      const key = `${target}:${miss.measure}:${Object.keys(miss.read)[0]}`;
+      const target = this.tree.descend(miss.node, miss.read.path);
+      const key = `${target}:${miss.measure}:${kind(miss.read)}`;
       if (this.pending.has(key) || this.asked.get(key) === this.tree.revisionOf(target)) continue;
       const after = (this.failed.get(key) ?? -Infinity) + RETRY_MS - performance.now();
       if (after > 0) {

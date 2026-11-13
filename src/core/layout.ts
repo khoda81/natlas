@@ -66,16 +66,23 @@ export interface Box {
   y1: number;
 }
 
-/** How an Expand reads the tree below its node: down a path, the children
- * holding points (each ln of the mass below it), or the children along
- * branches. */
-export type Read = { path: Branch[] } | { points: number[] } | { branches: Branch[] };
+/** What an Expand reads of the node its path ends at: the children holding
+ * points (each ln of the mass below it), or the children along branches. */
+export type Within = { points: number[] } | { branches: Branch[] };
+
+/** How an Expand reads the tree below its node: down a path, placing each of
+ * its branches, and then within the node it ends at. Without ``within`` that
+ * node is named, not read. */
+export interface Read {
+  path: Branch[];
+  within?: Within;
+}
 
 /** What a frame lacks, as the Expand request that fills it: ``read`` below
- * ``node``, filling in ``target``, which is ``node`` or a child it holds. */
+ * ``node``, a node the tree holds. A child the tree only knows as its
+ * parent's branch is read down that branch. */
 export interface Miss {
   node: NodeId;
-  target: NodeId;
   measure: number;
   read: Read;
   /** Visible pixels; larger first. */

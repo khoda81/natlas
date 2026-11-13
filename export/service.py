@@ -96,15 +96,15 @@ class Model:
         request's node. Stops early once ``canceled`` is set.
         """
         node = request.node
-        path = list(request.path.branches)
+        path = list(request.path)
         with self.names:
-            match request.WhichOneof("read"):
-                case "path":
-                    walk = self.tree.start_path(node, path)
+            match request.WhichOneof("within"):
                 case "points":
-                    walk = self.tree.start_points(node, list(request.points.ln_below))
+                    walk = self.tree.start(node, path, points=list(request.points.ln_below))
+                case "branches":
+                    walk = self.tree.start(node, path, branches=list(request.branches.branches))
                 case _:
-                    walk = self.tree.start_branches(node, list(request.branches.branches))
+                    walk = self.tree.start(node, path)
             # A path is known ahead, so the model reads it in one pass.
             ahead = tuple(self.tree.path(node)) + tuple(path)
         started = time.perf_counter()
@@ -150,7 +150,7 @@ class Model:
                         self.tree.forget(forgotten, measure)
         elapsed = (time.perf_counter() - started) * 1000
         print(
-            f"expand m{measure} depth {len(ahead)} {request.WhichOneof('read')}: {computed} computed, {elapsed:.0f} ms",
+            f"expand m{measure} depth {len(ahead)} {request.WhichOneof('within') or 'path'}: {computed} computed, {elapsed:.0f} ms",
             file=sys.stderr,
         )
 
@@ -214,11 +214,10 @@ def app(
                 return _stream(
                     [_end({"code": "invalid_argument", "message": str(error)})]
                 )
-            read = request_message.WhichOneof("read")
             # NaN fails the comparison.
-            if read is None or (read == "points" and not all(point <= 0 for point in request_message.points.ln_below)):
+            if not all(point <= 0 for point in request_message.points.ln_below):
                 return _stream(
-                    [_end({"code": "invalid_argument", "message": "an Expand needs a path, points of mass, or branches"})]
+                    [_end({"code": "invalid_argument", "message": "points are ln of the mass below them, at most 0"})]
                 )
             # The walk runs on its own thread, holding the model for its whole
             # length, and hands each node's children over as it places them. A client that

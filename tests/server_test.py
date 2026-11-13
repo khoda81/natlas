@@ -105,14 +105,13 @@ def messages(body):
 
 
 def request(node, path=None, points=None, branches=None):
-    """Expand down ``path``, or at ``points``, or along ``branches``."""
+    """Expand down ``path``, then at ``points`` or along ``branches``."""
+    within = {}
     if points is not None:
-        read = {"points": pb.Points(ln_below=points)}
+        within = {"points": pb.Points(ln_below=points)}
     elif branches is not None:
-        read = {"branches": pb.Branches(branches=branches)}
-    else:
-        read = {"path": pb.Path(branches=path or [])}
-    return pb.ExpandRequest(node=node, **read)
+        within = {"branches": pb.Branches(branches=branches)}
+    return pb.ExpandRequest(node=node, path=path or [], **within)
 
 
 def answers(model, node, path=None, points=None, branches=None, measure=0):
@@ -139,7 +138,7 @@ class CoreTests(unittest.TestCase):
 
     def test_a_walk_places_what_the_core_holds_and_asks_for_what_it_lacks(self):
         tree = Tree(1)
-        walk = tree.start_points(0, [math.log(0.9), math.log(0.4)])
+        walk = tree.start(0, [], points=[math.log(0.9), math.log(0.4)])
         self.assertEqual(tree.advance(walk, 0), ("missing", 0))
         with np.errstate(divide="ignore"):
             tree.set(0, 0, np.log([0.2, 0.5, 0.0, 0.3]))
@@ -150,7 +149,11 @@ class CoreTests(unittest.TestCase):
         self.assertAlmostEqual(math.exp(ln_below[-1]), 0.2, places=12)
         self.assertIsNone(tree.advance(walk, 0))
         with self.assertRaises(ValueError):
-            tree.start_points(0, [0.5])
+            tree.start(0, [], points=[0.5])
+        with self.assertRaises(ValueError):
+            tree.start(0, [], points=[-1.0], branches=[1])
+        # Nothing to read is nothing to compute.
+        self.assertIsNone(tree.advance(tree.start(0, []), 0))
 
 
 class ModelTests(unittest.TestCase):
@@ -179,6 +182,12 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(model.measures[0].calls[-1], (99, 0))
         (branches,) = answers(model, 0, branches=[4, 1, 7])
         self.assertEqual(placed(branches), [[1], [4]])
+        # Down a path and then points, in one request: the path's branch,
+        # then the children of the node it reaches.
+        calls = len(model.measures[0].calls)
+        both = answers(model, 0, [0], points=[math.log(0.9), math.log(0.3)])
+        self.assertEqual([placed(children) for children in both], [[[0]], [[0, 1]]])
+        self.assertEqual(len(model.measures[0].calls), calls)
 
     def test_eviction_forgets_the_oldest_and_recomputes_it_alike(self):
         model, _ = fixture()
@@ -277,14 +286,12 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
 
     def test_invalid_requests_return_protocol_errors(self):
-        untargeted = pb.ExpandRequest(node=0).SerializeToString()
-        empty = request(0, points=[0.5]).SerializeToString()
+        positive = request(0, points=[0.5]).SerializeToString()
         for body in [
             b"",
             b"\x00\x00\x00\x00\x04\x80",
             service._envelope(0, b"\x80"),
-            service._envelope(0, untargeted),
-            service._envelope(0, empty),
+            service._envelope(0, positive),
         ]:
             frames = messages(self.expand(body).content)
             self.assertEqual(

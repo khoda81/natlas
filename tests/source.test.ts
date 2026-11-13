@@ -22,6 +22,10 @@ async function steps(source: Source, tree: IntervalTree, request: ExpandRequest)
   return result;
 }
 
+/** Reads of the node itself. */
+const points = (points: number[]) => ({ path: [], within: { points } });
+const branches = (branches: number[]) => ({ path: [], within: { branches } });
+
 /** The branches a step places, in rank order. */
 const placed = (step: Step | undefined) => step?.runs.flatMap((run) => Array.from(run.branches));
 
@@ -31,7 +35,7 @@ describe("SnapshotSource", () => {
     const tree = new IntervalTree(1);
     // 0.9 and 0.6 lie in branch 0's (0.5, 1], 0.4 in branch 1's (0.3, 0.5],
     // and 0.05 in the unrecorded rest.
-    const [step] = await steps(source, tree, { node: ROOT, points: [0.9, 0.6, 0.4, 0.05].map(Math.log) });
+    const [step] = await steps(source, tree, { node: ROOT, ...points([0.9, 0.6, 0.4, 0.05].map(Math.log)) });
     expect(placed(step)).toEqual([0, 1]);
     expect(step!.runs).toHaveLength(1);
   });
@@ -42,17 +46,21 @@ describe("SnapshotSource", () => {
     const walk = await steps(source, tree, { node: ROOT, path: [1, 4, 0, 2] });
     expect(walk.map(({ node }) => tree.path(node))).toEqual([[], [1], [1, 4]]);
     expect(walk.map(placed)).toEqual([[1], [4], [0]]);
-    expect(await steps(source, tree, { node: tree.descend(ROOT, [9, 9]), points: [-1] })).toEqual([]);
+    expect(await steps(source, tree, { node: tree.descend(ROOT, [9, 9]), ...points([-1]) })).toEqual([]);
+    // Down a path and then points: the path's branch, then the node it reaches.
+    const both = await steps(source, tree, { node: ROOT, path: [1], within: { points: [0.9, 0.4].map(Math.log) } });
+    expect(both.map(({ node }) => tree.path(node))).toEqual([[], [1]]);
+    expect(both.map(placed)).toEqual([[1], [0, 1]]);
   });
 
   it("descends where all the points fall in one child, and reads branches alone", async () => {
     const source = snapshot(TextLabels.none(), [[], [0]]);
     const tree = new IntervalTree(1);
-    const walk = await steps(source, tree, { node: ROOT, points: [0.9, 0.6].map(Math.log) });
+    const walk = await steps(source, tree, { node: ROOT, ...points([0.9, 0.6].map(Math.log)) });
     expect(walk.map(({ node }) => tree.path(node))).toEqual([[], [0]]);
     expect(placed(walk[0])).toEqual([0]);
-    const [branches] = await steps(source, tree, { node: ROOT, branches: [4, 2, 9] });
-    expect(placed(branches)).toEqual([2, 4]);
+    const [listed] = await steps(source, tree, { node: ROOT, ...branches([4, 2, 9]) });
+    expect(placed(listed)).toEqual([2, 4]);
   });
 
   it("refuses an older recording, and searches recorded paths by their text", async () => {
@@ -64,7 +72,7 @@ describe("SnapshotSource", () => {
 });
 
 describe("ConnectSource", () => {
-  it("names a request by its node's id, and by a path from the root once the server has not learned it", async () => {
+  it("names a request by its node's id, and from the root in one request once the server has not learned it", async () => {
     const requests: string[] = [];
     const learned = new Set([ROOT]);
     const names = new IntervalTree(1);
@@ -80,19 +88,17 @@ describe("ConnectSource", () => {
       port: 0,
       async fetch(request) {
         const body = new Uint8Array(await request.arrayBuffer());
-        const { node, read } = fromBinary(ExpandRequestSchema, body.subarray(5));
+        const { node, path, within } = fromBinary(ExpandRequestSchema, body.subarray(5));
         const end = (error?: object) => envelope(2, new TextEncoder().encode(JSON.stringify(error ? { error } : {})));
         const respond = (chunks: BlobPart[]) => new Response(new Blob(chunks), { headers: { "content-type": "application/connect+proto" } });
-        requests.push(read.case === "path" ? `${node === ROOT ? "root" : "deep"} path ${read.value.branches}` : `${node === ROOT ? "root" : "deep"} ${read.case}`);
+        requests.push([node === ROOT ? "root" : "deep", ...(path.length ? [`path ${path}`] : []), ...(within.case ? [within.case] : [])].join(" "));
         if (!learned.has(node)) return respond([end({ code: "not_found", message: "unknown node" })]);
-        if (read.case !== "path") return respond([message(answer([1])), end()]);
         // Placing each branch teaches the server the nodes along the path.
-        const { branches } = read.value;
-        const chunks = branches.map((branch, i) => {
-          learned.add(names.descend(node, branches.slice(0, i + 1)));
+        const chunks = path.map((branch, i) => {
+          learned.add(names.descend(node, path.slice(0, i + 1)));
           return message({ runs: [{ rank: 0, branches: [branch], lnBelow: [0, -1] }] });
         });
-        return respond([...chunks, end()]);
+        return respond([...chunks, ...(within.case ? [message(answer([1]))] : []), end()]);
       },
     });
     try {
@@ -101,11 +107,11 @@ describe("ConnectSource", () => {
       const deep = tree.descend(ROOT, [5, 6]);
       const walk = await steps(source, tree, { node: deep, path: [7] });
       expect(walk.map(({ node }) => tree.path(node))).toEqual([[], [5], [5, 6]]);
-      // Points on a node the server has not learned: a path teaches it, then the points.
+      // Points on a node the server has not learned: down its path from the root, then the points.
       const other = tree.descend(ROOT, [9]);
-      const sampled = await steps(source, tree, { node: other, points: [-1] });
+      const sampled = await steps(source, tree, { node: other, ...points([-1]) });
       expect(sampled.map(({ node }) => tree.path(node))).toEqual([[], [9]]);
-      expect(requests).toEqual(["deep path 7", "root path 5,6,7", "deep points", "root path 9", "deep points"]);
+      expect(requests).toEqual(["deep path 7", "root path 5,6,7", "deep points", "root path 9 points"]);
     } finally {
       server.stop(true);
     }
@@ -124,7 +130,7 @@ function counting(answer: (request: ExpandRequest) => Step[] | Promise<Step[]>):
   };
 }
 
-const rootMiss: Miss = { node: ROOT, target: ROOT, measure: 0, read: { points: [-0.5] }, priority: 1 };
+const rootMiss: Miss = { node: ROOT, measure: 0, read: points([-0.5]), priority: 1 };
 
 describe("Expander", () => {
   it("asks once for what a view lacks, and not again for what a source could not give", async () => {
@@ -155,7 +161,7 @@ describe("Expander", () => {
     } finally { expander.dispose(); }
   });
 
-  it("asks for a child by points on its parent, and refills capacity from current demand", async () => {
+  it("asks for a child down its branch from its parent, and refills capacity from current demand", async () => {
     const tree = new IntervalTree(1);
     const child = tree.child(ROOT, 1);
     const source = counting(() => tree.has(ROOT, 0)
@@ -163,9 +169,10 @@ describe("Expander", () => {
       : [{ node: ROOT, runs: [run([0.5, 0.5])] }]);
     const expander = new Expander(tree, [source], 1);
     try {
-      expander.request(() => tree.has(ROOT, 0) ? [{ ...rootMiss, target: child, read: { points: [Math.log(0.25)] } }] : [rootMiss]);
+      const down: Miss = { ...rootMiss, read: { path: [1], within: { points: [Math.log(0.25)] } } };
+      expander.request(() => tree.has(ROOT, 0) ? [down] : [rootMiss]);
       await waitUntil(() => tree.has(child, 0));
-      expect(source.requests).toEqual([{ node: ROOT, points: [-0.5] }, { node: ROOT, points: [Math.log(0.25)] }]);
+      expect(source.requests).toEqual([{ node: ROOT, ...rootMiss.read }, { node: ROOT, ...down.read }]);
     } finally { expander.dispose(); }
   });
 

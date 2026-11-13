@@ -27,16 +27,20 @@ package natlas;
 // to chance at 64 bits.
 
 service Natlas {
-  // Reads the tree below a node one of three ways, answering one node at a
-  // time with the children it places there:
+  // Reads the tree at an address below a node: down a path of branches, and
+  // then within the node the path ends at. It answers one node at a time
+  // with the children it places there:
   //
-  // - a path: the starting node and every node down the path, each placing
-  //   the path's next branch;
-  // - points, each ln of the mass below it: the children holding them, and
-  //   where all of them fall in one child, that child alone and the same
-  //   points within it, so a view samples its children and a deep zoom
-  //   reaches them in one request;
-  // - branches: those children of the node, for a measure read only for q.
+  // - down the path: the starting node and every node along it, each
+  //   placing the path's next branch;
+  // - then, at its end, either points, each ln of the mass below it: the
+  //   children holding them, and where all of them fall in one child, that
+  //   child alone and the same points within it, so a view samples its
+  //   children and a deep zoom reaches them in one request;
+  // - or branches: those children of the node, for a measure read only for
+  //   q;
+  // - or nothing: the path's last branch names the node it reaches, which
+  //   the server learns but does not read.
   //
   // So every message but the last places a single child, and the next
   // message is that child's: id(node, its branch). Each child is placed
@@ -46,7 +50,7 @@ service Natlas {
   // A server may end the stream early at any node, and ends a path before a
   // branch of weight zero, which has no place. It answers NOT_FOUND when it
   // has not learned the starting node, and the client names it from the
-  // root with a path.
+  // root by a longer path.
   rpc Expand(ExpandRequest) returns (stream Children);
   // The sequence for a text, under the server's text mapping. The server
   // learns the ids along it, so expanding them needs no path.
@@ -55,16 +59,13 @@ service Natlas {
 
 message ExpandRequest {
   fixed64 node = 1;
-  oneof read {
-    Path path = 2;
+  // Branches down from the node.
+  repeated uint32 path = 2;
+  // What to read of the node the path ends at.
+  oneof within {
     Points points = 3;
     Branches branches = 4;
   }
-}
-
-// Branches down from a node.
-message Path {
-  repeated uint32 branches = 1;
 }
 
 // Points of a node, each ln of the mass below it: at most 0, as exact deep

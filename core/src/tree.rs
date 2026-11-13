@@ -293,12 +293,48 @@ impl Tree {
     }
 }
 
-/// How an Expand reads the tree below its node.
+/// How an Expand reads the tree below its node: down a path, placing each of
+/// its branches, and then within the node it ends at. Without a `within`,
+/// the path's last branch names the node it reaches, which is not read.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Read {
+    #[serde(default)]
+    pub path: Vec<Branch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within: Option<Within>,
+}
+
+impl Read {
+    /// Down these branches, placing each.
+    pub fn path(path: Vec<Branch>) -> Self {
+        Self { path, within: None }
+    }
+
+    /// The children of the node holding these points.
+    pub fn points(points: Vec<f64>) -> Self {
+        Within::Points(points).into()
+    }
+
+    /// These children of the node.
+    pub fn branches(branches: Vec<Branch>) -> Self {
+        Within::Branches(branches).into()
+    }
+}
+
+/// A read of the node itself.
+impl From<Within> for Read {
+    fn from(within: Within) -> Self {
+        Self {
+            path: Vec::new(),
+            within: Some(within),
+        }
+    }
+}
+
+/// What an Expand reads of the node its path ends at.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum Read {
-    /// Down these branches, placing each.
-    Path(Vec<Branch>),
+pub enum Within {
     /// The children holding these points, each ln of the mass below it, and
     /// down through a child holding all of them.
     Points(Vec<f64>),
@@ -330,9 +366,9 @@ pub enum Advance {
 }
 
 impl Walk {
-    /// A read of `node`; points must be ln masses, at most 0.
+    /// A read below `node`; points must be ln masses, at most 0.
     pub fn new(node: NodeId, read: Read) -> Result<Self> {
-        if let Read::Points(points) = &read {
+        if let Some(Within::Points(points)) = &read.within {
             if points.iter().any(|point| point.is_nan() || 0.0 < *point) {
                 return Err("points must be ln masses below edges".into());
             }
@@ -351,28 +387,35 @@ impl Walk {
             return Ok(Advance::Done);
         }
         let node = self.node;
+        let Read { path, within } = &mut self.read;
+        // The path walked, its last branch named this node: it is read only
+        // for what is asked within it.
+        let step = match (path.get(self.at), within) {
+            (Some(&branch), _) => Ok(branch),
+            (None, Some(within)) => Err(within),
+            (None, None) => {
+                self.done = true;
+                return Ok(Advance::Done);
+            }
+        };
         let Some(distribution) = tree.distribution(node, measure)? else {
             return Ok(Advance::Missing(node));
         };
         let count = distribution.count();
         // What this node places, the child the walk goes on to, if any, and
-        // whether it reads that child too: a path's last branch names the
-        // node it reaches, which the walk learns but does not read.
-        let (runs, next, more) = match &mut self.read {
-            Read::Path(path) => {
+        // whether it reads that child too.
+        let (runs, next, more) = match step {
+            Ok(branch) => {
                 // A branch of weight zero has no place: the walk ends before it.
-                let Some(run) = path
-                    .get(self.at)
-                    .and_then(|&branch| distribution.place(branch))
-                else {
+                let Some(run) = distribution.place(branch) else {
                     self.done = true;
                     return Ok(Advance::Done);
                 };
-                let branch = path[self.at];
                 self.at += 1;
-                (vec![run], Some(branch), self.at < path.len())
+                let more = self.at < self.read.path.len() || self.read.within.is_some();
+                (vec![run], Some(branch), more)
             }
-            Read::Branches(branches) => {
+            Err(Within::Branches(branches)) => {
                 let mut children: Vec<_> = branches
                     .iter()
                     .filter_map(|&branch| distribution.locate_rank(distribution.rank(branch)?))
@@ -381,7 +424,7 @@ impl Walk {
                 children.dedup();
                 (distribution.runs_of(&children), None, false)
             }
-            Read::Points(points) => {
+            Err(Within::Points(points)) => {
                 let (children, all) = distribution.children_at(points);
                 let runs = distribution.runs_of(&children);
                 match (children.as_slice(), all) {
@@ -458,7 +501,7 @@ mod tests {
     #[test]
     fn a_walk_places_a_path_and_finds_children_at_points() {
         let mut tree = Tree::new(1);
-        let mut walk = Walk::new(ROOT, Read::Path(vec![2, 1])).unwrap();
+        let mut walk = Walk::new(ROOT, Read::path(vec![2, 1])).unwrap();
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Missing(ROOT));
         tree.set(ROOT, 0, weights(&[0.6, 0.3, 0.1])).unwrap();
         let Advance::Children(ROOT, runs, Some(3)) = walk.advance(&mut tree, 0).unwrap() else {
@@ -476,13 +519,13 @@ mod tests {
 
         // Points across two children list both; points all inside branch 0
         // (0.4, 1] descend into it, rescaled.
-        let mut walk = Walk::new(ROOT, Read::Points(vec![0.9f64.ln(), 0.2f64.ln()])).unwrap();
+        let mut walk = Walk::new(ROOT, Read::points(vec![0.9f64.ln(), 0.2f64.ln()])).unwrap();
         let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
             panic!("the root lists the children at the points");
         };
         assert_eq!(runs[0].branches(), [0, 1]);
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
-        let mut walk = Walk::new(ROOT, Read::Points(vec![0.9f64.ln(), 0.5f64.ln()])).unwrap();
+        let mut walk = Walk::new(ROOT, Read::points(vec![0.9f64.ln(), 0.5f64.ln()])).unwrap();
         assert!(matches!(
             walk.advance(&mut tree, 0).unwrap(),
             Advance::Children(ROOT, _, _)
@@ -493,23 +536,44 @@ mod tests {
         );
 
         // Branches list just those children; a weightless one is left out.
-        let mut walk = Walk::new(ROOT, Read::Branches(vec![1, 2, 7])).unwrap();
+        let mut walk = Walk::new(ROOT, Read::branches(vec![1, 2, 7])).unwrap();
         let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
             panic!("the root lists the branches it has");
         };
         assert_eq!(runs[0].branches(), [1, 2]);
-        assert!(Walk::new(ROOT, Read::Points(vec![0.5])).is_err());
+        assert!(Walk::new(ROOT, Read::points(vec![0.5])).is_err());
+
+        // A path and then points: the path's branch is placed, and the node
+        // it reaches is sampled in its own coordinates.
+        tree.set(child, 0, weights(&[0.5, 0.5])).unwrap();
+        let read = Read {
+            path: vec![2],
+            within: Some(Within::Points(vec![0.9f64.ln(), 0.2f64.ln()])),
+        };
+        let mut walk = Walk::new(ROOT, read).unwrap();
+        let Advance::Children(ROOT, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
+            panic!("the root places the path's branch");
+        };
+        assert_eq!(runs[0].branches(), [2]);
+        let Advance::Children(node, runs, _) = walk.advance(&mut tree, 0).unwrap() else {
+            panic!("the node the path reaches lists the children at the points");
+        };
+        assert_eq!((node, runs[0].branches()), (child, &[0, 1][..]));
+        assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
+        // Nothing to read is nothing to compute.
+        let mut walk = Walk::new(child_hash(ROOT, 9), Read::default()).unwrap();
+        assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
 
         // A path through a weightless branch ends before it; an ended node
         // says it has no children.
         tree.set(child, 0, Distribution::from_weights(&[]).unwrap())
             .unwrap();
-        let mut walk = Walk::new(child, Read::Points(vec![-1.0])).unwrap();
+        let mut walk = Walk::new(child, Read::points(vec![-1.0])).unwrap();
         assert_eq!(
             walk.advance(&mut tree, 0).unwrap(),
             Advance::Children(child, vec![], Some(0))
         );
-        let mut walk = Walk::new(child, Read::Path(vec![0])).unwrap();
+        let mut walk = Walk::new(child, Read::path(vec![0])).unwrap();
         assert_eq!(walk.advance(&mut tree, 0).unwrap(), Advance::Done);
     }
 }

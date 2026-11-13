@@ -76,9 +76,10 @@ class Model:
         self.tree = Tree(len(measures))
         self.recent: list[OrderedDict[int, None]] = [OrderedDict() for _ in measures]
         # Requests run on worker threads. One forward pass at a time keeps the
-        # device busy once and the cache whole; ``names`` guards the tree for
-        # the moments it is read or written, so naming a node never waits on
-        # inference. It is taken inside ``lock``, never the other way round.
+        # device busy once and the cache whole; ``names`` guards the tree and
+        # which distributions to forget for the moments they are read or
+        # written, so naming a node and reading one already held never wait
+        # on inference. It is taken inside ``lock``, never the other way round.
         self.lock = threading.Lock()
         self.names = threading.Lock()
 
@@ -112,23 +113,32 @@ class Model:
         started = time.perf_counter()
         computed = 0
         recent = self.recent[measure]
-        with self.lock:
+        # The model is taken at the walk's first forward pass and held to its
+        # end: a walk of distributions already held answers at once, however
+        # long another's passes run.
+        held = False
+        try:
             # A model walk along ``along``, yielding the distribution after
             # its first ``at`` tokens next.
             reading, along, at = None, (), 0
             while not canceled.is_set():
                 with self.names:
                     step = self.tree.advance(walk, measure)
+                    if step is not None and step[0] == "children" and step[1] in recent:
+                        recent.move_to_end(step[1])
                 if step is None:
                     break
                 if step[0] == "children":
-                    _, used, runs, count = step
-                    if used in recent:
-                        recent.move_to_end(used)
+                    _, _, runs, count = step
                     yield pb.Children(
                         runs=[pb.Run(rank=rank, branches=branches, ln_below=ln_below) for rank, branches, ln_below in runs],
                         count=count,
                     )
+                    continue
+                if not held:
+                    self.lock.acquire()
+                    held = True
+                    # Another walk may have computed it while this one waited.
                     continue
                 missing = step[1]
                 with self.names:
@@ -145,11 +155,13 @@ class Model:
                     computed += 1
                 with self.names:
                     self.tree.set(missing, measure, np.ascontiguousarray(ln_weights, dtype=np.float64))
-                recent[missing] = None
-                if len(recent) > _CACHED:
-                    forgotten, _ = recent.popitem(last=False)
-                    with self.names:
+                    recent[missing] = None
+                    if len(recent) > _CACHED:
+                        forgotten, _ = recent.popitem(last=False)
                         self.tree.forget(forgotten, measure)
+        finally:
+            if held:
+                self.lock.release()
         elapsed = (time.perf_counter() - started) * 1000
         print(
             f"expand m{measure} depth {len(ahead)} {request.WhichOneof('within') or 'path'}: {computed} computed, {elapsed:.0f} ms",

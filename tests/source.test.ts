@@ -177,6 +177,21 @@ describe("Expander", () => {
     } finally { expander.dispose(); }
   });
 
+  it("reads a node a source already answered for at once, however many new nodes it is computing", async () => {
+    const tree = new IntervalTree(1);
+    tree.insert(ROOT, 0, { runs: [run([0.5, 0.2], [1, 2], 0, 0.3)] });
+    // New nodes never answer; the root, already held, does.
+    const source = counting(({ node, path }) => path.length === 0 ? [{ node, runs: [run([0.1], [3], 2, 0.2)] }] : new Promise<Step[]>(() => {}));
+    const expander = new Expander(tree, [source], 1);
+    const down = (branch: number): Miss => ({ node: ROOT, measure: 0, read: { path: [branch], within: { points: at(0.5) } }, priority: 9 });
+    try {
+      expander.request(() => [down(1), down(2), rootMiss]);
+      await waitUntil(() => tree.entry(ROOT, { p: 0, q: 0 }, 3) !== undefined);
+      // One new node at a time, and the root beside it.
+      expect(source.requests.map(({ path }) => path)).toEqual([[1], []]);
+    } finally { expander.dispose(); }
+  });
+
   it("walks once from the deepest node already placed", async () => {
     const recording = snapshot(TextLabels.none(), [[], [1], [1, 2], [1, 2, 3]]);
     const requests: ExpandRequest[] = [];

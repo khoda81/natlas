@@ -25,6 +25,10 @@ export class Expander {
   private disposed = false;
   /** Aborts the work in flight for the current view. */
   private abort = new AbortController();
+  /** Requests in flight that a source may have to compute for: those reading
+   * a node it has not answered for yet. ``limit`` bounds these alone, since a
+   * source computes one at a time. What it already holds it answers at once,
+   * and waits for nothing. */
   private active = 0;
   private readonly waiting: (() => void)[] = [];
   onError: (error: unknown) => void = (error) => console.error(error);
@@ -74,13 +78,14 @@ export class Expander {
   }
 
   private pump(): void {
-    if (this.disposed || this.pending.size >= this.limit) return;
+    if (this.disposed) return;
     let retry = Infinity;
     for (const miss of this.demand().sort((a, b) => b.priority - a.priority)) {
-      if (this.pending.size >= this.limit) break;
       const target = this.tree.descend(miss.node, miss.read.path);
       const key = `${target}:${miss.measure}:${kind(miss.read)}`;
       if (this.pending.has(key) || this.asked.get(key) === this.tree.revisionOf(target)) continue;
+      const held = this.tree.has(target, miss.measure);
+      if (!held && this.limit <= this.active) continue;
       const after = (this.failed.get(key) ?? -Infinity) + RETRY_MS - performance.now();
       if (after > 0) {
         retry = Math.min(retry, after);
@@ -88,7 +93,7 @@ export class Expander {
       }
       const { signal } = this.abort;
       const request: ExpandRequest = { node: miss.node, ...miss.read };
-      void this.fetch(key, target, miss.measure, request).catch((error: unknown) => {
+      void this.fetch(key, target, miss.measure, request, held).catch((error: unknown) => {
         if (!signal.aborted) {
           this.failed.set(key, performance.now());
           this.onError(error);
@@ -111,31 +116,54 @@ export class Expander {
     while (first < chain.length - 1 && placed(first)) first++;
     if (first === chain.length - 1) return true;
     const path = chain.slice(first + 1).map((node) => this.tree.branch(node));
-    await this.fetch(`${target}:${measure}:path`, target, measure, { node: chain[first]!, path });
+    await this.fetch(`${target}:${measure}:path`, target, measure, { node: chain[first]!, path }, false);
     return chain.slice(0, -1).every((_, index) => placed(index));
   }
 
-  /** One request, unless the same is in flight; ``target``'s revision marks it answered. */
-  private fetch(key: string, target: NodeId, measure: number, request: ExpandRequest): Promise<void> {
+  /** Take in a request's answer, saying once when it has ``target``'s part:
+   * the messages after it are of nodes further down. */
+  private async answer(target: NodeId, measure: number, request: ExpandRequest, signal: AbortSignal, reached: () => void): Promise<void> {
+    signal.throwIfAborted();
+    for await (const { node, ...children } of this.sources[measure]!.expand(this.tree, request, signal)) {
+      signal.throwIfAborted();
+      this.tree.insert(node, measure, children);
+      if (node === target) reached();
+    }
+  }
+
+  /** One request, unless the same is in flight. ``held`` where it reads only
+   * what its source has answered for before, and so waits for no other. */
+  private fetch(key: string, target: NodeId, measure: number, request: ExpandRequest, held: boolean): Promise<void> {
     const pending = this.pending.get(key);
     if (pending !== undefined) return pending;
     const { signal } = this.abort;
     const before = this.tree.revisionOf(target);
-    const work = (async () => {
-      if (this.limit <= this.active) await new Promise<void>((resolve) => this.waiting.push(resolve));
-      else this.active++;
+    // The request is answered once ``target``'s own message is in, or the
+    // stream ends without one. A stream that goes on into deeper nodes no
+    // longer stands in the way of asking ``target`` for more.
+    let answered = false;
+    const reached = () => {
+      if (answered) return;
+      answered = true;
+      this.asked.set(key, before);
+      this.failed.delete(key);
+      if (this.pending.get(key) === work) this.pending.delete(key);
+      this.schedule();
+    };
+    const work: Promise<void> = (async () => {
+      if (!held) {
+        if (this.limit <= this.active) await new Promise<void>((resolve) => this.waiting.push(resolve));
+        else this.active++;
+      }
       try {
-        signal.throwIfAborted();
-        for await (const { node, ...children } of this.sources[measure]!.expand(this.tree, request, signal)) {
-          signal.throwIfAborted();
-          this.tree.insert(node, measure, children);
-        }
-        this.asked.set(key, before);
-        this.failed.delete(key);
+        await this.answer(target, measure, request, signal, reached);
+        reached();
       } finally {
-        const next = this.waiting.shift();
-        if (next === undefined) this.active--;
-        else next();
+        if (!held) {
+          const next = this.waiting.shift();
+          if (next === undefined) this.active--;
+          else next();
+        }
       }
     })();
     this.pending.set(key, work);

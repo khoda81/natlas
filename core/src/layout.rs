@@ -159,6 +159,9 @@ pub struct PickResult {
 pub struct Placed {
     top: (f64, f64),
     bottom: (f64, f64),
+    /// ln of how far each of the two is from the view's top, kept beside
+    /// them: every edge of the node is measured against both.
+    ln_heights: (f64, f64),
     /// ln of the node's p mass below the origin.
     ln_mass: f64,
     /// ln of view heights per unit of the node's mass.
@@ -168,30 +171,35 @@ pub struct Placed {
 }
 
 impl Placed {
+    fn new(top: (f64, f64), bottom: (f64, f64), ln_mass: f64, ln_scale: f64, x: f64) -> Self {
+        Self {
+            top,
+            bottom,
+            ln_heights: (top.1.abs().ln(), bottom.1.abs().ln()),
+            ln_mass,
+            ln_scale,
+            x,
+        }
+    }
+
     /// The view height of an edge, measured from the placed edge that
-    /// tells it best: a height rounds as the larger of the placed edge's own
-    /// height and the distance from it, so an edge in view is measured from
-    /// the one near it, never from one a great many views away.
+    /// tells it best. Outside the two, that is the one it is beyond. Between
+    /// them, a height rounds as the larger of the placed edge's own height
+    /// and the distance from it, so an edge in view is measured from the one
+    /// near it, never from one a great many views away.
     fn y(&self, ln_below: f64) -> f64 {
-        let ln_far = |edge: f64| {
-            self.ln_scale
-                + if ln_below <= edge {
-                    ln_between(edge, ln_below)
-                } else {
-                    ln_between(ln_below, edge)
-                }
-        };
-        let (top, bottom) = (ln_far(self.top.0), ln_far(self.bottom.0));
-        let ((edge, y), ln_far) =
-            if top.max(self.top.1.abs().ln()) <= bottom.max(self.bottom.1.abs().ln()) {
-                (self.top, top)
-            } else {
-                (self.bottom, bottom)
-            };
-        if ln_below <= edge {
-            y + ln_far.exp()
+        if self.top.0 <= ln_below {
+            return self.top.1 - (self.ln_scale + ln_between(ln_below, self.top.0)).exp();
+        }
+        if ln_below <= self.bottom.0 {
+            return self.bottom.1 + (self.ln_scale + ln_between(self.bottom.0, ln_below)).exp();
+        }
+        let down = self.ln_scale + ln_between(self.top.0, ln_below);
+        let up = self.ln_scale + ln_between(ln_below, self.bottom.0);
+        if down.max(self.ln_heights.0) <= up.max(self.ln_heights.1) {
+            self.top.1 + down.exp()
         } else {
-            y - ln_far.exp()
+            self.bottom.1 - up.exp()
         }
     }
 
@@ -222,13 +230,13 @@ impl Placed {
 
     /// Placed within a child of `p` mass between edges `top` and `bottom`.
     fn child(&self, top: f64, bottom: f64, ln_p: f64, x: f64) -> Placed {
-        Placed {
-            top: (0.0, self.y(top)),
-            bottom: (f64::NEG_INFINITY, self.y(bottom)),
-            ln_mass: self.ln_mass + ln_p,
-            ln_scale: self.ln_scale + ln_p,
+        Placed::new(
+            (0.0, self.y(top)),
+            (f64::NEG_INFINITY, self.y(bottom)),
+            self.ln_mass + ln_p,
+            self.ln_scale + ln_p,
             x,
-        }
+        )
     }
 }
 
@@ -520,27 +528,25 @@ fn place_chain(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Chain> {
         }
     };
     let (top, bottom) = around(tree.distribution(nodes[depth], lens.p)?, &point);
-    let mut placed = vec![
-        Placed {
-            top: (top, y(top)),
-            bottom: (bottom, y(bottom)),
-            ln_mass: ln_masses[depth],
-            ln_scale,
-            x: xs[depth],
-        };
-        nodes.len()
-    ];
+    let anchor = Placed::new(
+        (top, y(top)),
+        (bottom, y(bottom)),
+        ln_masses[depth],
+        ln_scale,
+        xs[depth],
+    );
+    let mut placed = vec![anchor; nodes.len()];
     let mut spans = vec![(y(0.0), y(f64::NEG_INFINITY)); nodes.len()];
     for i in (0..depth).rev() {
         let (top, bottom) = edges[i];
         let (y0, y1) = spans[i + 1];
-        placed[i] = Placed {
-            top: (top, y0),
-            bottom: (bottom, y1),
-            ln_mass: ln_masses[i],
-            ln_scale: ln_masses[i] + cam.x,
-            x: xs[i],
-        };
+        placed[i] = Placed::new(
+            (top, y0),
+            (bottom, y1),
+            ln_masses[i],
+            ln_masses[i] + cam.x,
+            xs[i],
+        );
         spans[i] = placed[i].span();
     }
     Ok(Chain {

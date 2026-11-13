@@ -207,6 +207,19 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(measure.walks, [((99, 0, 1, 2), 1), ((99, 3, 0), 2), ((99, 0, 1, 2), 3)])
         self.assertFalse(model.lock.locked())
 
+    def test_a_canceled_walk_leaves_the_queue_for_the_model(self):
+        model, _ = fixture()
+        canceled = threading.Event()
+        with model.lock, ThreadPoolExecutor() as pool:
+            waiting = pool.submit(lambda: list(model.expand(0, request(0, [0]), canceled)))
+            while not model.lock.wanted():
+                time.sleep(0.001)
+            canceled.set()
+            model.lock.wake()
+            self.assertEqual(waiting.result(timeout=5), [])
+            self.assertFalse(model.lock.wanted())
+        self.assertEqual(model.measures[0].calls, [])
+
     def test_points_place_the_children_holding_them_or_descend_into_one(self):
         model, _ = fixture()
         # 0.9 lies in branch 0's (0.4, 1], 0.3 in branch 1's (0.15, 0.4].

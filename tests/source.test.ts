@@ -241,6 +241,42 @@ describe("Expander", () => {
   });
 });
 
+describe("Expander and the view", () => {
+  it("abandons a read the view no longer lacks while its answer is outstanding, but not one past it, nor a walk", async () => {
+    const tree = new IntervalTree(1);
+    const signals = new Map<string, AbortSignal>();
+    const errors: unknown[] = [];
+    const hang = (signal: AbortSignal) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason)));
+    // A walk and a read of the root answer and go on, as a descent would;
+    // a read of a new node never answers.
+    const source: Source = {
+      async *expand(_tree, request, signal) {
+        const name = request.within === undefined ? "walk" : request.path.length === 0 ? "answered" : "outstanding";
+        signals.set(name, signal!);
+        if (name !== "outstanding") yield { node: request.node, runs: [run([0.5, 0.5])] };
+        await hang(signal!);
+      },
+    };
+    const expander = new Expander(tree, [source]);
+    expander.onError = (error) => errors.push(error);
+    const child: Miss = { ...rootMiss, read: { path: [1], within: { points: at(0.5) } } };
+    let lacking = [rootMiss];
+    expander.request(() => lacking);
+    await waitUntil(() => tree.has(ROOT, 0));
+    lacking = [child];
+    expander.request(() => lacking);
+    void expander.walk(ROOT, tree.descend(ROOT, [0, 0]), 0).catch(() => {});
+    await waitUntil(() => signals.size === 3);
+    lacking = [];
+    expander.request(() => lacking);
+    expect(Object.fromEntries([...signals].map(([name, signal]) => [name, signal.aborted])))
+      .toEqual({ answered: false, outstanding: true, walk: false });
+    await Bun.sleep(5);
+    expect(errors).toEqual([]);
+    expander.dispose();
+  });
+});
+
 async function waitUntil(condition: () => boolean): Promise<void> {
   const deadline = performance.now() + 1000;
   while (!condition()) {

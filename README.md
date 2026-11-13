@@ -164,8 +164,8 @@ selects the known child the pixel holds rather than a gap between children,
 and the highlight outlines the rows of the silhouette that child touches.
 
 Layout reads only what the tree holds and lists what the view lacks as Expand
-requests; the client sends each once, a few at a time, and redraws when an
-answer changes the tree. A request whose answer changed nothing is not asked
+requests; the client sends each once, a few at a time, abandons it once the
+view no longer lacks it, and redraws when an answer changes the tree. A request whose answer changed nothing is not asked
 again until something else changes its node. A server may also say how many
 of a node's children have weight; a gap then shows how many branches it
 holds. Recordings converted from listings do not say.

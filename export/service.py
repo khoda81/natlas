@@ -6,9 +6,9 @@ cached distributions and the hashed node ids shared with every client.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
-import queue
 import re
 import struct
 import sys
@@ -63,13 +63,28 @@ class Turns:
         self._waiting: deque[object] = deque()
         self._held = False
 
-    def acquire(self) -> None:
+    def acquire(self, canceled: threading.Event | None = None) -> bool:
+        """Wait for a turn and take it; False, without one, once ``canceled``
+        is set and ``wake`` called."""
+        def gone() -> bool:
+            return canceled is not None and canceled.is_set()
+
         with self._changed:
             ticket = object()
             self._waiting.append(ticket)
-            self._changed.wait_for(lambda: not self._held and self._waiting[0] is ticket)
-            self._waiting.popleft()
+            self._changed.wait_for(lambda: gone() or (not self._held and self._waiting[0] is ticket))
+            self._waiting.remove(ticket)
+            if gone():
+                # Whoever is next may be first now.
+                self._changed.notify_all()
+                return False
             self._held = True
+            return True
+
+    def wake(self) -> None:
+        """Have waiters look whether they were canceled."""
+        with self._changed:
+            self._changed.notify_all()
 
     def release(self) -> None:
         with self._changed:
@@ -180,7 +195,8 @@ class Model:
                     )
                     continue
                 if not held:
-                    self.lock.acquire()
+                    if not self.lock.acquire(canceled):
+                        break
                     held = True
                     # Another walk may have computed it while this one waited,
                     # and its passes moved the model's caches elsewhere.
@@ -288,25 +304,30 @@ def app(
                 return _stream(
                     [_end({"code": "invalid_argument", "message": "a part's ln mass is not a number"})]
                 )
-            # The walk runs on its own thread and hands each node's children
-            # over as it places them. A client that hangs up stops it at the
-            # next node.
-            items: queue.Queue[bytes | None] = queue.Queue()
+            # The walk runs on its own thread and hands each node's children to
+            # the event loop as it places them, so a stream holds no thread
+            # while it waits. A client that hangs up stops the walk at its
+            # next node, or before its turn at the model.
+            loop = asyncio.get_running_loop()
+            items: asyncio.Queue[bytes | None] = asyncio.Queue()
             canceled = threading.Event()
+
+            def put(item: bytes | None) -> None:
+                loop.call_soon_threadsafe(items.put_nowait, item)
 
             def work() -> None:
                 try:
                     for children in model.expand(measure, request_message, canceled):
-                        items.put(_envelope(0, children.SerializeToString()))
-                    items.put(_end())
+                        put(_envelope(0, children.SerializeToString()))
+                    put(_end())
                 except KeyError as error:
-                    items.put(_end({"code": "not_found", "message": error.args[0]}))
+                    put(_end({"code": "not_found", "message": error.args[0]}))
                 except TooLong as error:
-                    items.put(_end({"code": "out_of_range", "message": str(error)}))
+                    put(_end({"code": "out_of_range", "message": str(error)}))
                 except Exception as error:
                     # Answered as Connect, inside CORS, so the page sees why.
                     traceback.print_exc()
-                    items.put(
+                    put(
                         _end(
                             {
                                 "code": "internal",
@@ -315,18 +336,17 @@ def app(
                         )
                     )
                 finally:
-                    items.put(None)
+                    put(None)
 
             threading.Thread(target=work, daemon=True).start()
 
             async def chunks():
                 try:
-                    while (
-                        item := await anyio.to_thread.run_sync(items.get)
-                    ) is not None:
+                    while (item := await items.get()) is not None:
                         yield item
                 finally:
                     canceled.set()
+                    model.lock.wake()
 
             return StreamingResponse(chunks(), media_type=_CONTENT_TYPE)
 

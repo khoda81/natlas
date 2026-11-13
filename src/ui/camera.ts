@@ -15,6 +15,25 @@ export function moveDepth(cam: Camera, dx: number, fy: number): void {
   cam.a = fy + (cam.a - fy) * Math.exp(before - logView(cam));
 }
 
+/**
+ * Move ``share`` of the way to depth ``x`` with the point ``a`` view heights
+ * down. The view is an interval of its origin, and the motion maps one
+ * interval onto the other: a zoom about the one view fraction both leave in
+ * place, so an edge that ends where it starts never moves. Its steps toward
+ * the same target all zoom about that same fraction.
+ */
+export function glide(cam: Camera, to: { x: number; a: number }, share: number): void {
+  const dx = to.x - cam.x;
+  if (Math.abs(dx) < 1e-12) {
+    cam.a += (to.a - cam.a) * share;
+    return;
+  }
+  // The view's height grows by r = e^−dx; the fraction f with
+  // to.a = f + (cam.a − f) / r stays where it is.
+  const r = Math.exp(-dx);
+  moveDepth(cam, dx * share, (to.a * r - cam.a) / Math.expm1(-dx));
+}
+
 /** Shift content down by ``dy`` view heights. */
 export function panVertical(cam: Camera, dy: number): void {
   cam.a += dy;

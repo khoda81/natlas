@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { aim, type Camera, clamp, extent, layout, pick, settle, top } from "../src/core/layout";
-import { moveDepth, scale } from "../src/ui/camera";
+import { glide, moveDepth, scale } from "../src/ui/camera";
 import { chainTree, answer, digits } from "./build";
 import { IntervalTree, ROOT } from "../src/core/tree";
 
@@ -118,6 +118,25 @@ describe("layout", () => {
     expect(deeper.a).toBeCloseTo(0.5 - 0.5 * Math.exp(-2), 12);
     scale(cam, 1e12);
     expect(cam.k).toBe(1e14);
+  });
+
+  it("glides the view as an interval, so an edge that ends where it starts never moves", () => {
+    // The view's top and bottom below the camera's point, in origin heights.
+    const edges = (cam: Camera) => [-cam.a * Math.exp(-cam.x), (1 - cam.a) * Math.exp(-cam.x)];
+    const cam: Camera = { origin: 3n, x: 1, k: 100, anchor: top(), a: 0.2 };
+    const [topEdge] = edges(cam);
+    const to = { x: 3, a: 0.2 * Math.exp(2) };
+    for (let eased = 0, step = 1; step <= 10; step++) {
+      const next = 1 - (1 - step / 10) ** 2;
+      glide(cam, to, (next - eased) / (1 - eased));
+      eased = next;
+      expect(edges(cam)[0]! / topEdge!).toBeCloseTo(1, 12);
+    }
+    expect(cam.x).toBeCloseTo(to.x, 12);
+    expect(cam.a).toBeCloseTo(to.a, 12);
+    // Without a change of depth, it pans.
+    glide(cam, { x: 3, a: 0.5 }, 0.5);
+    expect(cam.a).toBeCloseTo(to.a + (0.5 - to.a) / 2, 12);
   });
 
   it("clamps the view inside the root's interval", () => {

@@ -17,7 +17,7 @@ import {
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "../data/source";
 import { IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
-import { moveDepth, panVertical, scale } from "./camera";
+import { glide, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, serializeView, viewKey } from "./view-state";
 import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
 import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, rulerCaption, type Units } from "./render";
@@ -46,12 +46,12 @@ const LOCAL_SERVER = "http://localhost:8421/";
 
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
+/** A glide to depth ``to.x`` with the camera's point ``to.a`` view heights
+ * down, begun at ``start``, ``eased`` of the way there so far. */
 interface Focus {
-  box: Box;
+  to: { x: number; a: number };
   start: number;
-  fromX: number;
-  toX: number;
-  fromCenter: number;
+  eased: number;
 }
 
 /**
@@ -393,9 +393,8 @@ export class App {
     flight.time = time;
     const close = this.reducedMotion.matches ? 1 : 1 - Math.exp(-dt / FLIGHT_MS);
     const toX = rootLike(flight.lnMass, flight.x1);
-    this.cam.x += (toX - this.cam.x) * close;
-    const height = Math.exp(flight.lnMass - logView(this.cam));
-    this.cam.a += (0.5 - height / 2 - this.cam.a) * close;
+    const height = Math.exp(flight.lnMass + toX);
+    glide(this.cam, { x: toX, a: 0.5 - height / 2 }, close);
     const arrived = flight.reached === chain.length - 1;
     if (arrived && flight.listed && Math.abs(toX - this.cam.x) < 1e-3) {
       this.flight = null;
@@ -881,13 +880,11 @@ export class App {
       this.cam.anchor = top([...path, box.branch]);
       this.cam.a = box.y0;
     }
-    this.focus = {
-      box,
-      start: performance.now(),
-      fromX: this.cam.x,
-      toX: rootLike(box.lnMass, box.x1),
-      fromCenter: (box.y0 + box.y1) / 2,
-    };
+    // Standing like the root: as tall as the view where its width allows,
+    // centred.
+    const x = rootLike(box.lnMass, box.x1);
+    const height = Math.exp(box.lnMass + x);
+    this.focus = { to: { x, a: 0.5 - height / 2 }, start: performance.now(), eased: 0 };
     this.invalidate();
   }
 
@@ -895,10 +892,9 @@ export class App {
     const focus = this.focus!;
     const t = Math.min(1, Math.max(0, (time - focus.start) / FOCUS_MS));
     const eased = t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
-    this.cam.x = focus.fromX + (focus.toX - focus.fromX) * eased;
-    const height = Math.exp(focus.box.lnMass - Math.min(0, -this.cam.x));
-    const center = focus.fromCenter + (0.5 - focus.fromCenter) * eased;
-    this.cam.a = center - height / 2;
+    // This frame's share of what was left.
+    glide(this.cam, focus.to, focus.eased < 1 ? (eased - focus.eased) / (1 - focus.eased) : 1);
+    focus.eased = eased;
     if (t === 1) this.focus = null;
   }
 

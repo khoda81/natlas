@@ -49,7 +49,9 @@ x counts q-surprisal while the height follows p.
 
 Opening a text flies there: the servers walk its path and place each branch
 along it as they compute it, and the camera descends along the nodes placed so
-far, a bar along the top showing how far. Only the root bounds the view. Past
+far, a bar along the top showing how far. Until the whole path is placed the
+view asks for nothing else, so the servers spend every turn on the path. Only
+the root bounds the view. Past
 any other origin, left, above or below, lies its parent, which is fetched as
 soon as the view goes there; until it arrives that space stays empty, and then
 the parent becomes the origin without moving the picture (with p = q).

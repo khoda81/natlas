@@ -498,6 +498,9 @@ export class App {
     if (previous !== null && previous !== frame) previous.dispose();
     this.expander?.request(() => {
       if (tree !== this.tree) return [];
+      // A flight placing its path wants that path alone: the view it passes
+      // through would take the source's turns from it.
+      if (this.flight !== null && !this.flight.listed) return [];
       return this.currentFrame({ ...this.cam }).misses;
     });
     this.reachOut(frame);

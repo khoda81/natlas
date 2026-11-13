@@ -75,7 +75,10 @@ impl PythonTree {
             .detach(|| Distribution::from_weights(&weights))
             .map_err(error)?;
         let bytes = distribution.bytes();
-        slf.borrow_mut().inner.set(node, measure, distribution).map_err(error)?;
+        slf.borrow_mut()
+            .inner
+            .set(node, measure, distribution)
+            .map_err(error)?;
         Ok(bytes)
     }
 

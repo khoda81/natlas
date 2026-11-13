@@ -49,8 +49,8 @@ _END_STREAM = 0x02
 _CONTENT_TYPE = "application/connect+proto"
 _PROTO_CONTENT_TYPE = "application/proto"
 # Memory for distributions a server keeps by default, across its measures.
-# The core keeps each sorted, 24 to 28 bytes per vocabulary entry: some 250
-# nodes of a 150k vocabulary, 900 of a 50k one.
+# The core keeps each sorted, 16 bytes per vocabulary entry: some 440 nodes of
+# a 150k vocabulary, 1360 of a 50k one.
 CACHE = 1 << 30
 
 

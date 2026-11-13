@@ -61,7 +61,8 @@ pub struct Run {
 /// Runs are what they place: the derived sums are not compared.
 impl PartialEq for Run {
     fn eq(&self, other: &Self) -> bool {
-        (self.rank, &self.branches, &self.ln_below) == (other.rank, &other.branches, &other.ln_below)
+        (self.rank, &self.branches, &self.ln_below)
+            == (other.rank, &other.branches, &other.ln_below)
     }
 }
 
@@ -212,11 +213,43 @@ pub struct Distribution {
 }
 
 /// Each known child's rank by its branch.
-type Ranks = HashMap<Branch, Rank, BuildHasherDefault<BranchHasher>>;
+#[derive(Clone, Debug)]
+enum Ranks {
+    /// Indexed by branch, `NO_RANK` for a weightless one: a whole vocabulary
+    /// as a measure computes it, a quarter of a hash table's size.
+    Dense(Vec<Rank>),
+    /// What a source's answers placed, of any branches.
+    Sparse(HashMap<Branch, Rank, BuildHasherDefault<BranchHasher>>),
+}
+
+/// No child has it: a run ends at `Rank::MAX` at the latest.
+const NO_RANK: Rank = Rank::MAX;
+
+impl Ranks {
+    fn get(&self, branch: Branch) -> Option<Rank> {
+        match self {
+            Self::Dense(ranks) => ranks
+                .get(branch as usize)
+                .copied()
+                .filter(|&rank| rank != NO_RANK),
+            Self::Sparse(ranks) => ranks.get(&branch).copied(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        use std::mem::size_of;
+        match self {
+            Self::Dense(ranks) => ranks.capacity() * size_of::<Rank>(),
+            // Slots of a branch, a rank and a control byte, one in eight
+            // left empty.
+            Self::Sparse(ranks) => ranks.capacity() * 8 / 7 * (size_of::<(Branch, Rank)>() + 1),
+        }
+    }
+}
 
 /// Branches come from the node's own source, mostly small and dense: one
 /// multiply spreads them across the table's bits at a fraction of SipHash's
-/// cost, which a server pays for its whole vocabulary on every node.
+/// cost.
 #[derive(Default)]
 struct BranchHasher(u64);
 
@@ -265,8 +298,16 @@ impl Distribution {
                 *edge = (*edge - total).min(0.0);
             }
         }
+        let mut ranks = vec![NO_RANK; ln_weights.len()];
+        for (rank, &(_, branch)) in (0..).zip(&order) {
+            ranks[branch as usize] = rank;
+        }
         let branches = order.into_iter().map(|(_, branch)| branch).collect();
-        Ok(Self::new(Run::new(0, branches, ln_below)?))
+        // One run of distinct branches: nothing for `from_runs` to check.
+        Ok(Self {
+            runs: vec![Run::new(0, branches, ln_below)?],
+            rank: Ranks::Dense(ranks),
+        })
     }
 
     pub fn runs(&self) -> &[Run] {
@@ -293,10 +334,8 @@ impl Distribution {
 
     /// Runs disjoint by rank, two neighbours with a gap between them.
     fn from_runs(runs: Vec<Run>) -> Result<Self> {
-        let mut rank = Ranks::with_capacity_and_hasher(
-            runs.iter().map(Run::len).sum(),
-            Default::default(),
-        );
+        let mut rank =
+            HashMap::with_capacity_and_hasher(runs.iter().map(Run::len).sum(), Default::default());
         for run in &runs {
             for (at, &branch) in (run.rank..).zip(&run.branches) {
                 if rank.insert(branch, at).is_some() {
@@ -311,10 +350,13 @@ impl Distribution {
         {
             return Err("runs overlap in mass".into());
         }
-        Ok(Self { runs, rank })
+        Ok(Self {
+            runs,
+            rank: Ranks::Sparse(rank),
+        })
     }
     pub fn rank(&self, branch: Branch) -> Option<Rank> {
-        self.rank.get(&branch).copied()
+        self.rank.get(branch)
     }
 
     /// The run and offset of a known child.
@@ -353,10 +395,7 @@ impl Distribution {
     pub fn bytes(&self) -> usize {
         use std::mem::size_of;
         let runs: usize = self.runs.iter().map(Run::bytes).sum();
-        // A hash table's slots, each a branch and rank and a control byte,
-        // with one slot in eight left empty.
-        let slots = self.rank.capacity() * 8 / 7;
-        size_of::<Self>() + runs + slots * (size_of::<(Branch, Rank)>() + 1)
+        size_of::<Self>() + runs + self.rank.bytes()
     }
 
     /// A known edge: rank 0's is the node's top, the whole mass, even where
@@ -688,7 +727,9 @@ mod tests {
         .unwrap();
         let run = &d.runs()[0];
         assert_eq!(run.branches(), [1, 3, 0, 5, 4]);
-        assert_eq!(d.rank(2), None);
+        // Every branch's rank, none for a weightless one or one past them.
+        let ranks: Vec<_> = (0..7).map(|branch| d.rank(branch)).collect();
+        assert_eq!(ranks, [Some(2), Some(0), None, Some(1), Some(4), Some(3), None]);
         close(run.ln_p(0), (0.5f64 / 1.2).ln());
         // The lightest child keeps its own weight, far below any float of 1 − cdf.
         close(run.ln_p(4), tiny.ln() - 1.2f64.ln());

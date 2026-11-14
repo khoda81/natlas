@@ -1138,13 +1138,20 @@ pub fn pick(
         return Ok(Some(origin));
     }
     let mut node = cam.origin;
+    // The box of the node the pointer is in, below the origin.
+    let mut within = None;
     loop {
         let (Some(placed), Some(d)) = (frame.placed.get(&node), tree.distribution(node, lens.p)?)
         else {
             return Ok(Some(origin));
         };
+        // Nothing at any height: a node known to have no children, whose
+        // box is all there is.
         let Some(item) = d.locate_by(|edge| placed.y(edge) <= y) else {
-            return Ok(Some(origin));
+            return Ok(Some(within.map_or(origin, |b| PickResult {
+                r#box: b,
+                exact: true,
+            })));
         };
         let item = band_child(frame, node, placed, d, item, y, y + pixel_px / view.height);
         let b = item_box(tree, lens, node, placed, d, item)?;
@@ -1159,6 +1166,7 @@ pub fn pick(
                 exact: false,
             }));
         }
+        within = Some(b);
         node = child;
     }
 }
@@ -1775,6 +1783,24 @@ mod tests {
         assert_eq!(
             pick(&empty, LENS, &frame, &camera, VIEW, -1.0, 400.0, 1.0).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn past_a_node_with_no_children_the_pointer_picks_that_node() {
+        // Branch 0 ends the sequence: nothing lies past its box.
+        let (mut tree, _) = chain_tree(&[0.5, 0.5], &[]);
+        let ended = tree.child(ROOT, 0).unwrap();
+        tree.set(ended, 0, Distribution::from_weights(&[]).unwrap())
+            .unwrap();
+        let camera = cam(ROOT, 0.0, top(&[]), 0.0);
+        let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
+        let hit = pick(&tree, LENS, &frame, &camera, VIEW, 300.0, 200.0, 1.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (hit.r#box.node, hit.r#box.branch, hit.exact),
+            (ROOT, Some(0), true)
         );
     }
 }

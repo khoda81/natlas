@@ -226,7 +226,7 @@ impl Run {
     }
 
     /// Children [from, to) as a run of their own.
-    fn slice(&self, from: usize, to: usize) -> Run {
+    pub(crate) fn slice(&self, from: usize, to: usize) -> Run {
         let branches = match &self.children {
             Children::Listed { branches, .. } => branches[from..to].to_vec(),
             Children::Packed(packed) => packed.branches(from, to),

@@ -143,6 +143,10 @@ impl Tree {
         Ok(node)
     }
 
+    pub fn measures(&self) -> usize {
+        self.measures
+    }
+
     /// Whether this tree has learned the node.
     pub fn contains(&self, id: NodeId) -> bool {
         self.nodes.contains_key(&id)

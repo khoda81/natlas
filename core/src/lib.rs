@@ -3,6 +3,7 @@ pub mod distribution;
 pub mod layout;
 mod packed;
 pub mod point;
+pub mod session;
 pub mod tree;
 
 pub type Result<T> = std::result::Result<T, String>;

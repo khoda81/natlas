@@ -552,6 +552,7 @@ export class App {
       ancestors,
       units: this.units,
       glyph: (node, branch) => this.glyph(node, branch),
+      child: (node, branch) => tree.child(node, branch),
       note: origin && { text: origin.text, sweep: origin.loading && !this.reducedMotion.matches ? time : null },
     });
     this.fadeOut(time);

@@ -173,7 +173,7 @@ function equal(a: Uint8Array, b: Uint8Array): boolean {
 
 /** Whitespace made visible, for a label shown on its own. */
 function visible(text: string): string {
-  return text.replace(/[ \n\r\t]/g, (c) => ({ " ": "␠", "\n": "↵", "\r": "↩", "\t": "⇥" })[c]!);
+  return text.replace(/[ \n\r\t]/g, (c) => ({ " ": "␣", "\n": "↵", "\r": "↩", "\t": "⇥" })[c]!);
 }
 
 function token(text: string, kind?: string): HTMLElement {

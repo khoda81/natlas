@@ -7,7 +7,7 @@ import { answer, digits, run } from "./build";
 
 const view = { width: 270, height: 340 };
 const palette = Palette.current();
-const state = { hover: null, ancestors: new Set<string>(), units: NATS, glyph: () => ({ text: "" }), note: null };
+const state = { hover: null, ancestors: new Set<string>(), units: NATS, glyph: () => ({ text: "" }), child: (node: bigint, branch: number) => uniform.child(node, branch), note: null };
 const cam = (phase = 0) => ({ origin: ROOT, x: 0, k: 23, anchor: top(), a: phase / view.height });
 const rgb = (color: string) => color.startsWith("#")
   ? color.slice(1).match(/../g)!.map(c => Number.parseInt(c, 16))

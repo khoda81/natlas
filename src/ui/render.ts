@@ -22,6 +22,8 @@ export interface DrawState {
   units: Units;
   /** How the child along ``branch`` of node ``node`` reads. */
   glyph: (node: NodeId, branch: number) => Glyph;
+  /** The node the child along ``branch`` of ``node`` is. */
+  child: (node: NodeId, branch: number) => NodeId;
   /** Why the origin shows no children, if it does not; ``sweep`` animates
    * a faint band behind the text while they load. */
   note: { text: string; sweep: number | null } | null;
@@ -30,12 +32,19 @@ export interface DrawState {
 const FAMILY = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 const BASE_SIZE = 12;
 const FONT = `${BASE_SIZE}px ${FAMILY}`;
-const LABEL_MIN_HEIGHT = 8;
-/** Labels grow to fit their box's height or width, whichever binds first, within these sizes. */
+// Label sizes are text sizes, in CSS pixels like the page's own text, so they
+// scale with it across devices and zoom, never with the view.
+/** The smallest a label reads at. A label that needs less is shortened, or not drawn. */
+const LABEL_MIN_SIZE = 8;
+/** Labels grow to fit their box, up to this size. */
 const LABEL_MAX_SIZE = 96;
-/** Fraction of the visible box height a label may fill. */
-const LABEL_HEIGHT_FILL = 0.6;
-const LABEL_MIN_WIDTH = 14;
+/** Fraction of the box a label may fill across its text. */
+const LABEL_FILL = 0.6;
+/** Room left at each end of a label, in ems. */
+const LABEL_PAD = 0.25;
+/** How strongly a near-certain continuation shows beside a label's own text. */
+const CONTINUATION_ALPHA = 0.6;
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const GAP_MIN = 4;
 /** A mark's width, and the space after it, in ems. */
 const MARK_WIDTH = 0.8;
@@ -124,7 +133,7 @@ export function draw(
   ctx.font = FONT;
   ctx.textBaseline = "middle";
 
-  const labels: { box: Box; rect: ScreenRect; glyph: Glyph; ink: string; grows: boolean }[] = [];
+  const labels: { box: Box; rect: ScreenRect; ink: string }[] = [];
   let visible = false;
   for (let i = 0; i < frame.boxes.length; i++) {
     const box = frame.boxes[i]!;
@@ -156,51 +165,95 @@ export function draw(
       ctx.fillRect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0 - separator, pixels.y1 - pixels.y0 - separator);
     }
 
-    if (
-      height <= LABEL_MIN_HEIGHT
-      || width <= LABEL_MIN_WIDTH
-      || box.count === 0
-    ) {
-      continue;
-    }
-
-    labels.push({
-      box,
-      rect,
-      glyph: box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box),
-      ink,
-      grows: box.branch !== null
-    });
+    if (box.count !== 0) labels.push({ box, rect, ink });
   }
+
+  // Boxes by the node whose children they are, to follow a chain of
+  // near-certain children from a label's box.
+  const children = new Map<NodeId, Box[]>();
+  for (const box of frame.boxes) {
+    const siblings = children.get(box.node);
+    if (siblings === undefined) children.set(box.node, [box]);
+    else siblings.push(box);
+  }
+  const fits = new Map<Box, Fit | null>();
+  const fitOf = (box: Box): Fit | null => {
+    let fit = fits.get(box);
+    if (fit === undefined) {
+      const glyph = box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box);
+      const width = (box.x1 - box.x0) * cam.k - 2;
+      const height = (box.y1 - box.y0) * view.height;
+      fits.set(box, fit = fitLabel(ctx, glyph, width, height, box.branch !== null));
+    }
+    return fit;
+  };
+  /** The child holding most of the box's p mass, if any. */
+  const dominant = (box: Box): Box | null => {
+    if (box.branch === null) return null;
+    const below = children.get(state.child(box.node, box.branch)) ?? [];
+    return below.find((child) => child.branch !== null && child.kind !== "merged" && 0.5 < child.p) ?? null;
+  };
+  /** The text of the chain of dominant children below a box that have no
+   * label of their own, as much as ``room`` ems holds. */
+  const continuation = (box: Box, room: number): string => {
+    let text = "";
+    for (let child = dominant(box); child !== null && fitOf(child) === null; child = dominant(child)) {
+      const glyph = state.glyph(child.node, child.branch!);
+      if (glyph.mark !== undefined) break;
+      text += glyph.text;
+      if (room < measure(ctx, text) / BASE_SIZE) return shortened(ctx, text, room) ?? "";
+    }
+    return text;
+  };
 
   // A label's size follows its whole box, never the viewport. Within its box,
   // a label moves toward the viewport as far as the box allows: it starts at
   // the box's left, centered, and slides right past the left screen edge and
-  // up or down into view, stopping at the box's own edges. A label that still
-  // does not fit stays its size and is clipped.
-  for (const { box, rect, glyph, ink, grows } of labels) {
-    const boxLeft = (box.x0 - cam.x) * cam.k;
-    const width = (box.x1 - box.x0) * cam.k - 2;
+  // up or down into view, stopping at the box's own edges. A label reading up
+  // a box is centered both ways and slides into view the same way. A chain of
+  // near-certain children too thin for labels of their own continues their
+  // ancestor's label, fainter, in the room its box has left.
+  for (const { box, rect, ink } of labels) {
+    const fit = fitOf(box);
+    if (fit === null) continue;
+    const { text, size, vertical, marked } = fit;
+    const left = (box.x0 - cam.x) * cam.k;
+    const right = left + (box.x1 - box.x0) * cam.k - 2;
     const top = box.y0 * view.height;
     const bottom = box.y1 * view.height;
-    const marked = glyph.mark === undefined ? 0 : MARK_WIDTH + (glyph.text === "" ? 0 : MARK_GAP);
-    const textWidth = measure(ctx, glyph.text) / BASE_SIZE + marked;
-    // At size s the text spans textWidth·s, plus s/4 of padding on each side.
-    const fit = Math.min((bottom - top) * LABEL_HEIGHT_FILL, width / (textWidth + 0.5));
-    const size = grows ? Math.min(LABEL_MAX_SIZE, fit) : BASE_SIZE;
-    const pad = Math.max(4, size / 4);
-    const span = textWidth * size;
-    const x = within(pad, boxLeft + pad, boxLeft + width - pad - span);
-    const y = within(within((top + bottom) / 2, size / 2, view.height - size / 2), top + size / 2, bottom - size / 2);
-    if (x > view.width || x + span < 0 || y - size / 2 > view.height || y + size / 2 < 0) continue;
+    const pad = LABEL_PAD * size;
+    const own = (measure(ctx, text) / BASE_SIZE + marked) * size;
+    const along = vertical ? bottom - top : right - left;
+    const more = continuation(box, (along - 2 * pad - own) / size);
+    const span = own + (measure(ctx, more) / BASE_SIZE) * size;
+    // Where the text starts, and the screen rectangle it covers.
+    let x: number, y: number, covers: ScreenRect;
+    if (vertical) {
+      x = within(within((left + right) / 2, size / 2, view.width - size / 2), left + size / 2, right - size / 2);
+      const middle = within(within((top + bottom) / 2, pad + span / 2, view.height - pad - span / 2), top + pad + span / 2, bottom - pad - span / 2);
+      y = middle + span / 2;
+      covers = { x0: x - size / 2, y0: y - span, x1: x + size / 2, y1: y };
+    } else {
+      x = within(pad, left + pad, right - pad - span);
+      y = within(within((top + bottom) / 2, size / 2, view.height - size / 2), top + size / 2, bottom - size / 2);
+      covers = { x0: x, y0: y - size / 2, x1: x + span, y1: y + size / 2 };
+    }
+    if (view.width < covers.x0 || covers.x1 < 0 || view.height < covers.y0 || covers.y1 < 0) continue;
     ctx.save();
     ctx.beginPath();
     ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0 - 2, rect.y1 - rect.y0);
     ctx.clip();
+    ctx.translate(x, y);
+    if (vertical) ctx.rotate(-Math.PI / 2);
     ctx.font = `${size}px ${FAMILY}`;
-    if (glyph.mark !== undefined) mark(ctx, glyph.mark, x, y, size, glyph.tint ?? ink, ink);
+    const glyph = box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box);
+    if (glyph.mark !== undefined) mark(ctx, glyph.mark, 0, 0, size, glyph.tint ?? ink, ink);
     ctx.fillStyle = ink;
-    ctx.fillText(glyph.text, x + marked * size, y);
+    ctx.fillText(text, marked * size, 0);
+    if (more !== "") {
+      ctx.globalAlpha = CONTINUATION_ALPHA;
+      ctx.fillText(more, own, 0);
+    }
     ctx.restore();
   }
 
@@ -274,6 +327,52 @@ function tail(
 }
 
 /** What a gap or the origin says of itself: how many children it holds, where known. */
+/** A label as drawn: its text, maybe shortened, its size, which way it
+ * reads, and the ems its mark takes before the text. */
+interface Fit {
+  text: string;
+  size: number;
+  vertical: boolean;
+  marked: number;
+}
+
+/** The largest label a box of ``width`` by ``height`` CSS pixels holds:
+ * across it, or up it where it is taller than wide and that is larger. A
+ * label too long to read at any size the box allows keeps as much of its
+ * start as fits at the smallest readable size; one that keeps nothing is
+ * not drawn. Gap labels, which do not ``grow``, stay at the base size. */
+function fitLabel(ctx: CanvasRenderingContext2D, glyph: Glyph, width: number, height: number, grows: boolean): Fit | null {
+  const marked = glyph.mark === undefined ? 0 : MARK_WIDTH + (glyph.text === "" ? 0 : MARK_GAP);
+  const ems = measure(ctx, glyph.text) / BASE_SIZE + marked;
+  const largest = grows ? LABEL_MAX_SIZE : BASE_SIZE;
+  const size = (across: number, along: number) => Math.min(largest, across * LABEL_FILL, along / (ems + 2 * LABEL_PAD));
+  const sideways = size(height, width);
+  const upward = width < height ? size(width, height) : 0;
+  const vertical = sideways < upward;
+  const best = Math.max(sideways, upward);
+  if (LABEL_MIN_SIZE <= best) return { text: glyph.text, size: best, vertical, marked };
+  // Ems of text that fit at the smallest readable size.
+  const room = (across: number, along: number) =>
+    LABEL_MIN_SIZE <= across * LABEL_FILL ? along / LABEL_MIN_SIZE - 2 * LABEL_PAD - marked : 0;
+  const across = room(height, width);
+  const up = width < height ? room(width, height) : 0;
+  const text = shortened(ctx, glyph.text, Math.max(across, up));
+  return text === null ? null : { text, size: LABEL_MIN_SIZE, vertical: across < up, marked };
+}
+
+/** The longest start of ``text``, whole characters followed by an
+ * ellipsis, that fits ``room`` ems; null if not even one character does. */
+function shortened(ctx: CanvasRenderingContext2D, text: string, room: number): string | null {
+  let start = "";
+  let fits: string | null = null;
+  for (const { segment } of graphemes.segment(text)) {
+    start += segment;
+    if (room < measure(ctx, start + MORE.text) / BASE_SIZE) break;
+    fits = start + MORE.text;
+  }
+  return fits;
+}
+
 function gapGlyph(box: Box): Glyph {
   if (box.kind !== "gap" || box.count === 0) return MORE;
   return { text: box.count === 1 ? "1 child" : `${box.count.toLocaleString()} children` };

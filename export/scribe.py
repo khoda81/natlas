@@ -236,31 +236,53 @@ class Scribe:
         return conditions
 
     def _slot(self, window: Window, written: list[int]) -> tuple[_Slot, int | None]:
-        """The cache that saves the most steps, and how many of its events to keep, or None to start over."""
-        best: tuple[tuple[int, int], _Slot, int | None] | None = None
-        for slot in self.slots:
-            kept = None
-            if slot.window == window:
-                shared = 0
-                for have, want in zip(slot.fed, written):
-                    if have != want:
-                        break
-                    shared += 1
-                # Keep the prologue whole: it is written in one pass.
-                if shared >= len(window.prologue):
-                    kept = shared
-            score = (-1 if kept is None else kept, -slot.used)
-            if best is None or score > best[0]:
-                best = (score, slot, kept)
-        if best is None or (best[2] is None and len(self.slots) < self.capacity):
-            sequence_length = self.prepend + 1 + self.windows.max_events
-            slot = _Slot(init_states(self.lm, batch_size=1, sequence_length=sequence_length))
-            self.slots.append(slot)
-            best = ((-1, 0), slot, None)
-        _, slot, kept = best
+        """The cache to read ``written`` in, and how many of its events it
+        holds already, or None to start over.
+
+        A cache holding a prefix of ``written`` goes on in place. Otherwise
+        a new cache while there is room, else the least recently used, takes
+        what the cache sharing the most with it holds, up to what they share.
+        Rewinding the shared cache whatever its use would lose the walk it
+        holds: walks that take turns, as passes do while one runs and the
+        next waits, would each read their whole path again on every pass.
+        """
+        shared: dict[int, int] = {}
+        for index, slot in enumerate(self.slots):
+            if slot.window != window:
+                continue
+            kept = 0
+            for have, want in zip(slot.fed, written):
+                if have != want:
+                    break
+                kept += 1
+            # Keep the prologue whole: it is written in one pass.
+            if len(window.prologue) <= kept:
+                shared[index] = kept
+        source = max(shared, key=shared.__getitem__, default=None)
         self.clock += 1
+        if source is not None and shared[source] == len(self.slots[source].fed):
+            slot = self.slots[source]
+        else:
+            if len(self.slots) < self.capacity:
+                sequence_length = self.prepend + 1 + self.windows.max_events
+                self.slots.append(_Slot(init_states(self.lm, batch_size=1, sequence_length=sequence_length)))
+                target = len(self.slots) - 1
+            else:
+                target = min(range(len(self.slots)), key=lambda index: self.slots[index].used)
+            slot = self.slots[target]
+            if source is not None and target != source:
+                self._copy(self.slots[source], slot, shared[source])
         slot.used = self.clock
-        return slot, kept
+        return slot, None if source is None else shared[source]
+
+    def _copy(self, source: _Slot, target: _Slot, kept: int) -> None:
+        """Make ``target`` hold the first ``kept`` events ``source`` holds."""
+        end = self.prepend + 1 + kept
+        for name, state in source.state.items():
+            into = target.state[name]
+            if "cache" in state:
+                into["cache"][:, :, :end].copy_(state["cache"][:, :, :end])
+        target.window, target.fed, target.logits = source.window, source.fed[:kept], None
 
     @torch.inference_mode()
     def _evaluate(self, window: Window, written: list[int]) -> torch.Tensor:

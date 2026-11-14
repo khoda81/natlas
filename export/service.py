@@ -16,7 +16,7 @@ import time
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -63,15 +63,35 @@ class Client:
     session: Session = field(default_factory=Session)
 
 
+@dataclass(frozen=True)
+class Pass:
+    """One forward pass for a client: the distributions of ``nodes`` under
+    ``measure``, each the child of the one before."""
+
+    client: Client
+    measure: int
+    nodes: tuple[int, ...]
+
+
+# Forward passes submitted and not yet finished: the one running and the one
+# queued behind it, so the model starts the next the moment one ends while
+# the scheduler packs the last one's result. A queued pass can still be
+# withdrawn; a running one cannot.
+_SUBMITTED = 2
+
+
 class Model:
     """The integer-sequence distribution under each measure, computed for the
     clients looking at it.
 
     One scheduler thread owns the core tree, the distributions kept and the
-    model; everything else posts work to its inbox. It steps every client's
-    session, sends what is new, and computes the distribution the next client
-    in turn waits on most, choosing again after every pass. Clients take
-    turns pass by pass; within a client, worth alone decides.
+    sessions; everything else posts work to its inbox. It takes everything
+    posted at once, so a burst of demands costs one step, steps every
+    client's session, sends what is new, and keeps the model busy with the
+    distribution the next client in turn waits on most. The model runs on a
+    thread of its own; only the scheduler submits passes to it. Clients take
+    turns pass by pass; within a client, worth alone decides. A new demand
+    withdraws the client's queued pass, so the next one is chosen from it.
     """
 
     def __init__(
@@ -98,11 +118,14 @@ class Model:
         self.clients: list[Client] = []
         # The client whose turn is next.
         self.turn = 0
-        self.inbox: queue.Queue[tuple[Callable[[], Any], Future]] = queue.Queue()
+        # Passes whose results the scheduler has not taken yet.
+        self.passes: dict[Future[list[np.ndarray]], Pass] = {}
+        self.inbox: queue.SimpleQueue[tuple[Callable[[], Any], Future]] = queue.SimpleQueue()
+        self.inference = ThreadPoolExecutor(1, thread_name_prefix="inference")
         threading.Thread(target=self._run, daemon=True, name="scheduler").start()
 
     def call[T](self, work: Callable[[], T]) -> Future[T]:
-        """Run ``work`` on the scheduler, between passes."""
+        """Run ``work`` on the scheduler."""
         future: Future[T] = Future()
         self.inbox.put((work, future))
         return future
@@ -116,7 +139,11 @@ class Model:
         return self.call(opened)
 
     def close(self, client: Client) -> Future[None]:
-        return self.call(lambda: self.clients.remove(client))
+        def closed() -> None:
+            self.clients.remove(client)
+            self._withdraw(client)
+
+        return self.call(closed)
 
     def demand(self, client: Client, demand: pb.Demand) -> Future[None]:
         """What ``client`` looks at now. The future fails with ValueError for
@@ -126,7 +153,12 @@ class Model:
             v = demand.view
             view = (v.node, v.top, v.ln_height, v.rows, v.right)
         path = (demand.path.node, list(demand.path.branches)) if demand.HasField("path") else None
-        return self.call(lambda: client.session.demand(self.tree, demand.p, demand.q, view=view, path=path))
+
+        def demanded() -> None:
+            client.session.demand(self.tree, demand.p, demand.q, view=view, path=path)
+            self._withdraw(client)
+
+        return self.call(demanded)
 
     def learn(self, path: Sequence[int]) -> Future[list[int]]:
         """Learn the ids along ``path``, so demands can name them alone."""
@@ -134,86 +166,125 @@ class Model:
 
     def _run(self) -> None:
         while True:
-            self._take(wait=False)
+            item = self.inbox.get()
+            while True:
+                work, future = item
+                try:
+                    future.set_result(work())
+                except Exception as error:
+                    future.set_exception(error)
+                try:
+                    item = self.inbox.get_nowait()
+                except queue.Empty:
+                    break
             for client in self.clients:
                 self._step(client)
-            chosen = self._chosen()
-            if chosen is None:
-                self._take(wait=True)
-                continue
-            self._compute(*chosen)
-
-    def _take(self, wait: bool) -> None:
-        """Run what was posted; with ``wait``, wait for something first."""
-        try:
-            item = self.inbox.get() if wait else self.inbox.get_nowait()
-        except queue.Empty:
-            return
-        while True:
-            work, future = item
-            try:
-                future.set_result(work())
-            except Exception as error:
-                future.set_exception(error)
-            try:
-                item = self.inbox.get_nowait()
-            except queue.Empty:
-                return
+            self._submit()
 
     def _step(self, client: Client) -> None:
         updates = client.session.step(self.tree)
         if updates:
             client.send(_encode(updates))
 
-    def _chosen(self) -> tuple[int, int, float, list[int]] | None:
-        """The next client in turn that waits on something, and the most
-        valuable distribution it waits on."""
+    def _withdraw(self, client: Client) -> None:
+        """Withdraw the client's queued pass; its result is taken, and the
+        pass forgotten, when the future's callback reaches the inbox."""
+        for future, job in self.passes.items():
+            if job.client is client:
+                future.cancel()
+
+    def _submit(self) -> None:
+        """Keep the model busy: submit what the next clients in turn wait on
+        most, and is not on its way already."""
+        reserved = {(job.measure, node) for job in self.passes.values() for node in job.nodes}
+        while sum(not future.done() for future in self.passes) < _SUBMITTED:
+            chosen = self._chosen(reserved)
+            if chosen is None:
+                return
+            client, (measure, node, worth, ahead) = chosen
+            job, work = self._pass(client, measure, node, worth, ahead, reserved)
+            reserved.update((measure, node) for node in job.nodes)
+            if work is None:
+                future: Future[list[np.ndarray]] = Future()
+                future.set_result([np.empty(0)])
+            else:
+                future = self.inference.submit(work)
+            self.passes[future] = job
+            future.add_done_callback(lambda future: self.call(lambda: self._finish(future)))
+
+    def _chosen(self, reserved: set[tuple[int, int]]) -> tuple[Client, tuple[int, int, float, list[int]]] | None:
+        """The next client in turn that waits on something not reserved,
+        and the most valuable such distribution it waits on."""
         count = len(self.clients)
         for offset in range(count):
             client = self.clients[(self.turn + offset) % count]
-            blocked = client.session.blocked()
-            if blocked:
-                self.turn = (self.turn + offset + 1) % count
-                return blocked[0]
+            for blocked in client.session.blocked():
+                if blocked[:2] not in reserved:
+                    self.turn = (self.turn + offset + 1) % count
+                    return client, blocked
         return None
 
-    def _compute(self, measure: int, node: int, worth: float, ahead: list[int]) -> None:
-        """Compute a distribution, and where a path goes on below it, the
-        next nodes along it, as many as the measure reads in one pass."""
-        started = time.perf_counter()
+    def _pass(
+        self,
+        client: Client,
+        measure: int,
+        node: int,
+        worth: float,
+        ahead: list[int],
+        reserved: set[tuple[int, int]],
+    ) -> tuple[Pass, Callable[[], list[np.ndarray]] | None]:
+        """A pass computing a distribution, and where a path goes on below
+        it, the next nodes along it that are neither held nor on their way,
+        as many as the measure reads in one pass; with the work to run on
+        the model, or None for a node with no children."""
         tokens = tuple(self.tree.path(node))
+        if self._empty(tokens):
+            return Pass(client, measure, (node,)), None
         # Down the path as far as one pass reads and the sequence goes on.
-        along = tokens
+        nodes, along = [node], tokens
         for branch in ahead[: self.measures[measure].positions - 1]:
-            if self._empty(along) or self._empty(along + (branch,)):
+            if self._empty(along + (branch,)):
                 break
+            (_, child) = self.tree.walk(nodes[-1], [branch])
+            if (measure, child) in reserved or self.tree.has(child, measure):
+                break
+            nodes.append(child)
             along += (branch,)
-        try:
-            if self._empty(tokens):
-                computed = [np.empty(0)]
-            else:
-                walk = self.measures[measure].walk(self.root + along, len(self.root) + len(tokens))
-                computed = [ln_weights for ln_weights, _ in zip(walk, range(len(along) - len(tokens) + 1), strict=False)]
-        except Exception as error:
-            if not isinstance(error, TooLong):
-                traceback.print_exc()
-            message = str(error) if isinstance(error, TooLong) else f"{type(error).__name__}: {error}"
-            for client in self.clients:
-                if any(blocked[:2] == (measure, node) for blocked in client.session.blocked()):
-                    client.session.failed(measure, node, message)
+        walk = self.measures[measure].walk
+
+        def work() -> list[np.ndarray]:
+            started = time.perf_counter()
+            computed = list(walk(self.root + along, len(self.root) + len(tokens)))
+            elapsed = (time.perf_counter() - started) * 1000
+            print(
+                f"m{measure} depth {len(tokens)} worth {worth:.1f}: {len(computed)} computed, {elapsed:.0f} ms",
+                file=sys.stderr,
+            )
+            return computed
+
+        return Pass(client, measure, tuple(nodes)), work
+
+    def _finish(self, future: Future[list[np.ndarray]]) -> None:
+        """Keep what a pass computed, or fail what waits on it."""
+        job = self.passes.pop(future)
+        if future.cancelled():
             return
-        nodes = self.tree.walk(node, list(along[len(tokens) :]))
-        for at, ln_weights in zip(nodes, computed, strict=False):
-            self._keep(measure, at, ln_weights)
-        elapsed = (time.perf_counter() - started) * 1000
-        print(
-            f"m{measure} depth {len(tokens)} worth {worth:.1f}: {len(computed)} computed, {elapsed:.0f} ms",
-            file=sys.stderr,
-        )
+        error = future.exception()
+        if error is None:
+            for node, ln_weights in zip(job.nodes, future.result(), strict=True):
+                self._keep(job.measure, node, ln_weights)
+            return
+        if not isinstance(error, TooLong):
+            traceback.print_exception(error)
+        message = str(error) if isinstance(error, TooLong) else f"{type(error).__name__}: {error}"
+        key = (job.measure, job.nodes[0])
+        for client in self.clients:
+            if any(blocked[:2] == key for blocked in client.session.blocked()):
+                client.session.failed(*key, message)
 
     def _empty(self, tokens: tuple[int, ...]) -> bool:
         """Whether a sequence has no children: finished, or past the vocabulary."""
-        return self.ends(tokens) or any(branch >= self.vocabulary for branch in tokens)
+        return self.ends(tokens) or any(self.vocabulary <= branch for branch in tokens)
 
     def _keep(self, measure: int, node: int, ln_weights: np.ndarray) -> None:
         size = self.tree.set(node, measure, np.ascontiguousarray(ln_weights, dtype=np.float64))
@@ -263,28 +334,47 @@ def app(
     async def session(websocket: WebSocket) -> None:
         await websocket.accept()
         loop = asyncio.get_running_loop()
-        outbox: asyncio.Queue[bytes] = asyncio.Queue()
-        client = await asyncio.wrap_future(model.open(lambda frame: loop.call_soon_threadsafe(outbox.put_nowait, frame)))
+        # Frames to send, or why the session ends.
+        outbox: asyncio.Queue[bytes | Exception] = asyncio.Queue()
 
-        async def send() -> None:
-            while True:
-                await websocket.send_bytes(await outbox.get())
+        def post(item: bytes | Exception) -> None:
+            loop.call_soon_threadsafe(outbox.put_nowait, item)
 
-        sending = asyncio.create_task(send())
-        try:
-            while True:
-                try:
+        def refused(future: Future[None]) -> None:
+            if (error := future.exception()) is not None:
+                post(error)
+
+        client = await asyncio.wrap_future(model.open(post))
+
+        async def receive() -> Exception | None:
+            # Demands are posted without waiting for the scheduler to take
+            # them: it takes all posted at once, the latest last.
+            try:
+                while True:
                     demand = pb.Demand.FromString(await websocket.receive_bytes())
-                    await asyncio.wrap_future(model.demand(client, demand))
-                except (DecodeError, ValueError) as error:
-                    # 1007: the message is not one a demand can be.
-                    await websocket.close(1007, str(error)[:120])
-                    return
+                    model.demand(client, demand).add_done_callback(refused)
+            except WebSocketDisconnect:
+                return None
+            except DecodeError as error:
+                return error
+
+        async def send() -> Exception:
+            while isinstance(item := await outbox.get(), bytes):
+                await websocket.send_bytes(item)
+            return item
+
+        tasks = [asyncio.create_task(receive()), asyncio.create_task(send())]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if (error := done.pop().result()) is not None:
+                # 1007: the message is not one a demand can be.
+                await websocket.close(1007, str(error)[:120])
         except WebSocketDisconnect:
             pass
         finally:
-            sending.cancel()
-            await asyncio.wrap_future(model.close(client))
+            for task in tasks:
+                task.cancel()
+            model.close(client)
 
     async def search_rpc(request: Request) -> Response:
         if search is None:

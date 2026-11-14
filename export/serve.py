@@ -27,9 +27,9 @@ The root is the empty sequence; the model reads its start-of-text token
 internally before that path. Every other node is a complete token path from
 the root, and its children are the next tokens. Every measure is one Natlas
 service under its own URL prefix, /0/ for the model itself and /1/, /2/, …
-for the --q measures. Expand uses Connect server streaming and Search uses
-Connect unary. GET /manifest.json describes the measures and GET /labels.json
-holds the token bytes.
+for the --q measures. The browser sends demands and receives updates over
+the /session WebSocket. Search uses Connect unary. GET /manifest.json
+describes the measures and GET /labels.json holds the token bytes.
 """
 
 from __future__ import annotations

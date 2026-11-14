@@ -152,7 +152,10 @@ impl PythonSession {
         mut tree: PyRefMut<'_, PythonTree>,
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyAny>>> {
-        let updates = self.inner.step(&mut tree.inner).map_err(error)?;
+        let session = &mut self.inner;
+        let tree = &mut tree.inner;
+        // Without the GIL, so the model's thread runs while views are read.
+        let updates = py.detach(|| session.step(tree)).map_err(error)?;
         updates
             .into_iter()
             .map(|update| {

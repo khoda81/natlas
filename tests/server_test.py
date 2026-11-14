@@ -149,7 +149,7 @@ def settle(model):
     def idle():
         for client in model.clients:
             model._step(client)  # noqa: SLF001
-        return not any(client.session.blocked() for client in model.clients)
+        return not model.passes and not any(client.session.blocked() for client in model.clients)
 
     deadline = time.monotonic() + 5
     while not model.call(idle).result(5):
@@ -158,11 +158,28 @@ def settle(model):
         time.sleep(0.001)
 
 
+def queued(model, client):
+    """Wait until a pass for ``client`` is submitted."""
+    deadline = time.monotonic() + 5
+    while not model.call(lambda: any(job.client is client for job in model.passes.values())).result(5):
+        if deadline < time.monotonic():
+            raise AssertionError("no pass was submitted for the client")
+        time.sleep(0.001)
+
+
 def held(model):
     """Hold the scheduler until the returned gate is set: what is posted
     meanwhile is taken at once, in order."""
     gate = threading.Event()
-    model.call(gate.wait)
+    entered = threading.Event()
+
+    def hold():
+        entered.set()
+        gate.wait(5)
+
+    model.call(hold)
+    if not entered.wait(5):
+        raise AssertionError("the scheduler did not reach the gate")
     return gate
 
 
@@ -204,9 +221,11 @@ class ModelTests(unittest.TestCase):
         calls = model.measures[0].calls
         # Ten rows: 6 on branch 0, then 3.6 on its own branch 0, 2.5 on
         # branch 1, 2.16 below 0, 0, and 1.5 each on two more; what starts
-        # past two nats, or is worth less than a row, is not computed.
-        self.assertEqual(calls[:5], [(99,), (99, 0), (99, 0, 0), (99, 1), (99, 0, 0, 0)])
-        self.assertEqual(set(calls[5:]), {(99, 0, 1), (99, 1, 0)})
+        # past two nats, or is worth less than a row, is not computed. Each
+        # pass is chosen while the one before runs, from what is known then:
+        # (1) goes while (0) runs, before (0) tells of (0, 0).
+        self.assertEqual(calls[:3], [(99,), (99, 0), (99, 1)])
+        self.assertEqual(set(calls[3:]), {(99, 0, 0), (99, 0, 0, 0), (99, 0, 1), (99, 1, 0)})
         self.assertEqual(len(calls), 7)
         self.assertEqual(client.answered(0)[:3], [0, 1, 2])
         (answer,) = [answer for answer in client.kinds("answer") if answer.node == node_id([0, 0])]
@@ -216,9 +235,11 @@ class ModelTests(unittest.TestCase):
         model, _ = fixture()
         first, second = Received(model), Received(model)
         gate = held(model)
-        model.demand(first.client, demand(path=(0, [1, 1, 1])))
-        model.demand(second.client, demand(path=(0, [2, 2, 2])))
+        one = model.demand(first.client, demand(path=(0, [1, 1, 1])))
+        two = model.demand(second.client, demand(path=(0, [2, 2, 2])))
         gate.set()
+        one.result(5)
+        two.result(5)
         settle(model)
         self.assertEqual(model.measures[0].calls, [(99,), (99, 2), (99, 1), (99, 2, 2), (99, 1, 1)])
         self.assertEqual([list(path.branches) for path in first.kinds("placed")], [[1, 1, 1]])
@@ -227,7 +248,7 @@ class ModelTests(unittest.TestCase):
     def test_a_pass_computes_as_much_of_a_path_as_the_model_reads_at_once(self):
         model, _ = fixture(positions=3)
         client = Received(model)
-        model.demand(client.client, demand(path=(0, [0, 1, 2, 3])))
+        model.demand(client.client, demand(path=(0, [0, 1, 2, 3]))).result(5)
         settle(model)
         measure = model.measures[0]
         self.assertEqual(measure.walks, [((99, 0, 1), 1), ((99, 0, 1, 2, 3), 4)])
@@ -241,12 +262,58 @@ class ModelTests(unittest.TestCase):
         client = Received(model)
         model.demand(client.client, demand(path=(0, [1, 1, 1])))
         self.assertTrue(measure.reached.wait(5))
-        # While (1) is computed, the client looks elsewhere.
-        model.demand(client.client, demand(path=(0, [2])))
+        # While (1) is computed, the client looks elsewhere, and the
+        # scheduler takes it at once.
+        model.demand(client.client, demand(path=(0, [2]))).result(5)
         gate.set()
         settle(model)
         self.assertEqual(measure.calls, [(99,), (99, 1)])
         self.assertEqual([list(path.branches) for path in client.kinds("placed")], [[2]])
+
+    def test_a_burst_of_demands_computes_only_what_the_latest_wants(self):
+        model, _ = fixture()
+        client = Received(model)
+        gate = held(model)
+        # Views under the other measure, each superseded before it is read.
+        for rows in range(1, 100):
+            model.demand(client.client, demand(p=1, q=1, view=(0, float(rows), 1.0)))
+        latest = model.demand(client.client, demand(path=(0, [2])))
+        gate.set()
+        latest.result(5)
+        settle(model)
+        self.assertEqual(model.measures[1].calls, [])
+        self.assertEqual(model.measures[0].calls, [(99,)])
+        self.assertEqual([list(path.branches) for path in client.kinds("placed")], [[2]])
+
+    def test_the_next_pass_is_queued_while_one_runs_and_withdrawn_on_close(self):
+        model, _ = fixture()
+        measure = model.measures[0]
+        gate = measure.gates[(99,)] = threading.Event()
+        first, second = Received(model), Received(model)
+        model.learn([2]).result(5)
+        model.demand(first.client, demand(path=(0, [1])))
+        self.assertTrue(measure.reached.wait(5))
+        model.demand(second.client, demand(path=(node_id([2]), [0])))
+        queued(model, second.client)
+        model.close(second.client).result(5)
+        gate.set()
+        settle(model)
+        self.assertEqual(measure.calls, [(99,)])
+        self.assertEqual(second.updates, [])
+
+    def test_a_distribution_on_its_way_is_not_computed_again(self):
+        model, _ = fixture()
+        measure = model.measures[0]
+        gate = measure.gates[(99,)] = threading.Event()
+        first, second = Received(model), Received(model)
+        model.demand(first.client, demand(path=(0, [1])))
+        self.assertTrue(measure.reached.wait(5))
+        model.demand(second.client, demand(path=(0, [2]))).result(5)
+        gate.set()
+        settle(model)
+        self.assertEqual(measure.calls, [(99,)])
+        self.assertEqual([list(path.branches) for path in first.kinds("placed")], [[1]])
+        self.assertEqual([list(path.branches) for path in second.kinds("placed")], [[2]])
 
     def test_ended_sequences_and_branches_past_the_vocabulary_have_no_children(self):
         model, _ = fixture()

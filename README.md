@@ -110,53 +110,28 @@ survive. What lies between runs is a **gap**: its mass is known, its children
 are not. A gap is left undrawn, and a child whose q is not yet known reaches
 past any view.
 
-Each server serves one measure through two Connect RPCs:
+The browser sends its current view and optional path to place over
+`/session`, one WebSocket per server. The server streams children as runs
+of ranks. It places the path first, then prioritizes missing distributions
+by how many pixel rows depend on them. If the server does not know an id,
+the browser names it with a path from the root. The view's top is encoded
+as base-256 digits so deep zooms retain their position.
 
-- `Expand(node, path, points | branches)` reads the tree at an address below
-  `node`: down a path of branches, then within the node the path ends at. It
-  streams one `Children` message per node: the runs it places there, and how
-  many children the node has where the server knows.
-  - The **path** places each branch, one child per node. Alone, it names the
-    node it reaches without reading it: flights and restores read by paths,
-    from the deepest node already placed.
-  - **Points** place the children holding them, each once; where several
-    points all fall in one child, that child alone, and the same points
-    within it. One point is its child alone. They
-    are sampled from **parts** of the node: a part is its top, as base-256
-    digits of the fraction of the node's mass above it, ln of its mass, and
-    how many points to spread evenly through it. Digits tell a top exactly
-    however deep in the node, or in its light tail, the part is, so a view
-    far smaller than any float of the node's mass resolves is still sampled
-    where it is. Views read by points: a child the tree knows only as its
-    parent's branch is sampled down that branch, and a deep zoom reaches its
-    target in one request.
-  - **Branches** place those children of the node: how a view reads q, which
-    is per-branch metadata, for the children p placed.
-
-  Every message but the last places a single child, which names the next
-  node. A request on a node the server has not learned is asked again from
-  the root, down the node's own path first.
-- `Search(text)` maps text to its complete path, using the model's tokenizer,
-  and teaches the server the ids along it. The browser searches on input and
-  opens the result only when it is selected. Music services return
-  `unimplemented` for text search.
+The Connect `Search(text)` RPC maps text to a token path and teaches the
+server the ids along it. The browser searches on input and opens the result
+on selection. Music services return `unimplemented` for text search.
 
 Comparing p with q means asking both servers about the same nodes: p's ranks
 order and split heights, and q is read by branch for the children p places.
 Placed branches use the same colors whether their children are known yet.
 
-Rendering samples rather than fetches every child. A gap is asked for by
-its visible size, two points per CSS pixel, spread evenly through its mass:
-every child wider than half a CSS pixel is placed exactly, and thinner ones
-are drawn with probability proportional to p. Children thinner than a
+The session samples stretches of thin children at two points per physical
+pixel row, spread evenly through their mass. Children thinner than a
 physical pixel, with the gaps between them, are drawn as bands about a
 physical pixel tall, borderless silhouettes whose width Σ p (−ln q) / Σ p is
 a Monte Carlo estimate from their known children: exact when p = q and the
 band holds no gap, since children sorted by p have nearly equal surprisal
-side by side. Where gaps remain, the estimate's error on screen is about
-k σ / √n pixels, with k the horizontal scale, σ the spread of the band's
-surprisal and n its known children; a band off by more than a pixel asks for
-more points in its gaps, so horizontal zoom alone can ask for more samples.
+side by side.
 Touching sibling bands share one contour, filled with a vertical gradient
 whose stops retain each band's color. Both of a band's conditional weights
 are p-weighted geometric means, so its comparison color shows the children's
@@ -165,17 +140,16 @@ still resolves a band's individual children: on a band's pixel, the pointer
 selects the known child the pixel holds rather than a gap between children,
 and the highlight outlines the rows of the silhouette that child touches.
 
-Layout reads only what the tree holds and lists what the view lacks as Expand
-requests; the client sends each once, a few at a time, abandons it once the
-view no longer lacks it, and redraws when an answer changes the tree. A request whose answer changed nothing is not asked
-again until something else changes its node. A server may also say how many
-of a node's children have weight; a gap then shows how many branches it
-holds. Recordings converted from listings do not say.
+Layout draws what the tree holds and redraws when an answer changes it.
+A server may also say how many of a node's children have weight. A gap then
+shows how many branches it holds. Recordings converted from listings omit
+the count.
 
-A `Snapshot` records each node's children with its complete path, and answers
-Expand through the same walk a server uses. Recorded search includes listed leaves as
-well as expanded nodes, and returns an exact match, a completion, or the
-deepest recorded prefix. Text with no recorded match shows an error.
+A `Snapshot` records each node's children with its complete path. The browser
+answers from it with the same session logic as the server. Recorded search
+includes listed leaves and expanded nodes, and returns an exact match, a
+completion, or the deepest recorded prefix. Text with no recorded match
+shows an error.
 Recordings of runs, the previous format, convert once, without model
 inference:
 
@@ -203,31 +177,30 @@ uv run serve.py --p HuggingFaceTB/SmolLM2-360M \
   --q context:4 --q temperature:1.6
 ```
 
-`export/serve.py` loads the model and serves each measure as its own `Natlas`
-service, `/0/` for the model and `/1/`, `/2/`, … for the `--q` measures, over
-the Connect protocol. The root is the empty text; the start-of-text token is
-internal to the model. `/manifest.json` describes the measures and
+`export/serve.py` loads the model and serves all measures over `/session`.
+The Connect search endpoints are under `/0/` for the model and `/1/`, `/2/`, …
+for the `--q` measures. The root is the empty text; the start-of-text token
+is internal to the model. `/manifest.json` describes the measures and
 `/labels.json` holds each token's bytes. With `bun run dev` running, the page
 finds a local server and lists it first; `?server=URL` points it elsewhere.
 Edit the text in the top path inspector and select a result to fly there.
 
-`export/service.py` owns the model-independent RPC handlers and the model's
-forward passes. Node naming, the distributions themselves (sorted once per
-node and packed in about 4 bytes per vocabulary entry: branches at the
-vocabulary's width, and ln weights as f32s, the precision of a model's
-logits, each told by its step below the one before, with every 16th edge;
-the rest are summed from those when read. The most recently read are kept
-within `--cache` GiB, 1 by default) and
-Expand's walk belong to the shared Rust core, which recordings in the browser
-use too; the server computes each distribution the walk reports missing,
-reading a request's path in one pass. A walk runs on a worker thread, sends
-each node's children as it places them, and stops when the client hangs up.
-It takes the model only for forward passes, so naming a node or reading what
-the server holds never waits on inference, and before each pass it hands the
-model to any walk waiting for it: a long path delays others by a pass, not
-by its length. transformers models keep the KV cache of the last path they read and
-walk a path in chunks of positions, whose last bits can differ slightly
-(about 1e-5 in ln p in float32) from a position computed alone.
+`export/service.py` takes demands from the WebSocket without waiting on the
+model. One scheduler thread owns the shared Rust tree and the clients'
+sessions: it takes everything posted at once, so a burst of demands while
+panning costs one step, sends each client what is new, and submits the
+distribution the next client in turn waits on most. The model runs on a
+thread of its own, which owns the KV cache, with one pass running and one
+queued behind it, so it starts the next the moment one ends while the
+scheduler packs the last result. The queued pass is chosen before the
+running one's result is known; a new demand or a disconnect withdraws it,
+and a pass already running finishes into the cache. Clients take turns pass
+by pass; within a client, worth alone decides.
+
+The scheduler keeps packed distributions within `--cache` GiB (1 by
+default), at about four bytes per vocabulary entry. Transformers models
+reuse the KV cache of the last path and read ahead in chunks. Float32
+results can differ slightly from a position computed alone.
 
 Models load in float32 by default, which is both more precise and, on a GTX
 1660 Ti, about 5× faster than float16; `--dtype` trades that for memory on
@@ -242,7 +215,8 @@ common prefixes. A request reads on from the sequence it shares the most
 with, or branches off into a sequence of its own, so walking down a path
 costs one token per step, and walks down different branches take turns
 without reading each other's tokens again. The least recently read
-sequences give way when the cells run out.
+sequences give way when the cells run out. llama.cpp decodes one token at a
+time so a distribution's ranks stay consistent when the server recomputes it.
 
 ```bash
 uv run serve.py \
@@ -330,9 +304,8 @@ tokenizer, `context:N` (p seeing only its last N tokens) or `temperature:T`.
 
 The source is split by responsibility:
 
-- `core/`: Rust tree, hashed node ids, runs and gaps per measure, Expand's
-  walk for servers and recordings alike, anchored geometry, picking and the
-  requests a view lacks.
+- `core/`: Rust tree, hashed node ids, runs and gaps per measure, the demand
+  session for servers and recordings alike, anchored geometry and picking.
 - `src/core/`: thin TypeScript adapters to that core, compiled to WebAssembly.
 - `src/data/`: live/recorded sources, dataset loading and the read-through
   fetching of what views lack.

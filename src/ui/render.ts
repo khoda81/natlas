@@ -44,6 +44,11 @@ const LABEL_FILL = 0.6;
 const LABEL_PAD = 0.25;
 /** How strongly a near-certain continuation shows beside a label's own text. */
 const CONTINUATION_ALPHA = 0.6;
+/** A continuation's tokens are framed, in ems: room inside a frame at each
+ * side, the space before each frame, and the frame's half height. */
+const TOKEN_PAD = 0.2;
+const TOKEN_GAP = 0.3;
+const TOKEN_HALF = 0.6;
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const GAP_MIN = 4;
 /** A mark's width, and the space after it, in ems. */
@@ -193,17 +198,28 @@ export function draw(
     const below = children.get(state.child(box.node, box.branch)) ?? [];
     return below.find((child) => child.branch !== null && child.kind !== "merged" && 0.5 < child.p) ?? null;
   };
-  /** The text of the chain of dominant children below a box that have no
-   * label of their own, as much as ``room`` ems holds. */
-  const continuation = (box: Box, room: number): string => {
-    let text = "";
+  /** The tokens of the chain of dominant children below a box that have no
+   * label of their own, as many whole ones as ``room`` ems holds, then an
+   * ellipsis where more did not fit; and their width in ems. */
+  const continuation = (box: Box, room: number): { glyphs: Glyph[]; cut: boolean; width: number } => {
+    const glyphs: Glyph[] = [];
+    let width = 0;
+    let cut = false;
     for (let child = dominant(box); child !== null && fitOf(child) === null; child = dominant(child)) {
       const glyph = state.glyph(child.node, child.branch!);
-      if (glyph.mark !== undefined) break;
-      text += glyph.text;
-      if (room < measure(ctx, text) / BASE_SIZE) return shortened(ctx, text, room) ?? "";
+      const next = TOKEN_GAP + tokenEms(ctx, glyph);
+      if (room < width + next) {
+        cut = true;
+        break;
+      }
+      glyphs.push(glyph);
+      width += next;
     }
-    return text;
+    if (!cut) return { glyphs, cut, width };
+    const ellipsis = TOKEN_GAP + measure(ctx, MORE.text) / BASE_SIZE;
+    while (0 < glyphs.length && room < width + ellipsis) width -= TOKEN_GAP + tokenEms(ctx, glyphs.pop()!);
+    if (room < width + ellipsis) return { glyphs: [], cut: false, width: 0 };
+    return { glyphs, cut, width: width + ellipsis };
   };
 
   // A label's size follows its whole box, never the viewport. Within its box,
@@ -225,7 +241,7 @@ export function draw(
     const own = (measure(ctx, text) / BASE_SIZE + marked) * size;
     const along = vertical ? bottom - top : right - left;
     const more = continuation(box, (along - 2 * pad - own) / size);
-    const span = own + (measure(ctx, more) / BASE_SIZE) * size;
+    const span = own + more.width * size;
     // Where the text starts, and the screen rectangle it covers.
     let x: number, y: number, covers: ScreenRect;
     if (vertical) {
@@ -250,10 +266,23 @@ export function draw(
     if (glyph.mark !== undefined) mark(ctx, glyph.mark, 0, 0, size, glyph.tint ?? ink, ink);
     ctx.fillStyle = ink;
     ctx.fillText(text, marked * size, 0);
-    if (more !== "") {
-      ctx.globalAlpha = CONTINUATION_ALPHA;
-      ctx.fillText(more, own, 0);
+    ctx.globalAlpha = CONTINUATION_ALPHA;
+    ctx.lineWidth = Math.max(1, size / 16);
+    let at = own;
+    for (const token of more.glyphs) {
+      at += TOKEN_GAP * size;
+      const width = tokenEms(ctx, token) * size;
+      ctx.strokeStyle = ink;
+      ctx.beginPath();
+      ctx.roundRect(at, -TOKEN_HALF * size, width, 2 * TOKEN_HALF * size, TOKEN_PAD * size);
+      ctx.stroke();
+      const marked = markEms(token) * size;
+      if (token.mark !== undefined) mark(ctx, token.mark, at + TOKEN_PAD * size, 0, size, token.tint ?? ink, ink);
+      ctx.fillStyle = ink;
+      ctx.fillText(token.text, at + TOKEN_PAD * size + marked, 0);
+      at += width;
     }
+    if (more.cut) ctx.fillText(MORE.text, at + TOKEN_GAP * size, 0);
     ctx.restore();
   }
 
@@ -342,7 +371,7 @@ interface Fit {
  * start as fits at the smallest readable size; one that keeps nothing is
  * not drawn. Gap labels, which do not ``grow``, stay at the base size. */
 function fitLabel(ctx: CanvasRenderingContext2D, glyph: Glyph, width: number, height: number, grows: boolean): Fit | null {
-  const marked = glyph.mark === undefined ? 0 : MARK_WIDTH + (glyph.text === "" ? 0 : MARK_GAP);
+  const marked = markEms(glyph);
   const ems = measure(ctx, glyph.text) / BASE_SIZE + marked;
   const largest = grows ? LABEL_MAX_SIZE : BASE_SIZE;
   const size = (across: number, along: number) => Math.min(largest, across * LABEL_FILL, along / (ems + 2 * LABEL_PAD));
@@ -358,6 +387,16 @@ function fitLabel(ctx: CanvasRenderingContext2D, glyph: Glyph, width: number, he
   const up = width < height ? room(width, height) : 0;
   const text = shortened(ctx, glyph.text, Math.max(across, up));
   return text === null ? null : { text, size: LABEL_MIN_SIZE, vertical: across < up, marked };
+}
+
+/** The ems a glyph's mark takes before its text. */
+function markEms(glyph: Glyph): number {
+  return glyph.mark === undefined ? 0 : MARK_WIDTH + (glyph.text === "" ? 0 : MARK_GAP);
+}
+
+/** The ems a continuation token takes inside its frame. */
+function tokenEms(ctx: CanvasRenderingContext2D, glyph: Glyph): number {
+  return 2 * TOKEN_PAD + markEms(glyph) + measure(ctx, glyph.text) / BASE_SIZE;
 }
 
 /** The longest start of ``text``, whole characters followed by an

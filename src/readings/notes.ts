@@ -139,8 +139,11 @@ export class NoteLabels implements Labels {
       case "EOS":
         if (score.ended || score.window + 1 >= this.file.windows) return { text: "end", mark: "end" };
         return { text: `⇥ ${clock(this.seconds((score.window + 1) * this.span), 0)}`, mark: "end" };
-      case "shift":
-        return { text: clock(this.seconds(score.window * this.span + value)), mark: "time" };
+      case "shift": {
+        const seconds = this.seconds(score.window * this.span + value);
+        // Under a second, in milliseconds: shifts are steps of 10 ms.
+        return { text: seconds < 1 ? `${Math.round(seconds * 1000)} ms` : clock(seconds), mark: "time" };
+      }
       case "tie":
         return { text: "tie", mark: "tie" };
       case "program":

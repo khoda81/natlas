@@ -1,126 +1,189 @@
-// Integer-sequence sources: one per measure. Nodes are named by their shared
-// hashed ids. A recorded snapshot answers from memory; a live server uses Connect.
+// Servers: where a dataset's distributions come from. The page says what it
+// looks at, over a session; the server works out what the view lacks and
+// answers. A live server is a WebSocket; a recording answers in the page.
 
-import { fromBinary } from "@bufbuild/protobuf";
-import { Code, ConnectError, createClient } from "@connectrpc/connect";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
-import { Natlas, SnapshotSchema } from "../gen/natlas/natlas_pb";
+import { DemandSchema, Natlas, SnapshotSchema, UpdatesSchema } from "../gen/natlas/natlas_pb";
 import { TextLabels } from "../readings/labels";
 import { type NotesFile, NoteLabels } from "../readings/notes";
 import type { Labels } from "../readings/reading";
-import type { Read } from "../core/layout";
-import { type Branch, type Children, IntervalTree, type NodeId, ROOT } from "../core/tree";
+import type { Lens, Path, View } from "../core/layout";
+import { Session } from "../core/wasm";
+import { type Branch, IntervalTree, type NodeId, ROOT, type Run } from "../core/tree";
 
-/** The protocol's Expand: a read below ``node``. */
-export type ExpandRequest = { node: NodeId } & Read;
-
-/** One message of an answer: what it places of a node's children. */
-export interface Step extends Children {
-  node: NodeId;
+/** What the page looks at now, in place of what it looked at before. */
+export interface Demand {
+  lens: Lens;
+  view: View | null;
+  /** Placed before anything else. */
+  path: Path | null;
 }
 
-export interface Source {
-  /** The protocol's Expand, each message's node named in ``tree``. */
-  expand(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step>;
-  /** Map text to branches from the root, when this source has a text mapping. */
-  search?(text: string, signal?: AbortSignal): Promise<Branch[]>;
+/** What a server tells the page. */
+export type Update =
+  /** Children of a node under a measure, named below ``parent`` along
+   * ``branch``: the page may never have named it. */
+  | { kind: "answer"; measure: number; node: NodeId; parent: NodeId | null; branch: Branch | null; runs: Run[]; count: number | null }
+  /** The demand names a node the server has not learned. */
+  | { kind: "unknown"; node: NodeId }
+  /** The demand's path is placed as far as the server places it. */
+  | { kind: "placed"; node: NodeId; branches: Branch[] }
+  /** The server will never have this distribution. */
+  | { kind: "lacks"; measure: number; node: NodeId }
+  | { kind: "failed"; measure: number; node: NodeId; message: string };
+
+/** A session with a server. */
+export interface Connection {
+  demand(demand: Demand): void;
+  close(): void;
 }
 
-/** Name each message's node in ``tree``: the start, then the child along the
- * path's next branch, or the single child the points descend into. */
-async function* named(tree: IntervalTree, request: ExpandRequest, answers: AsyncIterable<Children> | Iterable<Children>): AsyncIterable<Step> {
-  const { path } = request;
-  let current = request.node;
-  let next: Branch | undefined;
-  let depth = 0;
-  for await (const { runs, count } of answers) {
-    if (depth > 0) {
-      if (next === undefined) throw new Error("the source went on past a node it placed more than one child of");
-      current = tree.child(current, next);
-    }
-    const only = runs.length === 1 && runs[0]!.branches.length === 1 ? runs[0]!.branches[0] : undefined;
-    const branch = path[depth];
-    if (branch !== undefined && only !== branch) throw new Error("the source placed another branch than the path's");
-    yield { node: current, runs, count };
-    next = branch ?? only;
-    depth++;
+export interface Server {
+  /** A session: ``updates`` hears each batch, ``failed`` what went wrong. */
+  connect(updates: (updates: Update[]) => void, failed: (error: unknown) => void): Connection;
+  /** Map text to branches from the root, where the server has a text mapping. */
+  search?(text: string, measure: number, signal?: AbortSignal): Promise<Branch[]>;
+}
+
+/** A live server: one WebSocket session at ``session`` beside its manifest,
+ * opened again with the same demand after a drop. */
+export class LiveServer implements Server {
+  constructor(private readonly base: string) {}
+
+  connect(updates: (updates: Update[]) => void, failed: (error: unknown) => void): Connection {
+    let socket: WebSocket | null = null;
+    let demand: Uint8Array<ArrayBuffer> | null = null;
+    let closed = false;
+    let wait = 0;
+    const open = () => {
+      const url = new URL("session", this.base);
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      const opened = socket = new WebSocket(url);
+      opened.binaryType = "arraybuffer";
+      opened.onopen = () => {
+        wait = 0;
+        if (demand !== null) opened.send(demand);
+      };
+      opened.onmessage = (event) => updates(decode(new Uint8Array(event.data as ArrayBuffer)));
+      opened.onclose = (event) => {
+        if (closed) return;
+        // 1007: the server refused the demand; the next one may do.
+        if (event.code === 1007) {
+          demand = null;
+          failed(new Error(`the server refused what the page asked: ${event.reason}`));
+        }
+        wait = Math.min(4000, wait === 0 ? 250 : wait * 2);
+        setTimeout(open, wait);
+      };
+    };
+    open();
+    return {
+      demand(next) {
+        demand = encode(next);
+        if (socket?.readyState === WebSocket.OPEN) socket.send(demand);
+      },
+      close() {
+        closed = true;
+        socket?.close();
+      },
+    };
+  }
+
+  async search(text: string, measure: number, signal?: AbortSignal): Promise<Branch[]> {
+    const transport = createConnectTransport({ baseUrl: new URL(`${measure}/`, this.base).href, useBinaryFormat: true });
+    return (await createClient(Natlas, transport).search({ text }, { signal })).path;
   }
 }
 
-/** A recorded server. Its own tree holds the recording and answers as a server would. */
-export class SnapshotSource implements Source {
-  private readonly recorded = new IntervalTree(1);
-  private readonly paths: Branch[][] = [];
+/** A demand as one WebSocket frame: bytes of their own buffer. */
+function encode({ lens, view, path }: Demand): Uint8Array<ArrayBuffer> {
+  return new Uint8Array(toBinary(DemandSchema, create(DemandSchema, {
+    p: lens.p,
+    q: lens.q,
+    view: view ?? undefined,
+    path: path ?? undefined,
+  })));
+}
 
-  constructor(
-    bytes: Uint8Array,
-    private readonly textLabels = TextLabels.none(),
-  ) {
-    const snapshot = fromBinary(SnapshotSchema, bytes);
-    if (snapshot.recordings.length === 0) {
-      throw new Error("an empty recording, or one in an older format: run scripts/migrate-snapshots.py");
+function decode(frame: Uint8Array): Update[] {
+  return fromBinary(UpdatesSchema, frame).updates.flatMap(({ kind }): Update[] => {
+    switch (kind.case) {
+      case "answer": {
+        const { measure, node, parent, branch, children } = kind.value;
+        const runs = (children?.runs ?? []).map(({ rank, branches, lnBelow }) => ({ rank, branches, lnBelow }));
+        return [{ kind: "answer", measure, node, parent: parent ?? null, branch: branch ?? null, runs, count: children?.count ?? null }];
+      }
+      case "unknown":
+        return [{ kind: "unknown", node: kind.value }];
+      case "placed":
+        return [{ kind: "placed", node: kind.value.node, branches: kind.value.branches }];
+      case "lacks":
+        return [{ kind: "lacks", measure: kind.value.measure, node: kind.value.node }];
+      case "failed":
+        return [{ kind: "failed", measure: kind.value.measure, node: kind.value.node, message: kind.value.message }];
+      default:
+        return [];
     }
-    const paths = new Map<string, Branch[]>();
-    for (const { path, children } of snapshot.recordings) {
-      if (children === undefined) throw new Error("a recorded node has no children");
-      this.recorded.insert(this.recorded.descend(ROOT, path), 0, children);
-      paths.set(path.join(","), path);
-      for (const run of children.runs) {
-        for (const branch of run.branches) {
-          const child = [...path, branch];
-          paths.set(child.join(","), child);
+  });
+}
+
+/** A recorded server, for static datasets: every measure's recording in one
+ * tree of its own, read through a session in the page as a server would,
+ * lacking whatever it did not record. */
+export class RecordedServer implements Server {
+  private readonly recorded: IntervalTree;
+  /** Each measure's recorded paths, for text search. */
+  private readonly paths: Branch[][][];
+
+  constructor(snapshots: Uint8Array[], private readonly textLabels = TextLabels.none()) {
+    this.recorded = new IntervalTree(snapshots.length);
+    this.paths = snapshots.map((bytes, measure) => {
+      const snapshot = fromBinary(SnapshotSchema, bytes);
+      if (snapshot.recordings.length === 0) {
+        throw new Error("an empty recording, or one in an older format: run scripts/migrate-snapshots.py");
+      }
+      const paths = new Map<string, Branch[]>();
+      for (const { path, children } of snapshot.recordings) {
+        if (children === undefined) throw new Error("a recorded node has no children");
+        this.recorded.insert(this.recorded.descend(ROOT, path), measure, children);
+        paths.set(path.join(","), path);
+        for (const run of children.runs) {
+          for (const branch of run.branches) {
+            const child = [...path, branch];
+            paths.set(child.join(","), child);
+          }
         }
       }
-    }
-    this.paths = [...paths.values()];
+      return [...paths.values()];
+    });
   }
 
-  async *expand(tree: IntervalTree, request: ExpandRequest): AsyncIterable<Step> {
-    const { node, ...read } = request;
-    yield* named(tree, request, this.recorded.raw.answer(node, 0, read) as Children[]);
+  connect(updates: (updates: Update[]) => void, failed: (error: unknown) => void): Connection {
+    const session = new Session();
+    let open = true;
+    return {
+      demand: ({ lens, view, path }) => {
+        try {
+          session.demand(this.recorded.raw, lens.p, lens.q, view, path);
+          const answered = session.answer(this.recorded.raw) as Update[];
+          // Told after the page's task, as a server's would be.
+          if (answered.length !== 0) queueMicrotask(() => { if (open) updates(answered); });
+        } catch (error) {
+          failed(error);
+        }
+      },
+      close: () => {
+        open = false;
+        session.free();
+      },
+    };
   }
 
-  async search(text: string): Promise<Branch[]> {
-    return this.textLabels.search(this.paths, text);
-  }
-}
-
-/** A live server. */
-export class ConnectSource implements Source {
-  private readonly client;
-
-  constructor(baseUrl: string) {
-    this.client = createClient(Natlas, createConnectTransport({ baseUrl, useBinaryFormat: true }));
-  }
-
-  /** Name the request from its node's id. Where the server has not learned
-   * that id (it restarted, or never saw it), the same read from the root,
-   * down the node's own path first, names it. */
-  async *expand(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step> {
-    let answered = false;
-    try {
-      for await (const step of this.ask(tree, request, signal)) {
-        answered = true;
-        yield step;
-      }
-    } catch (error) {
-      if (answered || request.node === ROOT || ConnectError.from(error).code !== Code.NotFound) throw error;
-      yield* this.ask(tree, { ...request, node: ROOT, path: [...tree.path(request.node), ...request.path] }, signal);
-    }
-  }
-
-  private ask(tree: IntervalTree, request: ExpandRequest, signal?: AbortSignal): AsyncIterable<Step> {
-    const { node, path, within } = request;
-    const read = within === undefined
-      ? { case: undefined }
-      : "points" in within
-        ? { case: "points" as const, value: { parts: within.points } }
-        : { case: "branches" as const, value: { branches: within.branches } };
-    return named(tree, request, this.client.expand({ node, path, within: read }, { signal }));
-  }
-
-  async search(text: string, signal?: AbortSignal): Promise<Branch[]> {
-    return (await this.client.search({ text }, { signal })).path;
+  async search(text: string, measure: number): Promise<Branch[]> {
+    // A recording finds the sequences recorded under the measure in view.
+    return this.textLabels.search(this.paths[measure] ?? [], text);
   }
 }
 
@@ -141,7 +204,7 @@ export interface Dataset {
   name: string;
   title: string;
   measures: string[];
-  sources: Source[];
+  server: Server;
   labels: Labels;
   searchable: boolean;
   search(text: string, measure: number, signal?: AbortSignal): Promise<Branch[]>;
@@ -178,7 +241,7 @@ function dataset(
   name: string,
   title: string,
   measures: string[],
-  sources: Source[],
+  server: Server,
   labels: Labels,
 ): Dataset {
   const searchable = labels instanceof TextLabels && labels.searchable;
@@ -187,15 +250,12 @@ function dataset(
     name,
     title,
     measures,
-    sources,
+    server,
     labels,
     searchable,
     async search(text, measure, signal) {
-      // A recording finds the sequences recorded under the measure in view.
-      const source = sources[measure];
-      const search = source?.search;
-      if (search === undefined) throw new Error("this dataset has no text search");
-      return search.call(source, text, signal);
+      if (server.search === undefined) throw new Error("this dataset has no text search");
+      return server.search(text, measure, signal);
     },
   };
 }
@@ -206,16 +266,22 @@ export async function fetchDataset(entry: DatasetEntry): Promise<Dataset> {
     entry.labels === undefined
       ? TextLabels.none()
       : parseLabels(await (await fetchOk(new URL(entry.labels, base))).text(), new URL(entry.labels, base));
-  const sources = await Promise.all(
-    entry.measures.map(async ({ file, url }): Promise<Source> => {
-      if (url !== undefined) return new ConnectSource(new URL(url, base).href);
+  // Every measure is a live server's, at one base, or each a recording.
+  const live = entry.measures.filter(({ url }) => url !== undefined);
+  let server: Server;
+  if (live.length === entry.measures.length) {
+    server = new LiveServer(base);
+  } else if (live.length === 0) {
+    const snapshots = await Promise.all(entry.measures.map(async ({ file }) => {
       if (file === undefined) throw new Error("a measure has neither a file nor a url");
-      const bytes = new Uint8Array(await (await fetchOk(new URL(file, base))).arrayBuffer());
-      return new SnapshotSource(bytes, labels instanceof TextLabels ? labels : TextLabels.none());
-    }),
-  );
+      return new Uint8Array(await (await fetchOk(new URL(file, base))).arrayBuffer());
+    }));
+    server = new RecordedServer(snapshots, labels instanceof TextLabels ? labels : TextLabels.none());
+  } else {
+    throw new Error("a dataset's measures are all a live server's or all recordings");
+  }
   const id = JSON.stringify([entry.name, ...entry.measures.map(({ file, url }) => new URL(url ?? file!, base).href)]);
-  return dataset(id, entry.name, entry.title, entry.measures.map(({ name }) => name), sources, labels);
+  return dataset(id, entry.name, entry.title, entry.measures.map(({ name }) => name), server, labels);
 }
 
 /** Dropped files: each .pb is one measure, a .json holds the labels. */
@@ -224,18 +290,14 @@ export async function droppedDataset(files: File[]): Promise<Dataset> {
   if (snapshots.length === 0) throw new Error("no .pb snapshot among the dropped files");
   const labelFile = files.find((file) => file.name.endsWith(".json"));
   const labels = labelFile === undefined ? TextLabels.none() : parseLabels(await labelFile.text(), null);
-  const sources = await Promise.all(
-    snapshots.map(async (file) => {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      return new SnapshotSource(bytes, labels instanceof TextLabels ? labels : TextLabels.none());
-    }),
-  );
+  const bytes = await Promise.all(snapshots.map(async (file) => new Uint8Array(await file.arrayBuffer())));
+  const server = new RecordedServer(bytes, labels instanceof TextLabels ? labels : TextLabels.none());
   const name = snapshots.map((file) => file.name).join(" · ");
   const hashes = await Promise.all(files.map(async (file) => {
     const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }));
-  return dataset(JSON.stringify([name, ...hashes]), name, name, snapshots.map((file) => file.name.replace(/\.pb$/, "")), sources, labels);
+  return dataset(JSON.stringify([name, ...hashes]), name, name, snapshots.map((file) => file.name.replace(/\.pb$/, "")), server, labels);
 }
 
 /** A labels file, read by its kind; ``url`` resolves its own references. */

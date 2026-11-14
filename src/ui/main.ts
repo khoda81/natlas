@@ -1,4 +1,4 @@
-import { Expander } from "../data/expand";
+import { Link } from "../data/link";
 import {
   aim,
   type Box,
@@ -13,6 +13,7 @@ import {
   type Selection,
   settle,
   top,
+  view,
   type Viewport,
 } from "../core/layout";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "../data/source";
@@ -104,7 +105,7 @@ export class App {
   private readonly unitsButton = element<HTMLButtonElement>("units");
 
   private tree: IntervalTree | null = null;
-  private expander: Expander | null = null;
+  private link: Link | null = null;
   private dataset: Dataset | null = null;
   private reading: Reading | null = null;
   private lens: Lens = { p: 0, q: 0 };
@@ -197,7 +198,7 @@ export class App {
   private setDataset(dataset: Dataset): void {
     this.flushView();
     this.loading++;
-    this.expander?.dispose();
+    this.link?.dispose();
     if (this.geometry?.frame !== this.frame) this.geometry?.frame.dispose();
     this.frame?.dispose();
     this.frame = null;
@@ -212,9 +213,9 @@ export class App {
     this.dataset = dataset;
     this.tree = tree;
     this.reading = dataset.labels.read(tree);
-    this.expander = new Expander(tree, dataset.sources);
+    this.link = new Link(tree, dataset.server);
     let failing = false;
-    this.expander.onError = (error) => {
+    this.link.onError = (error) => {
       if (tree !== this.tree) return;
       failing = true;
       this.setStatus(String(error));
@@ -272,13 +273,19 @@ export class App {
     this.navigation++;
     this.restoring = false;
     this.flight = null;
+    this.link?.stop();
   }
 
-  /** Walk every measure in view from ``origin`` to ``target``; true once all placed it. */
-  private async walk(origin: NodeId, target: NodeId): Promise<boolean> {
-    const measures = [...new Set([this.lens.p, this.lens.q])];
-    const placed = await Promise.all(measures.map((measure) => this.expander!.walk(origin, target, measure)));
-    return placed.every(Boolean);
+  /** Place the path from ``origin`` down to ``target``, from the deepest node
+   * already placed: true once all of it is, false where the server places no
+   * more of it, null if another path took its place. */
+  private async walk(origin: NodeId, target: NodeId): Promise<boolean | null> {
+    const tree = this.tree!;
+    const chain = tree.chain(origin, target);
+    let first = 0;
+    while (first < chain.length - 1 && tree.entry(chain[first]!, this.lens, tree.branch(chain[first + 1]!)) !== undefined) first++;
+    if (first === chain.length - 1) return true;
+    return this.link!.place(chain[first]!, chain.slice(first + 1).map((node) => tree.branch(node)));
   }
 
   /**
@@ -322,6 +329,8 @@ export class App {
     const { origin } = this.cam;
     const parent = tree.parent(origin);
     if (parent === null || !(this.cam.x < 0 || frame.originTop > 0 || frame.originBottom < 1)) return;
+    // A flight's or a restore's path comes first: one path at a time.
+    if (this.flight !== null || this.restoring) return;
     const edge = tree.entry(parent, this.lens, tree.branch(origin));
     if (edge === undefined || !Number.isFinite(edge.natsQ)) {
       void this.place(parent, origin);
@@ -363,7 +372,6 @@ export class App {
     const below = above.length <= path.length && above.every((branch, i) => branch === path[i]);
     if (below) {
       this.cancelNavigation();
-      this.expander?.cancel();
       this.focus = null;
     } else this.open(ROOT);
     const { origin } = this.cam;
@@ -390,7 +398,7 @@ export class App {
     void this.walk(origin, target).then((placed) => {
       flight.listed = true;
       if (this.flight !== flight) return;
-      if (!placed) this.open(target);
+      if (placed === false) this.open(target);
       this.invalidate();
     }, (error: unknown) => {
       if (this.flight === flight) this.flight = null;
@@ -435,7 +443,6 @@ export class App {
    */
   private open(node: NodeId, k = this.cam.k): void {
     this.cancelNavigation();
-    this.expander?.cancel();
     if (this.frame !== null && !this.reducedMotion.matches) {
       const image = this.transition?.image ?? document.createElement("canvas");
       image.width = this.canvas.width;
@@ -521,13 +528,8 @@ export class App {
     const frame = this.currentFrame();
     this.frame = frame;
     if (previous !== null && previous !== frame) previous.dispose();
-    this.expander?.request(() => {
-      if (tree !== this.tree) return [];
-      // A flight placing its path wants that path alone: the view it passes
-      // through would take the source's turns from it.
-      if (this.flight !== null && !this.flight.listed) return [];
-      return this.currentFrame({ ...this.cam }).misses;
-    });
+    // What the camera looks at, at the picture's finest: physical rows.
+    this.link?.look(this.lens, view(tree, this.lens, this.cam, this.view, this.view.height * this.pixelRatio));
     this.reachOut(frame);
     this.updateHover();
     const ancestors = new Set<string>();
@@ -568,7 +570,7 @@ export class App {
     const { origin } = this.cam;
     const measures = [...new Set([this.lens.p, this.lens.q])];
     if (tree.ended(origin, this.lens.p)) return { text: "The sequence ends here · press 0 for the root", loading: false };
-    if (measures.some((measure) => this.expander!.exhausted(origin, measure))) {
+    if (measures.some((measure) => this.link!.lacks(origin, measure))) {
       return { text: "This recording does not continue here · press 0 for the root", loading: false };
     }
     const waiting = measures.filter((measure) => !tree.has(origin, measure));
@@ -601,7 +603,7 @@ export class App {
     return `${this.tree!.revision}:${this.lens.p}:${this.lens.q}:${origin}:${x}:${k}:${anchor.path}:${anchor.digits}:${a}:${this.view.width}:${this.view.height}:${this.pixelRatio}`;
   }
 
-  /** Also shared with the completion-driven fetch pump between paint frames. */
+  /** The frame for a camera, kept while nothing it depends on changes. */
   private currentFrame(camera = this.cam): Frame {
     const key = this.geometryKey(camera);
     if (this.geometry?.key === key) return this.geometry.frame;

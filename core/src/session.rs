@@ -21,9 +21,11 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::ops::Range;
 
+use serde::{Deserialize, Serialize};
+
 use crate::distribution::{ln_between, Distribution, Item, Rank, Run};
 use crate::point::Point;
-use crate::tree::{Branch, Lens, NodeId, Tree};
+use crate::tree::{bytes, node_id, Branch, Lens, NodeId, Tree};
 use crate::Result;
 
 /// Samples per row of worth in a stretch of children each thinner than a
@@ -41,11 +43,14 @@ pub struct Demand {
 }
 
 /// An interval of a node's p mass, and the pixel rows it covers.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct View {
     /// The deepest node the client knows that holds the whole view.
+    #[serde(with = "node_id")]
     pub node: NodeId,
     /// The fraction of the node's mass above the view, in base 256.
+    #[serde(with = "bytes")]
     pub top: Vec<u8>,
     /// ln of the view's height, as a fraction of the node's mass.
     pub ln_height: f64,
@@ -57,8 +62,9 @@ pub struct View {
 }
 
 /// Branches down from a node.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Path {
+    #[serde(with = "node_id")]
     pub node: NodeId,
     pub branches: Vec<Branch>,
 }

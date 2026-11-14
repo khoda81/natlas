@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { aim, type Camera, clamp, extent, layout, pick, settle, top } from "../src/core/layout";
+import { aim, type Camera, clamp, extent, layout, pick, settle, top, view as viewOf } from "../src/core/layout";
 import { glide, moveDepth, scale } from "../src/ui/camera";
 import { chainTree, answer, digits } from "./build";
 import { IntervalTree, ROOT } from "../src/core/tree";
@@ -39,16 +39,14 @@ describe("layout", () => {
     frame.dispose();
   });
 
-  it("keeps the origin selectable before anything arrives, and asks for it", () => {
+  it("keeps the origin selectable before anything arrives, and looks at all of it", () => {
     const tree = new IntervalTree(1);
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
     const frame = layout(tree, lens, cam, view);
     expect(pick(tree, lens, frame, cam, view, 500, 400, 1)).toMatchObject({ box: { node: ROOT }, exact: false });
     expect(pick(tree, lens, frame, cam, view, -1, 400, 1)).toBeNull();
-    expect(frame.misses).toMatchObject([{ node: ROOT, measure: 0, read: { path: [] }, priority: 800 }]);
-    const { within } = frame.misses[0]!.read;
-    // Two points per visible pixel, through the whole root.
-    expect(within).toEqual({ points: [{ top: new Uint8Array(), lnMass: 0, count: 1600 }] });
+    // The whole root, worth every row, ten nats deep.
+    expect(viewOf(tree, lens, cam, view, 1600)).toEqual({ node: ROOT, top: new Uint8Array(), lnHeight: 0, rows: 1600, right: 10 });
   });
 
   it("splits heights by p in p's order and sizes widths by -ln q", () => {

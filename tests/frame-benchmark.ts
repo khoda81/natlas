@@ -6,7 +6,6 @@ import { type Camera, type Frame, top, type Viewport } from "../src/core/layout"
 import type { IntervalTree, Lens } from "../src/core/tree";
 import { digits, run } from "./build";
 import type { Dataset } from "../src/data/source";
-import type { Expander } from "../src/data/expand";
 
 interface Driver {
   setDataset(dataset: Dataset): void;
@@ -21,7 +20,6 @@ interface Driver {
   frame: Frame;
   pointer: { x: number; y: number } | null;
   storage: boolean;
-  expander: Expander;
   focus: unknown;
 }
 
@@ -62,10 +60,10 @@ let liveLabels: TextLabels | null = null;
 
 function setup(count: number, zipf: boolean, deep = false, real = false) {
   const dataset: Dataset = { id: "benchmark", name: "benchmark", title: `Frame benchmark · ${count.toLocaleString()} branches`,
-    measures: zipf ? ["p", "q"] : ["p"], sources: Array.from({ length: zipf ? 2 : 1 }, () => ({
-      // Four pending requests, like a busy live model.
-      async *expand() { await new Promise(() => {}); },
-    })), labels: real ? liveLabels! : labels, searchable: true, search: async () => [0] };
+    measures: zipf ? ["p", "q"] : ["p"],
+    // A server that never answers, like a busy live model.
+    server: { connect: () => ({ demand() {}, close() {} }) },
+    labels: real ? liveLabels! : labels, searchable: true, search: async () => [0] };
   driver.setDataset(dataset);
   const weights = Array.from({ length: count }, (_, i) => zipf ? (i + 1) ** -1.15 : 1);
   const total = weights.reduce((a, b) => a + b, 0);

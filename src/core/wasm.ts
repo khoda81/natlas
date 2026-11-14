@@ -5,8 +5,10 @@ import init, {
   extent,
   layout,
   LayoutFrame,
+  Session,
   settle,
   Tree,
+  view,
 } from "./generated/natlas_core";
 
 const wasm = typeof document === "undefined"
@@ -20,6 +22,8 @@ export {
   extent,
   layout,
   LayoutFrame,
+  Session,
   settle,
   Tree,
+  view,
 };

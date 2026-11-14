@@ -13,16 +13,11 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::OnceLock;
 
 use crate::packed::Packed;
-use crate::point::Point;
 use crate::tree::Branch;
 use crate::Result;
 
 /// A child's position in its measure's order: rank 0 is the heaviest.
 pub type Rank = u32;
-
-/// How far a window descends through children that hold it before a source
-/// lists one: each step costs a server one forward pass.
-pub const MAX_DESCENT: usize = 64;
 
 /// ln(e^a + e^b), exact for tiny terms.
 pub fn ln_add(a: f64, b: f64) -> f64 {
@@ -602,37 +597,6 @@ impl Distribution {
         (top, self.item_bottom(item))
     }
 
-    /// The known child holding a point, however deep the point is told.
-    pub fn child_at(&self, point: &Point) -> Option<(usize, usize)> {
-        let holds = |item: Item| {
-            let (top, bottom) = self.item_edges(item);
-            point.within(top, bottom)
-        };
-        // Where a float of the point finds it, most of the time; exactly
-        // where the point is too near an edge for that.
-        let item = self
-            .locate(point.ln_below())
-            .filter(|&item| holds(item))
-            .or_else(|| self.locate_by(|edge| point.below(edge)))?;
-        match item {
-            Item::Child { run, at } if holds(item) => Some((run, at)),
-            _ => None,
-        }
-    }
-
-    /// The known children holding `points`, once each and by rank, and
-    /// whether every point found one: a point in a gap holds no known child.
-    pub fn children_at(&self, points: &[Point]) -> (Vec<(usize, usize)>, bool) {
-        let mut found: Vec<_> = points
-            .iter()
-            .filter_map(|point| self.child_at(point))
-            .collect();
-        let all = found.len() == points.len();
-        found.sort_unstable();
-        found.dedup();
-        (found, all)
-    }
-
     /// Known children as runs: those consecutive in one run joined.
     pub fn runs_of(&self, children: &[(usize, usize)]) -> Vec<Run> {
         let mut runs = Vec::new();
@@ -932,30 +896,15 @@ mod tests {
     }
 
     #[test]
-    fn points_find_the_children_holding_them_once_each() {
+    fn known_children_join_into_runs_and_answers_replace_contradictions() {
         let mut d = Distribution::new(run(0, &[3, 4], &[0.5, 0.3], 0.2));
         d.insert(vec![run(4, &[8], &[0.05], 0.05)]).unwrap();
-        // 0.9 and 0.6 lie in branch 3, 0.4 in branch 4, 0.15 in a gap, 0.07 in branch 8.
-        let points = [0.9f64, 0.6, 0.4, 0.15, 0.07]
-            .map(|below| Point::off(below.ln(), true, 0.0, 0.0).unwrap());
-        let (children, all) = d.children_at(&points);
-        assert_eq!(children, [(0, 0), (0, 1), (1, 0)]);
-        assert!(!all);
-        let runs = d.runs_of(&children);
+        let runs = d.runs_of(&[(0, 0), (0, 1), (1, 0)]);
         assert_eq!(
             runs.iter()
                 .map(|run| (run.rank(), run.branches().to_vec()))
                 .collect::<Vec<_>>(),
             [(0, vec![3, 4]), (4, vec![8])]
-        );
-        // A point 2^-800 above branch 4's top is branch 3's, and the edge
-        // itself branch 4's: no float of a mass tells them apart.
-        let edge = 0.5f64.ln();
-        let over = Point::off(edge, false, 1.0, -800.0 * std::f64::consts::LN_2).unwrap();
-        assert_eq!(d.child_at(&over), Some((0, 0)));
-        assert_eq!(
-            d.child_at(&Point::off(edge, true, 0.0, 0.0).unwrap()),
-            Some((0, 1))
         );
         // An answer that places one rank twice is refused, and one that
         // contradicts what is known replaces it.

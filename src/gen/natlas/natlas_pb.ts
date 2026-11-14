@@ -10,123 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file natlas/natlas.proto.
  */
 export const file_natlas_natlas: GenFile = /*@__PURE__*/
-  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMifQoNRXhwYW5kUmVxdWVzdBIMCgRub2RlGAEgASgGEgwKBHBhdGgYAiADKA0SIAoGcG9pbnRzGAMgASgLMg4ubmF0bGFzLlBvaW50c0gAEiQKCGJyYW5jaGVzGAQgASgLMhAubmF0bGFzLkJyYW5jaGVzSABCCAoGd2l0aGluIiUKBlBvaW50cxIbCgVwYXJ0cxgBIAMoCzIMLm5hdGxhcy5QYXJ0IjMKBFBhcnQSCwoDdG9wGAEgASgMEg8KB2xuX21hc3MYAiABKAESDQoFY291bnQYAyABKA0iHAoIQnJhbmNoZXMSEAoIYnJhbmNoZXMYASADKA0iQwoIQ2hpbGRyZW4SGQoEcnVucxgBIAMoCzILLm5hdGxhcy5SdW4SEgoFY291bnQYAiABKA1IAIgBAUIICgZfY291bnQiNwoDUnVuEgwKBHJhbmsYASABKA0SEAoIYnJhbmNoZXMYAiADKA0SEAoIbG5fYmVsb3cYAyADKAEicgoGRGVtYW5kEgkKAXAYASABKA0SCQoBcRgCIAEoDRIfCgR2aWV3GAMgASgLMgwubmF0bGFzLlZpZXdIAIgBARIfCgRwYXRoGAQgASgLMgwubmF0bGFzLlBhdGhIAYgBAUIHCgVfdmlld0IHCgVfcGF0aCJRCgRWaWV3EgwKBG5vZGUYASABKAYSCwoDdG9wGAIgASgMEhEKCWxuX2hlaWdodBgDIAEoARIMCgRyb3dzGAQgASgBEg0KBXJpZ2h0GAUgASgBIiYKBFBhdGgSDAoEbm9kZRgBIAEoBhIQCghicmFuY2hlcxgCIAMoDSIqCgdVcGRhdGVzEh8KB3VwZGF0ZXMYASADKAsyDi5uYXRsYXMuVXBkYXRlIqkBCgZVcGRhdGUSIAoGYW5zd2VyGAEgASgLMg4ubmF0bGFzLkFuc3dlckgAEhEKB3Vua25vd24YAiABKAZIABIeCgZwbGFjZWQYAyABKAsyDC5uYXRsYXMuUGF0aEgAEiAKBWxhY2tzGAQgASgLMg8ubmF0bGFzLk1pc3NpbmdIABIgCgZmYWlsZWQYBSABKAsyDi5uYXRsYXMuRmFpbGVkSABCBgoEa2luZCKLAQoGQW5zd2VyEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhITCgZwYXJlbnQYAyABKAZIAIgBARITCgZicmFuY2gYBCABKA1IAYgBARIiCghjaGlsZHJlbhgFIAEoCzIQLm5hdGxhcy5DaGlsZHJlbkIJCgdfcGFyZW50QgkKB19icmFuY2giKAoHTWlzc2luZxIPCgdtZWFzdXJlGAEgASgNEgwKBG5vZGUYAiABKAYiOAoGRmFpbGVkEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhIPCgdtZXNzYWdlGAMgASgJIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIj0KCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEiIKCGNoaWxkcmVuGAMgASgLMhAubmF0bGFzLkNoaWxkcmVuMnYKBk5hdGxhcxIzCgZFeHBhbmQSFS5uYXRsYXMuRXhwYW5kUmVxdWVzdBoQLm5hdGxhcy5DaGlsZHJlbjABEjcKBlNlYXJjaBIVLm5hdGxhcy5TZWFyY2hSZXF1ZXN0GhYubmF0bGFzLlNlYXJjaFJlc3BvbnNlYgZwcm90bzM");
-
-/**
- * @generated from message natlas.ExpandRequest
- */
-export type ExpandRequest = Message<"natlas.ExpandRequest"> & {
-  /**
-   * @generated from field: fixed64 node = 1;
-   */
-  node: bigint;
-
-  /**
-   * Branches down from the node.
-   *
-   * @generated from field: repeated uint32 path = 2;
-   */
-  path: number[];
-
-  /**
-   * What to read of the node the path ends at.
-   *
-   * @generated from oneof natlas.ExpandRequest.within
-   */
-  within: {
-    /**
-     * @generated from field: natlas.Points points = 3;
-     */
-    value: Points;
-    case: "points";
-  } | {
-    /**
-     * @generated from field: natlas.Branches branches = 4;
-     */
-    value: Branches;
-    case: "branches";
-  } | { case: undefined; value?: undefined };
-};
-
-/**
- * Describes the message natlas.ExpandRequest.
- * Use `create(ExpandRequestSchema)` to create a new message.
- */
-export const ExpandRequestSchema: GenMessage<ExpandRequest> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 0);
-
-/**
- * Points of a node, sampled from parts of it.
- *
- * @generated from message natlas.Points
- */
-export type Points = Message<"natlas.Points"> & {
-  /**
-   * @generated from field: repeated natlas.Part parts = 1;
-   */
-  parts: Part[];
-};
-
-/**
- * Describes the message natlas.Points.
- * Use `create(PointsSchema)` to create a new message.
- */
-export const PointsSchema: GenMessage<Points> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 1);
-
-/**
- * `count` points evenly through the part of a node from `top` down
- * e^ln_mass of its mass, each in the middle of its share. A part of no mass
- * (ln_mass −∞) is its top alone; points past the node's bottom are none.
- *
- * @generated from message natlas.Part
- */
-export type Part = Message<"natlas.Part"> & {
-  /**
-   * The fraction of the node's mass above the part, as digits in base 256,
-   * most significant first: exact however deep in the node, or in its light
-   * tail, the part is.
-   *
-   * @generated from field: bytes top = 1;
-   */
-  top: Uint8Array;
-
-  /**
-   * @generated from field: double ln_mass = 2;
-   */
-  lnMass: number;
-
-  /**
-   * @generated from field: uint32 count = 3;
-   */
-  count: number;
-};
-
-/**
- * Describes the message natlas.Part.
- * Use `create(PartSchema)` to create a new message.
- */
-export const PartSchema: GenMessage<Part> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 2);
-
-/**
- * Branches of one node.
- *
- * @generated from message natlas.Branches
- */
-export type Branches = Message<"natlas.Branches"> & {
-  /**
-   * @generated from field: repeated uint32 branches = 1;
-   */
-  branches: number[];
-};
-
-/**
- * Describes the message natlas.Branches.
- * Use `create(BranchesSchema)` to create a new message.
- */
-export const BranchesSchema: GenMessage<Branches> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 3);
+  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMiQwoIQ2hpbGRyZW4SGQoEcnVucxgBIAMoCzILLm5hdGxhcy5SdW4SEgoFY291bnQYAiABKA1IAIgBAUIICgZfY291bnQiNwoDUnVuEgwKBHJhbmsYASABKA0SEAoIYnJhbmNoZXMYAiADKA0SEAoIbG5fYmVsb3cYAyADKAEicgoGRGVtYW5kEgkKAXAYASABKA0SCQoBcRgCIAEoDRIfCgR2aWV3GAMgASgLMgwubmF0bGFzLlZpZXdIAIgBARIfCgRwYXRoGAQgASgLMgwubmF0bGFzLlBhdGhIAYgBAUIHCgVfdmlld0IHCgVfcGF0aCJRCgRWaWV3EgwKBG5vZGUYASABKAYSCwoDdG9wGAIgASgMEhEKCWxuX2hlaWdodBgDIAEoARIMCgRyb3dzGAQgASgBEg0KBXJpZ2h0GAUgASgBIiYKBFBhdGgSDAoEbm9kZRgBIAEoBhIQCghicmFuY2hlcxgCIAMoDSIqCgdVcGRhdGVzEh8KB3VwZGF0ZXMYASADKAsyDi5uYXRsYXMuVXBkYXRlIqkBCgZVcGRhdGUSIAoGYW5zd2VyGAEgASgLMg4ubmF0bGFzLkFuc3dlckgAEhEKB3Vua25vd24YAiABKAZIABIeCgZwbGFjZWQYAyABKAsyDC5uYXRsYXMuUGF0aEgAEiAKBWxhY2tzGAQgASgLMg8ubmF0bGFzLk1pc3NpbmdIABIgCgZmYWlsZWQYBSABKAsyDi5uYXRsYXMuRmFpbGVkSABCBgoEa2luZCKLAQoGQW5zd2VyEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhITCgZwYXJlbnQYAyABKAZIAIgBARITCgZicmFuY2gYBCABKA1IAYgBARIiCghjaGlsZHJlbhgFIAEoCzIQLm5hdGxhcy5DaGlsZHJlbkIJCgdfcGFyZW50QgkKB19icmFuY2giKAoHTWlzc2luZxIPCgdtZWFzdXJlGAEgASgNEgwKBG5vZGUYAiABKAYiOAoGRmFpbGVkEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhIPCgdtZXNzYWdlGAMgASgJIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIj0KCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEiIKCGNoaWxkcmVuGAMgASgLMhAubmF0bGFzLkNoaWxkcmVuMkEKBk5hdGxhcxI3CgZTZWFyY2gSFS5uYXRsYXMuU2VhcmNoUmVxdWVzdBoWLm5hdGxhcy5TZWFyY2hSZXNwb25zZWIGcHJvdG8z");
 
 /**
  * What a source places of one node's children.
@@ -153,7 +37,7 @@ export type Children = Message<"natlas.Children"> & {
  * Use `create(ChildrenSchema)` to create a new message.
  */
 export const ChildrenSchema: GenMessage<Children> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 4);
+  messageDesc(file_natlas_natlas, 0);
 
 /**
  * Consecutive ranks of a node's children in the measure's order: heaviest
@@ -187,7 +71,7 @@ export type Run = Message<"natlas.Run"> & {
  * Use `create(RunSchema)` to create a new message.
  */
 export const RunSchema: GenMessage<Run> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 5);
+  messageDesc(file_natlas_natlas, 1);
 
 /**
  * What the client is looking at now, in place of what it looked at before.
@@ -227,7 +111,7 @@ export type Demand = Message<"natlas.Demand"> & {
  * Use `create(DemandSchema)` to create a new message.
  */
 export const DemandSchema: GenMessage<Demand> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 6);
+  messageDesc(file_natlas_natlas, 2);
 
 /**
  * An interval of a node's p mass, and the pixel rows it covers. Its rows
@@ -281,7 +165,7 @@ export type View = Message<"natlas.View"> & {
  * Use `create(ViewSchema)` to create a new message.
  */
 export const ViewSchema: GenMessage<View> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 7);
+  messageDesc(file_natlas_natlas, 3);
 
 /**
  * Branches down from a node.
@@ -305,7 +189,7 @@ export type Path = Message<"natlas.Path"> & {
  * Use `create(PathSchema)` to create a new message.
  */
 export const PathSchema: GenMessage<Path> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 8);
+  messageDesc(file_natlas_natlas, 4);
 
 /**
  * What the server tells the client, a batch at a time.
@@ -324,7 +208,7 @@ export type Updates = Message<"natlas.Updates"> & {
  * Use `create(UpdatesSchema)` to create a new message.
  */
 export const UpdatesSchema: GenMessage<Updates> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 9);
+  messageDesc(file_natlas_natlas, 5);
 
 /**
  * @generated from message natlas.Update
@@ -383,7 +267,7 @@ export type Update = Message<"natlas.Update"> & {
  * Use `create(UpdateSchema)` to create a new message.
  */
 export const UpdateSchema: GenMessage<Update> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 10);
+  messageDesc(file_natlas_natlas, 6);
 
 /**
  * @generated from message natlas.Answer
@@ -423,7 +307,7 @@ export type Answer = Message<"natlas.Answer"> & {
  * Use `create(AnswerSchema)` to create a new message.
  */
 export const AnswerSchema: GenMessage<Answer> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 11);
+  messageDesc(file_natlas_natlas, 7);
 
 /**
  * @generated from message natlas.Missing
@@ -445,7 +329,7 @@ export type Missing = Message<"natlas.Missing"> & {
  * Use `create(MissingSchema)` to create a new message.
  */
 export const MissingSchema: GenMessage<Missing> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 12);
+  messageDesc(file_natlas_natlas, 8);
 
 /**
  * @generated from message natlas.Failed
@@ -472,7 +356,7 @@ export type Failed = Message<"natlas.Failed"> & {
  * Use `create(FailedSchema)` to create a new message.
  */
 export const FailedSchema: GenMessage<Failed> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 13);
+  messageDesc(file_natlas_natlas, 9);
 
 /**
  * @generated from message natlas.SearchRequest
@@ -489,7 +373,7 @@ export type SearchRequest = Message<"natlas.SearchRequest"> & {
  * Use `create(SearchRequestSchema)` to create a new message.
  */
 export const SearchRequestSchema: GenMessage<SearchRequest> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 14);
+  messageDesc(file_natlas_natlas, 10);
 
 /**
  * @generated from message natlas.SearchResponse
@@ -508,7 +392,7 @@ export type SearchResponse = Message<"natlas.SearchResponse"> & {
  * Use `create(SearchResponseSchema)` to create a new message.
  */
 export const SearchResponseSchema: GenMessage<SearchResponse> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 15);
+  messageDesc(file_natlas_natlas, 11);
 
 /**
  * A recorded server, used for static datasets: what it knows of each node.
@@ -527,7 +411,7 @@ export type Snapshot = Message<"natlas.Snapshot"> & {
  * Use `create(SnapshotSchema)` to create a new message.
  */
 export const SnapshotSchema: GenMessage<Snapshot> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 16);
+  messageDesc(file_natlas_natlas, 12);
 
 /**
  * @generated from message natlas.Recording
@@ -551,49 +435,15 @@ export type Recording = Message<"natlas.Recording"> & {
  * Use `create(RecordingSchema)` to create a new message.
  */
 export const RecordingSchema: GenMessage<Recording> = /*@__PURE__*/
-  messageDesc(file_natlas_natlas, 17);
+  messageDesc(file_natlas_natlas, 13);
 
 /**
  * @generated from service natlas.Natlas
  */
 export const Natlas: GenService<{
   /**
-   * Reads the tree at an address below a node: down a path of branches, and
-   * then within the node the path ends at. It answers one node at a time
-   * with the children it places there:
-   *
-   * - down the path: the starting node and every node along it, each
-   *   placing the path's next branch;
-   * - then, at its end, either points, sampled evenly through parts of the
-   *   node: the children holding them, and where several points all fall in
-   *   one child, that child alone and the same points within it, so a view
-   *   samples its children and a deep zoom reaches them in one request. One
-   *   point is its child alone;
-   * - or branches: those children of the node, for a measure read only for
-   *   q;
-   * - or nothing: the path's last branch names the node it reaches, which
-   *   the server learns but does not read.
-   *
-   * So every message but the last places a single child, and the next
-   * message is that child's: id(node, its branch). Each child is placed
-   * once, however many points it holds; a point in a part the server does
-   * not know places nothing.
-   *
-   * A server may end the stream early at any node, and ends a path before a
-   * branch of weight zero, which has no place. It answers NOT_FOUND when it
-   * has not learned the starting node, and the client names it from the
-   * root by a longer path.
-   *
-   * @generated from rpc natlas.Natlas.Expand
-   */
-  expand: {
-    methodKind: "server_streaming";
-    input: typeof ExpandRequestSchema;
-    output: typeof ChildrenSchema;
-  },
-  /**
    * The sequence for a text, under the server's text mapping. The server
-   * learns the ids along it, so expanding them needs no path.
+   * learns the ids along it, so a demand can name them alone.
    *
    * @generated from rpc natlas.Natlas.Search
    */

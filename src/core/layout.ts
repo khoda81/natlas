@@ -9,6 +9,7 @@ import {
   layout as layoutFrame,
   settle as settleAnchor,
   type LayoutFrame,
+  view as viewOf,
 } from "./wasm";
 import type { Branch, IntervalTree, Lens, NodeId, Rank } from "./tree";
 
@@ -66,45 +67,30 @@ export interface Box {
   y1: number;
 }
 
-/** ``count`` points of a node, evenly through the part of it from ``top``
- * (the fraction of its mass above the part, as digits in base 256) down
- * e^``lnMass`` of its mass. A part of no mass is its top alone. */
-export interface Part {
-  top: Uint8Array;
-  lnMass: number;
-  count: number;
-}
-
-/** What an Expand reads of the node its path ends at: the children holding
- * the points of parts of it, or the children along branches. */
-export type Within = { points: Part[] } | { branches: Branch[] };
-
-/** How an Expand reads the tree below its node: down a path, placing each of
- * its branches, and then within the node it ends at. Without ``within`` that
- * node is named, not read. */
-export interface Read {
-  path: Branch[];
-  within?: Within;
-}
-
-/** What a frame lacks, as the Expand request that fills it: ``read`` below
- * ``node``, a node the tree holds. A child the tree only knows as its
- * parent's branch is read down that branch. */
-export interface Miss {
+/** What a camera looks at, as a session's view: an interval of ``node``'s p
+ * mass, its top as digits in base 256 of the fraction of the mass above it
+ * and ``lnHeight`` ln of its height, worth ``rows`` pixel rows, seen ``right``
+ * nats of −ln q past where the node's children start. */
+export interface View {
   node: NodeId;
-  measure: number;
-  read: Read;
-  /** Visible pixels; larger first. */
-  priority: number;
+  top: Uint8Array;
+  lnHeight: number;
+  rows: number;
+  right: number;
+}
+
+/** Branches down from a node. */
+export interface Path {
+  node: NodeId;
+  branches: Branch[];
 }
 
 const KINDS: BoxKind[] = ["node", "leaf", "gap", "merged"];
 const boxBuffers: Box[][] = [];
 
-/** Rust owns the full frame. Only visible rectangles and requests cross the Wasm boundary. */
+/** Rust owns the full frame. Only visible rectangles cross the Wasm boundary. */
 export class Frame {
   readonly boxes: Box[];
-  private missesCache?: Miss[];
   private disposed = false;
 
   constructor(readonly raw: LayoutFrame) {
@@ -120,10 +106,6 @@ export class Frame {
       b.x0 = packed[i + 7]!; b.x1 = packed[i + 8]!; b.y0 = packed[i + 9]!; b.y1 = packed[i + 10]!;
     }
     this.boxes.length = packed.length / 11;
-  }
-
-  get misses(): Miss[] {
-    return this.missesCache ??= this.raw.misses();
   }
 
   get originTop(): number { return this.raw.originTop(); }
@@ -178,6 +160,12 @@ export function aim(tree: IntervalTree, lens: Lens, cam: Camera, fy: number): vo
   const aimed = aimAnchor(tree.raw, lens.p, lens.q, cam, fy) as { anchor: Anchor; a: number };
   cam.anchor = aimed.anchor;
   cam.a = aimed.a;
+}
+
+/** What the camera looks at, ``rows`` pixel rows of it, as a session's view:
+ * told exactly as a frame places it. */
+export function view(tree: IntervalTree, lens: Lens, cam: Camera, viewport: Viewport, rows: number): View {
+  return viewOf(tree.raw, lens.p, lens.q, cam, viewport, rows) as View;
 }
 
 /** The interval edges in view heights of the node ``depth`` steps down the

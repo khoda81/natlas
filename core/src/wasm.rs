@@ -6,7 +6,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::distribution::Run;
 use crate::layout::{self, Camera, Frame, Viewport};
-use crate::tree::{Advance, Lens, Read, Tree as NativeTree, Walk};
+use crate::session::{Demand, Path, Session as NativeSession, Update, View};
+use crate::tree::{Lens, Tree as NativeTree};
 
 fn js_error(error: impl std::fmt::Display) -> JsError {
     JsError::new(&error.to_string())
@@ -21,13 +22,34 @@ fn to_js<T: Serialize + ?Sized>(value: &T) -> std::result::Result<JsValue, JsErr
     value.serialize(&serializer).map_err(js_error)
 }
 
-/// One message of an Expand answer: what it places of a node's children. The
-/// client names the node.
+/// A session's update, as the page reads it: node ids as BigInts.
 #[derive(Serialize)]
-struct Message<'a> {
-    runs: Vec<RunMessage<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    children: Option<u32>,
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum UpdateMessage<'a> {
+    Answer {
+        measure: usize,
+        node: u128,
+        parent: Option<u128>,
+        branch: Option<u32>,
+        runs: Vec<RunMessage<'a>>,
+        count: Option<u32>,
+    },
+    Unknown {
+        node: u128,
+    },
+    Placed {
+        node: u128,
+        branches: &'a [u32],
+    },
+    Lacks {
+        measure: usize,
+        node: u128,
+    },
+    Failed {
+        measure: usize,
+        node: u128,
+        message: &'a str,
+    },
 }
 
 #[derive(Serialize)]
@@ -36,6 +58,52 @@ struct RunMessage<'a> {
     rank: u32,
     branches: std::borrow::Cow<'a, [u32]>,
     ln_below: std::borrow::Cow<'a, [f64]>,
+}
+
+fn update_message(update: &Update) -> UpdateMessage<'_> {
+    match update {
+        Update::Answer {
+            measure,
+            node,
+            edge,
+            runs,
+            count,
+        } => UpdateMessage::Answer {
+            measure: *measure,
+            node: u128::from(*node),
+            parent: edge.map(|(parent, _)| u128::from(parent)),
+            branch: edge.map(|(_, branch)| branch),
+            runs: runs
+                .iter()
+                .map(|run| RunMessage {
+                    rank: run.rank(),
+                    branches: run.branches(),
+                    ln_below: run.ln_below(),
+                })
+                .collect(),
+            count: *count,
+        },
+        Update::Unknown(node) => UpdateMessage::Unknown {
+            node: u128::from(*node),
+        },
+        Update::Placed(Path { node, branches }) => UpdateMessage::Placed {
+            node: u128::from(*node),
+            branches,
+        },
+        Update::Lacks { measure, node } => UpdateMessage::Lacks {
+            measure: *measure,
+            node: u128::from(*node),
+        },
+        Update::Failed {
+            measure,
+            node,
+            message,
+        } => UpdateMessage::Failed {
+            measure: *measure,
+            node: u128::from(*node),
+            message,
+        },
+    }
 }
 
 /// The integer-sequence tree, its distributions and their geometry, owned by
@@ -167,40 +235,65 @@ impl Tree {
     pub fn statistics(&self, id: u64, p: usize, q: usize) -> std::result::Result<JsValue, JsError> {
         to_js(&self.inner.statistics(id, Lens { p, q }).map_err(js_error)?)
     }
+}
 
-    /// What this tree, as a recording, answers to an Expand reading `read`
-    /// below `node`: the messages it can give before it lacks a distribution.
-    pub fn answer(
+/// A client's session with a recording: what the page looks at, read through
+/// the recorded tree. A recording has all it will ever have.
+#[wasm_bindgen]
+pub struct Session {
+    inner: NativeSession,
+}
+
+#[wasm_bindgen]
+impl Session {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: NativeSession::new(),
+        }
+    }
+
+    /// What the page looks at now: a view and a path, each or null.
+    pub fn demand(
         &mut self,
-        node: u64,
-        measure: usize,
-        read: JsValue,
-    ) -> std::result::Result<JsValue, JsError> {
-        let read: Read = from_js(read)?;
-        let mut answers = Vec::new();
-        if self.inner.contains(node) {
-            let mut walk = Walk::new(node, read).map_err(js_error)?;
-            while let Advance::Children(_, runs, children) =
-                walk.advance(&mut self.inner, measure).map_err(js_error)?
-            {
-                answers.push((runs, children));
+        recorded: &Tree,
+        p: usize,
+        q: usize,
+        view: JsValue,
+        path: JsValue,
+    ) -> std::result::Result<(), JsError> {
+        let view: Option<View> = from_js(view)?;
+        let path: Option<Path> = from_js(path)?;
+        let demand = Demand {
+            lens: Lens { p, q },
+            view,
+            path,
+        };
+        self.inner.demand(&recorded.inner, demand).map_err(js_error)
+    }
+
+    /// Everything new to the page: whatever the recording does not hold is
+    /// said to be lacking, and read past.
+    pub fn answer(&mut self, recorded: &mut Tree) -> std::result::Result<JsValue, JsError> {
+        let mut updates = Vec::new();
+        loop {
+            updates.extend(self.inner.step(&mut recorded.inner).map_err(js_error)?);
+            let blocked = self.inner.blocked();
+            if blocked.is_empty() {
+                break;
+            }
+            for missing in blocked {
+                self.inner.lacks(missing.measure, missing.node);
             }
         }
-        let messages: Vec<_> = answers
-            .iter()
-            .map(|(runs, children)| Message {
-                runs: runs
-                    .iter()
-                    .map(|run| RunMessage {
-                        rank: run.rank(),
-                        branches: run.branches(),
-                        ln_below: run.ln_below(),
-                    })
-                    .collect(),
-                children: *children,
-            })
-            .collect();
+        let messages: Vec<_> = updates.iter().map(update_message).collect();
         to_js(&messages)
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -223,7 +316,7 @@ pub fn layout_frame(
     })
 }
 
-/// A frame stays in Wasm; only visible boxes and requests cross.
+/// A frame stays in Wasm; only visible boxes cross.
 #[wasm_bindgen]
 pub struct LayoutFrame {
     inner: Frame,
@@ -274,10 +367,6 @@ impl LayoutFrame {
         packed
     }
 
-    pub fn misses(&self) -> std::result::Result<JsValue, JsError> {
-        to_js(&self.inner.misses)
-    }
-
     #[wasm_bindgen(js_name = originTop)]
     pub fn origin_top(&self) -> f64 {
         self.inner.origin_top
@@ -315,6 +404,21 @@ impl LayoutFrame {
         .map_err(js_error)?;
         to_js(&picked)
     }
+}
+
+/// What the camera looks at, as a session's view of `rows` pixel rows.
+#[wasm_bindgen]
+pub fn view(
+    tree: &Tree,
+    p: usize,
+    q: usize,
+    camera: JsValue,
+    viewport: JsValue,
+    rows: f64,
+) -> std::result::Result<JsValue, JsError> {
+    let camera: Camera = from_js(camera)?;
+    let viewport: Viewport = from_js(viewport)?;
+    to_js(&layout::view(&tree.inner, Lens { p, q }, &camera, viewport, rows).map_err(js_error)?)
 }
 
 /// The camera's point under the name that keeps the view exact.

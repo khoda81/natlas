@@ -1,25 +1,19 @@
 import { expect, it } from "bun:test";
-import { type Camera, layout, top } from "../src/core/layout";
+import { type Camera, top, view } from "../src/core/layout";
 import { IntervalTree, ROOT } from "../src/core/tree";
 import { answer } from "./build";
 
-const view = { width: 1000, height: 800 };
+const viewport = { width: 1000, height: 800 };
 const lens = { p: 0, q: 1 };
 
-it("opens a deep node on its own: its frame asks for it and then its children, never an ancestor", () => {
+it("looks at a deep node opened on its own, never an ancestor", () => {
   const tree = new IntervalTree(2);
   const origin = tree.descend(ROOT, Array.from({ length: 3000 }, (_, i) => i % 7));
   const cam: Camera = { origin, x: 0, k: 100, anchor: top(), a: 0 };
-  const asked = () => {
-    const frame = layout(tree, lens, cam, view);
-    try {
-      return frame.misses.map(({ node, read, measure }) => `${tree.path(node).length + read.path.length}:${measure}`);
-    } finally { frame.dispose(); }
-  };
-  expect(asked()).toEqual(["3000:0"]);
+  const looked = () => view(tree, lens, cam, viewport, 800);
+  expect(looked()).toMatchObject({ node: origin, lnHeight: 0, rows: 800, right: 10 });
   tree.insert(origin, 0, answer([0.75, 0.25]));
-  // Until q says how wide the children are, they reach past the view.
-  expect(asked()).toEqual(["3000:1"]);
   tree.insert(origin, 1, answer([0.5, 0.5]));
-  expect(asked()).toEqual(["3001:0", "3001:0"]);
+  // Its children known, the view is still all of it.
+  expect(looked()).toMatchObject({ node: origin, lnHeight: 0 });
 });

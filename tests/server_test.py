@@ -4,7 +4,7 @@
 # [tool.uv.sources]
 # natlas-core = { path = "../core" }
 # ///
-"""Native core and real Connect transport tests without loading an ML model.
+"""Native core, scheduler and session transport tests without loading an ML model.
 
 --serve starts the same deterministic fixture for browser verification.
 """
@@ -12,10 +12,8 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import math
 import os
-import struct
 import sys
 import threading
 import time
@@ -30,8 +28,10 @@ sys.path.insert(0, str(ROOT / "export"))
 import service  # noqa: E402
 from natlas import natlas_pb2 as pb  # noqa: E402
 from natlas_codec import labels_json  # noqa: E402
-from natlas_core import Tree  # noqa: E402
+from errors import TooLong  # noqa: E402
+from natlas_core import Session, Tree  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
+from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 MASK = (1 << 64) - 1
 
@@ -54,32 +54,43 @@ def node_id(path):
 class Measure:
     name = "fixture"
 
-    def __init__(self, weights=(0.6, 0.25, 0.1, 0.049, 0.001)):
+    def __init__(self, weights=(0.6, 0.25, 0.1, 0.049, 0.001), positions=1, longest=None):
         self.weights = np.array(weights, dtype=np.float64)
+        self.positions = positions
+        # Prefixes longer than this are too long for the model's context.
+        self.longest = longest
         # Every prefix whose distribution was computed, in order.
         self.calls = []
         # Every walk begun, as (tokens, start).
         self.walks = []
+        # Prefixes whose computation waits on a gate, and a flag raised when
+        # one is reached.
+        self.gates = {}
+        self.reached = threading.Event()
 
     def walk(self, tokens, start):
         self.walks.append((tuple(tokens), start))
         for end in range(start, len(tokens) + 1):
-            self.calls.append(tuple(tokens[:end]))
+            prefix = tuple(tokens[:end])
+            if self.longest is not None and self.longest < len(prefix):
+                raise TooLong(f"{len(prefix)} tokens, but the context holds {self.longest}")
+            if prefix in self.gates:
+                self.reached.set()
+                self.gates[prefix].wait(5)
+            self.calls.append(prefix)
             with np.errstate(divide="ignore"):
                 yield np.log(self.weights)
 
 
-def fixture():
-    measures = [Measure(), Measure((0.25, 0.6, 0.1, 0.049, 0.001))]
+def fixture(**measure):
+    measures = [Measure(**measure), Measure((0.25, 0.6, 0.1, 0.049, 0.001))]
     model = service.Model((99,), lambda path: len(path) >= 5, 5, measures)
     manifest = [
         {
             "name": "fixture",
             "title": "Integer sequence fixture",
             "labels": "labels.json",
-            "measures": [
-                {"name": f"measure {index}", "url": f"{index}/"} for index in range(2)
-            ],
+            "measures": [{"name": f"measure {index}", "url": f"{index}/"} for index in range(2)],
         }
     ]
     labels = [b"a", b"b", b"c", b"r", b"\n"]
@@ -95,47 +106,64 @@ def fixture():
     )
 
 
-def messages(body):
-    result = []
-    while body:
-        flags, length = struct.unpack_from(">BI", body)
-        payload, body = body[5 : 5 + length], body[5 + length :]
-        result.append((flags, payload))
-    return result
+class Received:
+    """A client of the model, keeping what it is sent."""
+
+    def __init__(self, model):
+        self.updates = []
+        self.client = model.open(self.send).result(5)
+
+    def send(self, frame):
+        self.updates.extend(pb.Updates.FromString(frame).updates)
+
+    def kinds(self, kind):
+        return [getattr(update, kind) for update in self.updates if update.WhichOneof("kind") == kind]
+
+    def answered(self, node, measure=0):
+        """The branches answered for a node, in order."""
+        return [
+            branch
+            for answer in self.kinds("answer")
+            if (answer.node, answer.measure) == (node, measure)
+            for run in answer.children.runs
+            for branch in run.branches
+        ]
 
 
-def at(*below):
-    """The points with these masses below them, each a part of its own."""
-
-    def digits(fraction):
-        digits = bytearray()
-        while 0 < fraction:
-            fraction *= 256
-            digits.append(int(fraction))
-            fraction -= int(fraction)
-        return bytes(digits)
-
-    return [(digits(1 - mass), -math.inf, 1) for mass in below]
-
-
-def request(node, path=None, points=None, branches=None):
-    """Expand down ``path``, then at the points of parts or along ``branches``."""
-    within = {}
-    if points is not None:
-        parts = [pb.Part(top=top, ln_mass=ln_mass, count=count) for top, ln_mass, count in points]
-        within = {"points": pb.Points(parts=parts)}
-    elif branches is not None:
-        within = {"branches": pb.Branches(branches=branches)}
-    return pb.ExpandRequest(node=node, path=path or [], **within)
+def demand(p=0, q=0, view=None, path=None):
+    """A demand: the view as (node, rows, right) of the node's whole mass, the
+    path as (node, branches)."""
+    message = pb.Demand(p=p, q=q)
+    if view is not None:
+        node, rows, right = view
+        message.view.CopyFrom(pb.View(node=node, top=b"", ln_height=0.0, rows=rows, right=right))
+    if path is not None:
+        node, branches = path
+        message.path.CopyFrom(pb.Path(node=node, branches=branches))
+    return message
 
 
-def answers(model, node, path=None, points=None, branches=None, measure=0):
-    return list(model.expand(measure, request(node, path, points, branches), threading.Event()))
+def settle(model):
+    """Wait until the scheduler has sent everything and has nothing to compute."""
+
+    def idle():
+        for client in model.clients:
+            model._step(client)  # noqa: SLF001
+        return not any(client.session.blocked() for client in model.clients)
+
+    deadline = time.monotonic() + 5
+    while not model.call(idle).result(5):
+        if deadline < time.monotonic():
+            raise AssertionError("the scheduler did not settle")
+        time.sleep(0.001)
 
 
-def placed(children):
-    """The branches one message places, run by run."""
-    return [list(run.branches) for run in children.runs]
+def held(model):
+    """Hold the scheduler until the returned gate is set: what is posted
+    meanwhile is taken at once, in order."""
+    gate = threading.Event()
+    model.call(gate.wait)
+    return gate
 
 
 class CoreTests(unittest.TestCase):
@@ -151,133 +179,116 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             tree.walk(node_id([1, 2]), [])
 
-    def test_a_walk_places_what_the_core_holds_and_asks_for_what_it_lacks(self):
+    def test_a_session_answers_what_the_tree_holds_and_waits_on_what_it_lacks(self):
         tree = Tree(1)
-        walk = tree.start(0, [], parts=at(0.9, 0.4))
-        self.assertEqual(tree.advance(walk, 0), ("missing", 0))
+        session = Session()
+        session.demand(tree, 0, 0, view=(0, b"", 0.0, 10.0, 0.1))
+        self.assertEqual(session.step(tree), [])
+        self.assertEqual(session.blocked(), [(0, 0, 10.0, [])])
         with np.errstate(divide="ignore"):
             tree.set(0, 0, np.log([0.2, 0.5, 0.0, 0.3]))
-        kind, node, runs, count = tree.advance(walk, 0)
-        self.assertEqual((kind, node, count), ("children", 0, 3))
-        ((rank, branches, ln_below),) = runs
-        self.assertEqual((rank, branches), (0, [1, 3]))
-        # A measure's weights are kept as f32s.
-        self.assertAlmostEqual(math.exp(ln_below[-1]), 0.2, places=7)
-        self.assertIsNone(tree.advance(walk, 0))
+        ((kind, measure, node, parent, branch, runs, count),) = session.step(tree)
+        self.assertEqual((kind, measure, node, parent, branch, count), ("answer", 0, 0, None, None, 3))
+        self.assertEqual([branches for _, branches, _ in runs], [[1, 3, 0]])
+        self.assertEqual(session.blocked(), [])
         with self.assertRaises(ValueError):
-            tree.start(0, [], parts=[(b"", math.nan, 1)])
-        with self.assertRaises(ValueError):
-            tree.start(0, [], parts=at(0.4), branches=[1])
-        # Four points evenly through the lower half: 0.5625 and 0.6875 down
-        # in branch 3, 0.8125 and 0.9375 in the lightest, 0.
-        walk = tree.start(0, [], parts=[(b"\x80", math.log(0.5), 4)])
-        _, _, ((rank, branches, _),), _ = tree.advance(walk, 0)
-        self.assertEqual((rank, branches), (1, [3, 0]))
-        # Nothing to read is nothing to compute.
-        self.assertIsNone(tree.advance(tree.start(0, []), 0))
+            session.demand(tree, 0, 1)
 
 
 class ModelTests(unittest.TestCase):
-    def test_a_path_is_placed_branch_by_branch_from_one_pass_of_the_model(self):
+    def test_a_view_is_computed_from_the_root_down_the_most_rows_first(self):
         model, _ = fixture()
-        walked = answers(model, 0, [0, 1, 2])
-        self.assertEqual([placed(children) for children in walked], [[[0]], [[1]], [[2]]])
-        self.assertEqual([children.runs[0].rank for children in walked], [0, 1, 2])
+        client = Received(model)
+        model.demand(client.client, demand(view=(0, 10.0, 2.0))).result(5)
+        settle(model)
+        calls = model.measures[0].calls
+        # Ten rows: 6 on branch 0, then 3.6 on its own branch 0, 2.5 on
+        # branch 1, 2.16 below 0, 0, and 1.5 each on two more; what starts
+        # past two nats, or is worth less than a row, is not computed.
+        self.assertEqual(calls[:5], [(99,), (99, 0), (99, 0, 0), (99, 1), (99, 0, 0, 0)])
+        self.assertEqual(set(calls[5:]), {(99, 0, 1), (99, 1, 0)})
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(client.answered(0)[:3], [0, 1, 2])
+        (answer,) = [answer for answer in client.kinds("answer") if answer.node == node_id([0, 0])]
+        self.assertEqual((answer.parent, answer.branch), (node_id([0]), 0))
+
+    def test_clients_take_turns_pass_by_pass(self):
+        model, _ = fixture()
+        first, second = Received(model), Received(model)
+        gate = held(model)
+        model.demand(first.client, demand(path=(0, [1, 1, 1])))
+        model.demand(second.client, demand(path=(0, [2, 2, 2])))
+        gate.set()
+        settle(model)
+        self.assertEqual(model.measures[0].calls, [(99,), (99, 2), (99, 1), (99, 2, 2), (99, 1, 1)])
+        self.assertEqual([list(path.branches) for path in first.kinds("placed")], [[1, 1, 1]])
+        self.assertEqual([list(path.branches) for path in second.kinds("placed")], [[2, 2, 2]])
+
+    def test_a_pass_computes_as_much_of_a_path_as_the_model_reads_at_once(self):
+        model, _ = fixture(positions=3)
+        client = Received(model)
+        model.demand(client.client, demand(path=(0, [0, 1, 2, 3])))
+        settle(model)
         measure = model.measures[0]
-        self.assertEqual(measure.walks, [((99, 0, 1, 2), 1)])
-        self.assertEqual(measure.calls, [(99,), (99, 0), (99, 0, 1)])
-        # The nodes along it are kept: naming the last by its parent
-        # computes nothing.
-        self.assertEqual(answers(model, node_id([0, 1]), [2]), walked[2:])
-        self.assertEqual(len(measure.calls), 3)
+        self.assertEqual(measure.walks, [((99, 0, 1), 1), ((99, 0, 1, 2, 3), 4)])
+        self.assertEqual(client.answered(node_id([0, 1, 2])), [3])
+        self.assertEqual(len(client.kinds("placed")), 1)
 
-    def test_a_walk_hands_the_model_to_one_waiting_after_its_pass(self):
-        model, _ = fixture()
-        measure = model.measures[0]
-        long = model.expand(0, request(0, [0, 1, 2]), threading.Event())
-        next(long)
-        self.assertTrue(model.lock.locked())
-        with ThreadPoolExecutor() as pool:
-            other = pool.submit(answers, model, 0, [3, 0])
-            while not model.lock.wanted():
-                time.sleep(0.001)
-            self.assertEqual(len(list(long)), 2)
-            self.assertEqual(len(other.result(timeout=5)), 2)
-        self.assertEqual(measure.calls, [(99,), (99, 0), (99, 3), (99, 0, 1)])
-        # The long walk read on from where the other left the model.
-        self.assertEqual(measure.walks, [((99, 0, 1, 2), 1), ((99, 3, 0), 2), ((99, 0, 1, 2), 3)])
-        self.assertFalse(model.lock.locked())
-
-    def test_a_canceled_walk_leaves_the_queue_for_the_model(self):
-        model, _ = fixture()
-        canceled = threading.Event()
-        with model.lock, ThreadPoolExecutor() as pool:
-            waiting = pool.submit(lambda: list(model.expand(0, request(0, [0]), canceled)))
-            while not model.lock.wanted():
-                time.sleep(0.001)
-            canceled.set()
-            model.lock.wake()
-            self.assertEqual(waiting.result(timeout=5), [])
-            self.assertFalse(model.lock.wanted())
-        self.assertEqual(model.measures[0].calls, [])
-
-    def test_points_place_the_children_holding_them_or_descend_into_one(self):
-        model, _ = fixture()
-        # 0.9 lies in branch 0's (0.4, 1], 0.3 in branch 1's (0.15, 0.4].
-        (root,) = answers(model, 0, points=at(0.9, 0.3))
-        self.assertEqual((placed(root), root.count), ([[0, 1]], 5))
-        # 0.9 and 0.5 both lie in branch 0: the points descend into it,
-        # where they fall 0.83 and 0.17 of the way up, in its branches 0 and 1.
-        descent = answers(model, 0, points=at(0.9, 0.5))
-        self.assertEqual([placed(children) for children in descent], [[[0]], [[0, 1]]])
-        self.assertEqual(model.measures[0].calls[-1], (99, 0))
-        (branches,) = answers(model, 0, branches=[4, 1, 7])
-        self.assertEqual(placed(branches), [[1], [4]])
-        # Down a path and then points, in one request: the path's branch,
-        # then the children of the node it reaches.
-        calls = len(model.measures[0].calls)
-        both = answers(model, 0, [0], points=at(0.9, 0.3))
-        self.assertEqual([placed(children) for children in both], [[[0]], [[0, 1]]])
-        self.assertEqual(len(model.measures[0].calls), calls)
-
-    def test_eviction_forgets_the_least_recently_read_and_recomputes_it_alike(self):
+    def test_a_new_demand_drops_what_the_old_one_waited_on(self):
         model, _ = fixture()
         measure = model.measures[0]
-        # Room for none but the one just computed.
+        gate = measure.gates[(99, 1)] = threading.Event()
+        client = Received(model)
+        model.demand(client.client, demand(path=(0, [1, 1, 1])))
+        self.assertTrue(measure.reached.wait(5))
+        # While (1) is computed, the client looks elsewhere.
+        model.demand(client.client, demand(path=(0, [2])))
+        gate.set()
+        settle(model)
+        self.assertEqual(measure.calls, [(99,), (99, 1)])
+        self.assertEqual([list(path.branches) for path in client.kinds("placed")], [[2]])
+
+    def test_ended_sequences_and_branches_past_the_vocabulary_have_no_children(self):
+        model, _ = fixture()
+        client = Received(model)
+        model.demand(client.client, demand(path=(0, [0] * 5))).result(5)
+        settle(model)
+        model.learn([7]).result(5)
+        for node in (node_id([0] * 5), node_id([7])):
+            model.demand(client.client, demand(view=(node, 10.0, 1.0))).result(5)
+            settle(model)
+            (answer,) = [answer for answer in client.kinds("answer") if answer.node == node]
+            self.assertEqual((list(answer.children.runs), answer.children.count), ([], 0))
+        self.assertTrue(all(len(call) <= 5 for call in model.measures[0].calls))
+        self.assertNotIn((99, 7), model.measures[0].calls)
+
+    def test_a_distribution_that_cannot_be_computed_fails_what_waits_on_it(self):
+        model, _ = fixture(longest=3)
+        client = Received(model)
+        model.demand(client.client, demand(path=(0, [0, 0, 0, 0]))).result(5)
+        settle(model)
+        (failed,) = client.kinds("failed")
+        self.assertEqual((failed.measure, failed.node), (0, node_id([0, 0, 0])))
+        self.assertIn("context", failed.message)
+
+    def test_eviction_forgets_the_oldest_and_recomputes_it_alike(self):
+        model, _ = fixture()
         model.cache = 1
-        first = answers(model, 0, [0, 1])
-        self.assertEqual(answers(model, 0, [0, 1]), first)
-        self.assertEqual(measure.calls.count((99,)), 2)
-        # Room for two, shared by the measures: the root under measure 1
-        # takes the place of the root under measure 0, read before its child.
-        model, _ = fixture()
-        answers(model, 0, [0, 1])
-        model.cache = model.held
-        answers(model, 0, [0], measure=1)
-        self.assertEqual(
-            [model.tree.has(node, of) for node, of in [(0, 0), (node_id([0]), 0), (0, 1)]],
-            [False, True, True],
-        )
-        self.assertLessEqual(model.held, model.cache)
+        client = Received(model)
+        model.demand(client.client, demand(path=(0, [0, 1]))).result(5)
+        settle(model)
+        model.demand(client.client, demand(path=(0, [0, 1, 2]))).result(5)
+        settle(model)
+        self.assertEqual(model.measures[0].calls.count((99,)), 2)
+        self.assertEqual(len(client.kinds("placed")), 2)
 
-    def test_ended_and_weightless_branches(self):
+    def test_a_node_the_server_never_learned_is_said_unknown(self):
         model, _ = fixture()
-        self.assertEqual(len(answers(model, 0, [0] * 5)), 5)
-        ended = answers(model, node_id([0] * 5), points=at(0.4))
-        self.assertEqual(ended, [pb.Children(count=0)])
-        # Branch 5 is past the vocabulary: nothing places it.
-        self.assertEqual(answers(model, 0, [5]), [])
-        with self.assertRaises(KeyError):
-            answers(model, node_id([3, 3]), [])
-
-    def test_a_canceled_walk_stops_at_the_next_node(self):
-        model, _ = fixture()
-        canceled = threading.Event()
-        walk = model.expand(0, request(0, [0, 1, 2]), canceled)
-        next(walk)
-        canceled.set()
-        self.assertEqual(list(walk), [])
-        self.assertFalse(model.lock.locked())
+        client = Received(model)
+        model.demand(client.client, demand(view=(node_id([3, 3]), 10.0, 1.0))).result(5)
+        settle(model)
+        self.assertEqual(client.kinds("unknown"), [node_id([3, 3])])
+        self.assertEqual(model.measures[0].calls, [])
 
 
 class TransportTests(unittest.TestCase):
@@ -285,40 +296,26 @@ class TransportTests(unittest.TestCase):
         self.model, application = fixture()
         self.client = TestClient(application)
 
-    def expand(self, body):
-        return self.client.post(
-            "/0/natlas.Natlas/Expand",
-            content=body,
-            headers={
-                "content-type": "application/connect+proto",
-                "origin": "http://localhost:5173",
-            },
-        )
+    def updates_until_placed(self, socket):
+        updates = []
+        while not any(update.WhichOneof("kind") == "placed" for update in updates):
+            updates.extend(pb.Updates.FromString(socket.receive_bytes()).updates)
+        return updates
 
-    def answers(self, node, path):
-        response = self.expand(service._envelope(0, request(node, path).SerializeToString()))
-        self.assertEqual(response.status_code, 200)
-        frames = messages(response.content)
-        return [
-            pb.Children.FromString(data) for flags, data in frames if not flags
-        ], json.loads(frames[-1][1])
+    def test_a_session_answers_its_demand_over_one_socket(self):
+        with self.client.websocket_connect("/session") as socket:
+            socket.send_bytes(demand(path=(0, [0, 1])).SerializeToString())
+            updates = self.updates_until_placed(socket)
+        answers = [(update.answer.node, [b for run in update.answer.children.runs for b in run.branches]) for update in updates if update.WhichOneof("kind") == "answer"]
+        self.assertEqual(answers, [(0, [0]), (node_id([0]), [1])])
+        self.assertEqual(self.client.get("/manifest.json").json()[0]["name"], "fixture")
 
-    def test_a_stream_holds_one_message_per_node_down_the_path(self):
-        answered, end = self.answers(0, [0, 1])
-        self.assertEqual(end, {})
-        self.assertEqual([placed(children) for children in answered], [[[0]], [[1]]])
-        again, _ = self.answers(node_id([0]), [1])
-        self.assertEqual(again, answered[1:])
-        self.assertEqual(self.model.measures[0].calls, [(99,), (99, 0)])
-        response = self.expand(
-            service._envelope(0, request(0).SerializeToString())
-        )
-        self.assertEqual(response.headers["access-control-allow-origin"], "*")
-
-    def test_an_unlearned_id_is_not_found(self):
-        answered, end = self.answers(node_id([2]), [3])
-        self.assertEqual(answered, [])
-        self.assertEqual(end["error"]["code"], "not_found")
+    def test_a_demand_the_server_cannot_take_closes_the_session(self):
+        with self.client.websocket_connect("/session") as socket:
+            socket.send_bytes(pb.Demand(p=0, q=9).SerializeToString())
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                socket.receive_bytes()
+        self.assertEqual(closed.exception.code, 1007)
 
     def test_search_teaches_the_server_the_ids_along_the_text(self):
         response = self.client.post(
@@ -327,39 +324,12 @@ class TransportTests(unittest.TestCase):
             headers={"content-type": "application/proto"},
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            list(pb.SearchResponse.FromString(response.content).path), [0, 1, 2]
-        )
+        self.assertEqual(list(pb.SearchResponse.FromString(response.content).path), [0, 1, 2])
         self.assertEqual(self.model.measures[0].calls, [])
-        _, end = self.answers(node_id([0, 1]), [2])
-        self.assertEqual(end, {})
+        with self.client.websocket_connect("/session") as socket:
+            socket.send_bytes(demand(path=(node_id([0, 1]), [2])).SerializeToString())
+            self.updates_until_placed(socket)
         self.assertEqual(self.model.measures[0].calls, [(99, 0, 1)])
-        self.assertNotIn("start", self.client.get("/manifest.json").json()[0])
-
-    def test_search_answers_while_a_forward_pass_runs(self):
-        def search():
-            return self.client.post(
-                "/0/natlas.Natlas/Search",
-                content=pb.SearchRequest(text="ab").SerializeToString(),
-                headers={"content-type": "application/proto"},
-            )
-
-        with self.model.lock, ThreadPoolExecutor() as pool:
-            response = pool.submit(search).result(timeout=5)
-        self.assertEqual(response.status_code, 200)
-
-    def test_invalid_requests_return_protocol_errors(self):
-        unmeasured = request(0, points=[(b"", math.nan, 1)]).SerializeToString()
-        for body in [
-            b"",
-            b"\x00\x00\x00\x00\x04\x80",
-            service._envelope(0, b"\x80"),
-            service._envelope(0, unmeasured),
-        ]:
-            frames = messages(self.expand(body).content)
-            self.assertEqual(
-                json.loads(frames[-1][1])["error"]["code"], "invalid_argument"
-            )
         response = self.client.post(
             "/0/natlas.Natlas/Search",
             content=b"\x80",

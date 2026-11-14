@@ -1,11 +1,13 @@
-//! Python adapter for servers: node identity, distributions and Expand's walk
-//! stay in the core; a server only computes the distributions a walk asks for.
+//! Python adapter for servers: node identity, distributions and what each
+//! client's view lacks stay in the core; a server only computes the
+//! distributions its sessions wait on.
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::distribution::Distribution;
-use crate::tree::{Advance, Part, Read, Tree, Walk, Within};
+use crate::distribution::{Distribution, Run};
+use crate::session::{Demand, Path, Session, Update, View};
+use crate::tree::{Lens, Tree};
 
 fn error(message: String) -> PyErr {
     PyValueError::new_err(message)
@@ -16,10 +18,11 @@ struct PythonTree {
     inner: Tree,
 }
 
-/// One Expand request in progress.
-#[pyclass(name = "Walk")]
-struct PythonWalk {
-    inner: Walk,
+/// One client's session: what it is looking at, read through a tree, and
+/// what it has been sent.
+#[pyclass(name = "Session")]
+struct PythonSession {
+    inner: Session,
 }
 
 #[pymethods]
@@ -85,74 +88,6 @@ impl PythonTree {
     fn forget(&mut self, node: u64, measure: usize) -> PyResult<()> {
         self.inner.forget(node, measure).map_err(error)
     }
-
-    /// Begin an Expand down `path` below `node`, then for the children of
-    /// the node it ends at holding the points of `parts`, each (top digits,
-    /// ln mass, count), or for those along `branches`. An unknown node
-    /// raises KeyError; a mass that is no number, or both parts and
-    /// branches, ValueError.
-    #[pyo3(signature = (node, path, parts=None, branches=None))]
-    fn start(
-        &self,
-        node: u64,
-        path: Vec<u32>,
-        parts: Option<Vec<(Vec<u8>, f64, u32)>>,
-        branches: Option<Vec<u32>>,
-    ) -> PyResult<PythonWalk> {
-        self.known(node)?;
-        let part = |(top, ln_mass, count)| Part {
-            top,
-            ln_mass,
-            count,
-        };
-        let within = match (parts, branches) {
-            (Some(_), Some(_)) => {
-                return Err(error("an Expand reads points or branches, not both".into()))
-            }
-            (Some(parts), None) => Some(Within::Points(parts.into_iter().map(part).collect())),
-            (None, Some(branches)) => Some(Within::Branches(branches)),
-            (None, None) => None,
-        };
-        Ok(PythonWalk {
-            inner: Walk::new(node, Read { path, within }).map_err(error)?,
-        })
-    }
-
-    /// The walk's next message as ("children", node, runs, children): runs
-    /// as (rank, branches, ln_below), children the node's count or None where
-    /// its end is unknown; ("missing", node) when it needs that node's
-    /// distribution first; or None once it is done.
-    fn advance(
-        &mut self,
-        walk: &mut PythonWalk,
-        measure: usize,
-        py: Python<'_>,
-    ) -> PyResult<Option<Py<PyAny>>> {
-        Ok(
-            match walk
-                .inner
-                .advance(&mut self.inner, measure)
-                .map_err(error)?
-            {
-                Advance::Children(node, runs, children) => {
-                    let runs: Vec<_> = runs
-                        .iter()
-                        .map(|run| (run.rank(), run.branches().to_vec(), run.ln_below().to_vec()))
-                        .collect();
-                    Some(
-                        ("children", node, runs, children)
-                            .into_pyobject(py)?
-                            .into_any()
-                            .unbind(),
-                    )
-                }
-                Advance::Missing(node) => {
-                    Some(("missing", node).into_pyobject(py)?.into_any().unbind())
-                }
-                Advance::Done => None,
-            },
-        )
-    }
 }
 
 impl PythonTree {
@@ -165,9 +100,126 @@ impl PythonTree {
     }
 }
 
+/// A run as (rank, branches, ln_below).
+fn run(run: &Run) -> (u32, Vec<u32>, Vec<f64>) {
+    (run.rank(), run.branches().to_vec(), run.ln_below().to_vec())
+}
+
+#[pymethods]
+impl PythonSession {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: Session::new(),
+        }
+    }
+
+    /// What the client is looking at now, under measures `p` and `q`: the
+    /// view as (node, top digits, ln height, rows, right), and the path as
+    /// (node, branches). ValueError for a demand the tree cannot take.
+    #[pyo3(signature = (tree, p, q, view=None, path=None))]
+    fn demand(
+        &mut self,
+        tree: PyRef<'_, PythonTree>,
+        p: usize,
+        q: usize,
+        view: Option<(u64, Vec<u8>, f64, f64, f64)>,
+        path: Option<(u64, Vec<u32>)>,
+    ) -> PyResult<()> {
+        let view = view.map(|(node, top, ln_height, rows, right)| View {
+            node,
+            top,
+            ln_height,
+            rows,
+            right,
+        });
+        let path = path.map(|(node, branches)| Path { node, branches });
+        let demand = Demand {
+            lens: Lens { p, q },
+            view,
+            path,
+        };
+        self.inner.demand(&tree.inner, demand).map_err(error)
+    }
+
+    /// Read on, and what is new to the client: ("answer", measure, node,
+    /// parent, branch, runs, count) with runs as (rank, branches, ln_below)
+    /// and parent, branch and count None where there are none;
+    /// ("unknown", node); ("placed", node, branches); ("lacks", measure,
+    /// node); ("failed", measure, node, message).
+    fn step(
+        &mut self,
+        mut tree: PyRefMut<'_, PythonTree>,
+        py: Python<'_>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let updates = self.inner.step(&mut tree.inner).map_err(error)?;
+        updates
+            .into_iter()
+            .map(|update| {
+                Ok(match update {
+                    Update::Answer {
+                        measure,
+                        node,
+                        edge,
+                        runs,
+                        count,
+                    } => {
+                        let runs: Vec<_> = runs.iter().map(run).collect();
+                        let (parent, branch) = edge.unzip();
+                        ("answer", measure, node, parent, branch, runs, count)
+                            .into_pyobject(py)?
+                            .into_any()
+                            .unbind()
+                    }
+                    Update::Unknown(node) => {
+                        ("unknown", node).into_pyobject(py)?.into_any().unbind()
+                    }
+                    Update::Placed(Path { node, branches }) => ("placed", node, branches)
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind(),
+                    Update::Lacks { measure, node } => ("lacks", measure, node)
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind(),
+                    Update::Failed {
+                        measure,
+                        node,
+                        message,
+                    } => ("failed", measure, node, message)
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind(),
+                })
+            })
+            .collect()
+    }
+
+    /// The distributions waited on, the most valuable first, as (measure,
+    /// node, worth, ahead): ahead the branches still to place below a node
+    /// on the path.
+    fn blocked(&self) -> Vec<(usize, u64, f64, Vec<u32>)> {
+        self.inner
+            .blocked()
+            .into_iter()
+            .map(|blocked| (blocked.measure, blocked.node, blocked.worth, blocked.ahead))
+            .collect()
+    }
+
+    /// The source will never have this distribution.
+    fn lacks(&mut self, measure: usize, node: u64) {
+        self.inner.lacks(measure, node);
+    }
+
+    /// Computing this distribution failed.
+    fn failed(&mut self, measure: usize, node: u64, message: &str) {
+        self.inner.failed(measure, node, message);
+    }
+}
+
 #[pymodule]
 fn natlas_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonTree>()?;
-    module.add_class::<PythonWalk>()?;
+    module.add_class::<PythonSession>()?;
     Ok(())
 }

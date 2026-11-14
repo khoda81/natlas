@@ -7,6 +7,7 @@
 #   "protobuf>=7.36.1",
 #   "starlette>=0.40",
 #   "uvicorn>=0.30",
+#   "websockets>=13",
 # ]
 #
 # [tool.uv.sources]
@@ -179,6 +180,8 @@ class Scribe:
     a request shares with what it holds, so walking down a path costs one
     step per event.
     """
+
+    positions = 1
 
     def __init__(
         self,

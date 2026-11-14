@@ -1,52 +1,52 @@
-"""Model-independent integer-sequence cache and Connect RPC transport.
+"""Model-independent integer-sequence cache, scheduler and session transport.
 
 Language and music adapters supply the measures; the Rust core owns their
-cached distributions and the hashed node ids shared with every client.
+cached distributions, the hashed node ids shared with every client, and what
+each client's view lacks.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import math
+import queue
 import re
-import struct
 import sys
 import threading
 import time
 import traceback
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
-from typing import Protocol
+from concurrent.futures import Future
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 import anyio.to_thread
 import numpy as np
 from errors import TooLong
 from google.protobuf.message import DecodeError
 from natlas import natlas_pb2 as pb
-from natlas_core import Tree
+from natlas_core import Session, Tree
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 
 class Measure(Protocol):
     """Next-token log-probabilities as a float64 array over the vocabulary."""
 
     name: str
+    # How many positions of a path one forward pass gives distributions for.
+    positions: int
 
     def walk(self, tokens: Sequence[int], start: int) -> Iterator[np.ndarray]:
         """Those after tokens[:k] for every k from ``start`` through len(tokens)."""
         ...
 
 
-# Connect envelopes: one flags byte, a big-endian length, the message.
-_COMPRESSED = 0x01
-_END_STREAM = 0x02
-_CONTENT_TYPE = "application/connect+proto"
 _PROTO_CONTENT_TYPE = "application/proto"
 # Memory for distributions a server keeps by default, across its measures.
 # The core keeps each sorted and packed, about 4 bytes per vocabulary entry:
@@ -54,61 +54,25 @@ _PROTO_CONTENT_TYPE = "application/proto"
 CACHE = 1 << 30
 
 
-class Turns:
-    """A lock taken in the order it was asked for, which says whether anyone
-    waits: a holder can hand it on and take it again behind them."""
+@dataclass(eq=False)
+class Client:
+    """One client's session, and how to hand it an Updates frame from any
+    thread."""
 
-    def __init__(self):
-        self._changed = threading.Condition()
-        self._waiting: deque[object] = deque()
-        self._held = False
-
-    def acquire(self, canceled: threading.Event | None = None) -> bool:
-        """Wait for a turn and take it; False, without one, once ``canceled``
-        is set and ``wake`` called."""
-        def gone() -> bool:
-            return canceled is not None and canceled.is_set()
-
-        with self._changed:
-            ticket = object()
-            self._waiting.append(ticket)
-            self._changed.wait_for(lambda: gone() or (not self._held and self._waiting[0] is ticket))
-            self._waiting.remove(ticket)
-            if gone():
-                # Whoever is next may be first now.
-                self._changed.notify_all()
-                return False
-            self._held = True
-            return True
-
-    def wake(self) -> None:
-        """Have waiters look whether they were canceled."""
-        with self._changed:
-            self._changed.notify_all()
-
-    def release(self) -> None:
-        with self._changed:
-            assert self._held, "released a lock nobody holds"
-            self._held = False
-            self._changed.notify_all()
-
-    def wanted(self) -> bool:
-        with self._changed:
-            return bool(self._waiting)
-
-    def locked(self) -> bool:
-        with self._changed:
-            return self._held
-
-    def __enter__(self) -> None:
-        self.acquire()
-
-    def __exit__(self, *_) -> None:
-        self.release()
+    send: Callable[[bytes], None]
+    session: Session = field(default_factory=Session)
 
 
 class Model:
-    """The integer-sequence distribution under each measure, computed on demand."""
+    """The integer-sequence distribution under each measure, computed for the
+    clients looking at it.
+
+    One scheduler thread owns the core tree, the distributions kept and the
+    model; everything else posts work to its inbox. It steps every client's
+    session, sends what is new, and computes the distribution the next client
+    in turn waits on most, choosing again after every pass. Clients take
+    turns pass by pass; within a client, worth alone decides.
+    """
 
     def __init__(
         self,
@@ -125,130 +89,167 @@ class Model:
         # Branches the model has; every other branch has weight zero.
         self.vocabulary = vocabulary
         self.measures = measures
-        # Node ids, distributions and Expand's walk are the core's; this keeps
-        # only which distributions to forget first: the least recently read,
-        # once those kept, by (node, measure), hold more than ``cache`` bytes.
-        # A walk leaves the deepest nodes along it, the ones in view.
         self.tree = Tree(len(measures))
+        # Which distributions to forget first: the oldest, once those kept,
+        # by (node, measure), hold more than ``cache`` bytes.
         self.cache = cache
-        self.recent: OrderedDict[tuple[int, int], int] = OrderedDict()
+        self.kept: OrderedDict[tuple[int, int], int] = OrderedDict()
         self.held = 0
-        # Requests run on worker threads. One forward pass at a time keeps the
-        # device busy once and the cache whole; ``names`` guards the tree and
-        # which distributions to forget for the moments they are read or
-        # written, so naming a node and reading one already held never wait
-        # on inference. It is taken inside ``lock``, never the other way round.
-        self.lock = Turns()
-        self.names = threading.Lock()
+        self.clients: list[Client] = []
+        # The client whose turn is next.
+        self.turn = 0
+        self.inbox: queue.Queue[tuple[Callable[[], Any], Future]] = queue.Queue()
+        threading.Thread(target=self._run, daemon=True, name="scheduler").start()
 
-    def learn(self, path: Sequence[int]) -> None:
-        """Learn the ids along ``path``, so requests can name them alone."""
-        with self.names:
-            self.tree.walk(0, list(path))
+    def call[T](self, work: Callable[[], T]) -> Future[T]:
+        """Run ``work`` on the scheduler, between passes."""
+        future: Future[T] = Future()
+        self.inbox.put((work, future))
+        return future
 
-    def expand(
-        self, measure: int, request: pb.ExpandRequest, canceled: threading.Event
-    ) -> Iterator[pb.Children]:
-        """The protocol's Expand: one message per node, computing each
-        distribution the walk needs as it gets there.
+    def open(self, send: Callable[[bytes], None]) -> Future[Client]:
+        def opened() -> Client:
+            client = Client(send)
+            self.clients.append(client)
+            return client
 
-        Raises KeyError, before yielding, when this server has not learned the
-        request's node. Stops early once ``canceled`` is set.
-        """
-        node = request.node
-        path = list(request.path)
-        with self.names:
-            match request.WhichOneof("within"):
-                case "points":
-                    parts = [(part.top, part.ln_mass, part.count) for part in request.points.parts]
-                    walk = self.tree.start(node, path, parts=parts)
-                case "branches":
-                    walk = self.tree.start(node, path, branches=list(request.branches.branches))
-                case _:
-                    walk = self.tree.start(node, path)
-            # A path is known ahead, so the model reads it in one pass.
-            ahead = tuple(self.tree.path(node)) + tuple(path)
-        started = time.perf_counter()
-        computed = 0
-        recent = self.recent
-        # The model is taken at the walk's first forward pass, so a walk of
-        # distributions already held answers at once, however long another's
-        # passes run. It is handed on after a pass whenever another walk
-        # waits for it: a long path costs others one pass each, not all of it.
-        held = False
+        return self.call(opened)
+
+    def close(self, client: Client) -> Future[None]:
+        return self.call(lambda: self.clients.remove(client))
+
+    def demand(self, client: Client, demand: pb.Demand) -> Future[None]:
+        """What ``client`` looks at now. The future fails with ValueError for
+        a demand the tree cannot take."""
+        view = None
+        if demand.HasField("view"):
+            v = demand.view
+            view = (v.node, v.top, v.ln_height, v.rows, v.right)
+        path = (demand.path.node, list(demand.path.branches)) if demand.HasField("path") else None
+        return self.call(lambda: client.session.demand(self.tree, demand.p, demand.q, view=view, path=path))
+
+    def learn(self, path: Sequence[int]) -> Future[list[int]]:
+        """Learn the ids along ``path``, so demands can name them alone."""
+        return self.call(lambda: self.tree.walk(0, list(path)))
+
+    def _run(self) -> None:
+        while True:
+            self._take(wait=False)
+            for client in self.clients:
+                self._step(client)
+            chosen = self._chosen()
+            if chosen is None:
+                self._take(wait=True)
+                continue
+            self._compute(*chosen)
+
+    def _take(self, wait: bool) -> None:
+        """Run what was posted; with ``wait``, wait for something first."""
         try:
-            # A model walk along ``along``, yielding the distribution after
-            # its first ``at`` tokens next.
-            reading, along, at = None, (), 0
-            while not canceled.is_set():
-                with self.names:
-                    step = self.tree.advance(walk, measure)
-                    if step is not None and step[0] == "children" and (step[1], measure) in recent:
-                        recent.move_to_end((step[1], measure))
-                if step is None:
-                    break
-                if step[0] == "children":
-                    _, _, runs, count = step
-                    yield pb.Children(
-                        runs=[pb.Run(rank=rank, branches=branches, ln_below=ln_below) for rank, branches, ln_below in runs],
-                        count=count,
-                    )
-                    continue
-                if not held:
-                    if not self.lock.acquire(canceled):
-                        break
-                    held = True
-                    # Another walk may have computed it while this one waited,
-                    # and its passes moved the model's caches elsewhere.
-                    reading = None
-                    continue
-                missing = step[1]
-                with self.names:
-                    tokens = tuple(self.tree.path(missing))
-                if self.ends(tokens) or any(branch >= self.vocabulary for branch in tokens):
-                    ln_weights = np.empty(0)
-                else:
-                    if reading is None or along[: len(tokens)] != tokens or at != len(tokens):
-                        along = ahead if ahead[: len(tokens)] == tokens else tokens
-                        reading = self.measures[measure].walk(self.root + along, len(self.root) + len(tokens))
-                        at = len(tokens)
-                    ln_weights = next(reading)
-                    at += 1
-                    computed += 1
-                with self.names:
-                    size = self.tree.set(missing, measure, np.ascontiguousarray(ln_weights, dtype=np.float64))
-                    recent[missing, measure] = size
-                    self.held += size
-                    # The one just computed stays, however large.
-                    while self.cache < self.held and 1 < len(recent):
-                        (forgotten, of), size = recent.popitem(last=False)
-                        self.tree.forget(forgotten, of)
-                        self.held -= size
-                # After a pass, never before: two walks handing it over
-                # before theirs would pass it back and forth forever. And
-                # after storing it, so a walk waiting for the same node
-                # finds it rather than computing it again.
-                if self.lock.wanted():
-                    self.lock.release()
-                    held = False
-        finally:
-            if held:
-                self.lock.release()
+            item = self.inbox.get() if wait else self.inbox.get_nowait()
+        except queue.Empty:
+            return
+        while True:
+            work, future = item
+            try:
+                future.set_result(work())
+            except Exception as error:
+                future.set_exception(error)
+            try:
+                item = self.inbox.get_nowait()
+            except queue.Empty:
+                return
+
+    def _step(self, client: Client) -> None:
+        updates = client.session.step(self.tree)
+        if updates:
+            client.send(_encode(updates))
+
+    def _chosen(self) -> tuple[int, int, float, list[int]] | None:
+        """The next client in turn that waits on something, and the most
+        valuable distribution it waits on."""
+        count = len(self.clients)
+        for offset in range(count):
+            client = self.clients[(self.turn + offset) % count]
+            blocked = client.session.blocked()
+            if blocked:
+                self.turn = (self.turn + offset + 1) % count
+                return blocked[0]
+        return None
+
+    def _compute(self, measure: int, node: int, worth: float, ahead: list[int]) -> None:
+        """Compute a distribution, and where a path goes on below it, the
+        next nodes along it, as many as the measure reads in one pass."""
+        started = time.perf_counter()
+        tokens = tuple(self.tree.path(node))
+        # Down the path as far as one pass reads and the sequence goes on.
+        along = tokens
+        for branch in ahead[: self.measures[measure].positions - 1]:
+            if self._empty(along) or self._empty(along + (branch,)):
+                break
+            along += (branch,)
+        try:
+            if self._empty(tokens):
+                computed = [np.empty(0)]
+            else:
+                walk = self.measures[measure].walk(self.root + along, len(self.root) + len(tokens))
+                computed = [ln_weights for ln_weights, _ in zip(walk, range(len(along) - len(tokens) + 1), strict=False)]
+        except Exception as error:
+            if not isinstance(error, TooLong):
+                traceback.print_exc()
+            message = str(error) if isinstance(error, TooLong) else f"{type(error).__name__}: {error}"
+            for client in self.clients:
+                if any(blocked[:2] == (measure, node) for blocked in client.session.blocked()):
+                    client.session.failed(measure, node, message)
+            return
+        nodes = self.tree.walk(node, list(along[len(tokens) :]))
+        for at, ln_weights in zip(nodes, computed, strict=False):
+            self._keep(measure, at, ln_weights)
         elapsed = (time.perf_counter() - started) * 1000
         print(
-            f"expand m{measure} depth {len(ahead)} {request.WhichOneof('within') or 'path'}: {computed} computed, {elapsed:.0f} ms",
+            f"m{measure} depth {len(tokens)} worth {worth:.1f}: {len(computed)} computed, {elapsed:.0f} ms",
             file=sys.stderr,
         )
 
+    def _empty(self, tokens: tuple[int, ...]) -> bool:
+        """Whether a sequence has no children: finished, or past the vocabulary."""
+        return self.ends(tokens) or any(branch >= self.vocabulary for branch in tokens)
 
-def _envelope(flags: int, payload: bytes) -> bytes:
-    return struct.pack(">BI", flags, len(payload)) + payload
+    def _keep(self, measure: int, node: int, ln_weights: np.ndarray) -> None:
+        size = self.tree.set(node, measure, np.ascontiguousarray(ln_weights, dtype=np.float64))
+        self.held += size - self.kept.pop((node, measure), 0)
+        self.kept[node, measure] = size
+        # The one just computed stays, however large.
+        while self.cache < self.held and 1 < len(self.kept):
+            (forgotten, of), size = self.kept.popitem(last=False)
+            self.tree.forget(forgotten, of)
+            self.held -= size
 
 
-def _end(error: dict | None = None) -> bytes:
-    return _envelope(
-        _END_STREAM, json.dumps({} if error is None else {"error": error}).encode()
-    )
+def _encode(updates: list[tuple]) -> bytes:
+    """A session's updates as one Updates frame."""
+    frame = pb.Updates()
+    for update in updates:
+        match update:
+            case ("answer", measure, node, parent, branch, runs, count):
+                answer = frame.updates.add().answer
+                answer.measure, answer.node = measure, node
+                if parent is not None:
+                    answer.parent, answer.branch = parent, branch
+                answer.children.runs.extend(
+                    pb.Run(rank=rank, branches=branches, ln_below=ln_below) for rank, branches, ln_below in runs
+                )
+                if count is not None:
+                    answer.children.count = count
+            case ("unknown", node):
+                frame.updates.add().unknown = node
+            case ("placed", node, branches):
+                frame.updates.add().placed.CopyFrom(pb.Path(node=node, branches=branches))
+            case ("lacks", measure, node):
+                frame.updates.add().lacks.CopyFrom(pb.Missing(measure=measure, node=node))
+            case ("failed", measure, node, message):
+                frame.updates.add().failed.CopyFrom(pb.Failed(measure=measure, node=node, message=message))
+    return frame.SerializeToString()
 
 
 def app(
@@ -257,128 +258,49 @@ def app(
     files: dict[str, tuple[bytes, str]],
     search: Callable[[str], Sequence[int]] | None = None,
 ) -> Starlette:
-    """The measures' services, manifest, files, and optional text-to-path search."""
+    """The session endpoint, manifest, files, and optional text-to-path search."""
 
-    def service(measure: int):
-        async def expand(request: Request) -> Response:
-            if (
-                request.headers.get("content-type", "").split(";", 1)[0].strip()
-                != _CONTENT_TYPE
-            ):
-                return Response(status_code=415, headers={"Accept-Post": _CONTENT_TYPE})
-            body = await request.body()
-            if len(body) < 5:
-                return _stream(
-                    [
-                        _end(
-                            {
-                                "code": "invalid_argument",
-                                "message": "no request message",
-                            }
-                        )
-                    ]
-                )
-            flags, length = struct.unpack_from(">BI", body)
-            if flags & _COMPRESSED:
-                return _stream(
-                    [_end({"code": "unimplemented", "message": "compressed requests"})]
-                )
-            if flags or length != len(body) - 5:
-                return _stream(
-                    [
-                        _end(
-                            {
-                                "code": "invalid_argument",
-                                "message": "invalid request envelope",
-                            }
-                        )
-                    ]
-                )
-            try:
-                request_message = pb.ExpandRequest.FromString(body[5:])
-            except DecodeError as error:
-                return _stream(
-                    [_end({"code": "invalid_argument", "message": str(error)})]
-                )
-            if any(math.isnan(part.ln_mass) for part in request_message.points.parts):
-                return _stream(
-                    [_end({"code": "invalid_argument", "message": "a part's ln mass is not a number"})]
-                )
-            # The walk runs on its own thread and hands each node's children to
-            # the event loop as it places them, so a stream holds no thread
-            # while it waits. A client that hangs up stops the walk at its
-            # next node, or before its turn at the model.
-            loop = asyncio.get_running_loop()
-            items: asyncio.Queue[bytes | None] = asyncio.Queue()
-            canceled = threading.Event()
+    async def session(websocket: WebSocket) -> None:
+        await websocket.accept()
+        loop = asyncio.get_running_loop()
+        outbox: asyncio.Queue[bytes] = asyncio.Queue()
+        client = await asyncio.wrap_future(model.open(lambda frame: loop.call_soon_threadsafe(outbox.put_nowait, frame)))
 
-            def put(item: bytes | None) -> None:
-                loop.call_soon_threadsafe(items.put_nowait, item)
+        async def send() -> None:
+            while True:
+                await websocket.send_bytes(await outbox.get())
 
-            def work() -> None:
+        sending = asyncio.create_task(send())
+        try:
+            while True:
                 try:
-                    for children in model.expand(measure, request_message, canceled):
-                        put(_envelope(0, children.SerializeToString()))
-                    put(_end())
-                except KeyError as error:
-                    put(_end({"code": "not_found", "message": error.args[0]}))
-                except TooLong as error:
-                    put(_end({"code": "out_of_range", "message": str(error)}))
-                except Exception as error:
-                    # Answered as Connect, inside CORS, so the page sees why.
-                    traceback.print_exc()
-                    put(
-                        _end(
-                            {
-                                "code": "internal",
-                                "message": f"{type(error).__name__}: {error}",
-                            }
-                        )
-                    )
-                finally:
-                    put(None)
-
-            threading.Thread(target=work, daemon=True).start()
-
-            async def chunks():
-                try:
-                    while (item := await items.get()) is not None:
-                        yield item
-                finally:
-                    canceled.set()
-                    model.lock.wake()
-
-            return StreamingResponse(chunks(), media_type=_CONTENT_TYPE)
-
-        return expand
+                    demand = pb.Demand.FromString(await websocket.receive_bytes())
+                    await asyncio.wrap_future(model.demand(client, demand))
+                except (DecodeError, ValueError) as error:
+                    # 1007: the message is not one a demand can be.
+                    await websocket.close(1007, str(error)[:120])
+                    return
+        except WebSocketDisconnect:
+            pass
+        finally:
+            sending.cancel()
+            await asyncio.wrap_future(model.close(client))
 
     async def search_rpc(request: Request) -> Response:
         if search is None:
-            return JSONResponse(
-                {"code": "unimplemented", "message": "text search"}, status_code=501
-            )
-        if (
-            request.headers.get("content-type", "").split(";", 1)[0].strip()
-            != _PROTO_CONTENT_TYPE
-        ):
-            return Response(
-                status_code=415, headers={"Accept-Post": _PROTO_CONTENT_TYPE}
-            )
+            return JSONResponse({"code": "unimplemented", "message": "text search"}, status_code=501)
+        if request.headers.get("content-type", "").split(";", 1)[0].strip() != _PROTO_CONTENT_TYPE:
+            return Response(status_code=415, headers={"Accept-Post": _PROTO_CONTENT_TYPE})
         try:
             request_message = pb.SearchRequest.FromString(await request.body())
             path = await anyio.to_thread.run_sync(search, request_message.text)
-            await anyio.to_thread.run_sync(model.learn, path)
+            await asyncio.wrap_future(model.learn(path))
             response = pb.SearchResponse(path=path)
         except DecodeError as error:
-            return JSONResponse(
-                {"code": "invalid_argument", "message": str(error)}, status_code=400
-            )
+            return JSONResponse({"code": "invalid_argument", "message": str(error)}, status_code=400)
         except Exception as error:
             traceback.print_exc()
-            return JSONResponse(
-                {"code": "internal", "message": f"{type(error).__name__}: {error}"},
-                status_code=500,
-            )
+            return JSONResponse({"code": "internal", "message": f"{type(error).__name__}: {error}"}, status_code=500)
         return Response(response.SerializeToString(), media_type=_PROTO_CONTENT_TYPE)
 
     async def manifest_json(_: Request) -> Response:
@@ -390,28 +312,12 @@ def app(
 
         return serve
 
-    routes = [Route("/manifest.json", manifest_json)]
+    routes: list = [Route("/manifest.json", manifest_json), WebSocketRoute("/session", session)]
     routes += [Route(f"/{path}", file(*served)) for path, served in files.items()]
-    routes += [
-        Route(f"/{index}/natlas.Natlas/Expand", service(index), methods=["POST"])
-        for index in range(len(model.measures))
-    ]
-    routes += [
-        Route(f"/{index}/natlas.Natlas/Search", search_rpc, methods=["POST"])
-        for index in range(len(model.measures))
-    ]
+    routes += [Route(f"/{index}/natlas.Natlas/Search", search_rpc, methods=["POST"]) for index in range(len(model.measures))]
     # Any page may read a local research server.
-    cors = Middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["GET", "POST"],
-        allow_headers=["*"],
-    )
+    cors = Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
     return Starlette(routes=routes, middleware=[cors])
-
-
-def _stream(chunks) -> StreamingResponse:
-    return StreamingResponse(iter(chunks), media_type=_CONTENT_TYPE)
 
 
 def _slug(text: str) -> str:

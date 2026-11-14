@@ -110,6 +110,92 @@ message Run {
   repeated double ln_below = 3;
 }
 
+// A session: one client, one WebSocket to a server at /session, carrying a
+// Demand from the client whenever its view changes and Updates from the
+// server. The client says what it is looking at; the server works out what
+// the view lacks, answers what it holds at once, and computes the missing
+// distribution the most pixel rows wait on next.
+
+// What the client is looking at now, in place of what it looked at before.
+message Demand {
+  // The measures in view: p places children and orders them, q sizes them.
+  uint32 p = 1;
+  uint32 q = 2;
+  optional View view = 3;
+  // Placed before anything else: a flight's or a restore's path, or the
+  // origin's place in its parent when the view reaches past the origin. A
+  // path stated again goes on where it was.
+  optional Path path = 4;
+}
+
+// An interval of a node's p mass, and the pixel rows it covers. Its rows
+// flow down the tree: an interval splits among the children it covers by the
+// mass of each it covers, a child worth a row or more goes on while its
+// children start on screen, and a stretch of thinner children is sampled.
+message View {
+  // The deepest node the client knows that holds the whole view.
+  fixed64 node = 1;
+  // The fraction of the node's mass above the view, as digits in base 256,
+  // most significant first: exact however deep the view is.
+  bytes top = 2;
+  // ln of the view's height, as a fraction of the node's mass.
+  double ln_height = 3;
+  // The pixel rows the view covers: physical ones, the picture's finest.
+  double rows = 4;
+  // How far right the screen reaches, in nats of -ln q from where the
+  // node's children start.
+  double right = 5;
+}
+
+// Branches down from a node.
+message Path {
+  fixed64 node = 1;
+  repeated uint32 branches = 2;
+}
+
+// What the server tells the client, a batch at a time.
+message Updates {
+  repeated Update updates = 1;
+}
+
+message Update {
+  oneof kind {
+    // Children of a node, under a measure, the client was not sent before.
+    Answer answer = 1;
+    // The demand names a node this server has not learned: the client names
+    // it again by its path, from a node the server knows.
+    fixed64 unknown = 2;
+    // The demand's path is placed as far as the source places it.
+    Path placed = 3;
+    // The source will never have this distribution: a recording that did
+    // not record it.
+    Missing lacks = 4;
+    // Computing a distribution failed, too long for the context or worse.
+    Failed failed = 5;
+  }
+}
+
+message Answer {
+  uint32 measure = 1;
+  fixed64 node = 2;
+  // Its parent and branch, absent at the root: the client may not have
+  // named a node the view reached.
+  optional fixed64 parent = 3;
+  optional uint32 branch = 4;
+  Children children = 5;
+}
+
+message Missing {
+  uint32 measure = 1;
+  fixed64 node = 2;
+}
+
+message Failed {
+  uint32 measure = 1;
+  fixed64 node = 2;
+  string message = 3;
+}
+
 message SearchRequest {
   string text = 1;
 }

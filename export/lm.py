@@ -38,6 +38,8 @@ class Measure:
     name: str
     log_probs: LogProbs
     walk: Walk
+    # How many positions of a path one forward pass gives distributions for.
+    positions: int
 
 
 def stepwise[T](log_probs: Callable[..., T], tokens: Sequence[int], start: int, *args) -> Iterator[T]:
@@ -77,6 +79,8 @@ class Language(Protocol):
     start: tuple[int, ...]
     # Tokens that end a text.
     eos: frozenset[int]
+    # How many positions of a path one forward pass of ``walk`` reads.
+    positions: int
 
     def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor: ...
     def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]: ...
@@ -90,7 +94,7 @@ class Transformers:
     path in chunks, reading every position's logits off one pass."""
 
     # Positions per forward pass while walking: logits for this many fit easily.
-    CHUNK = 256
+    positions = 256
 
     def __init__(self, model_id: str, device: str, dtype: str = "float32", tokenizer: str | None = None):
         from transformers import AutoTokenizer, DynamicCache
@@ -133,8 +137,8 @@ class Transformers:
             self.cache.crop(shared - len(self.fed))
         self.fed = tokens[:shared]
         with torch.inference_mode():
-            for begin in range(shared, len(tokens), self.CHUNK):
-                chunk = tokens[begin : begin + self.CHUNK]
+            for begin in range(shared, len(tokens), self.positions):
+                chunk = tokens[begin : begin + self.positions]
                 try:
                     logits = self.model(
                         input_ids=torch.tensor([chunk], device=self.device),
@@ -162,6 +166,8 @@ class LlamaCpp:
     its cache, so walking down a path costs a token per step, and walks down
     different branches take turns without reading each other's tokens again.
     Every token is evaluated alone."""
+
+    positions = 1
 
     def __init__(self, path: Path, context: int = 8192, gpu_layers: int = -1):
         from llama_cpp import Llama
@@ -383,6 +389,7 @@ def measures(own: Language, specs: Sequence[str], other: Callable[[str], Languag
             name,
             lambda tokens: _numpy(language.log_probs(tokens, temperature)),
             lambda tokens, start: map(_numpy, language.walk(tokens, start, temperature)),
+            language.positions,
         )
 
     def measure(spec: str) -> Measure:
@@ -393,7 +400,8 @@ def measures(own: Language, specs: Sequence[str], other: Callable[[str], Languag
             def window(tokens: Sequence[int]) -> np.ndarray:
                 return _numpy(own.log_probs(tokens[-n:]))
 
-            return Measure(f"{own.name} · last {n} tokens", window, lambda tokens, start: stepwise(window, tokens, start))
+            # Each position reads its own window: one a pass.
+            return Measure(f"{own.name} · last {n} tokens", window, lambda tokens, start: stepwise(window, tokens, start), 1)
         if kind == "temperature":
             t = float(value)
             return of(own, f"{own.name} · T={t:g}", t)

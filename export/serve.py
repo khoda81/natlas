@@ -10,6 +10,7 @@
 #   "torch>=2.2",
 #   "transformers>=4.51",
 #   "uvicorn>=0.30",
+#   "websockets>=13",
 # ]
 #
 # # llama.cpp for the GPU, built once; CMAKE_CUDA_ARCHITECTURES=75 is the GTX 1660 Ti.

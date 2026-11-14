@@ -272,6 +272,14 @@ for the model told what to expect, or `temperature:T`. Each measure keeps a
 few KV caches (`--slots`), one per window in reach, stepped back to the prefix
 a request shares with what they hold.
 
+`--dtype` sets the transformer weight and KV cache precision for all measures.
+Choose `float32`, `float16`, or `bfloat16`. When omitted, MuScriptor uses its
+device default. CUDA uses FP16 autocast for the initial pass of each window.
+
+```bash
+bun run scribe -- --p large --device cuda --dtype float16 song.mp3
+```
+
 Its `/labels.json` is a notes file rather than an array of bytes:
 `{"kind": "notes", "frameRate", "window", "windows", "at", "audio", "events":
 [[type, value], …], "instruments", "drums"}`. The client reads its kind and

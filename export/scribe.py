@@ -73,6 +73,7 @@ import torch.nn.functional as F
 import uvicorn
 from muscriptor import TranscriptionModel
 from muscriptor.events import ChunkBoundary, OpenNoteTracker
+from muscriptor.models.lm import TorchAutocast
 from muscriptor.modules.streaming import increment_steps, init_states
 from muscriptor.tokenizer.mt3 import (
     instrument_group_from_names,
@@ -427,6 +428,23 @@ def wav_file(samples: torch.Tensor) -> bytes:
     return out.getvalue()
 
 
+def _load_model(size: str, device: torch.device, dtype: torch.dtype | None) -> TranscriptionModel:
+    if device.type != "cuda" or dtype not in (torch.float16, torch.bfloat16):
+        return TranscriptionModel.load_model(size, device=device, dtype=dtype)
+
+    # MuScriptor 0.3.0 allocates FP32 weights on the requested device before casting.
+    model = TranscriptionModel.load_model(size, device="cpu", dtype=dtype)
+    decoder = model._model.to(device)  # noqa: SLF001
+    # Moving the module leaves MuScriptor's device attributes at their original values.
+    model._device = device  # noqa: SLF001
+    provider = decoder.condition_provider
+    provider.device = device
+    for conditioner in provider.conditioners.values():
+        conditioner.device = device
+    decoder.autocast = TorchAutocast(enabled=True, dtype=torch.float16)
+    return model
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("audio", type=Path, help="any file soundfile reads: wav, mp3, flac, …")
@@ -439,6 +457,11 @@ def main() -> None:
         help="further measure, repeatable: a model size, silence, instruments:NAMES or temperature:T",
     )
     parser.add_argument("--device", default=lm.default_device())
+    parser.add_argument(
+        "--dtype",
+        choices=lm.DTYPES,
+        help="precision of transformer weights and KV caches. Omit to use MuScriptor's device default",
+    )
     parser.add_argument("--max-events", type=int, default=MAX_EVENTS, help="per window, counting its prologue and EOS")
     parser.add_argument("--slots", type=int, default=2, help="KV caches per measure, each holding one window")
     parser.add_argument("--cache", type=float, default=CACHE / 2**30, help=f"GiB of memory for the distributions it keeps, default {CACHE / 2**30:g}")
@@ -448,14 +471,23 @@ def main() -> None:
     if any(spec.startswith("context:") for spec in args.q):
         parser.error("context:N would cut the start token, which carries the audio")
 
-    print(f"loading muscriptor-{args.p} …", file=sys.stderr)
-    models = {args.p: TranscriptionModel.load_model(args.p, device=args.device)}
-    wav = models[args.p]._load_wav(args.audio, None)  # noqa: SLF001
+    device = torch.device(args.device)
+    dtype = lm.DTYPES[args.dtype] if args.dtype is not None else None
+    models: dict[str, TranscriptionModel] = {}
+
+    def model_for(size: str) -> TranscriptionModel:
+        if size not in models:
+            print(f"loading muscriptor-{size} …", file=sys.stderr)
+            models[size] = _load_model(size, device, dtype)
+        return models[size]
+
+    primary = model_for(args.p)
+    wav = primary._load_wav(args.audio, None)  # noqa: SLF001
     start = round(args.at * SAMPLE_RATE)
     if start >= wav.shape[-1]:
         parser.error(f"--at {args.at:g} is past the audio's end at {wav.shape[-1] / SAMPLE_RATE:.1f} s")
     recording = wav[:, start:]
-    windows = Windows(models[args.p], args.at, math.ceil(recording.shape[-1] / WINDOW_SAMPLES), args.max_events)
+    windows = Windows(primary, args.at, math.ceil(recording.shape[-1] / WINDOW_SAMPLES), args.max_events)
 
     def heard(index: int) -> torch.Tensor:
         chunk = recording[:, index * WINDOW_SAMPLES : (index + 1) * WINDOW_SAMPLES]
@@ -465,10 +497,7 @@ def main() -> None:
         return torch.zeros_like(recording[:, :WINDOW_SAMPLES])
 
     def scribe(size: str, name: str, hear: Callable[[int], torch.Tensor] = heard, expect: str | None = None) -> Scribe:
-        if size not in models:
-            print(f"loading muscriptor-{size} …", file=sys.stderr)
-            models[size] = TranscriptionModel.load_model(size, device=args.device)
-        return Scribe(models[size], name, windows, hear, expect, args.slots)
+        return Scribe(model_for(size), name, windows, hear, expect, args.slots)
 
     own = scribe(args.p, f"muscriptor-{args.p}")
 
@@ -495,7 +524,7 @@ def main() -> None:
     ]
     model = Model(own.start, windows.ends, own.vocabulary, measures, round(args.cache * 2**30))
     files = {
-        "labels.json": (labels_file(models[args.p], windows), "application/json"),
+        "labels.json": (labels_file(primary, windows), "application/json"),
         "audio.wav": (wav_file(recording), "audio/wav"),
     }
     uvicorn.run(app(model, manifest, files), host=args.host, port=args.port, access_log=False)

@@ -990,9 +990,16 @@ pub(crate) fn layout_into(
     Ok(context.frame)
 }
 
-/// The origin's edges in view heights.
-pub fn extent(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Extent> {
-    let (top, bottom) = place_chain(tree, lens, cam)?.spans[0];
+/// The edges in view heights of the node `depth` steps down the camera's
+/// path from its origin, as far as p places that path.
+pub fn extent(tree: &Tree, lens: Lens, cam: &Camera, depth: usize) -> Result<Extent> {
+    let spans = place_chain(tree, lens, cam)?.spans;
+    let &(top, bottom) = spans.get(depth).ok_or_else(|| {
+        format!(
+            "the camera's path is placed {} deep, not {depth}",
+            spans.len() - 1
+        )
+    })?;
     Ok(Extent { top, bottom })
 }
 
@@ -1003,7 +1010,7 @@ pub fn clamp_position(tree: &Tree, lens: Lens, cam: &Camera) -> Result<f64> {
     if cam.origin != crate::tree::ROOT {
         return Ok(cam.a);
     }
-    let Extent { top, bottom } = extent(tree, lens, cam)?;
+    let Extent { top, bottom } = extent(tree, lens, cam, 0)?;
     Ok(if top > 0.0 {
         cam.a - top
     } else if bottom < 1.0 {
@@ -1753,7 +1760,7 @@ mod tests {
         let a = clamp_position(&tree, LENS, &camera).unwrap();
         near(a, 0.0);
         near(
-            extent(&tree, LENS, &Camera { a, ..camera }).unwrap().top,
+            extent(&tree, LENS, &Camera { a, ..camera }, 0).unwrap().top,
             0.0,
         );
 

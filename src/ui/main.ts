@@ -4,6 +4,7 @@ import {
   type Box,
   type Camera,
   clamp,
+  extent,
   type Frame,
   type Lens,
   layout,
@@ -350,16 +351,41 @@ export class App {
   /**
    * Fly to ``target`` as the walk down to it arrives: the camera follows the
    * deepest node placed so far, standing each as the origin does, and the
-   * descent is the progress. Where no source can place the path, ``target``
-   * opens as the origin instead.
+   * descent is the progress. A target below the origin is flown to from the
+   * view as it is, from the deepest node on both the camera's path and the
+   * target's; any other from the root. Where no source can place the path,
+   * ``target`` opens as the origin instead.
    */
   private fly(target: NodeId): void {
     const tree = this.tree!;
     const above = tree.path(this.cam.origin);
-    const origin = tree.path(target).slice(0, above.length).every((branch, i) => branch === above[i]) ? this.cam.origin : ROOT;
-    this.open(origin);
+    const path = tree.path(target);
+    const below = above.length <= path.length && above.every((branch, i) => branch === path[i]);
+    if (below) {
+      this.cancelNavigation();
+      this.expander?.cancel();
+      this.focus = null;
+    } else this.open(ROOT);
+    const { origin } = this.cam;
     const chain = tree.chain(origin, target);
     const flight: Flight = { chain, reached: 0, lnMass: 0, x1: 0, listed: false, time: null };
+    if (below) {
+      // Down the camera's path while the target's goes the same way, and p
+      // and q both place it.
+      settle(tree, this.lens, this.cam);
+      const { path: anchor } = this.cam.anchor;
+      while (flight.reached < Math.min(anchor.length, chain.length - 1) && anchor[flight.reached] === tree.branch(chain[flight.reached + 1]!)) {
+        const edge = tree.entry(chain[flight.reached]!, this.lens, anchor[flight.reached]!);
+        if (edge === undefined || !Number.isFinite(edge.natsQ)) break;
+        flight.lnMass += edge.lnP;
+        flight.x1 += edge.natsQ;
+        flight.reached++;
+      }
+      // The point moves to that node's top, where the view shows it now.
+      this.cam.a = extent(tree, this.lens, this.cam, flight.reached).top;
+      this.cam.anchor = top(anchor.slice(0, flight.reached));
+      this.invalidate();
+    }
     this.flight = flight;
     void this.walk(origin, target).then((placed) => {
       flight.listed = true;

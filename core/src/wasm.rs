@@ -349,9 +349,10 @@ pub fn extent(
     p: usize,
     q: usize,
     camera: JsValue,
+    depth: usize,
 ) -> std::result::Result<JsValue, JsError> {
     let camera: Camera = from_js(camera)?;
-    to_js(&layout::extent(&tree.inner, Lens { p, q }, &camera).map_err(js_error)?)
+    to_js(&layout::extent(&tree.inner, Lens { p, q }, &camera, depth).map_err(js_error)?)
 }
 
 /// Return the clamped camera `a`; the input camera is not mutated.

@@ -143,7 +143,7 @@ describe("layout", () => {
     const tree = chainTree([0.5, 0.5], [0]);
     const cam: Camera = { origin: ROOT, x: 0.5, k: 100, anchor: top([0]), a: 0.4 };
     clamp(tree, lens, cam);
-    expect(extent(tree, lens, cam).top).toBeCloseTo(0, 15);
+    expect(extent(tree, lens, cam, 0).top).toBeCloseTo(0, 15);
     expect(cam.a).toBeCloseTo(0, 15);
   });
 

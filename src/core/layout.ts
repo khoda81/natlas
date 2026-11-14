@@ -180,9 +180,10 @@ export function aim(tree: IntervalTree, lens: Lens, cam: Camera, fy: number): vo
   cam.a = aimed.a;
 }
 
-/** The origin's interval edges in view heights. */
-export function extent(tree: IntervalTree, lens: Lens, cam: Camera): { top: number; bottom: number } {
-  return measureExtent(tree.raw, lens.p, lens.q, cam) as { top: number; bottom: number };
+/** The interval edges in view heights of the node ``depth`` steps down the
+ * camera's path from its origin, as far as p places that path. */
+export function extent(tree: IntervalTree, lens: Lens, cam: Camera, depth: number): { top: number; bottom: number } {
+  return measureExtent(tree.raw, lens.p, lens.q, cam, depth) as { top: number; bottom: number };
 }
 
 export function clamp(tree: IntervalTree, lens: Lens, cam: Camera): void {

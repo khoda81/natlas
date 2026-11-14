@@ -62,32 +62,69 @@ impl PythonTree {
             .is_some())
     }
 
-    /// Set the node's children under `measure` from every branch's ln weight,
-    /// a float64 buffer indexed by branch, as a measure computes them, and
-    /// say about how many bytes they hold. The children are sorted without
-    /// the GIL, and before the tree is borrowed.
+    /// Set the children of each of `nodes` under `measure` from its row of
+    /// `ln_weights`: every branch's ln weight up to a constant, a float32
+    /// buffer indexed by branch, as a measure computes them. Says about how
+    /// many bytes each holds. The rows are sorted on every core, without
+    /// the GIL and before the tree is borrowed.
     fn set(
         slf: &Bound<'_, Self>,
-        node: u64,
+        nodes: Vec<u64>,
         measure: usize,
-        ln_weights: PyBuffer<f64>,
-    ) -> PyResult<usize> {
+        ln_weights: Vec<PyBuffer<f32>>,
+    ) -> PyResult<Vec<usize>> {
+        if nodes.len() != ln_weights.len() {
+            return Err(error(format!(
+                "{} nodes but {} rows of weights",
+                nodes.len(),
+                ln_weights.len()
+            )));
+        }
         let py = slf.py();
-        let weights = ln_weights.to_vec(py)?;
-        let distribution = py
-            .detach(|| Distribution::from_weights(&weights))
-            .map_err(error)?;
-        let bytes = distribution.bytes();
-        slf.borrow_mut()
-            .inner
-            .set(node, measure, distribution)
-            .map_err(error)?;
-        Ok(bytes)
+        let rows = ln_weights
+            .iter()
+            .map(|row| row.to_vec(py))
+            .collect::<PyResult<Vec<_>>>()?;
+        let distributions = py.detach(|| sorted(&rows)).map_err(error)?;
+        let mut tree = slf.borrow_mut();
+        nodes
+            .into_iter()
+            .zip(distributions)
+            .map(|(node, distribution)| {
+                let bytes = distribution.bytes();
+                tree.inner.set(node, measure, distribution).map_err(error)?;
+                Ok(bytes)
+            })
+            .collect()
     }
 
     fn forget(&mut self, node: u64, measure: usize) -> PyResult<()> {
         self.inner.forget(node, measure).map_err(error)
     }
+}
+
+/// Each row's distribution, rows shared out among the cores in order.
+fn sorted(rows: &[Vec<f32>]) -> Result<Vec<Distribution>, String> {
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let share = rows.len().div_ceil(cores).max(1);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = rows
+            .chunks(share)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|row| Distribution::from_weights(row))
+                        .collect::<Result<Vec<_>, String>>()
+                })
+            })
+            .collect();
+        let mut distributions = Vec::with_capacity(rows.len());
+        for worker in workers {
+            distributions.extend(worker.join().expect("sorting does not panic")?);
+        }
+        Ok(distributions)
+    })
 }
 
 impl PythonTree {

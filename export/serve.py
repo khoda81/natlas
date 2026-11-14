@@ -70,6 +70,8 @@ def main() -> None:
 
     language = open_language(args.p)
     measures = lm.measures(language, args.q, open_language)
+    for measure in measures:
+        print(f"{measure.name}: {measure.width} distributions a pass, of {measure.paths} paths at most", file=sys.stderr)
     labels = labels_json(language.token_bytes())
 
     manifest = [

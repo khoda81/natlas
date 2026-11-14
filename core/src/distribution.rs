@@ -289,23 +289,22 @@ impl Distribution {
     }
 
     /// Every branch's ln weight, indexed by branch, as a measure computes it:
-    /// complete, normalized, ties ranked by increasing branch. Weightless
-    /// branches have no rank.
-    pub fn from_weights(ln_weights: &[f64]) -> Result<Self> {
+    /// complete, up to a constant, as an f32 like a model's logits; ties
+    /// ranked by increasing branch. Weightless branches have no rank.
+    pub fn from_weights(ln_weights: &[f32]) -> Result<Self> {
         if ln_weights.iter().any(|weight| weight.is_nan()) {
             return Err("a weight is not a number".into());
         }
-        // Kept as f32, and so ranked as f32: ties among them by branch.
         // Each weight beside its branch: sorting them together reads memory
         // in order rather than looking every weight up.
         let mut order: Vec<(f32, Branch)> = ln_weights
             .iter()
             .zip(0..)
-            .map(|(&weight, branch)| (weight as f32, branch))
+            .map(|(&weight, branch)| (weight, branch))
             .filter(|&(weight, _)| weight > f32::NEG_INFINITY)
             .collect();
         if order.iter().any(|(weight, _)| weight.is_infinite()) {
-            return Err("a weight is past what an f32 holds".into());
+            return Err("a weight is infinite".into());
         }
         order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         if order.is_empty() {
@@ -751,14 +750,17 @@ mod tests {
     #[test]
     fn weights_rank_heaviest_first_and_keep_tiny_children_as_f32s() {
         let tiny = 1e-300f64;
-        let d = Distribution::from_weights(&[
-            0.2f64.ln(),
-            0.5f64.ln(),
-            f64::NEG_INFINITY,
-            0.3f64.ln() + tiny.ln_1p(),
-            tiny.ln(),
-            0.2f64.ln(),
-        ])
+        let d = Distribution::from_weights(
+            &[
+                0.2f64.ln(),
+                0.5f64.ln(),
+                f64::NEG_INFINITY,
+                0.3f64.ln() + tiny.ln_1p(),
+                tiny.ln(),
+                0.2f64.ln(),
+            ]
+            .map(|weight| weight as f32),
+        )
         .unwrap();
         let run = &d.runs()[0];
         assert_eq!(run.branches().as_ref(), [1, 3, 0, 5, 4]);
@@ -780,19 +782,20 @@ mod tests {
         near(run.ln_p(4), tiny.ln() - 1.2f64.ln());
         assert_eq!(*run.ln_below().last().unwrap(), f64::NEG_INFINITY);
         assert!(Distribution::from_weights(&[]).unwrap().ended());
-        assert!(Distribution::from_weights(&[f64::NAN]).is_err());
+        assert!(Distribution::from_weights(&[f32::NAN]).is_err());
+        assert!(Distribution::from_weights(&[f32::INFINITY]).is_err());
     }
 
     #[test]
     fn kept_edges_sum_to_the_same_edges_as_summing_them_all() {
         // Edges summed from the kept ones are those of one pass over every
         // weight, and points find the same children among them.
-        let weights: Vec<f64> = (0..1000)
-            .map(|i| -(f64::from(i % 97) * 0.37 + f64::from(i) * 0.01))
+        let weights: Vec<f32> = (0..1000)
+            .map(|i| -(f64::from(i % 97) * 0.37 + f64::from(i) * 0.01) as f32)
             .collect();
         let d = Distribution::from_weights(&weights).unwrap();
         let run = &d.runs()[0];
-        let mut sorted: Vec<f32> = weights.iter().map(|&w| w as f32).collect();
+        let mut sorted = weights.clone();
         sorted.sort_by(|a, b| b.total_cmp(a));
         let mut all = vec![f64::NEG_INFINITY; sorted.len() + 1];
         for i in (0..sorted.len()).rev() {

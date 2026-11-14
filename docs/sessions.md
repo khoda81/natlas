@@ -183,12 +183,13 @@ model. Its loop:
 1. Take every new demand and every `Search` path to learn since the last
    turn.
 2. `step` each session; send what it returns.
-3. Take the next client in turn with something blocked, and its most
-   valuable blocked distribution; compute it, and where the path goes on
-   below it, the next nodes along the path too, as many as the model reads
-   in one pass: 256 positions for a transformers model, which gets every
-   position's distribution out of one pass, and 1 for llama.cpp, which reads
-   a token at a time. Back to 1.
+3. Take the next client in turn with something blocked; under the measure
+   of its most valuable blocked distribution, take a walk from each client
+   in turn: a blocked distribution and, where the path goes on below it, the
+   next nodes along the path, while the pass has room. A transformers model
+   reads 256 positions of one path a pass, getting every position's
+   distribution out of it; llama.cpp reads as many tokens, of any paths, as
+   the batch it measured at startup. Back to 1.
 4. With nothing blocked, wait for the next demand.
 
 A flight's path is computed before anything else, while the view is answered

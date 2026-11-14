@@ -188,19 +188,31 @@ Edit the text in the top path inspector and select a result to fly there.
 `export/service.py` takes demands from the WebSocket without waiting on the
 model. One scheduler thread owns the shared Rust tree and the clients'
 sessions: it takes everything posted at once, so a burst of demands while
-panning costs one step, sends each client what is new, and submits the
-distribution the next client in turn waits on most. The model runs on a
+panning costs one step, sends each client what is new, and submits a pass
+of what the clients wait on most: as many distributions as the measure
+computes at once, a walk from each client in turn, from the next client in
+turn on. The model runs on a
 thread of its own, which owns the KV cache, with one pass running and one
 queued behind it, so it starts the next the moment one ends while the
 scheduler packs the last result. The queued pass is chosen before the
 running one's result is known; a new demand or a disconnect withdraws it,
-and a pass already running finishes into the cache. Clients take turns pass
-by pass; within a client, worth alone decides.
+and a pass already running finishes into the cache. Within a client, worth
+alone decides.
 
 The scheduler keeps packed distributions within `--cache` GiB (1 by
 default), at about four bytes per vocabulary entry. Transformers models
 reuse the KV cache of the last path and read ahead in chunks. Float32
 results can differ slightly from a position computed alone.
+
+A llama.cpp model reads several paths in one batch. At startup it times
+batches of 1, 2, 4, … paths branching off one token and reads as many a pass
+as make throughput over latency, k / t(k)², greatest: 4 for Qwen3-4B Q6_K on
+a GTX 1660 Ti, where 4 take 29 ms and 1 takes 19 (with an empty KV cache; a
+full 4096-cell one adds 12–17 ms). Batched logits round differently from a
+token read alone, so a node's numbers depend on its batch, by a KL of about
+1e-3 nats; llama.cpp's CPU backend differs from its GPU's by 4e-2. They
+already depended on what else the KV cache holds: a token read alone moves
+by up to 0.3 in its logits once 1200 cells hold other paths.
 
 Models load in float32 by default, which is both more precise and, on a GTX
 1660 Ti, about 5× faster than float16; `--dtype` trades that for memory on

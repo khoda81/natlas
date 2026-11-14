@@ -1,8 +1,9 @@
 """Language-model measures, shared by the exporter and the server.
 
-A measure is a model's next-token log-probabilities over the whole
-vocabulary, given the tokens so far, as a float64 numpy array; walking a path
-gives them after every prefix in turn. Besides the model itself, a measure spec
+A measure is a model's next-token ln weights over the whole vocabulary, up
+to a constant, given the tokens so far, as a float32 numpy row; walking a path
+gives them after every prefix in turn, and one call walks several paths.
+Besides the model itself, a measure spec
 names another model sharing its tokenizer, ``context:N`` for the model seeing
 only the last N tokens, ``temperature:T`` for the model at temperature T, or
 ``control:FILE`` for a .gguf model steered by a llama.cpp control vector (see
@@ -17,40 +18,46 @@ from __future__ import annotations
 import copy
 import ctypes
 import json
+import math
 import re
-from collections.abc import Callable, Iterator, Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 import torch
-from errors import TooLong
 
-type LogProbs = Callable[[Sequence[int]], np.ndarray]
-# The log-probabilities after tokens[:k] for every k from start through
-# len(tokens), in order.
-type Walk = Callable[[Sequence[int], int], Iterator[np.ndarray]]
+# For each walk (tokens, start), the ln weights after tokens[:k] for every k
+# from start through len(tokens), a float32 row each, in order.
+type Walk = Callable[[Sequence[tuple[Sequence[int], int]]], list[np.ndarray]]
 
 
 @dataclass(frozen=True)
 class Measure:
     name: str
-    log_probs: LogProbs
     walk: Walk
-    # How many positions of a path one forward pass gives distributions for.
-    positions: int
+    # How many distributions one forward pass computes, and of how many
+    # paths at most.
+    width: int
+    paths: int
+    # The most tokens a path it reads may hold, or None where nothing says.
+    longest: int | None
+
+    def log_probs(self, tokens: Sequence[int]) -> np.ndarray:
+        """The float64 log-probabilities after ``tokens``: normalizing in
+        float64 keeps -ln p precise where p is close to 1."""
+        (rows,) = self.walk([(tokens, len(tokens))])
+        row = rows[-1].astype(np.float64)
+        top = row.max()
+        return row - top - np.log(np.exp(row - top).sum())
 
 
-def stepwise[T](log_probs: Callable[..., T], tokens: Sequence[int], start: int, *args) -> Iterator[T]:
-    """Walk a path one prefix at a time: right for a model that reuses the
+def stepwise(ln_weights: Callable[[Sequence[int]], np.ndarray], walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
+    """Walks read one prefix at a time: right for a model that reuses the
     cache of the prefix it was last asked, where each step is one token."""
-    for end in range(start, len(tokens) + 1):
-        yield log_probs(tokens[:end], *args)
-
-
-def _numpy(log_probs: torch.Tensor) -> np.ndarray:
-    return log_probs.cpu().numpy()
+    return [np.stack([ln_weights(tokens[:end]) for end in range(start, len(tokens) + 1)]) for tokens, start in walks]
 
 
 def default_device() -> str:
@@ -79,11 +86,14 @@ class Language(Protocol):
     start: tuple[int, ...]
     # Tokens that end a text.
     eos: frozenset[int]
-    # How many positions of a path one forward pass of ``walk`` reads.
-    positions: int
+    # How many distributions one forward pass of ``walk`` computes, and of
+    # how many paths at most.
+    width: int
+    paths: int
+    # The most tokens a path it reads may hold, or None where nothing says.
+    longest: int | None
 
-    def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor: ...
-    def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]: ...
+    def walk(self, walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]: ...
     def encode(self, text: str) -> list[int]: ...
     def token_bytes(self) -> list[bytes]: ...
 
@@ -91,10 +101,13 @@ class Language(Protocol):
 class Transformers:
     """A Hugging Face model. It keeps the KV cache of the last path it read, so
     a request that shares a prefix with it feeds only the rest, and it walks a
-    path in chunks, reading every position's logits off one pass."""
+    path in chunks, reading every position's logits off one pass. Walks take
+    turns: one cache holds one path."""
 
     # Positions per forward pass while walking: logits for this many fit easily.
-    positions = 256
+    width = 256
+    paths = 1
+    longest = None
 
     def __init__(self, model_id: str, device: str, dtype: str = "float32", tokenizer: str | None = None):
         from transformers import AutoTokenizer, DynamicCache
@@ -112,17 +125,15 @@ class Transformers:
         # The tokens whose keys and values the cache holds.
         self.fed: list[int] = []
 
-    def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor:
-        return next(self.walk(tokens, len(tokens), temperature))
+    def walk(self, walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
+        return [self._walk([int(token) for token in tokens], start) for tokens, start in walks]
 
-    def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]:
-        """float64 log-probabilities after tokens[:k] for k from ``start`` on.
+    def _walk(self, tokens: list[int], start: int) -> np.ndarray:
+        """The logits after tokens[:k] for k from ``start`` on.
 
-        Normalizing in float64 keeps -ln p precise where p is close to 1.
         Positions are computed a chunk at a time, so their last bits can
         differ from one computed alone.
         """
-        tokens = [int(token) for token in tokens]
         # The distribution after tokens[:k] is the output at position k - 1,
         # so feeding starts at ``start - 1`` at the latest.
         shared = 0
@@ -136,9 +147,10 @@ class Transformers:
             # A negative crop removes that many tokens, in transformers 4 and 5.
             self.cache.crop(shared - len(self.fed))
         self.fed = tokens[:shared]
+        rows = []
         with torch.inference_mode():
-            for begin in range(shared, len(tokens), self.positions):
-                chunk = tokens[begin : begin + self.positions]
+            for begin in range(shared, len(tokens), self.width):
+                chunk = tokens[begin : begin + self.width]
                 try:
                     logits = self.model(
                         input_ids=torch.tensor([chunk], device=self.device),
@@ -150,8 +162,8 @@ class Transformers:
                     self.cache, self.fed = self.new_cache(), []
                     raise
                 self.fed += chunk
-                for offset in range(max(0, start - 1 - begin), len(chunk)):
-                    yield torch.log_softmax(logits[offset].to(torch.float64) / temperature, dim=-1)
+                rows.append(logits[max(0, start - 1 - begin) :].float())
+        return torch.cat(rows).cpu().numpy()
 
     def encode(self, text: str) -> list[int]:
         return [int(token) for token in self.tokenizer.encode(text, add_special_tokens=False)]
@@ -164,10 +176,8 @@ class LlamaCpp:
     """A GGUF model run by llama.cpp, its layers on the GPU as far as ``gpu_layers``
     says (-1 for all). Requests that share a prefix with one read before reuse
     its cache, so walking down a path costs a token per step, and walks down
-    different branches take turns without reading each other's tokens again.
-    Every token is evaluated alone."""
-
-    positions = 1
+    different branches do not read each other's tokens again. Paths are read
+    together, a batch of tokens per forward pass."""
 
     def __init__(self, path: Path, context: int = 8192, gpu_layers: int = -1):
         from llama_cpp import Llama
@@ -202,6 +212,8 @@ class LlamaCpp:
         self.start = (bos if bos >= 0 else eos,)
         self.eos = frozenset({eos} if eos >= 0 else ())
         self.reader = _Reader(context, self.vocabulary)
+        self.width = self.paths = self.reader.width()
+        self.longest = self.context
 
     def new_context(self):
         """A context of ``context`` tokens shared by as many sequences as
@@ -232,12 +244,8 @@ class LlamaCpp:
         steered.reader = _Reader(context, self.vocabulary)
         return steered
 
-    def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor:
-        logits = self.reader.logits([int(token) for token in tokens])
-        return torch.log_softmax(torch.from_numpy(logits.astype(np.float64)) / temperature, dim=-1)
-
-    def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]:
-        return stepwise(self.log_probs, tokens, start, temperature)
+    def walk(self, walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
+        return self.reader.read([([int(token) for token in tokens], start) for tokens, start in walks])
 
     def encode(self, text: str) -> list[int]:
         # Special tokens in the text are themselves, as transformers reads them.
@@ -255,52 +263,135 @@ _UNUSED_CONTEXT = 256
 class _Reader:
     """A llama.cpp context and the tokens each of its sequences holds.
 
-    Sequences share the cells of their common prefix. A request reading on
-    from a sequence's tokens extends it; one that branches off copies the
-    shared prefix into another sequence, at no cost, and reads only its own
-    tokens there, so the walk it branched from keeps its place. The least
-    recently read sequences give way when the context runs out of cells.
+    Sequences share the cells of their common prefix. A path reading on from
+    a sequence's tokens extends it; one that branches off copies the shared
+    prefix into another sequence, at no cost, and reads only its own tokens
+    there, so the walk it branched from keeps its place. The least recently
+    read sequences give way when the context runs out of cells.
+
+    The paths of a read go through the model together, as one batch of
+    tokens. llama.cpp's kernels round a batch differently from a token read
+    alone, so a node's numbers hang on how it was batched: on Qwen3-4B Q6_K
+    by a KL of about 1e-3 nats, where the CPU's differ from the GPU's by
+    4e-2. They hang on what else the cache holds too, batched or not: a
+    token read alone moves by up to 0.3 in its logits once 1200 cells hold
+    other paths. A recomputed node that differs replaces what a client knew.
     """
 
     def __init__(self, context, vocabulary: int):
-        from llama_cpp import llama_max_parallel_sequences
+        import llama_cpp
         from llama_cpp._internals import LlamaBatch
 
         self.context = context
-        self.batch = LlamaBatch(n_tokens=1, embd=0, n_seq_max=1, verbose=False)
+        # Tokens one llama_decode reads at most: one micro-batch, so a
+        # context out of cells refuses it whole.
+        self.tokens = llama_cpp.llama_n_ubatch(context.ctx)
+        self.batch = LlamaBatch(n_tokens=self.tokens, embd=0, n_seq_max=1, verbose=False)
         self.vocabulary = vocabulary
-        self.sequences = llama_max_parallel_sequences()
+        self.sequences = llama_cpp.llama_max_parallel_sequences()
         # Tokens by sequence, the least recently read first.
         self.fed: dict[int, list[int]] = {}
-        # The sequence and length the logits on hand are the last position of.
-        self.last: tuple[int, int] | None = None
+        # The logits after each path the last read computed.
+        self.last: dict[tuple[int, ...], np.ndarray] = {}
 
-    def logits(self, tokens: list[int]) -> np.ndarray:
-        """The logits after ``tokens``."""
+    def width(self) -> int:
+        """How many paths to read in one pass: of batches of 1, 2, 4, … paths
+        branching off one token, the one whose throughput over latency,
+        k / t(k)², is greatest, the knee of the cost curve. Past it a batch
+        takes longer than what it gains, which on a GTX 1660 Ti is 4."""
+        limit = min(self.sequences - 1, self.tokens)
+        best, power, k = 1, 0.0, 1
+        # A batch takes no less time than a smaller one, so once even the
+        # largest could not beat the best, none can.
+        while k <= limit:
+            seconds = math.inf
+            for _ in range(3):
+                self.clear()
+                self.read([([0], 1)])
+                started = time.perf_counter()
+                self.read([([0, branch], 2) for branch in range(k)])
+                seconds = min(seconds, time.perf_counter() - started)
+            if power < k / seconds**2:
+                best, power = k, k / seconds**2
+            if limit / seconds**2 <= power:
+                break
+            k *= 2
+        self.clear()
+        return best
+
+    def read(self, walks: list[tuple[list[int], int]]) -> list[np.ndarray]:
+        """For each walk (tokens, start), the logits after tokens[:k] for k
+        from ``start`` through len(tokens), a row each."""
         import llama_cpp
 
-        if self.context.n_ctx() < len(tokens):
-            raise TooLong(f"{len(tokens)} tokens, but the context holds {self.context.n_ctx()}")
+        if self.sequences < len(walks):
+            raise ValueError(f"{len(walks)} paths, but the context holds {self.sequences} sequences")
+        # Which sequence each walk reads in, chosen before any is read.
+        reading: list[int | np.ndarray] = []
+        for tokens, start in walks:
+            if self.context.n_ctx() < len(tokens):
+                raise ValueError(f"{len(tokens)} tokens, but the context holds {self.context.n_ctx()}")
+            on_hand = [self.last.get(tuple(tokens[:end])) for end in range(start, len(tokens) + 1)]
+            if all(row is not None for row in on_hand):
+                reading.append(np.stack(on_hand))
+            else:
+                reading.append(self._sequence(tokens, start, {r for r in reading if isinstance(r, int)}))
+        # Every token a walk lacks, in order, and whether its logits are wanted.
+        entries = [
+            (sequence, tokens[position], position, start - 1 <= position)
+            for sequence, (tokens, start) in zip(reading, walks, strict=True)
+            if isinstance(sequence, int)
+            for position in range(len(self.fed[sequence]), len(tokens))
+        ]
+        rows = []
+        try:
+            for begin in range(0, len(entries), self.tokens):
+                chunk = entries[begin : begin + self.tokens]
+                self._decode(chunk, {sequence for sequence in reading if isinstance(sequence, int)})
+                wanted = sum(want for *_, want in chunk)
+                logits = np.ctypeslib.as_array(llama_cpp.llama_get_logits(self.context.ctx), shape=(wanted, self.vocabulary))
+                rows.extend(logits.copy())
+                for sequence, token, _, _ in chunk:
+                    self.fed[sequence].append(token)
+        except Exception:
+            # What a failed batch left in the memory is unknown.
+            self.clear()
+            raise
+        computed = iter(rows)
+        results = []
+        self.last = {}
+        for sequence, (tokens, start) in zip(reading, walks, strict=True):
+            if isinstance(sequence, int):
+                sequence = np.stack([next(computed) for _ in range(start, len(tokens) + 1)])
+                self.last.update((tuple(tokens[:end]), row) for end, row in zip(range(start, len(tokens) + 1), sequence))
+            results.append(sequence)
+        return results
+
+    def _sequence(self, tokens: list[int], start: int, taken: set[int]) -> int:
+        """The sequence to read ``tokens`` in, holding as much of them as it
+        can short of the logits wanted, the most recently read: the one
+        sharing most with them where reading on from it is enough, else one
+        not ``taken`` by this read that the shared prefix is copied into."""
+        import llama_cpp
+
         memory = self.context.memory
         best, shared = None, 0
         for sequence, fed in self.fed.items():
             common = _common(fed, tokens)
             if best is None or shared < common:
                 best, shared = sequence, common
-        # The logits wanted are those of the last token read.
-        keep = min(shared, len(tokens) - 1)
-        # Read on from the sequence, or its logits on hand are the ones.
-        on_hand = self.last == (best, len(tokens)) and shared == len(tokens)
-        if best is not None and (keep == len(self.fed[best]) or on_hand):
+        # The logits wanted are those after tokens[:start], the last read first.
+        keep = min(shared, start - 1)
+        if best is not None and best not in taken and keep == len(self.fed[best]):
             sequence = best
         else:
-            free = next((sequence for sequence in range(self.sequences) if sequence not in self.fed), None)
-            sequence = free if free is not None else next(iter(self.fed))
+            free = next((sequence for sequence in range(self.sequences) if sequence not in self.fed and sequence not in taken), None)
+            sequence = free if free is not None else next(sequence for sequence in self.fed if sequence not in taken)
             if sequence == best:
-                # The one sequence there is: cut it back.
+                # Cut it back.
                 if not llama_cpp.llama_memory_seq_rm(memory, sequence, keep, -1):
                     # A recurrent layer's state cannot be cut back to a prefix.
-                    self.clear()
+                    llama_cpp.llama_memory_seq_rm(memory, sequence, -1, -1)
                     keep = 0
             else:
                 llama_cpp.llama_memory_seq_rm(memory, sequence, -1, -1)
@@ -309,34 +400,23 @@ class _Reader:
                 else:
                     keep = 0
             self.fed[sequence] = tokens[:keep]
-        fed = self.fed.pop(sequence)
-        self.fed[sequence] = fed
-        try:
-            # One token at a time: llama.cpp's kernels round a batch
-            # differently, so a node's numbers would hang on what was
-            # asked before it.
-            for token in tokens[len(fed) :]:
-                self.decode(sequence, token, len(fed))
-                fed.append(token)
-                self.last = (sequence, len(fed))
-        except Exception:
-            # What a failed batch left in the memory is unknown.
-            self.clear()
-            raise
-        return np.ctypeslib.as_array(self.context.get_logits(), shape=(self.vocabulary,))
+        self.fed[sequence] = self.fed.pop(sequence)
+        return sequence
 
-    def decode(self, sequence: int, token: int, position: int) -> None:
-        """Read ``token`` at ``position`` of ``sequence``, freeing the least
-        recently read other sequences while the context has no room."""
+    def _decode(self, entries: list[tuple[int, int, int, bool]], reading: set[int]) -> None:
+        """Read each (sequence, token, position, wanted) entry in one pass,
+        freeing the least recently read sequences not ``reading`` while the
+        context has no room."""
         import llama_cpp
 
         batch = self.batch.batch
-        batch.n_tokens = 1
-        batch.token[0], batch.pos[0], batch.n_seq_id[0], batch.logits[0] = token, position, 1, True
-        batch.seq_id[0][0] = sequence
+        batch.n_tokens = len(entries)
+        for i, (sequence, token, position, wanted) in enumerate(entries):
+            batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.logits[i] = token, position, 1, wanted
+            batch.seq_id[i][0] = sequence
         while (code := llama_cpp.llama_decode(self.context.ctx, batch)) == 1:
-            # 1: no room for the token's cells.
-            other = next((other for other in self.fed if other != sequence), None)
+            # 1: no room for the tokens' cells.
+            other = next((other for other in self.fed if other not in reading), None)
             if other is None:
                 break
             llama_cpp.llama_memory_seq_rm(self.context.memory, other, -1, -1)
@@ -347,7 +427,7 @@ class _Reader:
     def clear(self) -> None:
         self.context.kv_cache_clear()
         self.fed.clear()
-        self.last = None
+        self.last = {}
 
 
 def _common(have: Sequence[int], want: Sequence[int]) -> int:
@@ -385,23 +465,25 @@ def measures(own: Language, specs: Sequence[str], other: Callable[[str], Languag
     """The model itself, then one measure per spec; ``other`` opens a model a spec names."""
 
     def of(language: Language, name: str, temperature: float = 1.0) -> Measure:
-        return Measure(
-            name,
-            lambda tokens: _numpy(language.log_probs(tokens, temperature)),
-            lambda tokens, start: map(_numpy, language.walk(tokens, start, temperature)),
-            language.positions,
-        )
+        def walk(walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
+            return [rows / np.float32(temperature) for rows in language.walk(walks)]
+
+        return Measure(name, walk, language.width, language.paths, language.longest)
 
     def measure(spec: str) -> Measure:
         kind, _, value = spec.partition(":")
         if kind == "context":
             n = int(value)
 
-            def window(tokens: Sequence[int]) -> np.ndarray:
-                return _numpy(own.log_probs(tokens[-n:]))
+            def window(walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
+                # Each position reads its own window, a path of its own.
+                windows = [tokens[:end][-n:] for tokens, start in walks for end in range(start, len(tokens) + 1)]
+                rows = iter([rows[0] for rows in own.walk([(tokens, len(tokens)) for tokens in windows])])
+                return [np.stack([next(rows) for _ in range(start, len(tokens) + 1)]) for tokens, start in walks]
 
-            # Each position reads its own window: one a pass.
-            return Measure(f"{own.name} · last {n} tokens", window, lambda tokens, start: stepwise(window, tokens, start), 1)
+            # A window longer than the model reads fails on paths that long.
+            longest = None if own.longest is None or n <= own.longest else own.longest
+            return Measure(f"{own.name} · last {n} tokens", window, own.paths, own.paths, longest)
         if kind == "temperature":
             t = float(value)
             return of(own, f"{own.name} · T={t:g}", t)

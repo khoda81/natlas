@@ -15,14 +15,14 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from itertools import zip_longest
 from typing import Any, Protocol
 
 import anyio.to_thread
 import numpy as np
-from errors import TooLong
 from google.protobuf.message import DecodeError
 from natlas import natlas_pb2 as pb
 from natlas_core import Session, Tree
@@ -36,14 +36,20 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 
 class Measure(Protocol):
-    """Next-token log-probabilities as a float64 array over the vocabulary."""
+    """Next-token ln weights over the vocabulary, up to a constant, as
+    float32 rows."""
 
     name: str
-    # How many positions of a path one forward pass gives distributions for.
-    positions: int
+    # How many distributions one forward pass computes, and of how many
+    # paths at most.
+    width: int
+    paths: int
+    # The most tokens a path it reads may hold, or None where nothing says.
+    longest: int | None
 
-    def walk(self, tokens: Sequence[int], start: int) -> Iterator[np.ndarray]:
-        """Those after tokens[:k] for every k from ``start`` through len(tokens)."""
+    def walk(self, walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
+        """For each walk (tokens, start), the rows after tokens[:k] for every
+        k from ``start`` through len(tokens)."""
         ...
 
 
@@ -65,12 +71,13 @@ class Client:
 
 @dataclass(frozen=True)
 class Pass:
-    """One forward pass for a client: the distributions of ``nodes`` under
-    ``measure``, each the child of the one before."""
+    """One forward pass under ``measure``: for each walk, the distributions
+    of its nodes, each the child of the one before; and the clients waiting
+    on them, whose new demands withdraw it."""
 
-    client: Client
     measure: int
-    nodes: tuple[int, ...]
+    walks: tuple[tuple[int, ...], ...]
+    clients: frozenset[Client]
 
 
 # Forward passes submitted and not yet finished: the one running and the one
@@ -87,11 +94,13 @@ class Model:
     One scheduler thread owns the core tree, the distributions kept and the
     sessions; everything else posts work to its inbox. It takes everything
     posted at once, so a burst of demands costs one step, steps every
-    client's session, sends what is new, and keeps the model busy with the
-    distribution the next client in turn waits on most. The model runs on a
-    thread of its own; only the scheduler submits passes to it. Clients take
-    turns pass by pass; within a client, worth alone decides. A new demand
-    withdraws the client's queued pass, so the next one is chosen from it.
+    client's session, sends what is new, and keeps the model busy with what
+    the clients wait on most. The model runs on a thread of its own; only
+    the scheduler submits passes to it. A pass computes as many
+    distributions as the measure computes at once, taking a walk from each
+    client in turn, from the next client in turn on; within a client, worth
+    alone decides. A new demand withdraws the queued pass of the client, so
+    the next one is chosen from it.
     """
 
     def __init__(
@@ -177,9 +186,12 @@ class Model:
                     item = self.inbox.get_nowait()
                 except queue.Empty:
                     break
-            for client in self.clients:
-                self._step(client)
-            self._submit()
+            # What needs no pass is settled at once, and read on from.
+            while True:
+                for client in self.clients:
+                    self._step(client)
+                if not self._submit():
+                    break
 
     def _step(self, client: Client) -> None:
         updates = client.session.step(self.tree)
@@ -190,79 +202,109 @@ class Model:
         """Withdraw the client's queued pass; its result is taken, and the
         pass forgotten, when the future's callback reaches the inbox."""
         for future, job in self.passes.items():
-            if job.client is client:
+            if client in job.clients:
                 future.cancel()
 
-    def _submit(self) -> None:
-        """Keep the model busy: submit what the next clients in turn wait on
-        most, and is not on its way already."""
-        reserved = {(job.measure, node) for job in self.passes.values() for node in job.nodes}
+    def _submit(self) -> bool:
+        """Keep the model busy: submit what the clients wait on most, and is
+        not on its way already. Says whether it settled distributions that
+        need no pass."""
+        reserved = {(job.measure, node) for job in self.passes.values() for walk in job.walks for node in walk}
+        settled = False
         while sum(not future.done() for future in self.passes) < _SUBMITTED:
-            chosen = self._chosen(reserved)
-            if chosen is None:
-                return
-            client, (measure, node, worth, ahead) = chosen
-            job, work = self._pass(client, measure, node, worth, ahead, reserved)
-            reserved.update((measure, node) for node in job.nodes)
-            if work is None:
-                future: Future[list[np.ndarray]] = Future()
-                future.set_result([np.empty(0)])
-            else:
-                future = self.inference.submit(work)
+            job, settles = self._chosen(reserved)
+            settled |= settles
+            if job is None:
+                return settled
+            future = self.inference.submit(self._work(job))
             self.passes[future] = job
             future.add_done_callback(lambda future: self.call(lambda: self._finish(future)))
+        return settled
 
-    def _chosen(self, reserved: set[tuple[int, int]]) -> tuple[Client, tuple[int, int, float, list[int]]] | None:
-        """The next client in turn that waits on something not reserved,
-        and the most valuable such distribution it waits on."""
+    def _chosen(self, reserved: set[tuple[int, int]]) -> tuple[Pass | None, bool]:
+        """A pass under the measure that the next client in turn waiting on
+        something not reserved waits on most: a walk from each client in
+        turn, from that one on, while the measure has room, each reserved as
+        it is taken. Says too whether choosing it settled distributions that
+        need no pass."""
         count = len(self.clients)
-        for offset in range(count):
-            client = self.clients[(self.turn + offset) % count]
-            for blocked in client.session.blocked():
-                if blocked[:2] not in reserved:
-                    self.turn = (self.turn + offset + 1) % count
-                    return client, blocked
-        return None
+        order = [self.clients[(self.turn + offset) % count] for offset in range(count)]
+        waits = {client: [blocked for blocked in client.session.blocked() if blocked[:2] not in reserved] for client in order}
+        first = next((index for index, client in enumerate(order) if waits[client]), None)
+        if first is None:
+            return None, False
+        self.turn = (self.turn + first + 1) % count
+        order = order[first:] + order[:first]
+        measure = waits[order[0]][0][0]
+        turns = zip_longest(*([(client, blocked) for blocked in waits[client] if blocked[0] == measure] for client in order))
+        width, paths = self.measures[measure].width, self.measures[measure].paths
+        walks: list[tuple[int, ...]] = []
+        clients: set[Client] = set()
+        settled = False
+        for client, (_, node, _, ahead) in (taken for turn in turns for taken in turn if taken is not None):
+            room = width - sum(map(len, walks))
+            if room == 0 or len(walks) == paths:
+                break
+            # Another client's wait taken already.
+            if (measure, node) in reserved:
+                continue
+            nodes = self._walk(measure, node, ahead[: room - 1], reserved)
+            if nodes is None:
+                reserved.add((measure, node))
+                settled = True
+                continue
+            reserved.update((measure, node) for node in nodes)
+            walks.append(nodes)
+            clients.add(client)
+        if not walks:
+            return None, settled
+        return Pass(measure, tuple(walks), frozenset(clients)), settled
 
-    def _pass(
-        self,
-        client: Client,
-        measure: int,
-        node: int,
-        worth: float,
-        ahead: list[int],
-        reserved: set[tuple[int, int]],
-    ) -> tuple[Pass, Callable[[], list[np.ndarray]] | None]:
-        """A pass computing a distribution, and where a path goes on below
-        it, the next nodes along it that are neither held nor on their way,
-        as many as the measure reads in one pass; with the work to run on
-        the model, or None for a node with no children."""
+    def _walk(self, measure: int, node: int, ahead: list[int], reserved: set[tuple[int, int]]) -> tuple[int, ...] | None:
+        """The nodes a pass computes from ``node`` on: it, and where a path
+        goes on below it, the next nodes along ``ahead`` that are neither
+        held nor on their way. None where it needs no pass, as a node with no
+        children or one deeper than the measure reads, settled at once."""
         tokens = tuple(self.tree.path(node))
         if self._empty(tokens):
-            return Pass(client, measure, (node,)), None
-        # Down the path as far as one pass reads and the sequence goes on.
+            self._keep(measure, [node], [np.empty(0, np.float32)])
+            return None
+        longest = self.measures[measure].longest
+        if not self._reads(measure, tokens):
+            self._fail(measure, node, f"{len(self.root) + len(tokens)} tokens, but the context holds {longest}")
+            return None
         nodes, along = [node], tokens
-        for branch in ahead[: self.measures[measure].positions - 1]:
-            if self._empty(along + (branch,)):
+        for branch in ahead:
+            along += (branch,)
+            if self._empty(along) or not self._reads(measure, along):
                 break
             (_, child) = self.tree.walk(nodes[-1], [branch])
             if (measure, child) in reserved or self.tree.has(child, measure):
                 break
             nodes.append(child)
-            along += (branch,)
-        walk = self.measures[measure].walk
+        return tuple(nodes)
+
+    def _work(self, job: Pass) -> Callable[[], list[np.ndarray]]:
+        """What the model runs for a pass."""
+        walk = self.measures[job.measure].walk
+        reads = []
+        for nodes in job.walks:
+            path = self.root + tuple(self.tree.path(nodes[-1]))
+            reads.append((path, len(path) - len(nodes) + 1))
 
         def work() -> list[np.ndarray]:
             started = time.perf_counter()
-            computed = list(walk(self.root + along, len(self.root) + len(tokens)))
+            computed = walk(reads)
             elapsed = (time.perf_counter() - started) * 1000
+            depths = sorted({start - len(self.root) for _, start in reads})
             print(
-                f"m{measure} depth {len(tokens)} worth {worth:.1f}: {len(computed)} computed, {elapsed:.0f} ms",
+                f"m{job.measure} {len(reads)} paths, depth {depths[0]}–{depths[-1]}: "
+                f"{sum(map(len, job.walks))} computed, {elapsed:.0f} ms",
                 file=sys.stderr,
             )
             return computed
 
-        return Pass(client, measure, tuple(nodes)), work
+        return work
 
     def _finish(self, future: Future[list[np.ndarray]]) -> None:
         """Keep what a pass computed, or fail what waits on it."""
@@ -271,27 +313,37 @@ class Model:
             return
         error = future.exception()
         if error is None:
-            for node, ln_weights in zip(job.nodes, future.result(), strict=True):
-                self._keep(job.measure, node, ln_weights)
-            return
-        if not isinstance(error, TooLong):
-            traceback.print_exception(error)
-        message = str(error) if isinstance(error, TooLong) else f"{type(error).__name__}: {error}"
-        key = (job.measure, job.nodes[0])
+            computed = future.result()
+            if [len(rows) for rows in computed] == list(map(len, job.walks)):
+                self._keep(job.measure, [node for nodes in job.walks for node in nodes], [row for rows in computed for row in rows])
+                return
+            error = RuntimeError(f"walks of {list(map(len, job.walks))} nodes gave {[len(rows) for rows in computed]} distributions")
+        traceback.print_exception(error)
+        for nodes in job.walks:
+            self._fail(job.measure, nodes[0], f"{type(error).__name__}: {error}")
+
+    def _fail(self, measure: int, node: int, message: str) -> None:
+        """Fail the distribution for every client waiting on it."""
         for client in self.clients:
-            if any(blocked[:2] == key for blocked in client.session.blocked()):
-                client.session.failed(*key, message)
+            if any(blocked[:2] == (measure, node) for blocked in client.session.blocked()):
+                client.session.failed(measure, node, message)
+
+    def _reads(self, measure: int, tokens: tuple[int, ...]) -> bool:
+        """Whether the measure reads a path this long."""
+        longest = self.measures[measure].longest
+        return longest is None or len(self.root) + len(tokens) <= longest
 
     def _empty(self, tokens: tuple[int, ...]) -> bool:
         """Whether a sequence has no children: finished, or past the vocabulary."""
         return self.ends(tokens) or any(self.vocabulary <= branch for branch in tokens)
 
-    def _keep(self, measure: int, node: int, ln_weights: np.ndarray) -> None:
-        size = self.tree.set(node, measure, np.ascontiguousarray(ln_weights, dtype=np.float64))
-        self.held += size - self.kept.pop((node, measure), 0)
-        self.kept[node, measure] = size
-        # The one just computed stays, however large.
-        while self.cache < self.held and 1 < len(self.kept):
+    def _keep(self, measure: int, nodes: list[int], rows: list[np.ndarray]) -> None:
+        sizes = self.tree.set(nodes, measure, [np.ascontiguousarray(row, dtype=np.float32) for row in rows])
+        for node, size in zip(nodes, sizes, strict=True):
+            self.held += size - self.kept.pop((node, measure), 0)
+            self.kept[node, measure] = size
+        # Those just computed stay, however large.
+        while self.cache < self.held and len(nodes) < len(self.kept):
             (forgotten, of), size = self.kept.popitem(last=False)
             self.tree.forget(forgotten, of)
             self.held -= size

@@ -28,7 +28,6 @@ sys.path.insert(0, str(ROOT / "export"))
 import service  # noqa: E402
 from natlas import natlas_pb2 as pb  # noqa: E402
 from natlas_codec import labels_json  # noqa: E402
-from errors import TooLong  # noqa: E402
 from natlas_core import Session, Tree  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
@@ -54,32 +53,42 @@ def node_id(path):
 class Measure:
     name = "fixture"
 
-    def __init__(self, weights=(0.6, 0.25, 0.1, 0.049, 0.001), positions=1, longest=None):
+    def __init__(self, weights=(0.6, 0.25, 0.1, 0.049, 0.001), width=1, paths=1, longest=None):
         self.weights = np.array(weights, dtype=np.float64)
-        self.positions = positions
-        # Prefixes longer than this are too long for the model's context.
+        self.width, self.paths = width, paths
+        # The longest prefix the model's context holds.
         self.longest = longest
         # Every prefix whose distribution was computed, in order.
         self.calls = []
-        # Every walk begun, as (tokens, start).
+        # Every walk read, as (tokens, start), and the walks of each pass.
         self.walks = []
+        self.passes = []
         # Prefixes whose computation waits on a gate, and a flag raised when
         # one is reached.
         self.gates = {}
         self.reached = threading.Event()
 
-    def walk(self, tokens, start):
-        self.walks.append((tuple(tokens), start))
-        for end in range(start, len(tokens) + 1):
-            prefix = tuple(tokens[:end])
-            if self.longest is not None and self.longest < len(prefix):
-                raise TooLong(f"{len(prefix)} tokens, but the context holds {self.longest}")
-            if prefix in self.gates:
-                self.reached.set()
-                self.gates[prefix].wait(5)
-            self.calls.append(prefix)
-            with np.errstate(divide="ignore"):
-                yield np.log(self.weights)
+    def walk(self, walks):
+        walks = [(tuple(tokens), start) for tokens, start in walks]
+        self.walks.extend(walks)
+        self.passes.append(walks)
+        assert len(walks) <= self.paths, f"{len(walks)} paths in a pass"
+        assert sum(len(tokens) - start + 1 for tokens, start in walks) <= self.width, f"{walks} is wider than a pass"
+        computed = []
+        for tokens, start in walks:
+            rows = []
+            for end in range(start, len(tokens) + 1):
+                prefix = tokens[:end]
+                assert self.longest is None or len(prefix) <= self.longest, f"{prefix} is longer than the context"
+                if prefix in self.gates:
+                    self.reached.set()
+                    self.gates[prefix].wait(5)
+                self.calls.append(prefix)
+                with np.errstate(divide="ignore"):
+                    # Weights up to a constant.
+                    rows.append((np.log(self.weights) + 3.0).astype(np.float32))
+            computed.append(np.stack(rows))
+        return computed
 
 
 def fixture(**measure):
@@ -161,7 +170,7 @@ def settle(model):
 def queued(model, client):
     """Wait until a pass for ``client`` is submitted."""
     deadline = time.monotonic() + 5
-    while not model.call(lambda: any(job.client is client for job in model.passes.values())).result(5):
+    while not model.call(lambda: any(client in job.clients for job in model.passes.values())).result(5):
         if deadline < time.monotonic():
             raise AssertionError("no pass was submitted for the client")
         time.sleep(0.001)
@@ -203,7 +212,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(session.step(tree), [])
         self.assertEqual(session.blocked(), [(0, 0, 10.0, [])])
         with np.errstate(divide="ignore"):
-            tree.set(0, 0, np.log([0.2, 0.5, 0.0, 0.3]))
+            tree.set([0], 0, [np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32))])
         ((kind, measure, node, parent, branch, runs, count),) = session.step(tree)
         self.assertEqual((kind, measure, node, parent, branch, count), ("answer", 0, 0, None, None, 3))
         self.assertEqual([branches for _, branches, _ in runs], [[1, 3, 0]])
@@ -246,7 +255,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual([list(path.branches) for path in second.kinds("placed")], [[2, 2, 2]])
 
     def test_a_pass_computes_as_much_of_a_path_as_the_model_reads_at_once(self):
-        model, _ = fixture(positions=3)
+        model, _ = fixture(width=3)
         client = Received(model)
         model.demand(client.client, demand(path=(0, [0, 1, 2, 3]))).result(5)
         settle(model)
@@ -254,6 +263,43 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(measure.walks, [((99, 0, 1), 1), ((99, 0, 1, 2, 3), 4)])
         self.assertEqual(client.answered(node_id([0, 1, 2])), [3])
         self.assertEqual(len(client.kinds("placed")), 1)
+
+    def test_a_pass_computes_what_several_clients_wait_on(self):
+        # Each client's walk reads its node and the next along its path.
+        one, two = ((99, 1, 0), 2), ((99, 2, 0), 2)
+        for paths, passes in ((2, [[one, two]]), (1, [[one], [two]])):
+            with self.subTest(paths=paths):
+                model, _ = fixture(width=4, paths=paths)
+                model.learn([1]).result(5)
+                model.learn([2]).result(5)
+                first, second = Received(model), Received(model)
+                gate = held(model)
+                demands = [
+                    model.demand(first.client, demand(path=(node_id([1]), [0]))),
+                    model.demand(second.client, demand(path=(node_id([2]), [0]))),
+                ]
+                gate.set()
+                for demanded in demands:
+                    demanded.result(5)
+                settle(model)
+                self.assertEqual(model.measures[0].passes, passes)
+                for client in (first, second):
+                    self.assertEqual([list(path.branches) for path in client.kinds("placed")], [[0]])
+
+    def test_a_view_is_computed_in_passes_as_wide_as_the_measure(self):
+        model, _ = fixture(width=3, paths=3)
+        client = Received(model)
+        model.demand(client.client, demand(view=(0, 10.0, 2.0))).result(5)
+        settle(model)
+        measure = model.measures[0]
+        # What the view computes one at a time, each once.
+        self.assertEqual(
+            set(measure.calls),
+            {(99,), (99, 0), (99, 1), (99, 0, 0), (99, 0, 0, 0), (99, 0, 1), (99, 1, 0)},
+        )
+        self.assertEqual(len(measure.calls), 7)
+        self.assertLess(1, max(map(len, measure.passes)))
+        self.assertEqual(client.answered(0)[:3], [0, 1, 2])
 
     def test_a_new_demand_drops_what_the_old_one_waited_on(self):
         model, _ = fixture()

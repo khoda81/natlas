@@ -51,12 +51,13 @@ import math
 import sys
 import wave
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import lm
+import numpy as np
 import torch
 import torch.nn.functional as F
 import uvicorn
@@ -181,7 +182,8 @@ class Scribe:
     step per event.
     """
 
-    positions = 1
+    width = paths = 1
+    longest = None
 
     def __init__(
         self,
@@ -208,20 +210,20 @@ class Scribe:
         self.capacity = slots
         self.clock = 0
 
-    def log_probs(self, tokens: Sequence[int], temperature: float = 1.0) -> torch.Tensor:
+    def ln_weights(self, tokens: Sequence[int]) -> np.ndarray:
+        """Each event's ln weight after ``tokens``, up to a constant."""
         if tuple(tokens[:1]) != self.start:
             raise ValueError("a transcription begins with the start token")
         window, written = self.windows.locate(tuple(int(token) for token in tokens[1:]))
         forced = self.windows.forced(window, written)
         if forced is not None:
-            certain = torch.full((self.vocabulary,), -math.inf, dtype=torch.float64)
+            certain = np.full(self.vocabulary, -np.inf, dtype=np.float32)
             certain[forced] = 0.0
             return certain
-        logits = self._evaluate(window, list(written))
-        return torch.log_softmax(logits[: self.vocabulary].double() / temperature, dim=-1)
+        return self._evaluate(window, list(written))[: self.vocabulary].float().cpu().numpy()
 
-    def walk(self, tokens: Sequence[int], start: int, temperature: float = 1.0) -> Iterator[torch.Tensor]:
-        return lm.stepwise(self.log_probs, tokens, start, temperature)
+    def walk(self, walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
+        return lm.stepwise(self.ln_weights, walks)
 
     def _conditions(self, index: int) -> Any:
         conditions = self.conditions.get(index)

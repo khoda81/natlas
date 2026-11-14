@@ -82,9 +82,9 @@ halvings deep and beside children 2^−3000 of their parent.
 | drag | grab and move |
 | shift + wheel, ↑ ↓ | along the interval |
 | ctrl + wheel, pinch, + − | horizontal scale, about the left edge, leaving the vertical view alone |
-| double-click | glide until a box stands like the root, its children filling the view |
+| click | glide until a box stands like the root, its children filling the view |
 | hover | select a branch by height, then depth; empty space keeps the deepest known subtree selected |
-| top path inspector | click the displayed text to edit and search; select a result or press Enter to fly there |
+| top path inspector | click the displayed text to edit and search; leaving it shows hovered paths again and keeps the draft for when you come back, Escape or a click on the canvas discards it, and selecting a result or pressing Enter flies there |
 | 0 · s · b | back to the root as origin · swap p and q · nats/bits |
 
 ## Protocol

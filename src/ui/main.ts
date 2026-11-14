@@ -78,7 +78,10 @@ export class App {
   private readonly details = element<HTMLElement>("inspect-details");
   private readonly where = element<HTMLElement>("where");
   private readonly pathPanel = element<HTMLElement>("path-panel");
+  /** While the inspector has focus as an editor. */
   private editing = false;
+  /** Text edited when the editor last lost focus, given back when it regains it. */
+  private draft: string | null = null;
   private shownText = "";
   private shownPath: { node: NodeId; branch: number | null; more?: string } | null = null;
   /** The box the path panel shows, as node:rank:kind. */
@@ -120,7 +123,7 @@ export class App {
   private lastPick: { frame: Frame; x: number; y: number; selection: Selection | null } | null = null;
   /** Screen coordinates, converted against the current canvas rect every frame. */
   private pointer: { x: number; y: number } | null = null;
-  private dragging: { id: number; x: number; y: number } | null = null;
+  private dragging: { id: number; x: number; y: number; moved: boolean } | null = null;
   private focus: Focus | null = null;
   /** The view before the origin last changed, fading out over the new one. */
   private transition: { image: HTMLCanvasElement; start: number } | null = null;
@@ -232,6 +235,7 @@ export class App {
     }
     element("lens").hidden = dataset.measures.length <= 1;
     this.editing = false;
+    this.draft = null;
     this.shownText = "";
     this.shownPath = null;
     this.where.replaceChildren();
@@ -643,7 +647,7 @@ export class App {
       this.cancelNavigation();
       canvas.setPointerCapture(event.pointerId);
       this.pointer = { x: event.clientX, y: event.clientY };
-      this.dragging = { id: event.pointerId, x: event.offsetX, y: event.offsetY };
+      this.dragging = { id: event.pointerId, x: event.offsetX, y: event.offsetY, moved: false };
       this.focus = null;
       canvas.classList.add("dragging");
     });
@@ -651,19 +655,33 @@ export class App {
       this.pointer = { x: event.clientX, y: event.clientY };
       const grab = this.dragging;
       if (grab && grab.id === event.pointerId) {
-        // Content follows the pointer, zooming about its height.
-        this.pan((event.offsetY - grab.y) / this.view.height);
-        this.zoom(-(event.offsetX - grab.x) / this.cam.k, event.offsetY / this.view.height);
+        const dx = event.offsetX - grab.x;
+        const dy = event.offsetY - grab.y;
+        if (dx !== 0 || dy !== 0) {
+          // Content follows the pointer, zooming about its height.
+          this.pan(dy / this.view.height);
+          this.zoom(-dx / this.cam.k, event.offsetY / this.view.height);
+          grab.moved = true;
+        }
         grab.x = event.offsetX;
         grab.y = event.offsetY;
       }
       this.invalidate();
     });
     const release = (event: PointerEvent) => {
-      if (this.dragging?.id !== event.pointerId) return;
+      const grab = this.dragging;
+      if (grab?.id !== event.pointerId) return;
       this.dragging = null;
       this.pointer = event.type === "pointercancel" ? null : { x: event.clientX, y: event.clientY };
       canvas.classList.remove("dragging");
+      if (event.type === "pointerup" && !grab.moved) {
+        // A click, unlike a drag, lets go of the inspector's draft.
+        this.draft = null;
+        const x = pixelCorner(event.offsetX, this.pixelRatio);
+        const y = pixelCorner(event.offsetY, this.pixelRatio);
+        const selection = this.frame ? pick(this.tree!, this.lens, this.frame, this.cam, this.view, x, y, 1 / this.pixelRatio) : null;
+        if (selection) this.startFocus(selection.box);
+      }
       this.invalidate();
     };
     canvas.addEventListener("pointerup", release);
@@ -674,12 +692,6 @@ export class App {
       if (this.dragging) return;
       this.pointer = null;
       this.invalidate();
-    });
-    canvas.addEventListener("dblclick", (event) => {
-      const x = pixelCorner(event.offsetX, this.pixelRatio);
-      const y = pixelCorner(event.offsetY, this.pixelRatio);
-      const selection = this.frame ? pick(this.tree!, this.lens, this.frame, this.cam, this.view, x, y, 1 / this.pixelRatio) : null;
-      if (selection) this.startFocus(selection.box);
     });
   }
 
@@ -802,10 +814,26 @@ export class App {
       if (!this.dataset?.searchable || this.editing) return;
       this.held.clear();
       this.editing = true;
-      this.where.textContent = this.shownText;
+      const draft = this.draft;
+      this.draft = null;
+      this.where.textContent = draft ?? this.shownText;
       this.whereHeight = null;
+      if (draft !== null) void this.search(false, ++this.searchGeneration);
       this.invalidate();
     });
+    // Focus leaving the editor and its result puts the hovered path back,
+    // and keeps what was edited for the next focus.
+    const left = (event: FocusEvent) => {
+      const to = event.relatedTarget;
+      if (!this.editing || to === this.where || to === this.result) return;
+      // textContent is exactly what focus set while nothing was edited.
+      const edited = this.where.textContent !== this.shownText;
+      const text = this.where.innerText;
+      this.stopEditing();
+      if (edited) this.draft = text;
+    };
+    this.where.addEventListener("blur", left);
+    this.result.addEventListener("blur", left);
     this.where.addEventListener("input", () => {
       if (!this.dataset?.searchable) return;
       this.whereHeight = null;
@@ -821,6 +849,7 @@ export class App {
       if (!this.dataset?.searchable || event.isComposing) return;
       if (event.key === "Escape") {
         event.preventDefault();
+        this.stopEditing();
         this.where.blur();
         return;
       }
@@ -829,15 +858,10 @@ export class App {
       if (this.searchTimer !== null) clearTimeout(this.searchTimer);
       void this.search(true, ++this.searchGeneration);
     });
-    this.where.addEventListener("blur", (event) => {
-      if (event.relatedTarget !== this.result) this.finishEditing();
-    });
-    this.result.addEventListener("blur", (event) => {
-      if (event.relatedTarget !== this.where) this.finishEditing();
-    });
   }
 
-  private finishEditing(): void {
+  /** Show the hovered path again, leaving the editor's text behind. */
+  private stopEditing(): void {
     if (!this.editing) return;
     this.editing = false;
     this.found = null;
@@ -846,10 +870,11 @@ export class App {
     this.result.hidden = true;
     this.result.classList.remove("busy");
     this.where.classList.remove("found");
+    this.where.removeAttribute("title");
     this.shown = "";
-    const path = this.shownPath;
-    if (path === null) this.where.replaceChildren();
-    else this.showPath(path.node, path.branch, path.more);
+    if (this.hover !== null) this.showSelectionPath(this.hover);
+    else if (this.shownPath === null) this.where.replaceChildren();
+    else this.showPath(this.shownPath.node, this.shownPath.branch, this.shownPath.more);
     this.invalidate();
   }
 
@@ -877,7 +902,10 @@ export class App {
       if (!anchor) return;
       this.editing = false;
       this.shown = "";
+      this.found = null;
       this.result.hidden = true;
+      this.where.classList.remove("found");
+      this.where.removeAttribute("title");
       this.setStatus("");
       this.fly(this.tree!.descend(this.tree!.root, path));
       this.where.blur();
@@ -948,11 +976,12 @@ export class App {
     } else this.hover = null;
     this.avoidPointer();
     this.updateInspect();
-    if (this.hover) {
-      const { box, exact } = this.hover;
-      const more = !exact || box.branch === null ? " …" : undefined;
-      this.showPath(box.node, box.branch, more);
-    }
+    if (this.hover) this.showSelectionPath(this.hover);
+  }
+
+  private showSelectionPath({ box, exact }: Selection): void {
+    const more = !exact || box.branch === null ? " …" : undefined;
+    this.showPath(box.node, box.branch, more);
   }
 
   /**

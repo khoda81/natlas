@@ -24,15 +24,25 @@ on, scrolling through the windows as ``TranscriptionModel.transcribe`` does
 with its prelude forcing:
 
 * within a window, an event has MuScriptor's probability given that window's
-  audio and the window's events so far;
+  audio and the window's events so far, among the events that keep the path
+  a valid encoding (below);
 * EOS is the model's own decision; it ends the window and moves to the next;
 * a later window's tie prologue is forced from the notes the path leaves
-  sounding, so those events have probability one;
+  sounding, so those events have probability one; so is the first window's,
+  an empty one, when --at is 0 and nothing sounds before the recording;
 * a window that reaches MuScriptor's generation limit gets a forced EOS;
 * the last window's EOS ends the path.
 
-So a path's probability is the probability MuScriptor's chunked decoder
-gives that transcription, as in natwalk's MuScriptor demo.
+An event is valid where MuScriptor's decoder acts on it. Probability is
+taken from events it would drop or that would make the window malformed:
+pitches before an instrument and an on/off switch, note-offs of notes not
+sounding, switches to the instrument or on/off already set, or set and never
+used before the next switch or EOS, time that does not move forward or
+leaves the window, and a tie, velocity, drum, time shift or EOS inside a tie
+prologue, which names its instruments and pitches once each in ascending
+order, as MuScriptor's encoder writes it. So every path is a transcription
+MuScriptor decodes in full, and its probability is the model's, given that
+it is one, as in natwalk's MuScriptor demo.
 
 The measures are the model itself, then each --q: another model size hearing
 the same recording, ``silence`` for the model hearing nothing (so p against
@@ -111,6 +121,9 @@ class Windows:
         self.at = at
         self.count = count
         self.max_events = max_events
+        vocab = self.tokenizer._vocab  # noqa: SLF001
+        self.kinds = np.array([event.type for event in vocab])
+        self.values = np.array([event.value for event in vocab])
         # The decoder's state on entering a window, by the path up to that
         # window's start, which ends in the EOS before it.
         self.entered: OrderedDict[tuple[int, ...], tuple[Window, OpenNoteTracker]] = OrderedDict()
@@ -122,6 +135,53 @@ class Windows:
         """The window ``path`` ends in, and the events written in it so far, its prologue first."""
         start = len(path) - path[::-1].index(self.eos) if self.eos in path else 0
         return self._state(path[:start])[0], path[start:]
+
+    def valid(self, path: tuple[int, ...]) -> np.ndarray:
+        """Which events may follow ``path`` and keep it a valid encoding:
+        the ones MuScriptor's decoder acts on, by its own state there."""
+        window, written = self.locate(path)
+        before = path[: len(path) - len(written)]
+        vocab = self.tokenizer._vocab  # noqa: SLF001
+        tracker = copy.deepcopy(self._state(before)[1], {id(vocab): vocab})
+        # Instrument and on/off switches not yet used by a pitch.
+        unused: set[str] = set()
+        for token in written:
+            tracker.feed(token)
+            kind = vocab[token].type
+            if kind in ("program", "velocity"):
+                unused.add(kind)
+            elif kind == "pitch":
+                unused.clear()
+        # MuScriptor's decoder state, as OpenNoteTracker keeps it.
+        program, velocity = tracker._program, tracker._velocity  # noqa: SLF001
+        kinds, values = self.kinds, self.values
+        if tracker._in_prologue:  # noqa: SLF001
+            # Instruments ascending, each followed by its pitches ascending.
+            ok = (kinds == "program") & (True if program is None else program < values) & ("program" not in unused)
+            if program is not None:
+                named = [pitch for instrument, pitch in tracker._tie_set if instrument == program]  # noqa: SLF001
+                ok |= (kinds == "pitch") & (max(named, default=-1) < values)
+            if "program" not in unused:
+                ok |= kinds == "tie"
+            return ok
+        # Time moves forward, and stays in the window unless it is the last.
+        seek = tracker._next_seek_time  # noqa: SLF001
+        start, rate = tracker._start_tick, tracker._frame_rate  # noqa: SLF001
+        shifted = (start + values) / rate
+        ok = (kinds == "shift") & (tracker._tick_state - start < values) & (True if seek is None else shifted < seek)  # noqa: SLF001
+        ok |= (kinds == "program") & (values != (-1 if program is None else program)) & ("program" not in unused)
+        ok |= (kinds == "velocity") & (values != (-1 if velocity is None else velocity)) & ("velocity" not in unused)
+        if not unused:
+            ok |= kinds == "EOS"
+        if seek is None or tracker._tick_state / rate < seek:  # noqa: SLF001
+            ok |= kinds == "drum"
+            if program is not None and velocity is not None:
+                if 0 < velocity:
+                    ok |= kinds == "pitch"
+                else:
+                    sounding = [pitch for instrument, pitch in tracker._open if instrument == program]  # noqa: SLF001
+                    ok |= (kinds == "pitch") & np.isin(values, sounding)
+        return ok
 
     def forced(self, window: Window, written: tuple[int, ...]) -> int | None:
         if len(written) < len(window.prologue):
@@ -143,8 +203,11 @@ class Windows:
         if not before:
             tracker = OpenNoteTracker(vocab, self.tokenizer.frame_rate)
             tracker.feed(self._boundary(0))
-            # Nothing came before the first window to force its prologue from.
-            entered = (Window(0, ()), tracker)
+            # At the recording's start nothing sounds: its prologue is empty.
+            # Later in a recording what sounds before it is unknown, and the
+            # model names it.
+            prologue = tuple(self.tokenizer.tie_section_token_ids([])) if self.at == 0 else ()
+            entered = (Window(0, prologue), tracker)
         else:
             # The window before this one starts after its own preceding EOS.
             last = before[:-1]
@@ -220,7 +283,9 @@ class Scribe:
             certain = np.full(self.vocabulary, -np.inf, dtype=np.float32)
             certain[forced] = 0.0
             return certain
-        return self._evaluate(window, list(written))[: self.vocabulary].float().cpu().numpy()
+        ln_weights = self._evaluate(window, list(written))[: self.vocabulary].float().cpu().numpy()
+        ln_weights[~self.windows.valid(tuple(int(token) for token in tokens[1:]))] = -np.inf
+        return ln_weights
 
     def walk(self, walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
         return lm.stepwise(self.ln_weights, walks)

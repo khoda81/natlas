@@ -10,7 +10,7 @@
     "prebuild": "bun run core",
     "build": "tsc --noEmit && rm -rf dist && bun build ./index.html --outdir dist --minify && cp -r public/. dist/ && mkdir -p dist/generated && cp src/core/generated/natlas_core_bg.wasm dist/generated/",
     "pretest": "bun run core",
-    "test": "bun test && cargo test --manifest-path core/Cargo.toml && uv run tests/server_test.py",
+    "test": "bun test && cargo test --manifest-path core/Cargo.toml && uv run tests/server_test.py && uv run tests/scribe_test.py",
     "pretypecheck": "bun run core",
     "typecheck": "tsc --noEmit",
     "prebench": "bun run core",

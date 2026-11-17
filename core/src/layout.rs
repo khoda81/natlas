@@ -634,6 +634,13 @@ impl Layout<'_> {
                             .min((skip - r.rank()).saturating_sub(1) as usize)
                             .max(at);
                     }
+                    // Those before the last lie within `merge` of the top,
+                    // so only the last can be thick: one that is is drawn
+                    // as itself. Heaviest first, none after a thin one is.
+                    let (y0, y1) = heights.item(Item::Child { run, at: end });
+                    if at < end && self.merge <= y1 - y0 {
+                        end -= 1;
+                    }
                     let ln_mass = r.ln_mass(at, end + 1);
                     if self.lens.p == self.lens.q {
                         ln_known = ln_add(ln_known, ln_mass);
@@ -1240,6 +1247,30 @@ mod tests {
         for pair in bands.windows(2) {
             assert_eq!(pair[1].y0, pair[0].y1);
         }
+    }
+
+    #[test]
+    fn a_band_stops_before_a_thick_child_in_any_order() {
+        // By branch: a heavy child, a child a tenth of a pixel tall, then
+        // one of 80 pixels whose top is within a pixel of the thin one's.
+        let mut tree = Tree::new(1);
+        let runs = vec![
+            listed(0, &[0], &[0.9], 0.0),
+            listed(1, &[1, 2], &[1e-4, 0.0999], 0.9),
+            Run::end_at(3),
+        ];
+        tree.insert(ROOT, 0, runs).unwrap();
+        let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
+        let thick = frame
+            .boxes
+            .iter()
+            .find(|b| b.branch == Some(2))
+            .expect("the thick child is drawn as itself");
+        near(thick.y1 - thick.y0, 0.0999);
+        assert!(frame
+            .boxes
+            .iter()
+            .any(|b| b.kind == BoxKind::Merged && b.count == 1));
     }
 
     #[test]

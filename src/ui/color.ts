@@ -1,6 +1,7 @@
-// Box colors. With p = q, color repeats the conditional weight on a one-hue
-// sequential ramp; otherwise it shows the per-slot log ratio ln(p / q) on a
-// blue-gray-red diverging ramp, red where q under-weights the slot.
+// Box colors. With p = q, every box has one fill, and its labels one ink:
+// width already shows the weight. Otherwise color shows the per-slot log
+// ratio ln(p / q) on a blue-gray-red diverging ramp, red where q
+// under-weights the slot.
 
 type Rgb = readonly [number, number, number];
 
@@ -10,7 +11,8 @@ export interface Scheme {
   inkMuted: string;
   inkOnDark: string;
   inkOnLight: string;
-  sequential: string[];
+  /** Every box's fill with p = q. */
+  tile: string;
   diverging: string[];
 }
 
@@ -20,7 +22,7 @@ const LIGHT: Scheme = {
   inkMuted: "#52514e",
   inkOnDark: "#f0efec",
   inkOnLight: "#0b0b0b",
-  sequential: ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#104281"],
+  tile: "#9ec5f4",
   diverging: ["#1c5cab", "#5598e7", "#b7d3f6", "#f0efec", "#f6c4c1", "#e34948", "#a92b2b"],
 };
 
@@ -30,7 +32,7 @@ const DARK: Scheme = {
   inkMuted: "#c3c2b7",
   inkOnDark: "#f0efec",
   inkOnLight: "#0b0b0b",
-  sequential: ["#0d366b", "#184f95", "#256abf", "#3987e5", "#6da7ec", "#9ec5f4"],
+  tile: "#256abf",
   diverging: ["#9ec5f4", "#5598e7", "#2f5f9e", "#383835", "#8a3535", "#e34948", "#f4a3a1"],
 };
 
@@ -57,35 +59,37 @@ function luminance([r, g, b]: Rgb): number {
   return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
 }
 
-/** Precomputed fills and matching label inks for one ramp. */
-class Ramp {
-  readonly fill: string[] = [];
-  readonly ink: string[] = [];
+/** A box's fill and the ink its label reads in. */
+export interface Tile {
+  fill: string;
+  ink: string;
+}
 
-  constructor(stops: string[], scheme: Scheme) {
-    const colors = stops.map(parse);
-    const inkFor = (rgb: Rgb) => (luminance(rgb) > 0.3 ? scheme.inkOnLight : scheme.inkOnDark);
-    for (let level = 0; level < LEVELS; level++) {
-      const position = (level / (LEVELS - 1)) * (colors.length - 1);
-      const index = Math.min(colors.length - 2, Math.floor(position));
-      const rgb = mix(colors[index]!, colors[index + 1]!, position - index);
-      this.fill.push(css(rgb));
-      this.ink.push(inkFor(rgb));
-    }
-  }
-
-  level(t: number): number {
-    return Math.round(Math.min(1, Math.max(0, t)) * (LEVELS - 1));
-  }
+function tileOf(rgb: Rgb, scheme: Scheme): Tile {
+  return { fill: css(rgb), ink: luminance(rgb) > 0.3 ? scheme.inkOnLight : scheme.inkOnDark };
 }
 
 export class Palette {
-  readonly sequential: Ramp;
-  readonly diverging: Ramp;
+  private readonly flat: Tile;
+  /** The diverging ramp's tiles, precomputed at LEVELS steps. */
+  private readonly ramp: Tile[] = [];
 
   constructor(readonly scheme: Scheme) {
-    this.sequential = new Ramp(scheme.sequential, scheme);
-    this.diverging = new Ramp(scheme.diverging, scheme);
+    this.flat = tileOf(parse(scheme.tile), scheme);
+    const colors = scheme.diverging.map(parse);
+    for (let level = 0; level < LEVELS; level++) {
+      const position = (level / (LEVELS - 1)) * (colors.length - 1);
+      const index = Math.min(colors.length - 2, Math.floor(position));
+      this.ramp.push(tileOf(mix(colors[index]!, colors[index + 1]!, position - index), scheme));
+    }
+  }
+
+  /** A box's tile: the one fill with p = q, else its place on the
+   * diverging ramp in ln(p / q), saturating at ±DIVERGING_NATS. */
+  tile(p: number, q: number, equal: boolean): Tile {
+    if (equal) return this.flat;
+    const t = 0.5 + Math.log(p / q) / (2 * DIVERGING_NATS);
+    return this.ramp[Math.round(Math.min(1, Math.max(0, t)) * (LEVELS - 1))]!;
   }
 
   static current(): Palette {
@@ -95,13 +99,5 @@ export class Palette {
   }
 }
 
-/** Conditional weights shown in full color down to e^-SEQUENTIAL_NATS. */
-export const SEQUENTIAL_NATS = 7;
 /** Log ratios saturate at ±DIVERGING_NATS. */
 export const DIVERGING_NATS = 3;
-
-/** Ramp position of a slot: sequential in ln p, or diverging in ln(p / q). */
-export function rampPosition(p: number, q: number, equal: boolean): number {
-  if (equal) return 1 + Math.log(p) / SEQUENTIAL_NATS;
-  return 0.5 + Math.log(p / q) / (2 * DIVERGING_NATS);
-}

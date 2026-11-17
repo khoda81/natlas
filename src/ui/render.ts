@@ -1,7 +1,7 @@
 // Canvas 2D drawing of one laid-out frame.
 
 import { decimalTicks, layoutTicks } from "@qbar/qbar";
-import { type Palette, rampPosition } from "./color";
+import type { Palette } from "./color";
 import type { Box, Camera, Frame, Lens, Selection, Viewport } from "../core/layout";
 import type { NodeId } from "../core/tree";
 import type { Glyph, Mark, Timeline } from "../readings/reading";
@@ -142,7 +142,6 @@ export function draw(
   if (textWidths.get(ctx)?.scale !== scale) textWidths.set(ctx, { scale, widths: new Map() });
   const { scheme } = palette;
   const equal = lens.p === lens.q;
-  const ramp = equal ? palette.sequential : palette.diverging;
 
   ctx.fillStyle = scheme.surface;
   ctx.fillRect(0, 0, view.width, view.height + RULER_HEIGHT);
@@ -162,7 +161,7 @@ export function draw(
     if (box.kind === "merged") {
       const start = i;
       while (i + 1 < frame.boxes.length && joined(frame.boxes[i]!, frame.boxes[i + 1]!)) i++;
-      tail(ctx, frame.boxes, start, i, cam, view, equal, ramp, scale);
+      tail(ctx, frame.boxes, start, i, cam, view, (box) => palette.tile(box.p, box.q, equal).fill, scale);
       continue;
     }
 
@@ -170,10 +169,9 @@ export function draw(
     // only its label shows. One with an estimate is drawn as a silhouette.
     let ink = scheme.inkMuted;
     if (box.kind !== "gap" || Number.isFinite(box.x1)) {
-      // With p = q, a gap's q estimates a typical child's weight.
-      const level = ramp.level(rampPosition(equal ? box.q : box.p, box.q, equal));
-      ink = ramp.ink[level]!;
-      ctx.fillStyle = ramp.fill[level]!;
+      const tile = palette.tile(box.p, box.q, equal);
+      ink = tile.ink;
+      ctx.fillStyle = tile.fill;
       // A separator is the box's own last column and row of pixels, left
       // as the background. No other box shows on them.
       const separator = box.kind !== "gap" && GAP_MIN <= width && GAP_MIN <= height ? 1 / scale : 0;
@@ -360,8 +358,7 @@ function tail(
   end: number,
   cam: Camera,
   view: Viewport,
-  equal: boolean,
-  ramp: Palette["sequential"],
+  fill: (box: Box) => string,
   scale: number,
 ): void {
   const first = screenRect(boxes[start]!, cam, view);
@@ -370,7 +367,6 @@ function tail(
   // keep the measured contour and color boundaries at full precision.
   const edges = pixelRect({ ...first, y1: bottom }, scale);
   if (edges.y1 <= edges.y0) return;
-  const fill = (box: Box) => ramp.fill[ramp.level(rampPosition(box.p, box.q, equal))]!;
   const initial = fill(boxes[start]!);
   let previous = initial;
   let gradient: CanvasGradient | null = null;

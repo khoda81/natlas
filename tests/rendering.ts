@@ -1,7 +1,7 @@
 // Real Canvas pixel checks, served by scripts/check-rendering.ts.
 import { layout, pick, top, type Box, type Frame } from "../src/core/layout";
 import { IntervalTree, ROOT } from "../src/core/tree";
-import { Palette, rampPosition } from "../src/ui/color";
+import { Palette } from "../src/ui/color";
 import { draw, NATS, RULER_HEIGHT } from "../src/ui/render";
 import { answer, digits, run } from "./build";
 
@@ -53,7 +53,6 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       const ctx = canvas(dpr).getContext("2d")!;
       draw(ctx, frame, camera, view, lens, palette, state);
       const pixels = ctx.getImageData(Math.round(10 * dpr), 0, 1, Math.floor(view.height * dpr)).data;
-      const ramp = lens.p === lens.q ? palette.sequential : palette.diverging;
       let index = 0, error = 0;
       for (let row = 2; row < view.height * dpr - 2; row++) {
         const top = row / dpr / view.height, bottom = (row + 1) / dpr / view.height;
@@ -61,7 +60,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
         const colors: number[][] = [];
         for (let i = index; i < frame.boxes.length && frame.boxes[i]!.y0 < bottom; i++) {
           const box = frame.boxes[i]!;
-          colors.push(rgb(ramp.fill[ramp.level(rampPosition(box.p, box.q, lens.p === lens.q))]!));
+          colors.push(rgb(palette.tile(box.p, box.q, lens.p === lens.q).fill));
         }
         // This column is fully covered. A pixel straddling colors may mix
         // them, but must not include the background. Allow one channel step
@@ -91,7 +90,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const c = canvas(dpr), ctx = c.getContext("2d")!;
     draw(ctx, frame, cam(), view, { p: 0, q: 0 }, palette, state);
     const pixels = ctx.getImageData(0, 0, c.width, c.height).data;
-    const color = rgb(palette.sequential.fill[palette.sequential.level(rampPosition(0.5, 0.5, true))]!);
+    const color = rgb(palette.tile(0.5, 0.5, true).fill);
     const background = rgb(palette.scheme.surface);
     const difference = (x: number, y: number, expected: number[]) =>
       Math.max(...expected.map((v, i) => Math.abs(v - pixels[(y * c.width + x) * 4 + i]!)));
@@ -110,8 +109,8 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const glyph = () => ({ text: "1.20 s", mark: "time" as const, time: { from: 50, to: 120 } });
     const c = canvas(dpr), ctx = c.getContext("2d")!;
     draw(ctx, { boxes: [box] } as Frame, cam(), view, { p: 0, q: 0 }, palette, { ...state, glyph, timeline });
-    const level = palette.sequential.level(rampPosition(0.5, 0.5, true));
-    const fill = rgb(palette.sequential.fill[level]!), ink = rgb(palette.sequential.ink[level]!);
+    const tile = palette.tile(0.5, 0.5, true);
+    const fill = rgb(tile.fill), ink = rgb(tile.ink);
     const shaded = fill.map((v, i) => v + 0.28 * (ink[i]! - v));
     const pixel = (x: number) => ctx.getImageData(Math.floor(x * dpr), Math.floor(40 * dpr), 1, 1).data;
     const difference = (x: number, expected: number[]) => Math.max(...expected.map((v, i) => Math.abs(v - pixel(x)[i]!)));
@@ -137,7 +136,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       const separator = drawn !== undefined && 4 <= (drawn.y1 - drawn.y0) * view.height
         && Math.ceil(drawn.y1 * view.height * dpr) - 1 === top + row;
       const expected = rgb(drawn === undefined || separator ? palette.scheme.surface
-        : palette.diverging.fill[palette.diverging.level(rampPosition(box.p, box.q, false))]!);
+        : palette.tile(box.p, box.q, false).fill);
       for (let channel = 0; channel < 3; channel++) {
         error = Math.max(error, Math.abs(expected[channel]! - pixels[row * 4 + channel]!));
       }

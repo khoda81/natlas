@@ -21,7 +21,7 @@ import { IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
 import { glide, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, serializeView, viewKey } from "./view-state";
-import { DIVERGING_NATS, Palette, SEQUENTIAL_NATS } from "./color";
+import { DIVERGING_NATS, Palette } from "./color";
 import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, rulerCaption, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
@@ -1123,12 +1123,12 @@ export class App {
   }
 
   private updateLegend(): void {
+    // With p = q, color says nothing: every box has one fill.
     const equal = this.lens.p === this.lens.q;
-    const stops = equal ? this.palette.scheme.sequential : this.palette.scheme.diverging;
-    const gradient = `linear-gradient(to right, ${stops.join(", ")})`;
-    const [low, high] = equal
-      ? [`p ≤ e^−${SEQUENTIAL_NATS}`, "p = 1"]
-      : [`p/q ≤ e^−${DIVERGING_NATS}`, `p/q ≥ e^${DIVERGING_NATS}`];
+    this.legend.hidden = equal;
+    if (equal) return;
+    const gradient = `linear-gradient(to right, ${this.palette.scheme.diverging.join(", ")})`;
+    const [low, high] = [`p/q ≤ e^−${DIVERGING_NATS}`, `p/q ≥ e^${DIVERGING_NATS}`];
     this.legend.innerHTML = "";
     const swatch = document.createElement("span");
     swatch.className = "swatch";
@@ -1138,9 +1138,7 @@ export class App {
     const highText = document.createElement("span");
     highText.textContent = high;
     this.legend.append(lowText, swatch, highText);
-    this.legend.title = equal
-      ? "Color repeats each slot's conditional probability. Area is entropy."
-      : "Color is ln(p/q) per slot: red where q under-weights it. Area is cross-entropy.";
+    this.legend.title = "Color is ln(p/q) per slot: red where q under-weights it. Area is cross-entropy.";
   }
 
   // Remember the camera as it is: its point is named by the deepest node

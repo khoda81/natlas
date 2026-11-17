@@ -108,22 +108,27 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     results.push({ name: "strokes outline each node's children, never between siblings", dpr, phase, error });
   }
 
-  // A time box is a window onto the timeline drawn across the same pixels:
-  // the time its event moves over shaded, a line where it lands.
+  // A node's time branches are one CDF on the timeline drawn across the same
+  // pixels: at the time each lands on, straight across a band between them,
+  // and the time they move over, from where the path is, shaded.
   {
-    const box: Box = { node: ROOT, rank: 0, count: 1, kind: "leaf", branch: 0,
-      p: 0.5, q: 0.5, lnMass: Math.log(0.5), x0: 10 / 23, x1: 200 / 23, y0: 10 / view.height, y1: 80 / view.height };
+    const at = (rank: number, branch: number | null, y0: number, y1: number): Box => ({ node: ROOT, rank, count: 1,
+      kind: branch === null ? "merged" : "leaf", branch, p: 0.5, q: 0.5, lnMass: Math.log(0.5),
+      x0: 10 / 23, x1: 200 / 23, y0: y0 / view.height, y1: y1 / view.height });
+    const frame = { boxes: [at(0, 0, 10, 40), at(1, null, 40, 50), at(2, 2, 50, 80)] } as Frame;
     const timeline = { x: (time: number) => time, left: 0, right: view.width };
-    const glyph = () => ({ text: "1.20 s", mark: "time" as const, time: { from: 50, to: 120 } });
+    const glyph = (_: bigint, branch: number) => ({ text: "", mark: "time" as const, time: { from: 20, to: branch === 0 ? 60 : 140 } });
     const c = canvas(dpr), ctx = c.getContext("2d")!;
-    draw(ctx, { boxes: [box] } as Frame, cam(), view, { p: 0, q: 0 }, palette, { ...state, glyph, timeline });
+    draw(ctx, frame, cam(), view, { p: 0, q: 0 }, palette, { ...state, glyph, timeline });
     const tile = palette.tile(0.5, 0.5, true);
     const fill = rgb(tile.fill), ink = rgb(tile.ink);
     const shaded = fill.map((v, i) => v + 0.28 * (ink[i]! - v));
-    const pixel = (x: number) => ctx.getImageData(Math.floor(x * dpr), Math.floor(40 * dpr), 1, 1).data;
-    const difference = (x: number, expected: number[]) => Math.max(...expected.map((v, i) => Math.abs(v - pixel(x)[i]!)));
-    const error = Math.max(difference(30, fill), difference(85, shaded), difference(120, ink), difference(160, fill));
-    results.push({ name: "a time box is a window onto the timeline", dpr, phase: 0, error });
+    const pixel = (x: number, y: number) => ctx.getImageData(Math.floor(x * dpr), Math.floor(y * dpr), 1, 1).data;
+    const difference = (x: number, y: number, expected: number[]) => Math.max(...expected.map((v, i) => Math.abs(v - pixel(x, y)[i]!)));
+    // Halfway down the band, the line is halfway from 60 to 140.
+    const error = Math.max(difference(40, 25, shaded), difference(60, 25, ink), difference(100, 25, fill),
+      difference(50, 45, shaded), difference(130, 45, fill), difference(140, 65, ink), difference(170, 65, fill));
+    results.push({ name: "time branches are one CDF on the timeline", dpr, phase: 0, error });
   }
 
   // Thin children between a bordered one and the background: each physical

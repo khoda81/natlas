@@ -61,10 +61,8 @@ const MARK_GAP = 0.3;
 const MORE: Glyph = { text: "…" };
 /** How strongly a time window shades the time its event moves over. */
 const TIME_ALPHA = 0.28;
-/** A time window's line where its event lands, and the arrow pointing to it
- * from the window's edge where it lands outside, in CSS pixels. */
+/** The width of a time CDF's line, in CSS pixels. */
 const TIME_LINE = 2;
-const TIME_ARROW = 5;
 export const RULER_HEIGHT = 22;
 const RULER_SCALE = decimalTicks();
 /** Ruler marks fade in over this much room to their neighbours of the same step. */
@@ -148,11 +146,11 @@ export function draw(
   ctx.textBaseline = "middle";
 
   // Each node's children as drawn, whose outline is stroked over them.
-  const children = new Map<NodeId, ScreenRect[]>();
+  const children = new Map<NodeId, Drawn[]>();
   const drawn = (box: Box, rect: ScreenRect) => {
-    const rects = children.get(box.node);
-    if (rects === undefined) children.set(box.node, [rect]);
-    else rects.push(rect);
+    const boxes = children.get(box.node);
+    if (boxes === undefined) children.set(box.node, [{ box, rect }]);
+    else boxes.push({ box, rect });
   };
   const labels: { box: Box; rect: ScreenRect; ink: string }[] = [];
   let visible = false;
@@ -185,6 +183,12 @@ export function draw(
     }
 
     if (box.count !== 0) labels.push({ box, rect, ink });
+  }
+  for (const boxes of children.values()) boxes.sort((a, b) => a.rect.y0 - b.rect.y0);
+  if (state.timeline !== null) {
+    const timeline = state.timeline;
+    timeCdfs(ctx, children, timeline, view, (box) => (box.branch === null ? undefined : state.glyph(box.node, box.branch).time),
+      (box) => palette.tile(box.p, box.q, equal).ink);
   }
   outlines(ctx, children, scale, scheme.surface);
 
@@ -238,11 +242,8 @@ export function draw(
   // a box carries come first, framed and fainter, and a label wraps between
   // its pieces where lines make it larger.
   for (const { box, rect, ink } of labels) {
-    const glyph = box.branch === null ? null : state.glyph(box.node, box.branch);
-    if (glyph?.time !== undefined && state.timeline !== null) {
-      timeWindow(ctx, rect, view, glyph.time, state.timeline, ink);
-      continue;
-    }
+    // A time branch reads as its node's CDF on the timeline.
+    if (box.branch !== null && windowed(state.glyph(box.node, box.branch))) continue;
     const fit = fitOf(box);
     if (fit === null) continue;
     const { lines, size, vertical } = fit;
@@ -295,53 +296,75 @@ export function draw(
   ruler(ctx, cam, view, state.units, palette);
 }
 
-/** A box as a window onto a timeline drawn above it, across the same
- * pixels: the time its event moves over shaded, and a line where it lands,
- * or an arrow at the window's edge toward where it lands outside. */
-function timeWindow(
+/** A box drawn, and where on screen. */
+interface Drawn {
+  box: Box;
+  rect: ScreenRect;
+}
+
+/** Each node's time branches as one CDF on the timeline drawn above them,
+ * across the same pixels: down a run of them, the line stands at the time
+ * each lands on, and crosses the bands of children too thin to draw between
+ * known ones straight; the time they move over, from where the path is, is
+ * shaded. Clipped to their boxes: a window onto the timeline. ``children``
+ * are each node's in order down. */
+function timeCdfs(
   ctx: CanvasRenderingContext2D,
-  rect: ScreenRect,
-  view: Viewport,
-  time: { from: number; to: number },
+  children: Map<NodeId, Drawn[]>,
   timeline: Timeline,
-  ink: string,
+  view: Viewport,
+  timeOf: (box: Box) => { from: number; to: number } | undefined,
+  inkOf: (box: Box) => string,
 ): void {
-  // The box's own pixels, short of its separator, as labels have them.
-  const left = rect.x0;
-  const right = rect.x1 - 2;
-  const top = rect.y0;
-  const bottom = rect.y1;
-  if (right <= left || bottom <= top) return;
-  const from = timeline.x(time.from);
-  const to = timeline.x(time.to);
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(left, top, right - left, bottom - top);
-  ctx.clip();
-  ctx.fillStyle = ink;
   // Far-off coordinates lose precision and can stall rasterizing.
-  const shaded0 = Math.max(left, Math.min(from, to));
-  const shaded1 = Math.min(right, Math.max(from, to));
-  if (shaded0 < shaded1) {
-    ctx.globalAlpha = TIME_ALPHA;
-    ctx.fillRect(shaded0, top, shaded1 - shaded0, bottom - top);
-    ctx.globalAlpha = 1;
+  const x = (time: number) => within(timeline.x(time), -OVERSCAN, view.width + OVERSCAN);
+  for (const drawn of children.values()) {
+    let first = 0;
+    while (first < drawn.length) {
+      const start = timeOf(drawn[first]!.box);
+      if (start === undefined) {
+        first++;
+        continue;
+      }
+      // Through the last time branch before another branch: bands and gaps
+      // between them are part of the run.
+      let last = first;
+      for (let i = first + 1; i < drawn.length; i++) {
+        const box = drawn[i]!.box;
+        if (timeOf(box) !== undefined) last = i;
+        else if (box.branch !== null) break;
+      }
+      const run = drawn.slice(first, last + 1);
+      const line: [number, number][] = [];
+      for (const { box, rect } of run) {
+        const time = timeOf(box);
+        if (time !== undefined) line.push([x(time.to), rect.y0], [x(time.to), rect.y1]);
+      }
+      const from = x(start.from);
+      const [top, bottom] = [run[0]!.rect.y0, run[run.length - 1]!.rect.y1];
+      ctx.save();
+      ctx.beginPath();
+      for (const { rect } of run) ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
+      ctx.clip();
+      const ink = inkOf(run[0]!.box);
+      ctx.fillStyle = ctx.strokeStyle = ink;
+      ctx.beginPath();
+      ctx.moveTo(from, top);
+      for (const [px, py] of line) ctx.lineTo(px, py);
+      ctx.lineTo(from, bottom);
+      ctx.closePath();
+      ctx.globalAlpha = TIME_ALPHA;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      line.forEach(([px, py], i) => (i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py)));
+      ctx.lineWidth = TIME_LINE;
+      ctx.lineJoin = "round";
+      ctx.stroke();
+      ctx.restore();
+      first = last + 1;
+    }
   }
-  if (left <= to && to <= right) {
-    ctx.fillRect(Math.round(to) - TIME_LINE / 2, top, TIME_LINE, bottom - top);
-  } else {
-    const size = Math.min(TIME_ARROW, (bottom - top) / 2, (right - left) / 2);
-    // In the middle of the window's part in view.
-    const middle = (Math.max(top, 0) + Math.min(bottom, view.height)) / 2;
-    const tip = to < left ? left + 1 : right - 1;
-    const back = to < left ? tip + size : tip - size;
-    ctx.beginPath();
-    ctx.moveTo(tip, middle);
-    ctx.lineTo(back, middle - size);
-    ctx.lineTo(back, middle + size);
-    ctx.fill();
-  }
-  ctx.restore();
 }
 
 /** The outline of each node's children taken together, a physical pixel of
@@ -351,12 +374,12 @@ function timeWindow(
  * unstroked: where their widths part, the outline already parts them. The
  * strokes are a box's own last column and row, or the row above its top,
  * so a stroke shared by neighbours is one pixel. */
-function outlines(ctx: CanvasRenderingContext2D, children: Map<NodeId, ScreenRect[]>, scale: number, color: string): void {
+function outlines(ctx: CanvasRenderingContext2D, children: Map<NodeId, Drawn[]>, scale: number, color: string): void {
   const pixel = 1 / scale;
   const edge = (at: number) => Math.ceil(at * scale) / scale;
   ctx.fillStyle = color;
-  for (const rects of children.values()) {
-    rects.sort((a, b) => a.y0 - b.y0);
+  for (const drawn of children.values()) {
+    const rects = drawn.map(({ rect }) => rect);
     rects.forEach((rect, i) => {
       const [x0, x1, y0, y1] = [edge(rect.x0), edge(rect.x1), edge(rect.y0), edge(rect.y1)];
       ctx.fillRect(x1 - pixel, y0, pixel, y1 - y0);

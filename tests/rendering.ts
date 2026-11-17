@@ -81,11 +81,13 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const box: Box = { node: ROOT, rank: 0, count: 1, kind: "leaf", branch: 0,
       p: 0.5, q: 0.5, lnMass: Math.log(0.5), x0: 10 / 23, x1: right / 23,
       y0: 10 / view.height, y1: bottom / view.height };
-    // The separator is the box's own last column and row of pixels; its
-    // neighbours below and to the right fill the pixels after it.
-    const frame = { boxes: [box,
-      { ...box, rank: 1, branch: 1, y0: box.y1, y1: 150 / dpr / view.height },
+    // A box's separators are its own last column of pixels, and its last
+    // row where it is its node's last child; its neighbours below and to
+    // the right fill the pixels after them. Siblings meet unseparated.
+    const sibling = { ...box, rank: 1, branch: 1, y0: box.y1, y1: 150 / dpr / view.height };
+    const frame = { boxes: [box, sibling,
       { ...box, node: 1n, x0: box.x1, x1: (220 / dpr) / 23 },
+      { ...sibling, node: 2n, y0: sibling.y1, y1: 200 / dpr / view.height },
     ] } as Frame;
     const c = canvas(dpr), ctx = c.getContext("2d")!;
     draw(ctx, frame, cam(), view, { p: 0, q: 0 }, palette, state);
@@ -95,9 +97,11 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const difference = (x: number, y: number, expected: number[]) =>
       Math.max(...expected.map((v, i) => Math.abs(v - pixels[(y * c.width + x) * 4 + i]!)));
     const x = Math.ceil(right * dpr) - 1, y = Math.ceil(bottom * dpr) - 1;
-    const error = Math.max(difference(30, y - 1, color), difference(30, y, background), difference(30, y + 1, color),
+    // Where the sibling's last row falls, as its edge rounds to physical pixels.
+    const last = Math.ceil(sibling.y1 * view.height * dpr) - 1;
+    const error = Math.max(difference(30, y, color), difference(30, last, background), difference(30, last + 1, color),
       difference(x - 1, 30, color), difference(x, 30, background), difference(x + 1, 30, color));
-    results.push({ name: "separator is the box's last physical pixel", dpr, phase, error });
+    results.push({ name: "separators are a box's last column and a node's last row of pixels", dpr, phase, error });
   }
 
   // A time box is a window onto the timeline drawn across the same pixels:
@@ -133,7 +137,8 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       const y = (top + row) / dpr;
       const box = pick(thin, comparison, frame, camera, view, column / dpr, y, 1 / dpr)!.box;
       const drawn = frame.boxes.find(b => b.node === box.node && b.branch === box.branch);
-      const separator = drawn !== undefined && 4 <= (drawn.y1 - drawn.y0) * view.height
+      const last = drawn !== undefined && drawn.y1 === Math.max(...frame.boxes.filter(b => b.node === drawn.node).map(b => b.y1));
+      const separator = last && 4 <= (drawn.y1 - drawn.y0) * view.height
         && Math.ceil(drawn.y1 * view.height * dpr) - 1 === top + row;
       const expected = rgb(drawn === undefined || separator ? palette.scheme.surface
         : palette.tile(box.p, box.q, false).fill);

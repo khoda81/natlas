@@ -55,6 +55,7 @@ const TOKEN_HALF = 0.6;
 /** How far apart, in ems, the lines of a wrapped label are: frames clear each other. */
 const LABEL_LINE = 1.4;
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+/** Boxes at least this many CSS pixels across keep a separator that way. */
 const GAP_MIN = 4;
 /** A mark's width, and the space after it, in ems. */
 const MARK_WIDTH = 0.8;
@@ -148,6 +149,10 @@ export function draw(
   ctx.font = FONT;
   ctx.textBaseline = "middle";
 
+  // Where each node's children end in view: the last one's bottom meets the
+  // children of the node's sibling below.
+  const ends = new Map<NodeId, number>();
+  for (const box of frame.boxes) ends.set(box.node, Math.max(ends.get(box.node) ?? -Infinity, box.y1));
   const labels: { box: Box; rect: ScreenRect; ink: string }[] = [];
   let visible = false;
   for (let i = 0; i < frame.boxes.length; i++) {
@@ -172,11 +177,14 @@ export function draw(
       const tile = palette.tile(box.p, box.q, equal);
       ink = tile.ink;
       ctx.fillStyle = tile.fill;
-      // A separator is the box's own last column and row of pixels, left
-      // as the background. No other box shows on them.
-      const separator = box.kind !== "gap" && GAP_MIN <= width && GAP_MIN <= height ? 1 / scale : 0;
+      // Separators are the box's own last column and row of pixels, left as
+      // the background; no other box shows on them. The column parts a
+      // child from its children. The row parts only a node's last child
+      // from its cousins below: siblings part where their widths do.
+      const column = box.kind !== "gap" && GAP_MIN <= width ? 1 / scale : 0;
+      const row = box.y1 === ends.get(box.node) && GAP_MIN <= height ? 1 / scale : 0;
       const pixels = pixelRect(rect, scale);
-      ctx.fillRect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0 - separator, pixels.y1 - pixels.y0 - separator);
+      ctx.fillRect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0 - column, pixels.y1 - pixels.y0 - row);
     }
 
     if (box.count !== 0) labels.push({ box, rect, ink });

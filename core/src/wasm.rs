@@ -386,6 +386,23 @@ impl LayoutFrame {
         packed
     }
 
+    /// The known children of `node` that reach into the view, however thin:
+    /// three f64s each, its branch and its top and bottom in view heights.
+    pub fn known(
+        &self,
+        tree: &Tree,
+        p: usize,
+        q: usize,
+        node: u64,
+    ) -> std::result::Result<Vec<f64>, JsError> {
+        let known =
+            layout::known(&tree.inner, Lens { p, q }, &self.inner, node).map_err(js_error)?;
+        Ok(known
+            .into_iter()
+            .flat_map(|(branch, y0, y1)| [f64::from(branch), y0, y1])
+            .collect())
+    }
+
     #[wasm_bindgen(js_name = originTop)]
     pub fn origin_top(&self) -> f64 {
         self.inner.origin_top

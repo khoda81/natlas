@@ -779,6 +779,35 @@ pub(crate) fn layout_into(
     Ok(context.frame)
 }
 
+/// The known children of a node the frame laid out, those that reach into
+/// the view, top to bottom: each one's branch and its edges in view heights,
+/// however thin, even where the frame draws it in a band.
+pub fn known(
+    tree: &Tree,
+    lens: Lens,
+    frame: &Frame,
+    node: NodeId,
+) -> Result<Vec<(Branch, f64, f64)>> {
+    let (Some(placed), Some(d)) = (frame.placed.get(&node), tree.distribution(node, lens.p)?)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut heights = Heights::new(placed, d);
+    let mut known = Vec::new();
+    let mut item = d.locate(&placed.at(0.0));
+    while let Some(found) = item {
+        let (y0, y1) = heights.item(found);
+        if 1.0 <= y0 {
+            break;
+        }
+        if let Item::Child { run, at } = found {
+            known.push((d.runs()[run].branch(at), y0, y1));
+        }
+        item = d.next(found);
+    }
+    Ok(known)
+}
+
 /// What the camera looks at, as a session's view of `rows` pixel rows: the
 /// deepest node on the camera's path that holds the whole view, the view's
 /// top in it, exact as a frame places it, ln of the view's height in it, and
@@ -1172,6 +1201,11 @@ mod tests {
             .iter()
             .find(|b| b.kind == BoxKind::Merged)
             .expect("the light children merge");
+        // Each of them is still known, however thin, with its own edges.
+        let thin = known(&tree, LENS, &frame, ROOT).unwrap();
+        assert_eq!(thin.len(), 5);
+        near(thin[2].1, 0.988);
+        near(thin[4].2, 1.0);
         let area: f64 = weights_[2..].iter().map(|w| -w * w.ln()).sum();
         assert!((band.ln_mass.exp() * (band.x1 - band.x0) - area).abs() < 1e-12);
         assert_eq!(band.count, 3);

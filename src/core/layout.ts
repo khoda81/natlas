@@ -86,6 +86,13 @@ export interface Path {
 }
 
 const KINDS: BoxKind[] = ["node", "leaf", "gap", "merged"];
+
+/** A known child of a laid-out node: its branch and its edges in view heights. */
+export interface Known {
+  branch: Branch;
+  y0: number;
+  y1: number;
+}
 const boxBuffers: Box[][] = [];
 
 /** Rust owns the full frame. Only visible rectangles cross the Wasm boundary. */
@@ -106,6 +113,15 @@ export class Frame {
       b.x0 = packed[i + 7]!; b.x1 = packed[i + 8]!; b.y0 = packed[i + 9]!; b.y1 = packed[i + 10]!;
     }
     this.boxes.length = packed.length / 11;
+  }
+
+  /** The known children of ``node`` that reach into the view, top to
+   * bottom, however thin: even those drawn inside a band. */
+  known(tree: IntervalTree, lens: Lens, node: NodeId): Known[] {
+    const packed = this.raw.known(tree.raw, lens.p, lens.q, node);
+    const known: Known[] = [];
+    for (let i = 0; i < packed.length; i += 3) known.push({ branch: packed[i]!, y0: packed[i + 1]!, y1: packed[i + 2]! });
+    return known;
   }
 
   get originTop(): number { return this.raw.originTop(); }

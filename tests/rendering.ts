@@ -7,7 +7,7 @@ import { answer, digits, run } from "./build";
 
 const view = { width: 270, height: 340 };
 const palette = Palette.current();
-const state = { hover: null, ancestors: new Set<string>(), units: NATS, glyph: () => ({ text: "" }), child: (node: bigint, branch: number) => (node << 20n) + BigInt(branch) + 1n, note: null, timeline: null };
+const state = { hover: null, ancestors: new Set<string>(), units: NATS, glyph: () => ({ text: "" }), child: (node: bigint, branch: number) => (node << 20n) + BigInt(branch) + 1n, note: null, timeline: null, known: () => [] };
 const cam = (phase = 0) => ({ origin: ROOT, x: 0, k: 23, anchor: top(), a: phase / view.height });
 const rgb = (color: string) => color.startsWith("#")
   ? color.slice(1).match(/../g)!.map(c => Number.parseInt(c, 16))
@@ -117,17 +117,21 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       x0: 10 / 23, x1: 200 / 23, y0: y0 / view.height, y1: y1 / view.height });
     const frame = { boxes: [at(0, 0, 10, 40), at(1, null, 40, 50), at(2, 2, 50, 80)] } as Frame;
     const timeline = { x: (time: number) => time, left: 0, right: view.width };
-    const glyph = (_: bigint, branch: number) => ({ text: "", mark: "time" as const, time: { from: 20, to: branch === 0 ? 60 : 140 } });
+    const glyph = (_: bigint, branch: number) => ({ text: "", mark: "time" as const, time: { from: 20, to: [60, 100, 140][branch]! } });
     const c = canvas(dpr), ctx = c.getContext("2d")!;
-    draw(ctx, frame, cam(), view, { p: 0, q: 0 }, palette, { ...state, glyph, timeline });
+    // The band holds a known time branch too thin to draw, landing at 100.
+    const known = () => [{ branch: 0, y0: 10 / view.height, y1: 40 / view.height },
+      { branch: 1, y0: 44 / view.height, y1: 46 / view.height }, { branch: 2, y0: 50 / view.height, y1: 80 / view.height }];
+    draw(ctx, frame, cam(), view, { p: 0, q: 0 }, palette, { ...state, glyph, timeline, known });
     const tile = palette.tile(0.5, 0.5, true);
     const fill = rgb(tile.fill), ink = rgb(tile.ink);
     const shaded = fill.map((v, i) => v + 0.28 * (ink[i]! - v));
     const pixel = (x: number, y: number) => ctx.getImageData(Math.floor(x * dpr), Math.floor(y * dpr), 1, 1).data;
     const difference = (x: number, y: number, expected: number[]) => Math.max(...expected.map((v, i) => Math.abs(v - pixel(x, y)[i]!)));
-    // Halfway down the band, the line is halfway from 60 to 140.
+    // Within the band, the line stands at the known branch inside it.
     const error = Math.max(difference(40, 25, shaded), difference(60, 25, ink), difference(100, 25, fill),
-      difference(50, 45, shaded), difference(130, 45, fill), difference(140, 65, ink), difference(170, 65, fill));
+      difference(50, 45, shaded), difference(100, 45, ink), difference(130, 45, fill), difference(140, 65, ink),
+      difference(170, 65, fill));
     results.push({ name: "time branches are one CDF on the timeline", dpr, phase: 0, error });
   }
 

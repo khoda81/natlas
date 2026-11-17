@@ -2,7 +2,7 @@
 
 import { decimalTicks, layoutTicks } from "@qbar/qbar";
 import type { Palette } from "./color";
-import type { Box, Camera, Frame, Lens, Selection, Viewport } from "../core/layout";
+import type { Box, Camera, Frame, Known, Lens, Selection, Viewport } from "../core/layout";
 import type { NodeId } from "../core/tree";
 import type { Glyph, Mark, Timeline } from "../readings/reading";
 
@@ -30,6 +30,8 @@ export interface DrawState {
   /** Where the reading draws its time, in canvas pixels, while it does:
    * a box whose glyph moves time is a window onto it. */
   timeline: Timeline | null;
+  /** The known children of a laid-out node in view, however thin. */
+  known: (node: NodeId) => readonly Known[];
 }
 
 const FAMILY = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
@@ -187,7 +189,7 @@ export function draw(
   for (const boxes of children.values()) boxes.sort((a, b) => a.rect.y0 - b.rect.y0);
   if (state.timeline !== null) {
     const timeline = state.timeline;
-    timeCdfs(ctx, children, timeline, view, (box) => (box.branch === null ? undefined : state.glyph(box.node, box.branch).time),
+    timeCdfs(ctx, children, timeline, view, state.known, (node, branch) => state.glyph(node, branch).time,
       (box) => palette.tile(box.p, box.q, equal).ink);
   }
   outlines(ctx, children, scale, scheme.surface);
@@ -304,50 +306,55 @@ interface Drawn {
 
 /** Each node's time branches as one CDF on the timeline drawn above them,
  * across the same pixels: down a run of them, the line stands at the time
- * each lands on, and crosses the bands of children too thin to draw between
- * known ones straight; the time they move over, from where the path is, is
- * shaded. Clipped to their boxes: a window onto the timeline. ``children``
- * are each node's in order down. */
+ * each known one lands on, however thin, and crosses straight over the
+ * unknown ones between; the time they move over, from where the path is,
+ * is shaded. Clipped to their boxes and the bands among them: a window onto
+ * the timeline. ``children`` are each node's in order down. */
 function timeCdfs(
   ctx: CanvasRenderingContext2D,
   children: Map<NodeId, Drawn[]>,
   timeline: Timeline,
   view: Viewport,
-  timeOf: (box: Box) => { from: number; to: number } | undefined,
+  known: (node: NodeId) => readonly Known[],
+  timeOf: (node: NodeId, branch: number) => { from: number; to: number } | undefined,
   inkOf: (box: Box) => string,
 ): void {
   // Far-off coordinates lose precision and can stall rasterizing.
   const x = (time: number) => within(timeline.x(time), -OVERSCAN, view.width + OVERSCAN);
-  for (const drawn of children.values()) {
+  for (const [node, drawn] of children) {
+    // Where time can be drawn: the boxes of time branches, and bands.
+    const windows = drawn.filter(({ box }) => box.branch === null ? box.kind === "merged" : timeOf(node, box.branch) !== undefined);
+    if (windows.length === 0) continue;
+    const children = known(node);
     let first = 0;
-    while (first < drawn.length) {
-      const start = timeOf(drawn[first]!.box);
+    while (first < children.length) {
+      const start = timeOf(node, children[first]!.branch);
       if (start === undefined) {
         first++;
         continue;
       }
-      // Through the last time branch before another branch: bands and gaps
-      // between them are part of the run.
+      // A run of known time branches, up to the next known other branch.
       let last = first;
-      for (let i = first + 1; i < drawn.length; i++) {
-        const box = drawn[i]!.box;
-        if (timeOf(box) !== undefined) last = i;
-        else if (box.branch !== null) break;
-      }
-      const run = drawn.slice(first, last + 1);
+      while (last + 1 < children.length && timeOf(node, children[last + 1]!.branch) !== undefined) last++;
       const line: [number, number][] = [];
-      for (const { box, rect } of run) {
-        const time = timeOf(box);
-        if (time !== undefined) line.push([x(time.to), rect.y0], [x(time.to), rect.y1]);
+      for (let i = first; i <= last; i++) {
+        const { branch, y0, y1 } = children[i]!;
+        const to = x(timeOf(node, branch)!.to);
+        line.push([to, y0 * view.height], [to, y1 * view.height]);
       }
       const from = x(start.from);
-      const [top, bottom] = [run[0]!.rect.y0, run[run.length - 1]!.rect.y1];
+      const [top, bottom] = [line[0]![1], line[line.length - 1]![1]];
+      const shown = windows.filter(({ rect }) => top < rect.y1 && rect.y0 < bottom);
+      first = last + 1;
+      if (shown.length === 0) continue;
       ctx.save();
       ctx.beginPath();
-      for (const { rect } of run) ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
+      for (const { rect } of shown) ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
       ctx.clip();
-      const ink = inkOf(run[0]!.box);
-      ctx.fillStyle = ctx.strokeStyle = ink;
+      ctx.beginPath();
+      ctx.rect(-OVERSCAN, top, view.width + 2 * OVERSCAN, bottom - top);
+      ctx.clip();
+      ctx.fillStyle = ctx.strokeStyle = inkOf(shown[0]!.box);
       ctx.beginPath();
       ctx.moveTo(from, top);
       for (const [px, py] of line) ctx.lineTo(px, py);
@@ -362,7 +369,6 @@ function timeCdfs(
       ctx.lineJoin = "round";
       ctx.stroke();
       ctx.restore();
-      first = last + 1;
     }
   }
 }

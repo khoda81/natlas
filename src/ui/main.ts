@@ -215,7 +215,7 @@ export class App {
     const tree = new IntervalTree(dataset.measures.length);
     this.dataset = dataset;
     this.tree = tree;
-    this.reading = dataset.labels.read(tree);
+    this.reading = dataset.labels.read(tree, () => this.invalidate());
     this.link = new Link(tree, dataset.server);
     let failing = false;
     this.link.onError = (error) => {
@@ -547,7 +547,15 @@ export class App {
       }
     }
     const origin = this.originNote(tree);
+    // The reading's time, from the page's pixels to the canvas's.
+    const timeline = this.reading?.timeline?.() ?? null;
+    const canvasLeft = timeline === null ? 0 : this.canvas.getBoundingClientRect().left;
     draw(this.ctx, frame, this.cam, this.view, this.lens, this.palette, {
+      timeline: timeline && {
+        x: (time) => timeline.x(time) - canvasLeft,
+        left: timeline.left - canvasLeft,
+        right: timeline.right - canvasLeft,
+      },
       hover: this.hover,
       ancestors,
       units: this.units,

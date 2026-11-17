@@ -9,10 +9,24 @@ export interface Glyph {
   text: string;
   mark?: Mark;
   tint?: string;
+  /** Where the event moves time from and to, in the reading's time: what a
+   * timeline shows in place of the text. */
+  time?: { from: number; to: number };
+}
+
+/** Where a reading draws its time across the page. */
+export interface Timeline {
+  /** The client x of a time. */
+  x(time: number): number;
+  /** The client x range it draws. */
+  left: number;
+  right: number;
 }
 
 export interface Labels {
-  read(tree: IntervalTree): Reading;
+  /** ``changed`` is told when what glyphs show changes without the tree:
+   * a timeline that moved. */
+  read(tree: IntervalTree, changed: () => void): Reading;
 }
 
 export interface Reading {
@@ -22,6 +36,8 @@ export interface Reading {
   /** Plain text for editing/searching, for readers whose labels represent text. */
   text?(node: NodeId, branch: Branch | null): string;
   key?(event: KeyboardEvent): boolean;
+  /** Where its time is on the page now, while it shows it. */
+  timeline?(): Timeline | null;
 }
 
 /** Reader state after each node path, reconstructed from the nearest known ancestor. */

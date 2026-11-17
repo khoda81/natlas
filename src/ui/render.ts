@@ -4,7 +4,7 @@ import { decimalTicks, layoutTicks } from "@qbar/qbar";
 import { type Palette, rampPosition } from "./color";
 import type { Box, Camera, Frame, Lens, Selection, Viewport } from "../core/layout";
 import type { NodeId } from "../core/tree";
-import type { Glyph, Mark } from "../readings/reading";
+import type { Glyph, Mark, Timeline } from "../readings/reading";
 
 export interface Units {
   name: string;
@@ -27,6 +27,9 @@ export interface DrawState {
   /** Why the origin shows no children, if it does not; ``sweep`` animates
    * a faint band behind the text while they load. */
   note: { text: string; sweep: number | null } | null;
+  /** Where the reading draws its time, in canvas pixels, while it does:
+   * a box whose glyph moves time is a window onto it. */
+  timeline: Timeline | null;
 }
 
 const FAMILY = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
@@ -57,6 +60,12 @@ const GAP_MIN = 4;
 const MARK_WIDTH = 0.8;
 const MARK_GAP = 0.3;
 const MORE: Glyph = { text: "…" };
+/** How strongly a time window shades the time its event moves over. */
+const TIME_ALPHA = 0.28;
+/** A time window's line where its event lands, and the arrow pointing to it
+ * from the window's edge where it lands outside, in CSS pixels. */
+const TIME_LINE = 2;
+const TIME_ARROW = 5;
 export const RULER_HEIGHT = 22;
 const RULER_SCALE = decimalTicks();
 /** Ruler marks fade in over this much room to their neighbours of the same step. */
@@ -183,18 +192,25 @@ export function draw(
     if (box.kind !== "merged" && box.branch !== null) parents.set(state.child(box.node, box.branch), box);
   }
   const carriedBy = new Map<NodeId, readonly Glyph[]>();
-  /** The labels the children of ``node`` carry, outermost first. */
+  /** The labels the children of ``node`` carry, outermost first. A time
+   * window shows its time at any size and carries what it was handed on. */
   const carried = (node: NodeId): readonly Glyph[] => {
     let glyphs = carriedBy.get(node);
     if (glyphs === undefined) {
       const parent = parents.get(node);
-      glyphs = parent === undefined || fitOf(parent) !== null
+      const glyph = parent && state.glyph(parent.node, parent.branch!);
+      glyphs = parent === undefined || glyph === undefined
         ? []
-        : [...carried(parent.node), state.glyph(parent.node, parent.branch!)];
+        : windowed(glyph)
+        ? carried(parent.node)
+        : fitOf(parent) !== null
+        ? []
+        : [...carried(parent.node), glyph];
       carriedBy.set(node, glyphs);
     }
     return glyphs;
   };
+  const windowed = (glyph: Glyph) => glyph.time !== undefined && state.timeline !== null;
   const fits = new Map<Box, Fit | null>();
   const fitOf = (box: Box): Fit | null => {
     let fit = fits.get(box);
@@ -218,6 +234,11 @@ export function draw(
   // a box carries come first, framed and fainter, and a label wraps between
   // its pieces where lines make it larger.
   for (const { box, rect, ink } of labels) {
+    const glyph = box.branch === null ? null : state.glyph(box.node, box.branch);
+    if (glyph?.time !== undefined && state.timeline !== null) {
+      timeWindow(ctx, rect, view, glyph.time, state.timeline, ink);
+      continue;
+    }
     const fit = fitOf(box);
     if (fit === null) continue;
     const { lines, size, vertical } = fit;
@@ -268,6 +289,55 @@ export function draw(
 
   outline(ctx, frame, cam, view, state, scheme.ink);
   ruler(ctx, cam, view, state.units, palette);
+}
+
+/** A box as a window onto a timeline drawn above it, across the same
+ * pixels: the time its event moves over shaded, and a line where it lands,
+ * or an arrow at the window's edge toward where it lands outside. */
+function timeWindow(
+  ctx: CanvasRenderingContext2D,
+  rect: ScreenRect,
+  view: Viewport,
+  time: { from: number; to: number },
+  timeline: Timeline,
+  ink: string,
+): void {
+  // The box's own pixels, short of its separator, as labels have them.
+  const left = rect.x0;
+  const right = rect.x1 - 2;
+  const top = rect.y0;
+  const bottom = rect.y1;
+  if (right <= left || bottom <= top) return;
+  const from = timeline.x(time.from);
+  const to = timeline.x(time.to);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(left, top, right - left, bottom - top);
+  ctx.clip();
+  ctx.fillStyle = ink;
+  // Far-off coordinates lose precision and can stall rasterizing.
+  const shaded0 = Math.max(left, Math.min(from, to));
+  const shaded1 = Math.min(right, Math.max(from, to));
+  if (shaded0 < shaded1) {
+    ctx.globalAlpha = TIME_ALPHA;
+    ctx.fillRect(shaded0, top, shaded1 - shaded0, bottom - top);
+    ctx.globalAlpha = 1;
+  }
+  if (left <= to && to <= right) {
+    ctx.fillRect(Math.round(to) - TIME_LINE / 2, top, TIME_LINE, bottom - top);
+  } else {
+    const size = Math.min(TIME_ARROW, (bottom - top) / 2, (right - left) / 2);
+    // In the middle of the window's part in view.
+    const middle = (Math.max(top, 0) + Math.min(bottom, view.height)) / 2;
+    const tip = to < left ? left + 1 : right - 1;
+    const back = to < left ? tip + size : tip - size;
+    ctx.beginPath();
+    ctx.moveTo(tip, middle);
+    ctx.lineTo(back, middle - size);
+    ctx.lineTo(back, middle + size);
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
 /** Whether ``below`` continues the band silhouette ``above`` ends: only

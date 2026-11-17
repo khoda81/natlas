@@ -140,9 +140,11 @@ export class NoteLabels implements Labels {
         if (score.ended || score.window + 1 >= this.file.windows) return { text: "end", mark: "end" };
         return { text: `⇥ ${clock(this.seconds((score.window + 1) * this.span), 0)}`, mark: "end" };
       case "shift": {
-        const seconds = this.seconds(score.window * this.span + value);
+        const start = score.window * this.span;
+        const seconds = this.seconds(start + value);
         // Under a second, in milliseconds: shifts are steps of 10 ms.
-        return { text: seconds < 1 ? `${Math.round(seconds * 1000)} ms` : clock(seconds), mark: "time" };
+        const text = seconds < 1 ? `${Math.round(seconds * 1000)} ms` : clock(seconds);
+        return { text, mark: "time", time: { from: start + score.tick, to: start + value } };
       }
       case "tie":
         return { text: "tie", mark: "tie" };
@@ -243,9 +245,9 @@ export class NoteLabels implements Labels {
     return { notes: notes.filter((note) => note.end !== note.start), hits, score, now, touched };
   }
 
-  read(tree: IntervalTree): Reading {
+  read(tree: IntervalTree, changed: () => void): Reading {
     const scores = new States<Score>(tree, START, (score, branch) => this.after(score, branch));
-    const panel = new ScorePanel(this);
+    const panel = new ScorePanel(this, changed);
     return {
       glyph: (node: NodeId, branch: Branch) => this.glyph(scores.at(node), branch),
       show: (element: HTMLElement, node: NodeId, branch: Branch | null) => {
@@ -258,6 +260,7 @@ export class NoteLabels implements Labels {
         panel.toggle(event.shiftKey ? "both" : "notes");
         return true;
       },
+      timeline: () => panel.timeline(),
     };
   }
 }

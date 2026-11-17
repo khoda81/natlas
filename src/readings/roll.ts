@@ -5,6 +5,7 @@
 import { durationTicks, layoutTicks, type DurationStep } from "@qbar/qbar";
 import { clock, DRUM_PROGRAM, pitchName, pitchTicks, tint } from "./music";
 import type { Hit, Note, NoteLabels, Transcript } from "./notes";
+import type { Timeline } from "./reading";
 
 type Playing = "notes" | "audio" | "both";
 
@@ -70,8 +71,14 @@ export class ScorePanel {
   private audio: AudioContext | null = null;
   private recording: Promise<AudioBuffer> | null = null;
   private playing: { mode: Playing; started: number; from: number; stop: () => void } | null = null;
+  /** The time axis as last drawn, in client pixels: told to ``changed`` when it moves. */
+  private axis = "";
 
-  constructor(private readonly labels: NoteLabels) {
+  constructor(
+    private readonly labels: NoteLabels,
+    /** Told when the time axis moves, which time glyphs elsewhere follow. */
+    private readonly changed: () => void,
+  ) {
     this.view = { start: 0, span: 2 * labels.span };
     this.root.className = "score";
     const bar = document.createElement("div");
@@ -211,6 +218,18 @@ export class ScorePanel {
     return { width, height, top, bottom, right, lane, row, high: wanted };
   }
 
+  /** Where shift steps are on the page, while the roll shows them. */
+  timeline(): Timeline | null {
+    if (this.transcript === null || !this.root.isConnected) return null;
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width === 0) return null;
+    const { right } = this.geometry();
+    const view = this.inView();
+    const left = rect.left + GUTTER;
+    const plot = right - GUTTER;
+    return { x: (tick) => left + ((tick - view.start) / view.span) * plot, left, right: rect.left + right };
+  }
+
   /** The view, following the window being written when asked to. */
   private inView(): { start: number; span: number } {
     const transcript = this.transcript;
@@ -332,6 +351,12 @@ export class ScorePanel {
     const geometry = this.geometry();
     const { width, height, top, bottom, right, lane, row, high } = geometry;
     const ratio = devicePixelRatio || 1;
+    const view = this.inView();
+    const axis = `${view.start} ${view.span} ${right} ${this.canvas.getBoundingClientRect().left}`;
+    if (axis !== this.axis) {
+      this.axis = axis;
+      this.changed();
+    }
     if (this.canvas.width !== Math.round(width * ratio)) this.canvas.width = Math.round(width * ratio);
     if (this.canvas.height !== Math.round(height * ratio)) this.canvas.height = Math.round(height * ratio);
     const ctx = this.canvas.getContext("2d")!;
@@ -348,7 +373,6 @@ export class ScorePanel {
 
     const { labels } = this;
     const { frameRate } = labels.file;
-    const view = this.inView();
     const plot = right - GUTTER;
     const x = (tick: number) => GUTTER + ((tick - view.start) / view.span) * plot;
     const y = (pitch: number) => top + (high - pitch) * row;

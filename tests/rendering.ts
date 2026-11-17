@@ -7,7 +7,7 @@ import { answer, digits, run } from "./build";
 
 const view = { width: 270, height: 340 };
 const palette = Palette.current();
-const state = { hover: null, ancestors: new Set<string>(), units: NATS, glyph: () => ({ text: "" }), child: (node: bigint, branch: number) => uniform.child(node, branch), note: null };
+const state = { hover: null, ancestors: new Set<string>(), units: NATS, glyph: () => ({ text: "" }), child: (node: bigint, branch: number) => (node << 20n) + BigInt(branch) + 1n, note: null, timeline: null };
 const cam = (phase = 0) => ({ origin: ROOT, x: 0, k: 23, anchor: top(), a: phase / view.height });
 const rgb = (color: string) => color.startsWith("#")
   ? color.slice(1).match(/../g)!.map(c => Number.parseInt(c, 16))
@@ -99,6 +99,24 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const error = Math.max(difference(30, y - 1, color), difference(30, y, background), difference(30, y + 1, color),
       difference(x - 1, 30, color), difference(x, 30, background), difference(x + 1, 30, color));
     results.push({ name: "separator is the box's last physical pixel", dpr, phase, error });
+  }
+
+  // A time box is a window onto the timeline drawn across the same pixels:
+  // the time its event moves over shaded, a line where it lands.
+  {
+    const box: Box = { node: ROOT, rank: 0, count: 1, kind: "leaf", branch: 0,
+      p: 0.5, q: 0.5, lnMass: Math.log(0.5), x0: 10 / 23, x1: 200 / 23, y0: 10 / view.height, y1: 80 / view.height };
+    const timeline = { x: (time: number) => time, left: 0, right: view.width };
+    const glyph = () => ({ text: "1.20 s", mark: "time" as const, time: { from: 50, to: 120 } });
+    const c = canvas(dpr), ctx = c.getContext("2d")!;
+    draw(ctx, { boxes: [box] } as Frame, cam(), view, { p: 0, q: 0 }, palette, { ...state, glyph, timeline });
+    const level = palette.sequential.level(rampPosition(0.5, 0.5, true));
+    const fill = rgb(palette.sequential.fill[level]!), ink = rgb(palette.sequential.ink[level]!);
+    const shaded = fill.map((v, i) => v + 0.28 * (ink[i]! - v));
+    const pixel = (x: number) => ctx.getImageData(Math.floor(x * dpr), Math.floor(40 * dpr), 1, 1).data;
+    const difference = (x: number, expected: number[]) => Math.max(...expected.map((v, i) => Math.abs(v - pixel(x)[i]!)));
+    const error = Math.max(difference(30, fill), difference(85, shaded), difference(120, ink), difference(160, fill));
+    results.push({ name: "a time box is a window onto the timeline", dpr, phase: 0, error });
   }
 
   // Thin children between a bordered one and the background: each physical

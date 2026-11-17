@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use std::f64::consts::LN_2;
 
-use crate::distribution::{ln_add, ln_between, Distribution, Item, Rank};
+use crate::distribution::{ln_add, Distribution, Edge, Item, Rank};
 use crate::point::Point;
 use crate::session::View;
 use crate::tree::{bytes, child_hash, node_id, Branch, Lens, NodeId, Tree};
@@ -117,12 +117,12 @@ pub struct PickResult {
     pub exact: bool,
 }
 
-/// Where a laid-out node sits: two of its edges, as ln of the mass below
-/// them, placed exactly in view heights.
-#[derive(Clone, Copy, Debug)]
+/// Where a laid-out node sits: two of its edges placed exactly in view
+/// heights.
+#[derive(Clone, Debug)]
 pub struct Placed {
-    top: (f64, f64),
-    bottom: (f64, f64),
+    top: (Point, f64),
+    bottom: (Point, f64),
     /// ln of how far each of the two is from the view's top, kept beside
     /// them: every edge of the node is measured against both.
     ln_heights: (f64, f64),
@@ -135,11 +135,12 @@ pub struct Placed {
 }
 
 impl Placed {
-    fn new(top: (f64, f64), bottom: (f64, f64), ln_mass: f64, ln_scale: f64, x: f64) -> Self {
+    fn new(top: (Point, f64), bottom: (Point, f64), ln_mass: f64, ln_scale: f64, x: f64) -> Self {
+        let ln_heights = (top.1.abs().ln(), bottom.1.abs().ln());
         Self {
             top,
             bottom,
-            ln_heights: (top.1.abs().ln(), bottom.1.abs().ln()),
+            ln_heights,
             ln_mass,
             ln_scale,
             x,
@@ -151,15 +152,17 @@ impl Placed {
     /// them, a height rounds as the larger of the placed edge's own height
     /// and the distance from it, so an edge in view is measured from the one
     /// near it, never from one a great many views away.
-    fn y(&self, ln_below: f64) -> f64 {
-        if self.top.0 <= ln_below {
-            return self.top.1 - (self.ln_scale + ln_between(ln_below, self.top.0)).exp();
+    fn y(&self, edge: &Point) -> f64 {
+        let (under_top, ln_top) = self.top.0.to(edge);
+        if !under_top {
+            return self.top.1 - (self.ln_scale + ln_top).exp();
         }
-        if ln_below <= self.bottom.0 {
-            return self.bottom.1 + (self.ln_scale + ln_between(self.bottom.0, ln_below)).exp();
+        let (under_bottom, ln_bottom) = self.bottom.0.to(edge);
+        if under_bottom || ln_bottom == f64::NEG_INFINITY {
+            return self.bottom.1 + (self.ln_scale + ln_bottom).exp();
         }
-        let down = self.ln_scale + ln_between(self.top.0, ln_below);
-        let up = self.ln_scale + ln_between(ln_below, self.bottom.0);
+        let down = self.ln_scale + ln_top;
+        let up = self.ln_scale + ln_bottom;
         if down.max(self.ln_heights.0) <= up.max(self.ln_heights.1) {
             self.top.1 + down.exp()
         } else {
@@ -167,40 +170,81 @@ impl Placed {
         }
     }
 
-    /// The edge at a view height, clamped to the node.
-    fn ln_below(&self, y: f64) -> f64 {
+    /// The point at a view height, clamped to the node.
+    fn at(&self, y: f64) -> Point {
         let (edge, at) = if y <= self.top.1 || y - self.top.1 <= self.bottom.1 - y {
-            self.top
+            &self.top
         } else {
-            self.bottom
+            &self.bottom
         };
-        if y == at {
-            return edge;
-        }
-        let ln_mass = (y - at).abs().ln() - self.ln_scale;
-        if y < at {
-            ln_add(edge, ln_mass).min(0.0)
-        } else if ln_mass >= edge {
-            f64::NEG_INFINITY
-        } else {
-            ln_between(edge, ln_mass)
-        }
+        edge.moved(*at <= y, (y - at).abs(), -self.ln_scale)
+            .unwrap_or_else(|| {
+                if *at <= y {
+                    Point::bottom()
+                } else {
+                    Point::top()
+                }
+            })
     }
 
     /// The node's own extent in view heights.
     fn span(&self) -> (f64, f64) {
-        (self.y(0.0), self.y(f64::NEG_INFINITY))
+        (self.y(&Point::top()), self.y(&Point::bottom()))
     }
 
-    /// Placed within a child of `p` mass between edges `top` and `bottom`.
-    fn child(&self, top: f64, bottom: f64, ln_p: f64, x: f64) -> Placed {
+    /// Placed within a child of `ln_p` extent spanning `y0..y1`.
+    fn child(&self, (y0, y1): (f64, f64), ln_p: f64, x: f64) -> Placed {
         Placed::new(
-            (0.0, self.y(top)),
-            (f64::NEG_INFINITY, self.y(bottom)),
+            (Point::top(), y0),
+            (Point::bottom(), y1),
             self.ln_mass + ln_p,
             self.ln_scale + ln_p,
             x,
         )
+    }
+}
+
+/// View heights from a run's own point within which its edges are placed
+/// by f64 offsets from that point: within 2^16 view heights, a float of
+/// one is off by at most 2^-37 of a view height. Farther, an edge's height
+/// would cancel what places it, so it is measured exactly.
+const NEAR: f64 = 65536.0;
+
+/// The view heights of a placed node's edges: each run's own point placed
+/// exactly once, and its edges near the view by their f64 offsets from it.
+struct Heights<'a> {
+    placed: &'a Placed,
+    d: &'a Distribution,
+    /// Each run's point's height, NaN until asked.
+    runs: Vec<f64>,
+}
+
+impl<'a> Heights<'a> {
+    fn new(placed: &'a Placed, d: &'a Distribution) -> Self {
+        Self {
+            placed,
+            d,
+            runs: vec![f64::NAN; d.runs().len()],
+        }
+    }
+
+    fn y(&mut self, edge: Edge) -> f64 {
+        if let Edge::Of { run, at } = edge {
+            if let Some((point, offsets)) = self.d.runs()[run].offsets() {
+                if self.runs[run].is_nan() {
+                    self.runs[run] = self.placed.y(point);
+                }
+                if self.runs[run].abs() <= NEAR {
+                    return self.runs[run] + (offsets[at].ln() + self.placed.ln_scale).exp();
+                }
+            }
+        }
+        self.placed.y(&self.d.point(edge))
+    }
+
+    fn item(&mut self, item: Item) -> (f64, f64) {
+        let (top, bottom) = self.d.item_bounds(item);
+        (self.y(top), self.y(bottom))
     }
 }
 
@@ -231,10 +275,17 @@ fn item_box(
     placed: &Placed,
     d: &Distribution,
     item: Item,
+    (y0, y1): (f64, f64),
 ) -> Result<LayoutBox> {
-    let (top, bottom) = (d.item_top(item), d.item_bottom(item));
-    let ln_p = ln_between(top, bottom);
     let rank = d.item_rank(item);
+    // A child is sized by its weight, a gap by what its neighbours leave it.
+    let ln_p = match item {
+        Item::Child { run, at } => d.runs()[run].ln_p(at),
+        Item::Gap { .. } => {
+            let (top, bottom) = d.item_edges(item);
+            Point::ln_between(&top, &bottom)
+        }
+    };
     let (kind, branch, nats) = match item {
         Item::Child { run, at } => {
             let branch = d.runs()[run].branch(at);
@@ -268,14 +319,14 @@ fn item_box(
         ln_mass: placed.ln_mass + ln_p,
         x0: placed.x,
         x1: placed.x + nats,
-        y0: placed.y(top),
-        y1: placed.y(bottom),
+        y0,
+        y1,
     })
 }
 
 /// The surprisal of a gap's children, as well as what is known tells, until
 /// samples tell more: with q = p and their number known, that of their mean
-/// weight, since children sorted by p are nearly alike side by side;
+/// weight, since children heaviest first are nearly alike side by side;
 /// otherwise the mean surprisal of the known children beside the gap.
 /// Infinite with neither.
 #[allow(clippy::too_many_arguments)]
@@ -331,7 +382,7 @@ struct ChainEntry {
 struct Steps {
     nodes: Vec<NodeId>,
     entries: Vec<ChainEntry>,
-    edges: Vec<(f64, f64)>,
+    edges: Vec<(Point, Point)>,
     ln_masses: Vec<f64>,
     xs: Vec<f64>,
 }
@@ -349,12 +400,16 @@ fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Ste
         let Some(p) = tree.distribution(node, lens.p)? else {
             break;
         };
-        let Some(rank) = p.rank(branch) else {
+        let Some((rank, (run, at))) = p
+            .rank(branch)
+            .and_then(|rank| Some((rank, p.locate_rank(rank)?)))
+        else {
             break;
         };
-        let (top, bottom) = (p.edge(rank), p.edge(rank + 1));
-        let (top, bottom) = (top.expect("ranked"), bottom.expect("ranked"));
-        let ln_p = ln_between(top, bottom);
+        let (top, bottom) = p.item_edges(Item::Child { run, at });
+        // Placed by its extent, sized by its weight.
+        let ln_extent = Point::ln_between(&top, &bottom);
+        let ln_p = p.runs()[run].ln_p(at);
         let nats_q = tree.nats_q(node, lens, branch, ln_p)?;
         steps.nodes.push(child_hash(node, branch));
         steps.entries.push(ChainEntry {
@@ -364,7 +419,7 @@ fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Ste
             nats_q,
         });
         steps.edges.push((top, bottom));
-        steps.ln_masses.push(steps.ln_masses[i] + ln_p);
+        steps.ln_masses.push(steps.ln_masses[i] + ln_extent);
         steps.xs.push(steps.xs[i] + nats_q);
     }
     Ok(steps)
@@ -372,22 +427,22 @@ fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Ste
 
 /// The known edges nearest a point of a node, above and below it: those of
 /// the item holding it, or the node's own.
-fn around(d: Option<&Distribution>, point: &Point) -> (f64, f64) {
-    d.and_then(|d| Some(d.item_edges(d.locate_by(|edge| point.below(edge))?)))
-        .filter(|&(top, bottom)| point.within(top, bottom))
-        .unwrap_or((0.0, f64::NEG_INFINITY))
+fn around(d: Option<&Distribution>, point: &Point) -> (Point, Point) {
+    d.and_then(|d| Some(d.item_edges(d.locate(point)?)))
+        .filter(|(top, bottom)| point.within(top, bottom))
+        .unwrap_or_else(|| (Point::top(), Point::bottom()))
 }
 
 /// The known child of a node holding a point, and its edges.
-fn held(d: Option<&Distribution>, point: &Point) -> Option<(Branch, f64, f64)> {
+fn held(d: Option<&Distribution>, point: &Point) -> Option<(Branch, Point, Point)> {
     let d = d?;
-    let item = d.locate_by(|edge| point.below(edge))?;
+    let item = d.locate(point)?;
     let Item::Child { run, at } = item else {
         return None;
     };
     let (top, bottom) = d.item_edges(item);
     point
-        .within(top, bottom)
+        .within(&top, &bottom)
         .then(|| (d.runs()[run].branch(at), top, bottom))
 }
 
@@ -426,7 +481,7 @@ fn place_chain(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Chain> {
     }
     let point = Point::new(&cam.anchor.digits);
     let ln_scale = ln_masses[depth] + cam.x;
-    let y = |edge: f64| {
+    let y = |edge: &Point| {
         let (under, ln_mass) = point.to(edge);
         let far = (ln_scale + ln_mass).exp();
         if under {
@@ -436,17 +491,17 @@ fn place_chain(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Chain> {
         }
     };
     let (top, bottom) = around(tree.distribution(nodes[depth], lens.p)?, &point);
+    let (y_top, y_bottom) = (y(&top), y(&bottom));
     let anchor = Placed::new(
-        (top, y(top)),
-        (bottom, y(bottom)),
+        (top, y_top),
+        (bottom, y_bottom),
         ln_masses[depth],
         ln_scale,
         xs[depth],
     );
     let mut placed = vec![anchor; nodes.len()];
-    let mut spans = vec![(y(0.0), y(f64::NEG_INFINITY)); nodes.len()];
-    for i in (0..depth).rev() {
-        let (top, bottom) = edges[i];
+    let mut spans = vec![(y(&Point::top()), y(&Point::bottom())); nodes.len()];
+    for (i, (top, bottom)) in edges.into_iter().enumerate().rev() {
         let (y0, y1) = spans[i + 1];
         placed[i] = Placed::new(
             (top, y0),
@@ -485,16 +540,16 @@ impl Layout<'_> {
     /// Lay out the node's children in view, all but the chain child at `skip`.
     fn lay(&mut self, node: NodeId, placed: Placed, skip: Option<Rank>) -> Result<()> {
         let tree = self.tree;
-        self.frame.placed.insert(node, placed);
+        self.frame.placed.insert(node, placed.clone());
         let Some(d) = tree.distribution(node, self.lens.p)? else {
             return Ok(());
         };
         // From the first item that ends in the view to the last that starts
-        // in it, told by view height: a view too small for any float of the
-        // node's mass to tell its top from its bottom still has both.
-        let mut item = d.locate_by(|edge| placed.y(edge) <= 0.0);
+        // in it.
+        let mut heights = Heights::new(&placed, d);
+        let mut item = d.locate(&placed.at(0.0));
         while let Some(found) = item {
-            let (y0, y1) = (placed.y(d.item_top(found)), placed.y(d.item_bottom(found)));
+            let (y0, y1) = heights.item(found);
             if 1.0 <= y0 {
                 break;
             }
@@ -502,46 +557,37 @@ impl Layout<'_> {
             item = if chain {
                 d.next(found)
             } else if self.merge <= y1 - y0 {
+                let b = item_box(self.tree, self.lens, node, &placed, d, found, (y0, y1))?;
                 match found {
-                    Item::Child { .. } => self.child(node, &placed, d, found, (y0, y1))?,
-                    Item::Gap { .. } => {
-                        self.push(item_box(self.tree, self.lens, node, &placed, d, found)?)
-                    }
+                    Item::Child { .. } => self.child(node, &placed, d, found, b)?,
+                    Item::Gap { .. } => self.push(b),
                 }
                 d.next(found)
             } else {
-                self.band(node, &placed, d, found, skip)?
+                self.band(node, &mut heights, found, skip)?
             };
         }
         Ok(())
     }
 
-    /// A child spanning `y0..y1`, in a node whose view spans the edges `view`.
+    /// A child's box, and its children where they start in view.
     fn child(
         &mut self,
         node: NodeId,
         placed: &Placed,
         d: &Distribution,
         item: Item,
-        (y0, y1): (f64, f64),
+        b: LayoutBox,
     ) -> Result<()> {
-        let tree = self.tree;
-        let mut b = item_box(tree, self.lens, node, placed, d, item)?;
-        // The band test's edges, so neighbours meet exactly.
-        (b.y0, b.y1) = (y0, y1);
-        let branch = b.branch.expect("a child has a branch");
-        let id = child_hash(node, branch);
-        let (x1, kind) = (b.x1, b.kind);
-        let (top, bottom) = (d.item_top(item), d.item_bottom(item));
+        let id = child_hash(node, b.branch.expect("a child has a branch"));
+        let (x1, kind, ys) = (b.x1, b.kind, (b.y0, b.y1));
         self.push(b);
         if self.right <= x1 || kind != BoxKind::Node {
             return Ok(());
         }
-        self.lay(
-            id,
-            placed.child(top, bottom, ln_between(top, bottom), x1),
-            None,
-        )
+        let (top, bottom) = d.item_edges(item);
+        let ln_extent = Point::ln_between(&top, &bottom);
+        self.lay(id, placed.child(ys, ln_extent, x1), None)
     }
 
     /// A band about `merge` tall from `start`: thin children and the gaps
@@ -551,20 +597,21 @@ impl Layout<'_> {
     fn band(
         &mut self,
         node: NodeId,
-        placed: &Placed,
-        d: &Distribution,
+        heights: &mut Heights,
         start: Item,
         skip: Option<Rank>,
     ) -> Result<Option<Item>> {
-        let height = |item: Item| placed.y(d.item_bottom(item)) - placed.y(d.item_top(item));
-        let target = placed.ln_below(placed.y(d.item_top(start)) + self.merge);
+        let (placed, d) = (heights.placed, heights.d);
+        let start_y = heights.item(start).0;
+        let target = start_y + self.merge;
         let (mut ln_known, mut ln_area) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
         let mut ln_ratio = 0.0;
         let mut count = 0usize;
         let mut last = start;
         let mut item = Some(start);
         while let Some(found) = item {
-            let thick = self.merge <= height(found);
+            let (y0, y1) = heights.item(found);
+            let thick = self.merge <= y1 - y0;
             if found != start && (thick || Some(d.item_rank(found)) == skip) {
                 break;
             }
@@ -572,14 +619,22 @@ impl Layout<'_> {
                 Item::Child { run, at } => {
                     let r = &d.runs()[run];
                     // Through the child about `merge` below the band's top,
-                    // short of the chain child.
-                    let mut end = r.holding(target).clamp(at, r.len() - 1);
+                    // short of the chain child: the last whose top is above.
+                    let (mut end, mut high) = (at, r.len() - 1);
+                    while end < high {
+                        let middle = (end + high).div_ceil(2);
+                        if heights.y(Edge::Of { run, at: middle }) <= target {
+                            end = middle;
+                        } else {
+                            high = middle - 1;
+                        }
+                    }
                     if let Some(skip) = skip.filter(|&skip| r.rank() + (at as Rank) < skip) {
                         end = end
                             .min((skip - r.rank()).saturating_sub(1) as usize)
                             .max(at);
                     }
-                    let ln_mass = ln_between(r.edge(at), r.edge(end + 1));
+                    let ln_mass = r.ln_mass(at, end + 1);
                     if self.lens.p == self.lens.q {
                         ln_known = ln_add(ln_known, ln_mass);
                         ln_area = ln_add(ln_area, r.ln_surprisal(at, end + 1));
@@ -605,27 +660,26 @@ impl Layout<'_> {
                     }
                     last = Item::Child { run, at: end };
                     item = d.next(last);
-                    if r.edge(end + 1) <= target {
+                    if target <= heights.item(last).1 {
                         break;
                     }
                 }
                 Item::Gap { .. } => {
                     last = found;
                     item = d.next(found);
-                    if d.item_bottom(found) <= target {
+                    if target <= y1 {
                         break;
                     }
                 }
             }
         }
-        let (top, bottom) = (d.item_top(start), d.item_bottom(last));
-        let (y0, y1) = (placed.y(top), placed.y(bottom));
+        let (y0, y1) = (start_y, heights.item(last).1);
         if ln_known == f64::NEG_INFINITY {
             // Nothing known to draw.
             return Ok(item);
         }
         let nats = (ln_area - ln_known).exp();
-        let ln_p = ln_between(top, bottom);
+        let ln_p = (y1 - y0).ln() - placed.ln_scale;
         self.push(LayoutBox {
             node,
             rank: d.item_rank(start),
@@ -672,8 +726,8 @@ pub(crate) fn layout_into(
         placed,
         spans,
     } = place_chain(tree, lens, cam)?;
-    for (&node, &placed) in nodes.iter().zip(&placed) {
-        frame.placed.insert(node, placed);
+    for (&node, placed) in nodes.iter().zip(&placed) {
+        frame.placed.insert(node, placed.clone());
     }
     (frame.origin_top, frame.origin_bottom) = spans[0];
     let mut context = Layout {
@@ -685,9 +739,9 @@ pub(crate) fn layout_into(
         frame,
     };
     let depth = nodes.len() - 1;
-    context.lay(nodes[depth], placed[depth], None)?;
+    context.lay(nodes[depth], placed[depth].clone(), None)?;
     for i in (0..depth).rev() {
-        let (own, child, entry) = (placed[i], placed[i + 1], &entries[i]);
+        let (own, child, entry) = (&placed[i], &placed[i + 1], &entries[i]);
         let (y0, y1) = spans[i + 1];
         context.push(LayoutBox {
             node: nodes[i],
@@ -707,7 +761,7 @@ pub(crate) fn layout_into(
             y0,
             y1,
         });
-        context.lay(nodes[i], own, Some(entry.rank))?;
+        context.lay(nodes[i], own.clone(), Some(entry.rank))?;
         // Covering the view with its own box left of it, this node hides
         // every remaining ancestor's other children.
         let (top, bottom) = spans[i];
@@ -750,8 +804,9 @@ pub fn view(tree: &Tree, lens: Lens, cam: &Camera, viewport: Viewport, rows: f64
             let (top, bottom) = spans[0];
             let (from, to) = (top.max(0.0), bottom.min(1.0));
             let at = &placed[0];
-            let start =
-                Point::off(0.0, true, from - top, -at.ln_scale).unwrap_or_else(|| Point::new(&[]));
+            let start = Point::top()
+                .moved(true, from - top, -at.ln_scale)
+                .unwrap_or_else(Point::top);
             let shown = (to - from).max(0.0);
             (0, start, shown.ln() - at.ln_scale, rows * shown)
         }
@@ -777,10 +832,8 @@ fn view_top(placed: &Placed, point: Option<&Point>, a: f64) -> Option<Point> {
         Some(point) if a.abs() <= y0.abs().min(y1.abs()) => {
             point.moved(a <= 0.0, a.abs(), -placed.ln_scale)
         }
-        _ if y1.abs() < y0.abs() => {
-            Point::off(f64::NEG_INFINITY, y1 <= 0.0, y1.abs(), -placed.ln_scale)
-        }
-        _ => Point::off(0.0, true, y0.abs(), -placed.ln_scale),
+        _ if y1.abs() < y0.abs() => Point::bottom().moved(y1 <= 0.0, y1.abs(), -placed.ln_scale),
+        _ => Point::top().moved(true, y0.abs(), -placed.ln_scale),
     }
 }
 
@@ -834,13 +887,13 @@ pub fn settle(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Anchor> {
     // Whether the part of a node between two of its edges covers the view,
     // the node e^ln_scale view heights tall. A node that fits the view
     // covers it, whichever way its edges round.
-    let covers = |point: &Point, ln_scale: f64, top: f64, bottom: f64| {
+    let covers = |point: &Point, ln_scale: f64, top: &Point, bottom: &Point| {
         let ((_, above), (_, under)) = (point.to(top), point.to(bottom));
         cam.a - (ln_scale + above).exp() <= FIT && 1.0 - FIT <= cam.a + (ln_scale + under).exp()
     };
-    while let Some(&(top, bottom)) = path.len().checked_sub(1).map(|i| &steps.edges[i]) {
+    while let Some((top, bottom)) = path.len().checked_sub(1).map(|i| &steps.edges[i]) {
         let ln_scale = steps.ln_masses[path.len()] + cam.x;
-        if covers(&point, ln_scale, 0.0, f64::NEG_INFINITY) {
+        if covers(&point, ln_scale, &Point::top(), &Point::bottom()) {
             break;
         }
         point = point.out_of_child(top, bottom);
@@ -849,11 +902,11 @@ pub fn settle(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Anchor> {
     let mut node = steps.nodes[path.len()];
     let mut ln_scale = steps.ln_masses[path.len()] + cam.x;
     while let Some((branch, top, bottom)) = held(tree.distribution(node, lens.p)?, &point) {
-        if !covers(&point, ln_scale, top, bottom) {
+        if !covers(&point, ln_scale, &top, &bottom) {
             break;
         }
-        ln_scale += ln_between(top, bottom);
-        point = point.into_child(top, bottom, precision(ln_scale));
+        ln_scale += Point::ln_between(&top, &bottom);
+        point = point.into_child(&top, &bottom, precision(ln_scale));
         path.push(branch);
         node = child_hash(node, branch);
     }
@@ -941,14 +994,22 @@ pub fn pick(
         };
         // Nothing at any height: a node known to have no children, whose
         // box is all there is.
-        let Some(item) = d.locate_by(|edge| placed.y(edge) <= y) else {
+        let Some(item) = d.locate(&placed.at(y)) else {
             return Ok(Some(within.map_or(origin, |b| PickResult {
                 r#box: b,
                 exact: true,
             })));
         };
-        let item = band_child(frame, node, placed, d, item, y, y + pixel_px / view.height);
-        let b = item_box(tree, lens, node, placed, d, item)?;
+        let mut heights = Heights::new(placed, d);
+        let item = band_child(
+            frame,
+            node,
+            &mut heights,
+            item,
+            y,
+            y + pixel_px / view.height,
+        );
+        let b = item_box(tree, lens, node, placed, d, item, heights.item(item))?;
         let Some(branch) = b.branch.filter(|_| x >= b.x1) else {
             let exact = b.branch.is_some();
             return Ok(Some(PickResult { r#box: b, exact }));
@@ -973,8 +1034,7 @@ pub fn pick(
 fn band_child(
     frame: &Frame,
     node: NodeId,
-    placed: &Placed,
-    d: &Distribution,
+    heights: &mut Heights,
     item: Item,
     y: f64,
     bottom: f64,
@@ -988,9 +1048,9 @@ fn band_child(
     if !matches!(item, Item::Gap { .. }) || !banded(y) {
         return item;
     }
-    match d.next(item) {
+    match heights.d.next(item) {
         Some(next @ Item::Child { .. }) => {
-            let top = placed.y(d.item_top(next));
+            let top = heights.item(next).0;
             if top < bottom && banded(top) {
                 next
             } else {
@@ -1004,7 +1064,7 @@ fn band_child(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::{Distribution, Run};
+    use crate::distribution::{Distribution, Order, Run};
     use crate::tree::ROOT;
     use std::f64::consts::LN_2;
 
@@ -1016,6 +1076,11 @@ mod tests {
 
     fn weights(weights: &[f64]) -> Distribution {
         Distribution::exact(weights)
+    }
+
+    /// A run of these weights, `above` of the node above it, to 8 digits.
+    fn listed(rank: Rank, branches: &[Branch], weights: &[f64], above: f64) -> Run {
+        Run::weighed(rank, branches, weights, &Point::top().plus(above), 8)
     }
 
     fn cam(origin: NodeId, x: f64, anchor: Anchor, a: f64) -> Camera {
@@ -1158,17 +1223,10 @@ mod tests {
         // one-child gaps: every band boundary is a run's or a gap's edge.
         // The renderer joins touching bands by comparing edges exactly.
         let w = 1.25e-5;
-        let mut runs = vec![Run::new(0, vec![0], vec![0.0, 0.01f64.ln()]).unwrap()];
+        let mut runs = vec![listed(0, &[0], &[0.99], 0.0)];
         for i in 0..400u32 {
             let below = 0.01 - 2.0 * f64::from(i) * w;
-            runs.push(
-                Run::new(
-                    1 + 2 * i,
-                    vec![1 + 2 * i],
-                    vec![below.ln(), (below - w).ln()],
-                )
-                .unwrap(),
-            );
+            runs.push(listed(1 + 2 * i, &[1 + 2 * i], &[w], 1.0 - below));
         }
         let mut tree = Tree::new(1);
         tree.insert(ROOT, 0, runs).unwrap();
@@ -1188,22 +1246,16 @@ mod tests {
     fn a_band_pixel_selects_a_known_child_it_holds_over_a_gap() {
         // Known children alternate with one-child gaps, about 40 a pixel.
         let w = 1.25e-5;
-        let mut runs = vec![Run::new(0, vec![0], vec![0.0, 0.01f64.ln()]).unwrap()];
+        let mut runs = vec![listed(0, &[0], &[0.99], 0.0)];
         for i in 0..400u32 {
             let below = 0.01 - 2.0 * f64::from(i) * w;
-            runs.push(
-                Run::new(
-                    1 + 2 * i,
-                    vec![1 + 2 * i],
-                    vec![below.ln(), (below - w).ln()],
-                )
-                .unwrap(),
-            );
+            runs.push(listed(1 + 2 * i, &[1 + 2 * i], &[w], 1.0 - below));
         }
         let mut tree = Tree::new(1);
         tree.insert(ROOT, 0, runs).unwrap();
-        // Off the grid, so pixel corners fall inside items.
-        let camera = cam(ROOT, 0.0, top(&[]), 0.37 / VIEW.height);
+        // Off the grid, so pixel corners fall inside gaps, not on edges:
+        // a child and a gap repeat every 0.02 of a pixel.
+        let camera = cam(ROOT, 0.0, top(&[]), 0.385 / VIEW.height);
         let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let selected = |y_px: f64, pixel_px: f64| {
             let hit = pick(&tree, LENS, &frame, &camera, VIEW, 100.0, y_px, pixel_px);
@@ -1230,8 +1282,8 @@ mod tests {
         // starts; that child's pixels start at row 601.
         let below = 1.0 - 600.5 / VIEW.height;
         let runs = vec![
-            Run::new(0, vec![0], vec![0.0, 0.5f64.ln()]).unwrap(),
-            Run::new(5, vec![5], vec![below.ln(), (below - 0.1).ln()]).unwrap(),
+            listed(0, &[0], &[0.5], 0.0),
+            listed(5, &[5], &[0.1], 1.0 - below),
         ];
         let mut tree = Tree::new(1);
         tree.insert(ROOT, 0, runs).unwrap();
@@ -1265,29 +1317,20 @@ mod tests {
 
     #[test]
     fn a_child_deep_in_a_tail_sits_exactly_beside_its_neighbours() {
-        // Three children 2^-3000 of the root, below a heavy one: no float of
-        // a cdf tells them apart, but ln-below edges do.
-        let tiny = -3000.0 * LN_2;
+        // Three children 2^-1000 of the root, below a heavy one: no float of
+        // a cdf tells them apart, but a run's exact top does.
+        let tiny = -1000.0 * LN_2;
+        let above = Point::bottom().moved(false, 3.0, tiny).unwrap();
         let mut tree = Tree::new(1);
-        let ln_below = vec![
-            0.0,
-            tiny + 3f64.ln(),
-            tiny + 2f64.ln(),
-            tiny,
-            f64::NEG_INFINITY,
+        let runs = vec![
+            listed(0, &[0], &[1.0], 0.0),
+            Run::weighed(1, &[1, 2, 3], &[tiny.exp(); 3], &above, 140),
+            Run::end_at(4),
         ];
-        tree.set(
-            ROOT,
-            0,
-            Distribution::new(Run::new(0, vec![0, 1, 2, 3], ln_below).unwrap()),
-        )
-        .unwrap();
-        // The view is the tail itself: x = 3000 bits is where children
-        // 2^-3000 of the root fill it.
-        // The top of the first of them, 3 · 2^-3000 above the root's bottom.
-        let mut digits = vec![0xff; 374];
-        digits.extend([0xfd]);
-        let camera = cam(ROOT, -tiny - 3f64.ln(), at(&[], &digits), 0.0);
+        tree.insert(ROOT, 0, runs).unwrap();
+        // The view is the tail itself: x = 1000 bits is where children
+        // 2^-1000 of the root fill it, from the top of the first of them.
+        let camera = cam(ROOT, -tiny - 3f64.ln(), at(&[], &above.digits()), 0.0);
         let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let ys: Vec<_> = frame
             .boxes
@@ -1307,7 +1350,7 @@ mod tests {
         let mut tree = Tree::new(1);
         // The two heaviest children of the root, and the node's end at rank
         // 1000: a quarter of its mass in 998 unknown children.
-        let run = Run::new(0, vec![4, 7], vec![0.0, 0.5f64.ln(), 0.25f64.ln()]).unwrap();
+        let run = listed(0, &[4, 7], &[0.5, 0.25], 0.0);
         tree.insert(ROOT, 0, vec![run, Run::end_at(1000)]).unwrap();
         let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let gap = frame
@@ -1321,7 +1364,7 @@ mod tests {
         near(gap.y0, 0.75);
         // Not knowing how many, it is drawn as the child above it.
         let mut uncounted = Tree::new(1);
-        let run = Run::new(0, vec![4, 7], vec![0.0, 0.5f64.ln(), 0.25f64.ln()]).unwrap();
+        let run = listed(0, &[4, 7], &[0.5, 0.25], 0.0);
         uncounted.insert(ROOT, 0, vec![run]).unwrap();
         let frame_ = layout(&uncounted, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let gap_ = frame_
@@ -1334,13 +1377,8 @@ mod tests {
         // across them draw a silhouette from the samples.
         let samples: Vec<_> = (0..4)
             .map(|i| {
-                let top = (0.25 - 0.0625 * f64::from(i)).ln();
-                Run::new(
-                    2 + 100 * i,
-                    vec![100 + i],
-                    vec![top, (top.exp() - 1e-4).ln()],
-                )
-                .unwrap()
+                let below = 0.25 - 0.0625 * f64::from(i);
+                listed(2 + 100 * i, &[100 + i], &[1e-4], 1.0 - below)
             })
             .collect();
         tree.insert(ROOT, 0, samples).unwrap();
@@ -1554,8 +1592,12 @@ mod tests {
         // Branch 0 ends the sequence: nothing lies past its box.
         let (mut tree, _) = chain_tree(&[0.5, 0.5], &[]);
         let ended = tree.child(ROOT, 0).unwrap();
-        tree.set(ended, 0, Distribution::from_weights(&[]).unwrap())
-            .unwrap();
+        tree.set(
+            ended,
+            0,
+            Distribution::from_weights(&[], Order::Heaviest).unwrap(),
+        )
+        .unwrap();
         let camera = cam(ROOT, 0.0, top(&[]), 0.0);
         let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let hit = pick(&tree, LENS, &frame, &camera, VIEW, 300.0, 200.0, 1.0)

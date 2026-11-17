@@ -2,19 +2,13 @@
 
 import { type Children, IntervalTree, type NodeId, ROOT, type Run } from "../src/core/tree";
 
-/** ln(e^a + e^b). */
-function lnAdd(a: number, b: number): number {
-  const high = Math.max(a, b);
-  return high === -Infinity ? high : high + Math.log1p(Math.exp(Math.min(a, b) - high));
-}
-
-/** Children with ``weights``, heaviest first, from ``rank``, along branches
- * 0, 1, … unless given, with ``rest`` of the node's mass below them. */
+/** Children with ``weights`` from ``rank``, along branches 0, 1, … unless
+ * given, with ``rest`` of the node's mass below them: the run's top is what
+ * the children and the rest leave above it. */
 export function run(weights: number[], branches = weights.map((_, i) => i), rank = 0,
-  rest = Math.max(0, 1 - weights.reduce((a, b) => a + b, 0))): Run & { branches: number[]; lnBelow: number[] } {
-  const lnBelow = [Math.log(rest)];
-  for (const weight of weights.toReversed()) lnBelow.unshift(Math.min(0, lnAdd(lnBelow[0]!, Math.log(weight))));
-  return { rank, branches, lnBelow };
+  rest = Math.max(0, 1 - weights.reduce((a, b) => a + b, 0))): Run & { branches: number[]; lnWeights: number[] } {
+  const above = rank === 0 ? 0 : 1 - rest - weights.reduce((a, b) => a + b, 0);
+  return { rank, branches, lnWeights: weights.map(Math.log), top: digits(Math.max(0, above)) };
 }
 
 /** An anchor's digits for the point ``fraction`` of a node's mass below its top: exact for any float. */
@@ -29,9 +23,12 @@ export function at(...below: number[]): { top: Uint8Array; lnMass: number; count
   return below.map((mass) => ({ top: digits(1 - mass), lnMass: -Infinity, count: 1 }));
 }
 
-/** An answer placing those children, as one run. */
+/** An answer placing those children, as one run, and the node's end
+ * where nothing is left below them. */
 export function answer(...args: Parameters<typeof run>): Children & { runs: ReturnType<typeof run>[] } {
-  return { runs: [run(...args)] };
+  const placed = run(...args);
+  const rest = args[3] ?? Math.max(0, 1 - args[0].reduce((a, b) => a + b, 0));
+  return rest === 0 ? { runs: [placed], count: placed.rank + placed.branches.length } : { runs: [placed] };
 }
 
 /** A tree whose nodes along ``path`` all split their interval with ``weights``. */

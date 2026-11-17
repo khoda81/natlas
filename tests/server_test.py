@@ -212,10 +212,22 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(session.step(tree), [])
         self.assertEqual(session.blocked(), [(0, 0, 10.0, [])])
         with np.errstate(divide="ignore"):
-            tree.set([0], 0, [np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32))])
+            tree.set([0], 0, [np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32))], "heaviest")
         ((kind, measure, node, parent, branch, runs, count),) = session.step(tree)
         self.assertEqual((kind, measure, node, parent, branch, count), ("answer", 0, 0, None, None, 3))
-        self.assertEqual([branches for _, branches, _ in runs], [[1, 3, 0]])
+        self.assertEqual([branch for _, branches, _, _ in runs for branch in branches], [1, 3, 0])
+        # Each run's top is the mass above it, its weights the children's.
+        above = 0.0
+        for _, branches, ln_weights, top in runs:
+            self.assertAlmostEqual(int.from_bytes(top, "big") / 256 ** len(top), above, delta=256 ** -len(top))
+            above += sum(math.exp(ln) for ln in ln_weights)
+        self.assertAlmostEqual(above, 1.0)
+        # By branch, the same weights in branch order.
+        tree.set([0], 0, [np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32))], "branch")
+        session = Session()
+        session.demand(tree, 0, 0, view=(0, b"", 0.0, 10.0, 0.1))
+        ((*_, runs, _),) = session.step(tree)
+        self.assertEqual([branch for _, branches, _, _ in runs for branch in branches], [0, 1, 3])
         self.assertEqual(session.blocked(), [])
         with self.assertRaises(ValueError):
             session.demand(tree, 0, 1)
@@ -452,24 +464,28 @@ class TransportTests(unittest.TestCase):
 
 
 class MigrationTests(unittest.TestCase):
-    def test_run_recordings_become_children_once(self):
+    def test_edge_recordings_become_weighted_runs_once(self):
         spec = importlib.util.spec_from_file_location(
             "migration", ROOT / "scripts/migrate-snapshots.py"
         )
         migration = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(migration)
-        Snapshot = migration.run_schema()
+        Snapshot = migration.edge_schema()
         old = Snapshot()
         recording = old.recordings.add(path=[0xFFFFFFFF])
-        recording.run.branches.extend([3, 1])
-        recording.run.ln_below.extend([0.0, math.log(0.5), math.log(0.25)])
-        recording.run.children = 7
+        run = recording.children.runs.add(branches=[3, 1])
+        run.ln_below.extend([0.0, math.log(0.5), math.log(0.25)])
+        recording.children.count = 7
         converted = migration.convert(old.SerializeToString(), Snapshot)
         (current,) = pb.Snapshot.FromString(converted).recordings
         self.assertEqual(list(current.path), [0xFFFFFFFF])
-        (run,) = current.children.runs
-        self.assertEqual((run.rank, list(run.branches), current.children.count), (0, [3, 1], 7))
-        self.assertEqual(list(run.ln_below), [0.0, math.log(0.5), math.log(0.25)])
+        runs = current.children.runs
+        self.assertEqual([branch for run in runs for branch in run.branches], [3, 1])
+        self.assertEqual(current.children.count, 7)
+        weights = [math.exp(ln) for run in runs for ln in run.ln_weights]
+        self.assertAlmostEqual(weights[0], 0.5)
+        self.assertAlmostEqual(weights[1], 0.25)
+        self.assertEqual(runs[0].top, bytes(len(runs[0].top)))
         self.assertIsNone(migration.convert(converted, Snapshot))
 
 

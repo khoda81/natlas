@@ -37,6 +37,6 @@ describe("IntervalTree", () => {
     expect(tree.ended(ROOT, 0)).toBe(true);
     tree.insert(ROOT, 0, { runs: [], count: 0 });
     expect(changes).toBe(1);
-    expect(() => tree.insert(ROOT, 0, { runs: [{ rank: 0, branches: [1], lnBelow: [0] }] })).toThrow("edge");
+    expect(() => tree.insert(ROOT, 0, { runs: [{ rank: 0, branches: [1], lnWeights: [], top: new Uint8Array() }] })).toThrow("weight");
   });
 });

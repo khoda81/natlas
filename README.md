@@ -27,8 +27,8 @@ made likelier, and their extra width is what it told the model, KL(p‖q).
 Pick one measure **p** and one measure **q** (by default the same). A child of
 node N is a box
 
-- **height** ∝ p: N's interval split by p, heaviest first, recursively, so a
-  box's height is the p-probability of its whole path;
+- **height** ∝ p: N's interval split by p, in p's order of its children,
+  recursively, so a box's height is the p-probability of its whole path;
 - **width** = −log q nats, starting where N's own box ends, so a box's left
   edge is the q-surprisal of its path.
 
@@ -62,11 +62,10 @@ to the deepest node that covers the view, and base-256 digits for the fraction
 of that node's p mass above the point (see `core/src/point.rs`). Zooming aims
 the point at what is under the pointer and then changes depth alone, and going
 up a node keeps every digit, so zooming out and back in returns to the very
-same place. An edge is stored as
-ln of the mass below it, and since children rank heaviest first, the mass
-below a child is at most the number of children below it times its own weight:
-every edge stays exact relative to the children around it, however light they
-are. Each node is laid out from its two edges nearest the point, one binary
+same place. An edge is a point too: a run's top, as many digits as the view
+that asked for it needs, plus the f64 sum of the weights above it within the
+run, so a child keeps its place among its neighbours in any order, however
+light it is (see `docs/exact-runs.md`). Each node is laid out from its two edges nearest the point, one binary
 search to the first visible child, and children thinner than a physical pixel
 join bands about a physical pixel tall (see `core/src/layout.rs`). Touching
 bands draw as one silhouette with their individual colors, so internal
@@ -103,11 +102,14 @@ that has not learned that id (it restarted, or never saw the node) answers
 `not_found`, and the client names the node once more from the root with its
 whole path.
 
-A node's children are ranked heaviest first, ties by increasing branch, and
-known in **runs** of consecutive ranks. A run carries its branches and the ln
-of the mass below each of its edges, summed from the light end so tiny masses
-survive. What lies between runs is a **gap**: its mass is known, its children
-are not. A gap is left undrawn, and a child whose q is not yet known reaches
+A node's children are ranked in the order the server keeps: heaviest first,
+ties by increasing branch, or by branch (`serve.py --order branch`; the
+music scribe always does), and known in **runs** of consecutive ranks. A run
+carries its branches, each child's ln weight, and its top: the fraction of
+the node above it in base-256 digits, as precise as the view that asked.
+Each next edge is the one before plus a child's weight. A run sent more
+precisely replaces a coarser one. What lies between runs is a **gap**: its
+mass is known, its children are not. A gap is left undrawn, and a child whose q is not yet known reaches
 past any view.
 
 The browser sends its current view and optional path to place over
@@ -130,8 +132,8 @@ pixel row, spread evenly through their mass. Children thinner than a
 physical pixel, with the gaps between them, are drawn as bands about a
 physical pixel tall, borderless silhouettes whose width Σ p (−ln q) / Σ p is
 a Monte Carlo estimate from their known children: exact when p = q and the
-band holds no gap, since children sorted by p have nearly equal surprisal
-side by side.
+band holds no gap, and close for gaps heaviest first, since children sorted
+by p have nearly equal surprisal side by side; noisier in branch order.
 Touching sibling bands share one contour, filled with a vertical gradient
 whose stops retain each band's color. Both of a band's conditional weights
 are p-weighted geometric means, so its comparison color shows the children's

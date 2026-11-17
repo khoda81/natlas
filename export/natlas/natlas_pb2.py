@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13natlas/natlas.proto\x12\x06natlas\"C\n\x08\x43hildren\x12\x19\n\x04runs\x18\x01 \x03(\x0b\x32\x0b.natlas.Run\x12\x12\n\x05\x63ount\x18\x02 \x01(\rH\x00\x88\x01\x01\x42\x08\n\x06_count\"7\n\x03Run\x12\x0c\n\x04rank\x18\x01 \x01(\r\x12\x10\n\x08\x62ranches\x18\x02 \x03(\r\x12\x10\n\x08ln_below\x18\x03 \x03(\x01\"r\n\x06\x44\x65mand\x12\t\n\x01p\x18\x01 \x01(\r\x12\t\n\x01q\x18\x02 \x01(\r\x12\x1f\n\x04view\x18\x03 \x01(\x0b\x32\x0c.natlas.ViewH\x00\x88\x01\x01\x12\x1f\n\x04path\x18\x04 \x01(\x0b\x32\x0c.natlas.PathH\x01\x88\x01\x01\x42\x07\n\x05_viewB\x07\n\x05_path\"Q\n\x04View\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x0b\n\x03top\x18\x02 \x01(\x0c\x12\x11\n\tln_height\x18\x03 \x01(\x01\x12\x0c\n\x04rows\x18\x04 \x01(\x01\x12\r\n\x05right\x18\x05 \x01(\x01\"&\n\x04Path\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x10\n\x08\x62ranches\x18\x02 \x03(\r\"*\n\x07Updates\x12\x1f\n\x07updates\x18\x01 \x03(\x0b\x32\x0e.natlas.Update\"\xa9\x01\n\x06Update\x12 \n\x06\x61nswer\x18\x01 \x01(\x0b\x32\x0e.natlas.AnswerH\x00\x12\x11\n\x07unknown\x18\x02 \x01(\x06H\x00\x12\x1e\n\x06placed\x18\x03 \x01(\x0b\x32\x0c.natlas.PathH\x00\x12 \n\x05lacks\x18\x04 \x01(\x0b\x32\x0f.natlas.MissingH\x00\x12 \n\x06\x66\x61iled\x18\x05 \x01(\x0b\x32\x0e.natlas.FailedH\x00\x42\x06\n\x04kind\"\x8b\x01\n\x06\x41nswer\x12\x0f\n\x07measure\x18\x01 \x01(\r\x12\x0c\n\x04node\x18\x02 \x01(\x06\x12\x13\n\x06parent\x18\x03 \x01(\x06H\x00\x88\x01\x01\x12\x13\n\x06\x62ranch\x18\x04 \x01(\rH\x01\x88\x01\x01\x12\"\n\x08\x63hildren\x18\x05 \x01(\x0b\x32\x10.natlas.ChildrenB\t\n\x07_parentB\t\n\x07_branch\"(\n\x07Missing\x12\x0f\n\x07measure\x18\x01 \x01(\r\x12\x0c\n\x04node\x18\x02 \x01(\x06\"8\n\x06\x46\x61iled\x12\x0f\n\x07measure\x18\x01 \x01(\r\x12\x0c\n\x04node\x18\x02 \x01(\x06\x12\x0f\n\x07message\x18\x03 \x01(\t\"\x1d\n\rSearchRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\"\x1e\n\x0eSearchResponse\x12\x0c\n\x04path\x18\x01 \x03(\r\"1\n\x08Snapshot\x12%\n\nrecordings\x18\x02 \x03(\x0b\x32\x11.natlas.Recording\"=\n\tRecording\x12\x0c\n\x04path\x18\x01 \x03(\r\x12\"\n\x08\x63hildren\x18\x03 \x01(\x0b\x32\x10.natlas.Children2A\n\x06Natlas\x12\x37\n\x06Search\x12\x15.natlas.SearchRequest\x1a\x16.natlas.SearchResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13natlas/natlas.proto\x12\x06natlas\"C\n\x08\x43hildren\x12\x19\n\x04runs\x18\x01 \x03(\x0b\x32\x0b.natlas.Run\x12\x12\n\x05\x63ount\x18\x02 \x01(\rH\x00\x88\x01\x01\x42\x08\n\x06_count\"F\n\x03Run\x12\x0c\n\x04rank\x18\x01 \x01(\r\x12\x10\n\x08\x62ranches\x18\x02 \x03(\r\x12\x12\n\nln_weights\x18\x03 \x03(\x01\x12\x0b\n\x03top\x18\x04 \x01(\x0c\"r\n\x06\x44\x65mand\x12\t\n\x01p\x18\x01 \x01(\r\x12\t\n\x01q\x18\x02 \x01(\r\x12\x1f\n\x04view\x18\x03 \x01(\x0b\x32\x0c.natlas.ViewH\x00\x88\x01\x01\x12\x1f\n\x04path\x18\x04 \x01(\x0b\x32\x0c.natlas.PathH\x01\x88\x01\x01\x42\x07\n\x05_viewB\x07\n\x05_path\"Q\n\x04View\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x0b\n\x03top\x18\x02 \x01(\x0c\x12\x11\n\tln_height\x18\x03 \x01(\x01\x12\x0c\n\x04rows\x18\x04 \x01(\x01\x12\r\n\x05right\x18\x05 \x01(\x01\"&\n\x04Path\x12\x0c\n\x04node\x18\x01 \x01(\x06\x12\x10\n\x08\x62ranches\x18\x02 \x03(\r\"*\n\x07Updates\x12\x1f\n\x07updates\x18\x01 \x03(\x0b\x32\x0e.natlas.Update\"\xa9\x01\n\x06Update\x12 \n\x06\x61nswer\x18\x01 \x01(\x0b\x32\x0e.natlas.AnswerH\x00\x12\x11\n\x07unknown\x18\x02 \x01(\x06H\x00\x12\x1e\n\x06placed\x18\x03 \x01(\x0b\x32\x0c.natlas.PathH\x00\x12 \n\x05lacks\x18\x04 \x01(\x0b\x32\x0f.natlas.MissingH\x00\x12 \n\x06\x66\x61iled\x18\x05 \x01(\x0b\x32\x0e.natlas.FailedH\x00\x42\x06\n\x04kind\"\x8b\x01\n\x06\x41nswer\x12\x0f\n\x07measure\x18\x01 \x01(\r\x12\x0c\n\x04node\x18\x02 \x01(\x06\x12\x13\n\x06parent\x18\x03 \x01(\x06H\x00\x88\x01\x01\x12\x13\n\x06\x62ranch\x18\x04 \x01(\rH\x01\x88\x01\x01\x12\"\n\x08\x63hildren\x18\x05 \x01(\x0b\x32\x10.natlas.ChildrenB\t\n\x07_parentB\t\n\x07_branch\"(\n\x07Missing\x12\x0f\n\x07measure\x18\x01 \x01(\r\x12\x0c\n\x04node\x18\x02 \x01(\x06\"8\n\x06\x46\x61iled\x12\x0f\n\x07measure\x18\x01 \x01(\r\x12\x0c\n\x04node\x18\x02 \x01(\x06\x12\x0f\n\x07message\x18\x03 \x01(\t\"\x1d\n\rSearchRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\"\x1e\n\x0eSearchResponse\x12\x0c\n\x04path\x18\x01 \x03(\r\"1\n\x08Snapshot\x12%\n\nrecordings\x18\x02 \x03(\x0b\x32\x11.natlas.Recording\"=\n\tRecording\x12\x0c\n\x04path\x18\x01 \x03(\r\x12\"\n\x08\x63hildren\x18\x03 \x01(\x0b\x32\x10.natlas.Children2A\n\x06Natlas\x12\x37\n\x06Search\x12\x15.natlas.SearchRequest\x1a\x16.natlas.SearchResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,31 +34,31 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_CHILDREN']._serialized_start=31
   _globals['_CHILDREN']._serialized_end=98
   _globals['_RUN']._serialized_start=100
-  _globals['_RUN']._serialized_end=155
-  _globals['_DEMAND']._serialized_start=157
-  _globals['_DEMAND']._serialized_end=271
-  _globals['_VIEW']._serialized_start=273
-  _globals['_VIEW']._serialized_end=354
-  _globals['_PATH']._serialized_start=356
-  _globals['_PATH']._serialized_end=394
-  _globals['_UPDATES']._serialized_start=396
-  _globals['_UPDATES']._serialized_end=438
-  _globals['_UPDATE']._serialized_start=441
-  _globals['_UPDATE']._serialized_end=610
-  _globals['_ANSWER']._serialized_start=613
-  _globals['_ANSWER']._serialized_end=752
-  _globals['_MISSING']._serialized_start=754
-  _globals['_MISSING']._serialized_end=794
-  _globals['_FAILED']._serialized_start=796
-  _globals['_FAILED']._serialized_end=852
-  _globals['_SEARCHREQUEST']._serialized_start=854
-  _globals['_SEARCHREQUEST']._serialized_end=883
-  _globals['_SEARCHRESPONSE']._serialized_start=885
-  _globals['_SEARCHRESPONSE']._serialized_end=915
-  _globals['_SNAPSHOT']._serialized_start=917
-  _globals['_SNAPSHOT']._serialized_end=966
-  _globals['_RECORDING']._serialized_start=968
-  _globals['_RECORDING']._serialized_end=1029
-  _globals['_NATLAS']._serialized_start=1031
-  _globals['_NATLAS']._serialized_end=1096
+  _globals['_RUN']._serialized_end=170
+  _globals['_DEMAND']._serialized_start=172
+  _globals['_DEMAND']._serialized_end=286
+  _globals['_VIEW']._serialized_start=288
+  _globals['_VIEW']._serialized_end=369
+  _globals['_PATH']._serialized_start=371
+  _globals['_PATH']._serialized_end=409
+  _globals['_UPDATES']._serialized_start=411
+  _globals['_UPDATES']._serialized_end=453
+  _globals['_UPDATE']._serialized_start=456
+  _globals['_UPDATE']._serialized_end=625
+  _globals['_ANSWER']._serialized_start=628
+  _globals['_ANSWER']._serialized_end=767
+  _globals['_MISSING']._serialized_start=769
+  _globals['_MISSING']._serialized_end=809
+  _globals['_FAILED']._serialized_start=811
+  _globals['_FAILED']._serialized_end=867
+  _globals['_SEARCHREQUEST']._serialized_start=869
+  _globals['_SEARCHREQUEST']._serialized_end=898
+  _globals['_SEARCHRESPONSE']._serialized_start=900
+  _globals['_SEARCHRESPONSE']._serialized_end=930
+  _globals['_SNAPSHOT']._serialized_start=932
+  _globals['_SNAPSHOT']._serialized_end=981
+  _globals['_RECORDING']._serialized_start=983
+  _globals['_RECORDING']._serialized_end=1044
+  _globals['_NATLAS']._serialized_start=1046
+  _globals['_NATLAS']._serialized_end=1111
 # @@protoc_insertion_point(module_scope)

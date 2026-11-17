@@ -58,6 +58,12 @@ def main() -> None:
     parser.add_argument("--n-ctx", type=int, default=8192, help="llama.cpp: tokens of context, the deepest node")
     parser.add_argument("--gpu-layers", type=int, default=-1, help="llama.cpp: layers on the GPU, -1 for all")
     parser.add_argument("--cache", type=float, default=CACHE / 2**30, help=f"GiB of memory for the distributions it keeps, default {CACHE / 2**30:g}")
+    parser.add_argument(
+        "--order",
+        choices=["heaviest", "branch"],
+        default="heaviest",
+        help="how each node's children rank: heaviest first, or by token id",
+    )
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8421)
     args = parser.parse_args()
@@ -88,6 +94,7 @@ def main() -> None:
         language.vocabulary,
         measures,
         round(args.cache * 2**30),
+        args.order,
     )
     files = {"labels.json": (labels.encode(), "application/json")}
     uvicorn.run(

@@ -522,7 +522,9 @@ def main() -> None:
             "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
         }
     ]
-    model = Model(own.start, windows.ends, own.vocabulary, measures, round(args.cache * 2**30))
+    # MuScriptor's vocabulary is musical already: time shifts and pitches
+    # ascending, so children keep its order.
+    model = Model(own.start, windows.ends, own.vocabulary, measures, round(args.cache * 2**30), "branch")
     files = {
         "labels.json": (labels_file(primary, windows), "application/json"),
         "audio.wav": (wav_file(recording), "audio/wav"),

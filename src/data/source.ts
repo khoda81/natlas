@@ -112,7 +112,7 @@ function decode(frame: Uint8Array): Update[] {
     switch (kind.case) {
       case "answer": {
         const { measure, node, parent, branch, children } = kind.value;
-        const runs = (children?.runs ?? []).map(({ rank, branches, lnBelow }) => ({ rank, branches, lnBelow }));
+        const runs = (children?.runs ?? []).map(({ rank, branches, lnWeights, top }) => ({ rank, branches, lnWeights, top }));
         return [{ kind: "answer", measure, node, parent: parent ?? null, branch: branch ?? null, runs, count: children?.count ?? null }];
       }
       case "unknown":

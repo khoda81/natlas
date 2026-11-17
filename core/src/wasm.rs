@@ -57,7 +57,19 @@ enum UpdateMessage<'a> {
 struct RunMessage<'a> {
     rank: u32,
     branches: std::borrow::Cow<'a, [u32]>,
-    ln_below: std::borrow::Cow<'a, [f64]>,
+    ln_weights: std::borrow::Cow<'a, [f64]>,
+    #[serde(with = "serde_bytes_slice")]
+    top: Vec<u8>,
+}
+
+/// A run's top crosses as a Uint8Array.
+mod serde_bytes_slice {
+    pub fn serialize<S: serde::Serializer>(
+        digits: &[u8],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(digits)
+    }
 }
 
 fn update_message(update: &Update) -> UpdateMessage<'_> {
@@ -78,7 +90,8 @@ fn update_message(update: &Update) -> UpdateMessage<'_> {
                 .map(|run| RunMessage {
                     rank: run.rank(),
                     branches: run.branches(),
-                    ln_below: run.ln_below(),
+                    ln_weights: run.ln_weights(),
+                    top: run.top_digits(),
                 })
                 .collect(),
             count: *count,
@@ -161,10 +174,10 @@ impl Tree {
     }
 
     /// Add one answer for a node, validated here: its runs packed flat, each
-    /// starting at `ranks[i]` with `lengths[i]` branches and one edge more,
-    /// and the node's end where the source knows it. Whether anything
-    /// changed. Typed arrays cross as copies, so a whole vocabulary never
-    /// becomes JavaScript objects.
+    /// starting at `ranks[i]` with `lengths[i]` branches and weights and a
+    /// top of `digits[i]` digits, and the node's end where the source knows
+    /// it. Whether anything changed. Typed arrays cross as copies, so a
+    /// whole vocabulary never becomes JavaScript objects.
     #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
@@ -173,23 +186,29 @@ impl Tree {
         ranks: Vec<u32>,
         lengths: Vec<u32>,
         branches: Vec<u32>,
-        ln_below: Vec<f64>,
+        ln_weights: Vec<f64>,
+        digits: Vec<u32>,
+        tops: Vec<u8>,
         children: Option<u32>,
     ) -> std::result::Result<bool, JsError> {
-        let (mut branch, mut edge) = (0, 0);
+        let (mut child, mut digit) = (0, 0);
         let mut runs = Vec::with_capacity(ranks.len() + 1);
-        for (&rank, &length) in ranks.iter().zip(&lengths) {
-            let length = length as usize;
-            let (Some(run_branches), Some(run_edges)) = (
-                branches.get(branch..branch + length),
-                ln_below.get(edge..edge + length + 1),
+        for ((&rank, &length), &count) in ranks.iter().zip(&lengths).zip(&digits) {
+            let (length, count) = (length as usize, count as usize);
+            let (Some(run_branches), Some(run_weights), Some(top)) = (
+                branches.get(child..child + length),
+                ln_weights.get(child..child + length),
+                tops.get(digit..digit + count),
             ) else {
                 return Err(JsError::new(
-                    "runs pack fewer branches or edges than their lengths",
+                    "runs pack fewer branches, weights or digits than their lengths",
                 ));
             };
-            runs.push(Run::new(rank, run_branches.to_vec(), run_edges.to_vec()).map_err(js_error)?);
-            (branch, edge) = (branch + length, edge + length + 1);
+            runs.push(
+                Run::new(rank, run_branches.to_vec(), run_weights.to_vec(), top)
+                    .map_err(js_error)?,
+            );
+            (child, digit) = (child + length, digit + count);
         }
         runs.extend(children.map(Run::end_at));
         self.inner.insert(id, measure, runs).map_err(js_error)

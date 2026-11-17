@@ -40,10 +40,13 @@ The rows are the view's worth, and the server lets it flow down the tree: an
 interval of a node splits among the children it covers, each getting the
 share of the rows its covered mass takes, a real number. A child worth a row
 or more is an interval of its own and goes on, while its children start on
-screen. Children thinner than a row are drawn as bands; children run heaviest
-first, so past the first thin one every child is thin, and that stretch is
-sampled evenly, two samples a row, and not gone into: Monte Carlo sampling of
-the tree's tail at evenly placed points. A missing distribution is worth the
+screen. The interval is read at evenly placed points, two a row, each finding
+the child that holds it, the next point the first past that child: every
+child worth a row is found and goes on, and a stretch of thinner ones, drawn
+as bands, is sampled and not gone into, in whatever order the children run:
+Monte Carlo sampling of the tree at evenly placed points. Each child's top is
+sent to 1/256 of a row of the interval it was found in, and sent again when
+a later view asks it more precisely. A missing distribution is worth the
 rows waiting on it, so the most valuable is about the most pixels the view
 lacks.
 

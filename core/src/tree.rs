@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::distribution::{ln_between, Distribution, Run};
+use crate::distribution::{Distribution, Run};
+use crate::point::Point;
 use crate::Result;
 
 /// A node's id, hashed from its branches by [`child_hash`] and shared by every
@@ -255,7 +256,7 @@ impl Tree {
         let ln_p = p.ln_p(branch).expect("a ranked branch has a weight");
         Ok(Some(Entry {
             rank,
-            before: ln_between(0.0, top).exp(),
+            before: Point::ln_between(&Point::top(), &top).exp(),
             ln_p,
             nats_q: self.nats_q(id, lens, branch, ln_p)?,
         }))

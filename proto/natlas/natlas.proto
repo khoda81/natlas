@@ -40,14 +40,23 @@ message Children {
 }
 
 // Consecutive ranks of a node's children in the measure's order: heaviest
-// first, ties by increasing branch.
+// first, or by branch, or any order the server and its readers agree on.
+//
+// Rank r's top is the fraction of the node's mass above it. A run gives
+// its own: `top`, then each next one the one before plus the f64 weight of
+// the child between, e^ln_weight, summed in order from `top`. The child
+// at rank r spans from rank r's top to rank r + 1's; where two runs give
+// one rank's top, the one with more digits wins, and of two alike the
+// later. A run starting at the rank another ends at gives that edge.
 message Run {
   uint32 rank = 1;
   repeated uint32 branches = 2;
-  // ln of the mass at and below each edge, conditional on the node: edge i
-  // tops rank `rank + i`, and the last bottoms the run, one more edge than
-  // branches. Summed from the light end, so tiny masses survive.
-  repeated double ln_below = 3;
+  // ln of each child's weight, conditional on the node: its size, at
+  // relative precision however light it is.
+  repeated double ln_weights = 3;
+  // The fraction of the node's mass above the run, as digits in base 256,
+  // most significant first, rounded down: as precise as the view asks.
+  bytes top = 4;
 }
 
 // A session: one client, one WebSocket to a server at /session, carrying a

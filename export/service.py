@@ -110,6 +110,7 @@ class Model:
         vocabulary: int,
         measures: list[Measure],
         cache: int = CACHE,
+        order: str = "heaviest",
     ):
         # What the model reads before the root's children: a start-of-text token.
         self.root = root
@@ -118,6 +119,9 @@ class Model:
         # Branches the model has; every other branch has weight zero.
         self.vocabulary = vocabulary
         self.measures = measures
+        # The order each node's children rank in: "heaviest" first, or by
+        # "branch", where branches already follow the reading's own order.
+        self.order = order
         self.tree = Tree(len(measures))
         # Which distributions to forget first: the oldest, once those kept,
         # by (node, measure), hold more than ``cache`` bytes.
@@ -338,7 +342,8 @@ class Model:
         return self.ends(tokens) or any(self.vocabulary <= branch for branch in tokens)
 
     def _keep(self, measure: int, nodes: list[int], rows: list[np.ndarray]) -> None:
-        sizes = self.tree.set(nodes, measure, [np.ascontiguousarray(row, dtype=np.float32) for row in rows])
+        rows = [np.ascontiguousarray(row, dtype=np.float32) for row in rows]
+        sizes = self.tree.set(nodes, measure, rows, self.order)
         for node, size in zip(nodes, sizes, strict=True):
             self.held += size - self.kept.pop((node, measure), 0)
             self.kept[node, measure] = size
@@ -360,7 +365,8 @@ def _encode(updates: list[tuple]) -> bytes:
                 if parent is not None:
                     answer.parent, answer.branch = parent, branch
                 answer.children.runs.extend(
-                    pb.Run(rank=rank, branches=branches, ln_below=ln_below) for rank, branches, ln_below in runs
+                    pb.Run(rank=rank, branches=branches, ln_weights=ln_weights, top=bytes(top))
+                    for rank, branches, ln_weights, top in runs
                 )
                 if count is not None:
                     answer.children.count = count

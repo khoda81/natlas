@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file natlas/natlas.proto.
  */
 export const file_natlas_natlas: GenFile = /*@__PURE__*/
-  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMiQwoIQ2hpbGRyZW4SGQoEcnVucxgBIAMoCzILLm5hdGxhcy5SdW4SEgoFY291bnQYAiABKA1IAIgBAUIICgZfY291bnQiNwoDUnVuEgwKBHJhbmsYASABKA0SEAoIYnJhbmNoZXMYAiADKA0SEAoIbG5fYmVsb3cYAyADKAEicgoGRGVtYW5kEgkKAXAYASABKA0SCQoBcRgCIAEoDRIfCgR2aWV3GAMgASgLMgwubmF0bGFzLlZpZXdIAIgBARIfCgRwYXRoGAQgASgLMgwubmF0bGFzLlBhdGhIAYgBAUIHCgVfdmlld0IHCgVfcGF0aCJRCgRWaWV3EgwKBG5vZGUYASABKAYSCwoDdG9wGAIgASgMEhEKCWxuX2hlaWdodBgDIAEoARIMCgRyb3dzGAQgASgBEg0KBXJpZ2h0GAUgASgBIiYKBFBhdGgSDAoEbm9kZRgBIAEoBhIQCghicmFuY2hlcxgCIAMoDSIqCgdVcGRhdGVzEh8KB3VwZGF0ZXMYASADKAsyDi5uYXRsYXMuVXBkYXRlIqkBCgZVcGRhdGUSIAoGYW5zd2VyGAEgASgLMg4ubmF0bGFzLkFuc3dlckgAEhEKB3Vua25vd24YAiABKAZIABIeCgZwbGFjZWQYAyABKAsyDC5uYXRsYXMuUGF0aEgAEiAKBWxhY2tzGAQgASgLMg8ubmF0bGFzLk1pc3NpbmdIABIgCgZmYWlsZWQYBSABKAsyDi5uYXRsYXMuRmFpbGVkSABCBgoEa2luZCKLAQoGQW5zd2VyEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhITCgZwYXJlbnQYAyABKAZIAIgBARITCgZicmFuY2gYBCABKA1IAYgBARIiCghjaGlsZHJlbhgFIAEoCzIQLm5hdGxhcy5DaGlsZHJlbkIJCgdfcGFyZW50QgkKB19icmFuY2giKAoHTWlzc2luZxIPCgdtZWFzdXJlGAEgASgNEgwKBG5vZGUYAiABKAYiOAoGRmFpbGVkEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhIPCgdtZXNzYWdlGAMgASgJIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIj0KCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEiIKCGNoaWxkcmVuGAMgASgLMhAubmF0bGFzLkNoaWxkcmVuMkEKBk5hdGxhcxI3CgZTZWFyY2gSFS5uYXRsYXMuU2VhcmNoUmVxdWVzdBoWLm5hdGxhcy5TZWFyY2hSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMiQwoIQ2hpbGRyZW4SGQoEcnVucxgBIAMoCzILLm5hdGxhcy5SdW4SEgoFY291bnQYAiABKA1IAIgBAUIICgZfY291bnQiRgoDUnVuEgwKBHJhbmsYASABKA0SEAoIYnJhbmNoZXMYAiADKA0SEgoKbG5fd2VpZ2h0cxgDIAMoARILCgN0b3AYBCABKAwicgoGRGVtYW5kEgkKAXAYASABKA0SCQoBcRgCIAEoDRIfCgR2aWV3GAMgASgLMgwubmF0bGFzLlZpZXdIAIgBARIfCgRwYXRoGAQgASgLMgwubmF0bGFzLlBhdGhIAYgBAUIHCgVfdmlld0IHCgVfcGF0aCJRCgRWaWV3EgwKBG5vZGUYASABKAYSCwoDdG9wGAIgASgMEhEKCWxuX2hlaWdodBgDIAEoARIMCgRyb3dzGAQgASgBEg0KBXJpZ2h0GAUgASgBIiYKBFBhdGgSDAoEbm9kZRgBIAEoBhIQCghicmFuY2hlcxgCIAMoDSIqCgdVcGRhdGVzEh8KB3VwZGF0ZXMYASADKAsyDi5uYXRsYXMuVXBkYXRlIqkBCgZVcGRhdGUSIAoGYW5zd2VyGAEgASgLMg4ubmF0bGFzLkFuc3dlckgAEhEKB3Vua25vd24YAiABKAZIABIeCgZwbGFjZWQYAyABKAsyDC5uYXRsYXMuUGF0aEgAEiAKBWxhY2tzGAQgASgLMg8ubmF0bGFzLk1pc3NpbmdIABIgCgZmYWlsZWQYBSABKAsyDi5uYXRsYXMuRmFpbGVkSABCBgoEa2luZCKLAQoGQW5zd2VyEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhITCgZwYXJlbnQYAyABKAZIAIgBARITCgZicmFuY2gYBCABKA1IAYgBARIiCghjaGlsZHJlbhgFIAEoCzIQLm5hdGxhcy5DaGlsZHJlbkIJCgdfcGFyZW50QgkKB19icmFuY2giKAoHTWlzc2luZxIPCgdtZWFzdXJlGAEgASgNEgwKBG5vZGUYAiABKAYiOAoGRmFpbGVkEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhIPCgdtZXNzYWdlGAMgASgJIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIj0KCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEiIKCGNoaWxkcmVuGAMgASgLMhAubmF0bGFzLkNoaWxkcmVuMkEKBk5hdGxhcxI3CgZTZWFyY2gSFS5uYXRsYXMuU2VhcmNoUmVxdWVzdBoWLm5hdGxhcy5TZWFyY2hSZXNwb25zZWIGcHJvdG8z");
 
 /**
  * What a source places of one node's children.
@@ -41,7 +41,14 @@ export const ChildrenSchema: GenMessage<Children> = /*@__PURE__*/
 
 /**
  * Consecutive ranks of a node's children in the measure's order: heaviest
- * first, ties by increasing branch.
+ * first, or by branch, or any order the server and its readers agree on.
+ *
+ * Rank r's top is the fraction of the node's mass above it. A run gives
+ * its own: `top`, then each next one the one before plus the f64 weight of
+ * the child between, e^ln_weight, summed in order from `top`. The child
+ * at rank r spans from rank r's top to rank r + 1's; where two runs give
+ * one rank's top, the one with more digits wins, and of two alike the
+ * later. A run starting at the rank another ends at gives that edge.
  *
  * @generated from message natlas.Run
  */
@@ -57,13 +64,20 @@ export type Run = Message<"natlas.Run"> & {
   branches: number[];
 
   /**
-   * ln of the mass at and below each edge, conditional on the node: edge i
-   * tops rank `rank + i`, and the last bottoms the run, one more edge than
-   * branches. Summed from the light end, so tiny masses survive.
+   * ln of each child's weight, conditional on the node: its size, at
+   * relative precision however light it is.
    *
-   * @generated from field: repeated double ln_below = 3;
+   * @generated from field: repeated double ln_weights = 3;
    */
-  lnBelow: number[];
+  lnWeights: number[];
+
+  /**
+   * The fraction of the node's mass above the run, as digits in base 256,
+   * most significant first, rounded down: as precise as the view asks.
+   *
+   * @generated from field: bytes top = 4;
+   */
+  top: Uint8Array;
 };
 
 /**

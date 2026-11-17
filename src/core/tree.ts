@@ -10,7 +10,7 @@ export type NodeId = bigint;
 export const ROOT: NodeId = 0n;
 /** One of a node's 2^32 branches. What it denotes is up to a reading. */
 export type Branch = number;
-/** A child's position in its measure's order: 0 is the heaviest. */
+/** A child's position in its measure's order, from 0. */
 export type Rank = number;
 
 export interface Lens {
@@ -22,8 +22,10 @@ export interface Lens {
 export interface Run {
   rank: Rank;
   branches: ArrayLike<Branch>;
-  /** ln of the mass at and below each edge; one more than branches. */
-  lnBelow: ArrayLike<number>;
+  /** ln of each child's weight, conditional on the node. */
+  lnWeights: ArrayLike<number>;
+  /** The fraction of the node's mass above the run, in base 256. */
+  top: Uint8Array;
 }
 
 /** What a source places of one node's children in one answer. */
@@ -125,18 +127,20 @@ export class IntervalTree {
   /** Add one answer for a node. Listeners hear only of answers that changed something. */
   insert(id: NodeId, measure: number, { runs, count }: Children): void {
     for (const run of runs) {
-      if (run.lnBelow.length !== run.branches.length + 1) throw new Error("a run needs one more edge than branches");
+      if (run.lnWeights.length !== run.branches.length) throw new Error("a run needs a weight for every branch");
     }
     const ranks = Uint32Array.from(runs, (run) => run.rank);
     const lengths = Uint32Array.from(runs, (run) => run.branches.length);
+    const digits = Uint32Array.from(runs, (run) => run.top.length);
     const branches = new Uint32Array(lengths.reduce((sum, length) => sum + length, 0));
-    const lnBelow = new Float64Array(branches.length + runs.length);
-    // Each run's edges follow its branches' offset, one more per run before it.
-    for (let i = 0, at = 0; i < runs.length; at += runs[i]!.branches.length, i++) {
+    const lnWeights = new Float64Array(branches.length);
+    const tops = new Uint8Array(digits.reduce((sum, length) => sum + length, 0));
+    for (let i = 0, at = 0, digit = 0; i < runs.length; at += lengths[i]!, digit += digits[i]!, i++) {
       branches.set(runs[i]!.branches, at);
-      lnBelow.set(runs[i]!.lnBelow, at + i);
+      lnWeights.set(runs[i]!.lnWeights, at);
+      tops.set(runs[i]!.top, digit);
     }
-    if (!this.raw.insert(id, measure, ranks, lengths, branches, lnBelow, count)) return;
+    if (!this.raw.insert(id, measure, ranks, lengths, branches, lnWeights, digits, tops, count)) return;
     this.revision++;
     this.revisions.set(id, this.revision);
     for (const listener of this.listeners) listener();

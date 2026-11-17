@@ -5,7 +5,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::distribution::{Distribution, Run};
+use crate::distribution::{Distribution, Order, Run};
 use crate::session::{Demand, Path, Session, Update, View};
 use crate::tree::{Lens, Tree};
 
@@ -64,15 +64,22 @@ impl PythonTree {
 
     /// Set the children of each of `nodes` under `measure` from its row of
     /// `ln_weights`: every branch's ln weight up to a constant, a float32
-    /// buffer indexed by branch, as a measure computes them. Says about how
-    /// many bytes each holds. The rows are sorted on every core, without
-    /// the GIL and before the tree is borrowed.
+    /// buffer indexed by branch, as a measure computes them, ranked in
+    /// `order`: "heaviest" first or by "branch". Says about how many bytes
+    /// each holds. The rows are packed on every core, without the GIL and
+    /// before the tree is borrowed.
     fn set(
         slf: &Bound<'_, Self>,
         nodes: Vec<u64>,
         measure: usize,
         ln_weights: Vec<PyBuffer<f32>>,
+        order: &str,
     ) -> PyResult<Vec<usize>> {
+        let order = match order {
+            "heaviest" => Order::Heaviest,
+            "branch" => Order::Branch,
+            _ => return Err(error(format!("no order {order:?}: heaviest or branch"))),
+        };
         if nodes.len() != ln_weights.len() {
             return Err(error(format!(
                 "{} nodes but {} rows of weights",
@@ -85,7 +92,7 @@ impl PythonTree {
             .iter()
             .map(|row| row.to_vec(py))
             .collect::<PyResult<Vec<_>>>()?;
-        let distributions = py.detach(|| sorted(&rows)).map_err(error)?;
+        let distributions = py.detach(|| packed(&rows, order)).map_err(error)?;
         let mut tree = slf.borrow_mut();
         nodes
             .into_iter()
@@ -104,7 +111,7 @@ impl PythonTree {
 }
 
 /// Each row's distribution, rows shared out among the cores in order.
-fn sorted(rows: &[Vec<f32>]) -> Result<Vec<Distribution>, String> {
+fn packed(rows: &[Vec<f32>], order: Order) -> Result<Vec<Distribution>, String> {
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     let share = rows.len().div_ceil(cores).max(1);
     std::thread::scope(|scope| {
@@ -114,7 +121,7 @@ fn sorted(rows: &[Vec<f32>]) -> Result<Vec<Distribution>, String> {
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|row| Distribution::from_weights(row))
+                        .map(|row| Distribution::from_weights(row, order))
                         .collect::<Result<Vec<_>, String>>()
                 })
             })
@@ -137,9 +144,14 @@ impl PythonTree {
     }
 }
 
-/// A run as (rank, branches, ln_below).
-fn run(run: &Run) -> (u32, Vec<u32>, Vec<f64>) {
-    (run.rank(), run.branches().to_vec(), run.ln_below().to_vec())
+/// A run as (rank, branches, ln_weights, top digits).
+fn run(run: &Run) -> (u32, Vec<u32>, Vec<f64>, Vec<u8>) {
+    (
+        run.rank(),
+        run.branches().to_vec(),
+        run.ln_weights().to_vec(),
+        run.top_digits(),
+    )
 }
 
 #[pymethods]
@@ -180,7 +192,8 @@ impl PythonSession {
     }
 
     /// Read on, and what is new to the client: ("answer", measure, node,
-    /// parent, branch, runs, count) with runs as (rank, branches, ln_below)
+    /// parent, branch, runs, count) with runs as (rank, branches,
+    /// ln_weights, top)
     /// and parent, branch and count None where there are none;
     /// ("unknown", node); ("placed", node, branches); ("lacks", measure,
     /// node); ("failed", measure, node, message).

@@ -69,10 +69,9 @@ extent: the view the camera will have inside it.
 ## Server
 
 A measure computes ln weights (f32 for models, f64 in recordings). The
-server fixes each child's weight once as a dyadic, `w = round(e^ln w)`, the
-rounding `point.rs`'s `Dyadic::exp` already defines. The node's mass
-`W = Σ w` and every edge's fraction above, `Σ_{i<r} w_i / W`, are exact
-rationals, and `top` is one of them floored.
+server fixes each child's weight once as a float, `w = e^(ln w − max)`. The
+node's mass `W = Σ w` and every edge's fraction above, `Σ_{i<r} w_i / W`,
+are exact rationals, and `top` is one of them floored.
 
 That is the only exact arithmetic: once per run, a sum as large as the node
 taken to the run's precision. `Packed` keeps what it keeps now (branches
@@ -85,19 +84,35 @@ when a demand needs it more precise.
 
 ## Client
 
-A run keeps its `top` digits and its weights. The camera's point shares a
-run's leading digits wherever the run is in view, so placing a run is small
-arithmetic on the digits past the shared ones, then f64 sums of weights
-from there. Layout converts to view heights once per run; `point.rs`
-compares points and tops digit by digit, and its rounding of ln edges goes.
-Gap masses, worth and band heights are differences of edges.
+A run keeps its top and the f64 sums of its weights from it, fractions of
+the node: edge i is the top plus sum i, exactly. A part of a run keeps the
+top and sums of the whole, so inserting a finer run never moves the edges
+of the coarser one around it. Points and edges are one type, `Point`, and
+compare exactly.
+
+Each rank keeps the run with the more digits, the latest of two alike. Where
+two runs touch, the later's top bottoms the child before it.
+
+Layout places each run's top once, exactly, and its edges by their sums
+from it while that top is within 2^16 view heights, where a float is off by
+at most 2^-37 of a view height; farther, an edge is placed exactly, since
+its height would cancel what places it. Band heights and masses are
+differences of sums within a run.
 
 ## Recordings
 
 A snapshot is a server's answers saved to a file, read without a server:
 the static datasets in `public/data`. Nothing refines them, so each
-recorded run's top holds the digits its smallest recorded child needs.
-Existing snapshots are re-exported.
+recorded run's top holds the digits a view of its lightest child 4096 rows
+tall needs (`natlas_codec.py`, with exact fractions), and a run ends where
+its sums would drift past them. `scripts/migrate-snapshots.py` converts
+snapshots of ln-below edges.
+
+## Limits
+
+Sizes are floats: a child lighter than 2^-1074 of its node, about e^-745,
+has no extent, though its ln weight still sizes its width. Positions have
+no such floor.
 
 ## Order
 
@@ -135,3 +150,11 @@ Summing on demand costs a demand that answers a few hundred runs tens of
 milliseconds; keeping a sum every 256 children costs 3% more memory per
 node and keeps a run under a microsecond. `Packed` keeps an exact sum
 every 256 children: every 16th of its blocks.
+
+## Measured: built
+
+Laying out 60 views zooming into the zen recording, about 1000 boxes a
+frame: 1.03 ms a frame, against 0.89 ms with ln-below edges. A session
+reading a node of 151,936 synthetic weights: a whole view of 1600 rows in
+0.40 ms heaviest first and 0.55 ms by branch; a view 10^-6 of it by branch,
+0.33 ms.

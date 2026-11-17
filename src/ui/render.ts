@@ -42,10 +42,10 @@ const LABEL_MAX_SIZE = 96;
 const LABEL_FILL = 0.6;
 /** Room left at each end of a label, in ems. */
 const LABEL_PAD = 0.25;
-/** How strongly a near-certain continuation shows beside a label's own text. */
-const CONTINUATION_ALPHA = 0.6;
-/** A continuation's tokens are framed, in ems: room inside a frame at each
- * side, the space before each frame, and the frame's half height. */
+/** How strongly the labels a box carries from its ancestors show before its own. */
+const CARRIED_ALPHA = 0.6;
+/** Carried labels are framed, in ems: room inside a frame at each side, the
+ * space after each frame, and the frame's half height. */
 const TOKEN_PAD = 0.2;
 const TOKEN_GAP = 0.3;
 const TOKEN_HALF = 0.6;
@@ -173,75 +173,57 @@ export function draw(
     if (box.count !== 0) labels.push({ box, rect, ink });
   }
 
-  // Boxes by the node whose children they are, to follow a chain of
-  // near-certain children from a label's box.
-  const children = new Map<NodeId, Box[]>();
+  // A box whose label is too small to draw hands it, after the labels it
+  // carries itself, to each of its children; they carry it until one draws
+  // it before its own. A box's parent is the box of the branch its node is.
+  const parents = new Map<NodeId, Box>();
   for (const box of frame.boxes) {
-    const siblings = children.get(box.node);
-    if (siblings === undefined) children.set(box.node, [box]);
-    else siblings.push(box);
+    if (box.kind !== "merged" && box.branch !== null) parents.set(state.child(box.node, box.branch), box);
   }
+  const carriedBy = new Map<NodeId, readonly Glyph[]>();
+  /** The labels the children of ``node`` carry, outermost first. */
+  const carried = (node: NodeId): readonly Glyph[] => {
+    let glyphs = carriedBy.get(node);
+    if (glyphs === undefined) {
+      const parent = parents.get(node);
+      glyphs = parent === undefined || fitOf(parent) !== null
+        ? []
+        : [...carried(parent.node), state.glyph(parent.node, parent.branch!)];
+      carriedBy.set(node, glyphs);
+    }
+    return glyphs;
+  };
   const fits = new Map<Box, Fit | null>();
   const fitOf = (box: Box): Fit | null => {
     let fit = fits.get(box);
     if (fit === undefined) {
-      const glyph = box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box);
+      // A gap's label counts children; it carries nothing to them.
+      const [glyph, before] = box.branch !== null
+        ? [state.glyph(box.node, box.branch), carried(box.node)]
+        : [gapGlyph(box), []];
       const width = (box.x1 - box.x0) * cam.k - 2;
       const height = (box.y1 - box.y0) * view.height;
-      fits.set(box, fit = fitLabel(ctx, glyph, width, height, box.branch !== null));
+      fits.set(box, fit = fitLabel(ctx, before, glyph, width, height, box.branch !== null));
     }
     return fit;
-  };
-  /** The child holding most of the box's p mass, if any. */
-  const dominant = (box: Box): Box | null => {
-    if (box.branch === null) return null;
-    const below = children.get(state.child(box.node, box.branch)) ?? [];
-    return below.find((child) => child.branch !== null && child.kind !== "merged" && 0.5 < child.p) ?? null;
-  };
-  /** The tokens of the chain of dominant children below a box that have no
-   * label of their own, as many whole ones as ``room`` ems holds, then an
-   * ellipsis where more did not fit; and their width in ems. */
-  const continuation = (box: Box, room: number): { glyphs: Glyph[]; cut: boolean; width: number } => {
-    const glyphs: Glyph[] = [];
-    let width = 0;
-    let cut = false;
-    for (let child = dominant(box); child !== null && fitOf(child) === null; child = dominant(child)) {
-      const glyph = state.glyph(child.node, child.branch!);
-      const next = TOKEN_GAP + tokenEms(ctx, glyph);
-      if (room < width + next) {
-        cut = true;
-        break;
-      }
-      glyphs.push(glyph);
-      width += next;
-    }
-    if (!cut) return { glyphs, cut, width };
-    const ellipsis = TOKEN_GAP + measure(ctx, MORE.text) / BASE_SIZE;
-    while (0 < glyphs.length && room < width + ellipsis) width -= TOKEN_GAP + tokenEms(ctx, glyphs.pop()!);
-    if (room < width + ellipsis) return { glyphs: [], cut: false, width: 0 };
-    return { glyphs, cut, width: width + ellipsis };
   };
 
   // A label's size follows its whole box, never the viewport. Within its box,
   // a label moves toward the viewport as far as the box allows: it starts at
   // the box's left, centered, and slides right past the left screen edge and
   // up or down into view, stopping at the box's own edges. A label reading up
-  // a box is centered both ways and slides into view the same way. A chain of
-  // near-certain children too thin for labels of their own continues their
-  // ancestor's label, fainter, in the room its box has left.
+  // a box is centered both ways and slides into view the same way. The labels
+  // a box carries come first, framed and fainter.
   for (const { box, rect, ink } of labels) {
     const fit = fitOf(box);
     if (fit === null) continue;
-    const { text, size, vertical, marked } = fit;
+    const { carried, cut, text, size, vertical, marked } = fit;
     const left = (box.x0 - cam.x) * cam.k;
     const right = left + (box.x1 - box.x0) * cam.k - 2;
     const top = box.y0 * view.height;
     const bottom = box.y1 * view.height;
     const pad = LABEL_PAD * size;
-    const own = (measure(ctx, text) / BASE_SIZE + marked) * size;
-    const along = vertical ? bottom - top : right - left;
-    const more = continuation(box, (along - 2 * pad - own) / size);
-    const span = own + more.width * size;
+    const span = fit.ems * size;
     // Where the text starts, and the screen rectangle it covers.
     let x: number, y: number, covers: ScreenRect;
     if (vertical) {
@@ -262,17 +244,17 @@ export function draw(
     ctx.translate(x, y);
     if (vertical) ctx.rotate(-Math.PI / 2);
     ctx.font = `${size}px ${FAMILY}`;
-    const glyph = box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box);
-    if (glyph.mark !== undefined) mark(ctx, glyph.mark, 0, 0, size, glyph.tint ?? ink, ink);
     ctx.fillStyle = ink;
-    ctx.fillText(text, marked * size, 0);
-    ctx.globalAlpha = CONTINUATION_ALPHA;
+    ctx.strokeStyle = ink;
     ctx.lineWidth = Math.max(1, size / 16);
-    let at = own;
-    for (const token of more.glyphs) {
-      at += TOKEN_GAP * size;
+    ctx.globalAlpha = CARRIED_ALPHA;
+    let at = 0;
+    if (cut) {
+      ctx.fillText(MORE.text, 0, 0);
+      at += cutEms(ctx) * size;
+    }
+    for (const token of carried) {
       const width = tokenEms(ctx, token) * size;
-      ctx.strokeStyle = ink;
       ctx.beginPath();
       ctx.roundRect(at, -TOKEN_HALF * size, width, 2 * TOKEN_HALF * size, TOKEN_PAD * size);
       ctx.stroke();
@@ -280,9 +262,13 @@ export function draw(
       if (token.mark !== undefined) mark(ctx, token.mark, at + TOKEN_PAD * size, 0, size, token.tint ?? ink, ink);
       ctx.fillStyle = ink;
       ctx.fillText(token.text, at + TOKEN_PAD * size + marked, 0);
-      at += width;
+      at += width + TOKEN_GAP * size;
     }
-    if (more.cut) ctx.fillText(MORE.text, at + TOKEN_GAP * size, 0);
+    ctx.globalAlpha = 1;
+    const glyph = box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box);
+    if (glyph.mark !== undefined) mark(ctx, glyph.mark, at, 0, size, glyph.tint ?? ink, ink);
+    ctx.fillStyle = ink;
+    ctx.fillText(text, at + marked * size, 0);
     ctx.restore();
   }
 
@@ -355,38 +341,65 @@ function tail(
   ctx.fill();
 }
 
-/** What a gap or the origin says of itself: how many children it holds, where known. */
-/** A label as drawn: its text, maybe shortened, its size, which way it
- * reads, and the ems its mark takes before the text. */
+/** A label as drawn: the labels it carries that fit, outermost first, and
+ * whether outer ones were cut; its own text, maybe shortened; its size;
+ * which way it reads; the ems its own mark takes before its own text; and
+ * its whole length in ems. */
 interface Fit {
+  carried: readonly Glyph[];
+  cut: boolean;
   text: string;
   size: number;
   vertical: boolean;
   marked: number;
+  ems: number;
 }
 
 /** The largest label a box of ``width`` by ``height`` CSS pixels holds:
- * across it, or up it where it is taller than wide and that is larger. A
- * label too long to read at any size the box allows keeps as much of its
- * start as fits at the smallest readable size; one that keeps nothing is
- * not drawn. Gap labels, which do not ``grow``, stay at the base size. */
-function fitLabel(ctx: CanvasRenderingContext2D, glyph: Glyph, width: number, height: number, grows: boolean): Fit | null {
+ * across it, or up it where it is taller than wide and that is larger. The
+ * labels it carries come before its own, as many of the innermost as fit at
+ * a readable size, after an ellipsis where outer ones do not; where none
+ * does, it is its own alone. A label too long to read at any size the box
+ * allows keeps as much of its start as fits at the smallest readable size;
+ * one that keeps nothing is not drawn. Gap labels, which do not ``grow``,
+ * stay at the base size. */
+function fitLabel(
+  ctx: CanvasRenderingContext2D,
+  carried: readonly Glyph[],
+  glyph: Glyph,
+  width: number,
+  height: number,
+  grows: boolean,
+): Fit | null {
   const marked = markEms(glyph);
-  const ems = measure(ctx, glyph.text) / BASE_SIZE + marked;
+  const own = measure(ctx, glyph.text) / BASE_SIZE + marked;
   const largest = grows ? LABEL_MAX_SIZE : BASE_SIZE;
-  const size = (across: number, along: number) => Math.min(largest, across * LABEL_FILL, along / (ems + 2 * LABEL_PAD));
-  const sideways = size(height, width);
-  const upward = width < height ? size(width, height) : 0;
-  const vertical = sideways < upward;
-  const best = Math.max(sideways, upward);
-  if (LABEL_MIN_SIZE <= best) return { text: glyph.text, size: best, vertical, marked };
+  const size = (across: number, along: number, ems: number) =>
+    Math.min(largest, across * LABEL_FILL, along / (ems + 2 * LABEL_PAD));
+  const fit = (kept: readonly Glyph[], cut: boolean, ems: number): Fit | null => {
+    const sideways = size(height, width, ems);
+    const upward = width < height ? size(width, height, ems) : 0;
+    const best = Math.max(sideways, upward);
+    if (best < LABEL_MIN_SIZE) return null;
+    return { carried: kept, cut, text: glyph.text, size: best, vertical: sideways < upward, marked, ems };
+  };
+  // Outermost first, each carried label is dropped until the rest fit.
+  let ems = own + carried.reduce((sum, token) => sum + tokenEms(ctx, token) + TOKEN_GAP, 0);
+  for (let first = 0; first < carried.length; first++) {
+    const found = fit(carried.slice(first), 0 < first, ems + (0 < first ? cutEms(ctx) : 0));
+    if (found !== null) return found;
+    ems -= tokenEms(ctx, carried[first]!) + TOKEN_GAP;
+  }
+  const alone = fit([], false, own);
+  if (alone !== null) return alone;
   // Ems of text that fit at the smallest readable size.
   const room = (across: number, along: number) =>
     LABEL_MIN_SIZE <= across * LABEL_FILL ? along / LABEL_MIN_SIZE - 2 * LABEL_PAD - marked : 0;
   const across = room(height, width);
   const up = width < height ? room(width, height) : 0;
   const text = shortened(ctx, glyph.text, Math.max(across, up));
-  return text === null ? null : { text, size: LABEL_MIN_SIZE, vertical: across < up, marked };
+  if (text === null) return null;
+  return { carried: [], cut: false, text, size: LABEL_MIN_SIZE, vertical: across < up, marked, ems: measure(ctx, text) / BASE_SIZE + marked };
 }
 
 /** The ems a glyph's mark takes before its text. */
@@ -394,9 +407,14 @@ function markEms(glyph: Glyph): number {
   return glyph.mark === undefined ? 0 : MARK_WIDTH + (glyph.text === "" ? 0 : MARK_GAP);
 }
 
-/** The ems a continuation token takes inside its frame. */
+/** The ems a carried label's frame takes. */
 function tokenEms(ctx: CanvasRenderingContext2D, glyph: Glyph): number {
   return 2 * TOKEN_PAD + markEms(glyph) + measure(ctx, glyph.text) / BASE_SIZE;
+}
+
+/** The ems the ellipsis for cut carried labels takes, with the space after it. */
+function cutEms(ctx: CanvasRenderingContext2D): number {
+  return measure(ctx, MORE.text) / BASE_SIZE + TOKEN_GAP;
 }
 
 /** The longest start of ``text``, whole characters followed by an
@@ -412,6 +430,7 @@ function shortened(ctx: CanvasRenderingContext2D, text: string, room: number): s
   return fits;
 }
 
+/** What a gap or the origin says of itself: how many children it holds, where known. */
 function gapGlyph(box: Box): Glyph {
   if (box.kind !== "gap" || box.count === 0) return MORE;
   return { text: box.count === 1 ? "1 child" : `${box.count.toLocaleString()} children` };

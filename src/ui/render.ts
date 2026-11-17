@@ -55,8 +55,6 @@ const TOKEN_HALF = 0.6;
 /** How far apart, in ems, the lines of a wrapped label are: frames clear each other. */
 const LABEL_LINE = 1.4;
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-/** Boxes at least this many CSS pixels across keep a separator that way. */
-const GAP_MIN = 4;
 /** A mark's width, and the space after it, in ems. */
 const MARK_WIDTH = 0.8;
 const MARK_GAP = 0.3;
@@ -149,10 +147,13 @@ export function draw(
   ctx.font = FONT;
   ctx.textBaseline = "middle";
 
-  // Where each node's children end in view: the last one's bottom meets the
-  // children of the node's sibling below.
-  const ends = new Map<NodeId, number>();
-  for (const box of frame.boxes) ends.set(box.node, Math.max(ends.get(box.node) ?? -Infinity, box.y1));
+  // Each node's children as drawn, whose outline is stroked over them.
+  const children = new Map<NodeId, ScreenRect[]>();
+  const drawn = (box: Box, rect: ScreenRect) => {
+    const rects = children.get(box.node);
+    if (rects === undefined) children.set(box.node, [rect]);
+    else rects.push(rect);
+  };
   const labels: { box: Box; rect: ScreenRect; ink: string }[] = [];
   let visible = false;
   for (let i = 0; i < frame.boxes.length; i++) {
@@ -167,6 +168,7 @@ export function draw(
       const start = i;
       while (i + 1 < frame.boxes.length && joined(frame.boxes[i]!, frame.boxes[i + 1]!)) i++;
       tail(ctx, frame.boxes, start, i, cam, view, (box) => palette.tile(box.p, box.q, equal).fill, scale);
+      for (let band = start; band <= i; band++) drawn(frame.boxes[band]!, screenRect(frame.boxes[band]!, cam, view));
       continue;
     }
 
@@ -177,18 +179,14 @@ export function draw(
       const tile = palette.tile(box.p, box.q, equal);
       ink = tile.ink;
       ctx.fillStyle = tile.fill;
-      // Separators are the box's own last column and row of pixels, left as
-      // the background; no other box shows on them. The column parts a
-      // child from its children. The row parts only a node's last child
-      // from its cousins below: siblings part where their widths do.
-      const column = box.kind !== "gap" && GAP_MIN <= width ? 1 / scale : 0;
-      const row = box.y1 === ends.get(box.node) && GAP_MIN <= height ? 1 / scale : 0;
       const pixels = pixelRect(rect, scale);
-      ctx.fillRect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0 - column, pixels.y1 - pixels.y0 - row);
+      ctx.fillRect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0, pixels.y1 - pixels.y0);
+      drawn(box, rect);
     }
 
     if (box.count !== 0) labels.push({ box, rect, ink });
   }
+  outlines(ctx, children, scale, scheme.surface);
 
   // A box whose label is too small to draw hands it, after the labels it
   // carries itself, to each of its children; they carry it until one draws
@@ -344,6 +342,33 @@ function timeWindow(
     ctx.fill();
   }
   ctx.restore();
+}
+
+/** The outline of each node's children taken together, a physical pixel of
+ * the background: the line where they start, which is their parent's own
+ * right edge, one above the first and one below the last, and their right
+ * edges, stepping between siblings of different widths. Siblings meet
+ * unstroked: where their widths part, the outline already parts them. The
+ * strokes are a box's own last column and row, or the row above its top,
+ * so a stroke shared by neighbours is one pixel. */
+function outlines(ctx: CanvasRenderingContext2D, children: Map<NodeId, ScreenRect[]>, scale: number, color: string): void {
+  const pixel = 1 / scale;
+  const edge = (at: number) => Math.ceil(at * scale) / scale;
+  ctx.fillStyle = color;
+  for (const rects of children.values()) {
+    rects.sort((a, b) => a.y0 - b.y0);
+    rects.forEach((rect, i) => {
+      const [x0, x1, y0, y1] = [edge(rect.x0), edge(rect.x1), edge(rect.y0), edge(rect.y1)];
+      ctx.fillRect(x1 - pixel, y0, pixel, y1 - y0);
+      // Where the sibling above or below, if it touches, is narrower, or
+      // across the whole box where none does.
+      const above = rects[i - 1], below = rects[i + 1];
+      const top = above !== undefined && above.y1 === rect.y0 ? edge(above.x1) : x0;
+      if (top < x1) ctx.fillRect(top, y0 - pixel, x1 - top, pixel);
+      const bottom = below !== undefined && below.y0 === rect.y1 ? edge(below.x1) : x0;
+      if (bottom < x1) ctx.fillRect(bottom, y1 - pixel, x1 - bottom, pixel);
+    });
+  }
 }
 
 /** Whether ``below`` continues the band silhouette ``above`` ends: only

@@ -71,9 +71,11 @@ join bands about a physical pixel tall (see `core/src/layout.rs`). Touching
 bands draw as one silhouette with their individual colors, so internal
 antialiased edges cannot show through as stripes. A physical pixel shows, and
 the pointer over it selects, the box holding the pixel's top-left corner, so
-hovering a box a pixel or two tall never selects its neighbour. A box's last
-column of pixels separates it from its children, and a node's last child's
-last row from its cousins below; siblings part where their widths do. The tests pin exact geometry 80
+hovering a box a pixel or two tall never selects its neighbour. The
+children of each node are outlined together, a physical pixel of background
+at any size: where they start, above the first, below the last, and along
+their right edges as they step; siblings part where their widths do, never
+by a line between them. The tests pin exact geometry 80
 halvings deep and beside children 2^−3000 of their parent.
 
 | input | motion |

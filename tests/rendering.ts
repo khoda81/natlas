@@ -77,14 +77,15 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
   }
 
   for (const phase of [0, 0.2, 0.61, 0.99]) {
-    const right = (160 + phase) / dpr, bottom = (80 + phase) / dpr;
+    const right = (160 + phase) / dpr, bottom = (80 + phase) / dpr, narrow = (120 + phase) / dpr;
     const box: Box = { node: ROOT, rank: 0, count: 1, kind: "leaf", branch: 0,
       p: 0.5, q: 0.5, lnMass: Math.log(0.5), x0: 10 / 23, x1: right / 23,
       y0: 10 / view.height, y1: bottom / view.height };
-    // A box's separators are its own last column of pixels, and its last
-    // row where it is its node's last child; its neighbours below and to
-    // the right fill the pixels after them. Siblings meet unseparated.
-    const sibling = { ...box, rank: 1, branch: 1, y0: box.y1, y1: 150 / dpr / view.height };
+    // Two children of the root, the second narrower, a node right of the
+    // first, and a cousin below. Strokes are a box's own last column and
+    // row, or the row above it: siblings meet unstroked but where the first
+    // reaches past the second, and the last child's bottom is stroked.
+    const sibling = { ...box, rank: 1, branch: 1, y0: box.y1, y1: 150 / dpr / view.height, x1: narrow / 23 };
     const frame = { boxes: [box, sibling,
       { ...box, node: 1n, x0: box.x1, x1: (220 / dpr) / 23 },
       { ...sibling, node: 2n, y0: sibling.y1, y1: 200 / dpr / view.height },
@@ -96,12 +97,15 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const background = rgb(palette.scheme.surface);
     const difference = (x: number, y: number, expected: number[]) =>
       Math.max(...expected.map((v, i) => Math.abs(v - pixels[(y * c.width + x) * 4 + i]!)));
-    const x = Math.ceil(right * dpr) - 1, y = Math.ceil(bottom * dpr) - 1;
-    // Where the sibling's last row falls, as its edge rounds to physical pixels.
+    // Edges as they round to physical pixels: their last column or row.
+    const x = Math.ceil(right * dpr) - 1, y = Math.ceil(bottom * dpr) - 1, step = Math.ceil(narrow * dpr) - 1;
     const last = Math.ceil(sibling.y1 * view.height * dpr) - 1;
-    const error = Math.max(difference(30, y, color), difference(30, last, background), difference(30, last + 1, color),
+    const error = Math.max(
+      difference(30, y, color), difference(step - 5, y, color), difference(step + 5, y, background),
+      difference(step, y + 10, background), difference(step - 1, y + 10, color),
+      difference(30, last, background), difference(30, last + 1, color),
       difference(x - 1, 30, color), difference(x, 30, background), difference(x + 1, 30, color));
-    results.push({ name: "separators are a box's last column and a node's last row of pixels", dpr, phase, error });
+    results.push({ name: "strokes outline each node's children, never between siblings", dpr, phase, error });
   }
 
   // A time box is a window onto the timeline drawn across the same pixels:
@@ -137,9 +141,10 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       const y = (top + row) / dpr;
       const box = pick(thin, comparison, frame, camera, view, column / dpr, y, 1 / dpr)!.box;
       const drawn = frame.boxes.find(b => b.node === box.node && b.branch === box.branch);
-      const last = drawn !== undefined && drawn.y1 === Math.max(...frame.boxes.filter(b => b.node === drawn.node).map(b => b.y1));
-      const separator = last && 4 <= (drawn.y1 - drawn.y0) * view.height
-        && Math.ceil(drawn.y1 * view.height * dpr) - 1 === top + row;
+      // The outline of the node's children: above the first, below the last.
+      const ys = drawn === undefined ? [] : frame.boxes.filter(b => b.node === drawn.node).flatMap(b => [b.y0, b.y1]);
+      const separator = drawn !== undefined && [Math.min(...ys), Math.max(...ys)]
+        .some(edge => Math.ceil(edge * view.height * dpr) - 1 === top + row);
       const expected = rgb(drawn === undefined || separator ? palette.scheme.surface
         : palette.tile(box.p, box.q, false).fill);
       for (let channel = 0; channel < 3; channel++) {

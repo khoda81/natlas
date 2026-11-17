@@ -323,13 +323,13 @@ pub fn layout_frame(
     q: usize,
     camera: JsValue,
     view: JsValue,
-    merge_px: f64,
+    row_px: f64,
 ) -> std::result::Result<LayoutFrame, JsError> {
     let camera: Camera = from_js(camera)?;
     let view: Viewport = from_js(view)?;
     let frame = tree.frames.borrow_mut().pop().unwrap_or_default();
     Ok(LayoutFrame {
-        inner: layout::layout_into(&tree.inner, Lens { p, q }, &camera, view, merge_px, frame)
+        inner: layout::layout_into(&tree.inner, Lens { p, q }, &camera, view, row_px, frame)
             .map_err(js_error)?,
         pool: Rc::clone(&tree.frames),
     })
@@ -371,7 +371,7 @@ impl LayoutFrame {
                     layout::BoxKind::Node => 0.0,
                     layout::BoxKind::Leaf => 1.0,
                     layout::BoxKind::Gap => 2.0,
-                    layout::BoxKind::Merged => 3.0,
+                    layout::BoxKind::Row => 3.0,
                 },
                 b.branch.map_or(-1.0, f64::from),
                 b.p,

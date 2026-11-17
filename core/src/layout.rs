@@ -16,14 +16,12 @@ use serde::{Deserialize, Serialize};
 
 use std::f64::consts::LN_2;
 
-use crate::distribution::{ln_add, Distribution, Edge, Item, Rank};
+use crate::distribution::{Distribution, Edge, Item, Rank};
 use crate::point::Point;
 use crate::session::View;
 use crate::tree::{bytes, child_hash, node_id, Branch, Lens, NodeId, Tree};
 use crate::Result;
 
-/// Known children of a run a band reads q from, when q is another measure.
-const SAMPLES: usize = 4;
 /// View heights within which a node's edge is at the view's.
 const FIT: f64 = 1e-12;
 
@@ -70,8 +68,8 @@ pub enum BoxKind {
     Leaf,
     /// Children not yet known: they reach past any view until they are.
     Gap,
-    /// Consecutive children too thin to draw apart.
-    Merged,
+    /// A physical row of children each thinner than it, summed.
+    Row,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -84,11 +82,12 @@ pub struct LayoutBox {
     /// Children covered; a gap at a node's bottom has no known count, 0.
     pub count: u32,
     pub kind: BoxKind,
-    /// The child's branch; none for a gap or a merged band.
+    /// The child's branch; none for a gap or a row.
     pub branch: Option<Branch>,
-    /// Conditional probabilities; p-weighted geometric means for a band.
+    /// Conditional probabilities; for a row, geometric means weighted by
+    /// what each child covers of it.
     pub p: f64,
-    /// NaN while unknown; like p, a representative child weight for a band.
+    /// NaN while unknown; like p, a representative child weight for a row.
     pub q: f64,
     pub ln_mass: f64,
     pub x0: f64,
@@ -525,8 +524,9 @@ struct Layout<'a> {
     lens: Lens,
     cam: &'a Camera,
     right: f64,
-    /// A child shorter than this, in view heights, joins a band.
-    merge: f64,
+    /// A physical row, in view heights: a child shorter than one is drawn
+    /// in the rows it falls in.
+    row: f64,
     frame: Frame,
 }
 
@@ -537,35 +537,62 @@ impl Layout<'_> {
         }
     }
 
-    /// Lay out the node's children in view, all but the chain child at `skip`.
+    /// Lay out the node's children in view, all but the chain child at
+    /// `skip`: each item a physical row or more tall as a box of its own,
+    /// and each row thinner children fall in as one row, summing them.
     fn lay(&mut self, node: NodeId, placed: Placed, skip: Option<Rank>) -> Result<()> {
         let tree = self.tree;
         self.frame.placed.insert(node, placed.clone());
         let Some(d) = tree.distribution(node, self.lens.p)? else {
             return Ok(());
         };
+        let mut heights = Heights::new(&placed, d);
+        let mut rows = Rows::new(self.row);
         // From the first item that ends in the view to the last that starts
         // in it.
-        let mut heights = Heights::new(&placed, d);
         let mut item = d.locate(&placed.at(0.0));
         while let Some(found) = item {
+            item = d.next(found);
             let (y0, y1) = heights.item(found);
             if 1.0 <= y0 {
                 break;
             }
             let chain = matches!(found, Item::Child { .. }) && skip == Some(d.item_rank(found));
-            item = if chain {
-                d.next(found)
-            } else if self.merge <= y1 - y0 {
-                let b = item_box(self.tree, self.lens, node, &placed, d, found, (y0, y1))?;
+            if chain || self.row <= y1 - y0 {
+                // The rows its edges round to are its own.
+                for row in rows.claim(y0, y1) {
+                    self.push(row.layout_box(node, &placed, self.row));
+                }
+                if chain {
+                    continue;
+                }
+                let b = item_box(tree, self.lens, node, &placed, d, found, (y0, y1))?;
                 match found {
                     Item::Child { .. } => self.child(node, &placed, d, found, b)?,
                     Item::Gap { .. } => self.push(b),
                 }
-                d.next(found)
             } else {
-                self.band(node, &mut heights, found, skip)?
-            };
+                // Thinner than a row: its width and color in the rows it
+                // falls in. A gap adds the width its children are estimated
+                // at, and no color.
+                let rank = d.item_rank(found);
+                match found {
+                    Item::Child { run, at } => {
+                        let r = &d.runs()[run];
+                        let nats = tree.nats_q(node, self.lens, r.branch(at), r.ln_p(at))?;
+                        rows.add(y0, y1, rank, nats, Some(r.ln_p(at) + nats));
+                    }
+                    Item::Gap { before } => {
+                        let ln_mass = (y1 - y0).ln() - placed.ln_scale;
+                        let end = d.item_end(found);
+                        let nats = gap_nats(tree, self.lens, node, d, before, ln_mass, rank, end)?;
+                        rows.add(y0, y1, rank, nats, None);
+                    }
+                }
+            }
+        }
+        for row in rows.finish() {
+            self.push(row.layout_box(node, &placed, self.row));
         }
         Ok(())
     }
@@ -589,133 +616,125 @@ impl Layout<'_> {
         let ln_extent = Point::ln_between(&top, &bottom);
         self.lay(id, placed.child(ys, ln_extent, x1), None)
     }
+}
 
-    /// A band about `merge` tall from `start`: thin children and the gaps
-    /// between them, drawn as one silhouette whose width is estimated from
-    /// its known children, Σ p (−ln q) / Σ p. The item after the band, if
-    /// any.
-    fn band(
-        &mut self,
-        node: NodeId,
-        heights: &mut Heights,
-        start: Item,
-        skip: Option<Rank>,
-    ) -> Result<Option<Item>> {
-        let (placed, d) = (heights.placed, heights.d);
-        let start_y = heights.item(start).0;
-        let target = start_y + self.merge;
-        let (mut ln_known, mut ln_area) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        let mut ln_ratio = 0.0;
-        let mut count = 0usize;
-        let mut last = start;
-        let mut item = Some(start);
-        while let Some(found) = item {
-            let (y0, y1) = heights.item(found);
-            let thick = self.merge <= y1 - y0;
-            if found != start && (thick || Some(d.item_rank(found)) == skip) {
-                break;
+/// The physical rows of a node that items thinner than a row fall in, the
+/// k-th from k row heights down the view: each sums the children and gaps
+/// it holds, weighted by how much of it each covers. A row a box's rounded
+/// edges reach is the box's.
+struct Rows {
+    height: f64,
+    /// The first row no box has claimed.
+    free: i64,
+    /// Rows being summed, in order down.
+    open: Vec<Row>,
+}
+
+struct Row {
+    index: i64,
+    rank: Rank,
+    /// Its known children.
+    count: u32,
+    /// View heights of the row its items cover, and those heights times
+    /// each one's −ln q; and of those, its known children's, and those
+    /// heights times each one's ln(p / q).
+    covered: f64,
+    area: f64,
+    known: f64,
+    ratio: f64,
+}
+
+impl Rows {
+    fn new(height: f64) -> Self {
+        Self {
+            height,
+            free: i64::MIN,
+            open: Vec::new(),
+        }
+    }
+
+    /// An item from `y0` to `y1`, thinner than a row, `nats` wide, and a
+    /// known child's ln(p / q), in the rows it covers that no box has
+    /// claimed. One whose width is unknown has none to add.
+    fn add(&mut self, y0: f64, y1: f64, rank: Rank, nats: f64, ln_ratio: Option<f64>) {
+        if !nats.is_finite() {
+            return;
+        }
+        let first = (y0 / self.height).floor() as i64;
+        let last = ((y1 / self.height).ceil() as i64 - 1).max(first);
+        for index in first.max(self.free)..=last {
+            let top = index as f64 * self.height;
+            let covered = y1.min(top + self.height) - y0.max(top);
+            if covered <= 0.0 {
+                continue;
             }
-            match found {
-                Item::Child { run, at } => {
-                    let r = &d.runs()[run];
-                    // Through the child about `merge` below the band's top,
-                    // short of the chain child: the last whose top is above.
-                    let (mut end, mut high) = (at, r.len() - 1);
-                    while end < high {
-                        let middle = (end + high).div_ceil(2);
-                        if heights.y(Edge::Of { run, at: middle }) <= target {
-                            end = middle;
-                        } else {
-                            high = middle - 1;
-                        }
-                    }
-                    if let Some(skip) = skip.filter(|&skip| r.rank() + (at as Rank) < skip) {
-                        end = end
-                            .min((skip - r.rank()).saturating_sub(1) as usize)
-                            .max(at);
-                    }
-                    // Those before the last lie within `merge` of the top,
-                    // so only the last can be thick: one that is is drawn
-                    // as itself. Heaviest first, none after a thin one is.
-                    let (y0, y1) = heights.item(Item::Child { run, at: end });
-                    if at < end && self.merge <= y1 - y0 {
-                        end -= 1;
-                    }
-                    let ln_mass = r.ln_mass(at, end + 1);
-                    if self.lens.p == self.lens.q {
-                        ln_known = ln_add(ln_known, ln_mass);
-                        ln_area = ln_add(ln_area, r.ln_surprisal(at, end + 1));
-                        count += end + 1 - at;
-                    } else {
-                        let n = end + 1 - at;
-                        let (mut mass, mut area, mut ratio) = (0.0, 0.0, 0.0);
-                        for sample in 0..SAMPLES.min(n) {
-                            let i = at + sample * n / SAMPLES.min(n);
-                            let nats = self.tree.nats_q(node, self.lens, r.branch(i), r.ln_p(i))?;
-                            if nats.is_finite() {
-                                let p = (r.ln_p(i) - r.ln_p(at)).exp();
-                                (mass, area) = (mass + p, area + p * nats);
-                                ratio += p * (r.ln_p(i) + nats);
-                                count += 1;
-                            }
-                        }
-                        if 0.0 < mass {
-                            ln_known = ln_add(ln_known, ln_mass);
-                            ln_ratio += (ratio / mass - ln_ratio) * (ln_mass - ln_known).exp();
-                            ln_area = ln_add(ln_area, ln_mass + (area / mass).ln());
-                        }
-                    }
-                    last = Item::Child { run, at: end };
-                    item = d.next(last);
-                    if target <= heights.item(last).1 {
-                        break;
-                    }
-                }
-                Item::Gap { .. } => {
-                    last = found;
-                    item = d.next(found);
-                    if target <= y1 {
-                        break;
-                    }
-                }
+            if self.open.last().is_none_or(|row| row.index != index) {
+                self.open.push(Row {
+                    index,
+                    rank,
+                    count: 0,
+                    covered: 0.0,
+                    area: 0.0,
+                    known: 0.0,
+                    ratio: 0.0,
+                });
+            }
+            let row = self.open.last_mut().expect("a row");
+            row.covered += covered;
+            row.area += covered * nats;
+            if let Some(ln_ratio) = ln_ratio {
+                row.count += 1;
+                row.known += covered;
+                row.ratio += covered * ln_ratio;
             }
         }
-        let (y0, y1) = (start_y, heights.item(last).1);
-        if ln_known == f64::NEG_INFINITY {
-            // Nothing known to draw.
-            return Ok(item);
-        }
-        let nats = (ln_area - ln_known).exp();
-        let ln_p = (y1 - y0).ln() - placed.ln_scale;
-        self.push(LayoutBox {
-            node,
-            rank: d.item_rank(start),
-            count: count as u32,
-            kind: BoxKind::Merged,
-            branch: None,
-            // q already represents a typical child, not the whole band.
-            // Use the same p-weighted geometric mean for p so ln(p/q)
-            // is the children's mean log ratio, independent of grouping.
-            p: (ln_ratio - nats).exp(),
-            q: (-nats).exp(),
-            ln_mass: placed.ln_mass + ln_p,
-            x0: placed.x,
-            x1: placed.x + nats,
-            y0,
-            y1,
-        });
-        Ok(item)
+    }
+
+    /// The rows done before a box from `y0` to `y1`, which claims those its
+    /// edges round to: from the first at or below its top.
+    fn claim(&mut self, y0: f64, y1: f64) -> Vec<Row> {
+        let start = (y0 / self.height).ceil() as i64;
+        let mut done = std::mem::take(&mut self.open);
+        done.retain(|row| row.index < start);
+        self.free = self.free.max((y1 / self.height).ceil() as i64);
+        done
+    }
+
+    fn finish(self) -> Vec<Row> {
+        self.open
     }
 }
 
-pub fn layout(
-    tree: &Tree,
-    lens: Lens,
-    cam: &Camera,
-    view: Viewport,
-    merge_px: f64,
-) -> Result<Frame> {
-    layout_into(tree, lens, cam, view, merge_px, Frame::default())
+impl Row {
+    /// The row as a box: as wide as its items' mean −ln q, so its area is
+    /// theirs, and colored by its known children's mean ln(p / q), or
+    /// neutral without any.
+    fn layout_box(&self, node: NodeId, placed: &Placed, height: f64) -> LayoutBox {
+        let nats = self.area / self.covered;
+        let ln_ratio = if 0.0 < self.known {
+            self.ratio / self.known
+        } else {
+            0.0
+        };
+        LayoutBox {
+            node,
+            rank: self.rank,
+            count: self.count,
+            kind: BoxKind::Row,
+            branch: None,
+            p: (ln_ratio - nats).exp(),
+            q: (-nats).exp(),
+            ln_mass: placed.ln_mass + self.covered.ln() - placed.ln_scale,
+            x0: placed.x,
+            x1: placed.x + nats,
+            y0: self.index as f64 * height,
+            y1: (self.index + 1) as f64 * height,
+        }
+    }
+}
+
+pub fn layout(tree: &Tree, lens: Lens, cam: &Camera, view: Viewport, row_px: f64) -> Result<Frame> {
+    layout_into(tree, lens, cam, view, row_px, Frame::default())
 }
 
 pub(crate) fn layout_into(
@@ -723,7 +742,7 @@ pub(crate) fn layout_into(
     lens: Lens,
     cam: &Camera,
     view: Viewport,
-    merge_px: f64,
+    row_px: f64,
     mut frame: Frame,
 ) -> Result<Frame> {
     frame.clear();
@@ -742,7 +761,7 @@ pub(crate) fn layout_into(
         lens,
         cam,
         right: cam.x + view.width / cam.k,
-        merge: merge_px / view.height,
+        row: row_px / view.height,
         frame,
     };
     let depth = nodes.len() - 1;
@@ -781,7 +800,7 @@ pub(crate) fn layout_into(
 
 /// The known children of a node the frame laid out, those that reach into
 /// the view, top to bottom: each one's branch and its edges in view heights,
-/// however thin, even where the frame draws it in a band.
+/// however thin, even where the frame draws it in a row with others.
 pub fn known(
     tree: &Tree,
     lens: Lens,
@@ -982,7 +1001,7 @@ pub fn aim(tree: &Tree, lens: Lens, cam: &Camera, fy: f64) -> Result<Aim> {
 }
 
 /// The box a pixel shows, `pixel_px` square with its top-left corner at
-/// `(x_px, y_px)`: a child, however thin and merged, found by walking down
+/// `(x_px, y_px)`: a child, however thin, found by walking down
 /// from the origin through the nodes the frame laid out.
 #[allow(clippy::too_many_arguments)]
 pub fn pick(
@@ -1037,14 +1056,7 @@ pub fn pick(
             })));
         };
         let mut heights = Heights::new(placed, d);
-        let item = band_child(
-            frame,
-            node,
-            &mut heights,
-            item,
-            y,
-            y + pixel_px / view.height,
-        );
+        let item = pixel_child(&mut heights, item, y, y + pixel_px / view.height);
         let b = item_box(tree, lens, node, placed, d, item, heights.item(item))?;
         let Some(branch) = b.branch.filter(|_| x >= b.x1) else {
             let exact = b.branch.is_some();
@@ -1062,37 +1074,21 @@ pub fn pick(
     }
 }
 
-/// Bands draw thin children and the gaps between them as one silhouette,
-/// so on a pixel of one, from `y` to `bottom`, the known child the pixel
-/// holds is selected rather than the gap at its corner, whichever touching
-/// band draws it. A gap drawn as its own box keeps its pixels: the child
-/// after it starts on the next one.
-fn band_child(
-    frame: &Frame,
-    node: NodeId,
-    heights: &mut Heights,
-    item: Item,
-    y: f64,
-    bottom: f64,
-) -> Item {
-    let banded = |y: f64| {
-        frame
-            .boxes
-            .iter()
-            .any(|b| b.node == node && b.kind == BoxKind::Merged && b.y0 <= y && y < b.y1)
-    };
-    if !matches!(item, Item::Gap { .. }) || !banded(y) {
+/// The item a pixel from `y` down to `bottom` selects, its corner in
+/// `item`: a gap thinner than the pixel is drawn in the row it falls in,
+/// with the children there, so the known child after it in the pixel is
+/// selected instead. A gap a pixel or more tall is drawn as its own box and
+/// keeps its pixels.
+fn pixel_child(heights: &mut Heights, item: Item, y: f64, bottom: f64) -> Item {
+    if !matches!(item, Item::Gap { .. }) {
+        return item;
+    }
+    let (top, end) = heights.item(item);
+    if bottom - y <= end - top {
         return item;
     }
     match heights.d.next(item) {
-        Some(next @ Item::Child { .. }) => {
-            let top = heights.item(next).0;
-            if top < bottom && banded(top) {
-                next
-            } else {
-                item
-            }
-        }
+        Some(next @ Item::Child { .. }) if heights.item(next).0 < bottom => next,
         _ => item,
     }
 }
@@ -1190,79 +1186,86 @@ mod tests {
         near(frame.boxes[1].x1, 2f64.ln());
     }
 
-    #[test]
-    fn thin_children_merge_into_bands_that_keep_their_area_and_pick_apart() {
-        let weights_ = [0.5, 0.488, 0.006, 0.004, 0.002];
-        let (tree, _) = chain_tree(&weights_, &[]);
-        let camera = cam(ROOT, 0.0, top(&[]), 0.0);
-        let frame = layout(&tree, LENS, &camera, VIEW, 10.0).unwrap();
-        let band = frame
+    /// The rows of a frame, by index from the view's top.
+    fn rows(frame: &Frame) -> Vec<&LayoutBox> {
+        frame
             .boxes
             .iter()
-            .find(|b| b.kind == BoxKind::Merged)
-            .expect("the light children merge");
-        // Each of them is still known, however thin, with its own edges.
-        let thin = known(&tree, LENS, &frame, ROOT).unwrap();
-        assert_eq!(thin.len(), 5);
-        near(thin[2].1, 0.988);
-        near(thin[4].2, 1.0);
-        let area: f64 = weights_[2..].iter().map(|w| -w * w.ln()).sum();
-        assert!((band.ln_mass.exp() * (band.x1 - band.x0) - area).abs() < 1e-12);
-        assert_eq!(band.count, 3);
-        let hit = pick(
-            &tree,
-            LENS,
-            &frame,
-            &camera,
-            VIEW,
-            100.0,
-            0.991 * VIEW.height,
-            1.0,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(hit.r#box.branch, Some(2));
-        assert!(hit.exact);
+            .filter(|b| b.kind == BoxKind::Row)
+            .collect()
     }
 
     #[test]
-    fn bands_color_by_their_childrens_mean_log_ratio() {
-        let p = [0.5, 0.488, 0.006, 0.004, 0.002];
+    fn thin_children_are_summed_in_the_rows_they_fall_in_and_pick_apart() {
+        // Three children thinner than a pixel below two thick ones: the
+        // second ends at 798.8, so its box has rows to 799, and the last
+        // row holds the thin ones, each by how much of it it covers.
+        let weights_ = [0.5, 0.4985, 0.0006, 0.0005, 0.0004];
+        let (tree, _) = chain_tree(&weights_, &[]);
+        let camera = cam(ROOT, 0.0, top(&[]), 0.0);
+        let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
+        let rows_ = rows(&frame);
+        assert_eq!(rows_.len(), 1);
+        let row = rows_[0];
+        assert_eq!((row.rank, row.count), (2, 3));
+        near(row.y0 * VIEW.height, 799.0);
+        near(row.y1 * VIEW.height, 800.0);
+        // Its area is theirs: each child's −ln p over what it covers of it.
+        let covered = [799.28 - 799.0, 799.68 - 799.28, 800.0 - 799.68];
+        let area: f64 = covered
+            .iter()
+            .zip(&weights_[2..])
+            .map(|(height, w)| height * -w.ln())
+            .sum();
+        near(row.x1 - row.x0, area);
+        near(row.ln_mass.exp(), 1.0 / VIEW.height);
+        // A pixel of it selects the child it holds.
+        let hit = pick(&tree, LENS, &frame, &camera, VIEW, 100.0, 799.5, 1.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!((hit.r#box.branch, hit.exact), (Some(3), true));
+    }
+
+    #[test]
+    fn rows_color_by_their_childrens_mean_log_ratio() {
+        // The thick child ends at 790, in the row of 8 pixels from 784: the
+        // thin ones show in the row from 792.
+        let p = [0.5, 0.4875, 0.006, 0.004, 0.0025];
         let q = [0.5, 0.48, 0.004, 0.008, 0.008];
         let mut tree = Tree::new(2);
         tree.set(ROOT, 0, weights(&p)).unwrap();
         tree.set(ROOT, 1, weights(&q)).unwrap();
         let lens = Lens { p: 0, q: 1 };
         let camera = cam(ROOT, 0.0, top(&[]), 0.0);
-        let frame = layout(&tree, lens, &camera, VIEW, 10.0).unwrap();
-        let band = frame
-            .boxes
+        let frame = layout(&tree, lens, &camera, VIEW, 8.0).unwrap();
+        let rows_ = rows(&frame);
+        assert_eq!(rows_.len(), 1);
+        let edges: [f64; 4] = [790.0, 794.8, 798.0, 800.0];
+        let covered: Vec<f64> = edges.windows(2).map(|e| e[1] - e[0].max(792.0)).collect();
+        let total: f64 = covered.iter().sum();
+        let expected = covered
             .iter()
-            .find(|b| b.kind == BoxKind::Merged)
-            .unwrap();
-        let expected = p[2..]
-            .iter()
-            .zip(&q[2..])
-            .map(|(p, q)| p * (p / q).ln())
+            .zip(p[2..].iter().zip(&q[2..]))
+            .map(|(height, (p, q))| height * (p / q).ln())
             .sum::<f64>()
-            / p[2..].iter().sum::<f64>();
-        near((band.p / band.q).ln(), expected);
+            / total;
+        let row = rows_[0];
+        near((row.p / row.q).ln(), expected);
 
-        // Identical measures must stay neutral at every grouping size.
+        // Identical measures stay neutral at every row height.
         tree.set(ROOT, 1, weights(&p)).unwrap();
-        for merge in [1.0, 10.0, 100.0] {
-            let frame = layout(&tree, lens, &camera, VIEW, merge).unwrap();
-            for band in frame.boxes.iter().filter(|b| b.kind == BoxKind::Merged) {
-                near((band.p / band.q).ln(), 0.0);
+        for row_px in [1.0, 10.0, 100.0] {
+            let frame = layout(&tree, lens, &camera, VIEW, row_px).unwrap();
+            for row in rows(&frame) {
+                near((row.p / row.q).ln(), 0.0);
             }
         }
     }
 
     #[test]
-    fn touching_bands_share_their_edge_exactly_across_runs() {
+    fn rows_are_whole_physical_rows_beside_boxes_never_over_them() {
         // One heavy child, then thin known children alternating with
-        // one-child gaps: every band boundary is a run's or a gap's edge.
-        // The renderer joins touching bands by comparing edges exactly.
+        // one-child gaps, about forty to a pixel.
         let w = 1.25e-5;
         let mut runs = vec![listed(0, &[0], &[0.99], 0.0)];
         for i in 0..400u32 {
@@ -1271,20 +1274,53 @@ mod tests {
         }
         let mut tree = Tree::new(1);
         tree.insert(ROOT, 0, runs).unwrap();
-        let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
-        let bands: Vec<_> = frame
-            .boxes
-            .iter()
-            .filter(|b| b.kind == BoxKind::Merged)
-            .collect();
-        assert!(2 < bands.len());
-        for pair in bands.windows(2) {
-            assert_eq!(pair[1].y0, pair[0].y1);
+        let frame = layout(
+            &tree,
+            LENS,
+            &cam(ROOT, 0.0, top(&[]), 0.3 / VIEW.height),
+            VIEW,
+            1.0,
+        )
+        .unwrap();
+        let rows_ = rows(&frame);
+        assert!(2 < rows_.len());
+        for row in &rows_ {
+            let index = row.y0 * VIEW.height;
+            near(index, index.round());
+            near(row.y1 - row.y0, 1.0 / VIEW.height);
+            for b in frame.boxes.iter().filter(|b| b.kind != BoxKind::Row) {
+                assert!(
+                    b.y1 * VIEW.height <= index + 1e-9
+                        || row.y1 * VIEW.height <= (b.y0 * VIEW.height).ceil() + 1e-9
+                );
+            }
         }
     }
 
     #[test]
-    fn a_band_stops_before_a_thick_child_in_any_order() {
+    fn a_row_holding_only_a_thin_gap_is_drawn_at_its_estimate() {
+        // A heavy child to 798, a gap of four unknown children to 798.8, and
+        // a child from there: the row from 798 holds only the gap.
+        let mut tree = Tree::new(1);
+        let runs = vec![
+            listed(0, &[0], &[0.9975], 0.0),
+            listed(5, &[5], &[0.0015], 0.9985),
+            Run::end_at(6),
+        ];
+        tree.insert(ROOT, 0, runs).unwrap();
+        let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
+        let rows_ = rows(&frame);
+        assert_eq!(rows_.len(), 1);
+        let row = rows_[0];
+        near(row.y0 * VIEW.height, 798.0);
+        assert_eq!((row.rank, row.count), (1, 0));
+        // The gap's children at their mean weight, as a gap box draws them.
+        assert!((row.x1 - row.x0 - (4.0f64 / 0.001).ln()).abs() < 1e-6);
+        near((row.p / row.q).ln(), 0.0);
+    }
+
+    #[test]
+    fn a_thin_child_never_hides_a_thick_one_in_any_order() {
         // By branch: a heavy child, a child a tenth of a pixel tall, then
         // one of 80 pixels whose top is within a pixel of the thin one's.
         let mut tree = Tree::new(1);
@@ -1301,14 +1337,11 @@ mod tests {
             .find(|b| b.branch == Some(2))
             .expect("the thick child is drawn as itself");
         near(thick.y1 - thick.y0, 0.0999);
-        assert!(frame
-            .boxes
-            .iter()
-            .any(|b| b.kind == BoxKind::Merged && b.count == 1));
+        assert!(rows(&frame).iter().any(|row| row.count == 1));
     }
 
     #[test]
-    fn a_band_pixel_selects_a_known_child_it_holds_over_a_gap() {
+    fn a_row_pixel_selects_a_known_child_it_holds_over_a_gap() {
         // Known children alternate with one-child gaps, about 40 a pixel.
         let w = 1.25e-5;
         let mut runs = vec![listed(0, &[0], &[0.99], 0.0)];
@@ -1326,14 +1359,12 @@ mod tests {
             let hit = pick(&tree, LENS, &frame, &camera, VIEW, 100.0, y_px, pixel_px);
             hit.unwrap().unwrap().r#box.branch
         };
-        let rows = frame
-            .boxes
-            .iter()
-            .filter(|b| b.kind == BoxKind::Merged)
-            .flat_map(|b| (b.y0 * VIEW.height).ceil() as u32..(b.y1 * VIEW.height).ceil() as u32)
+        let pixels = rows(&frame)
+            .into_iter()
+            .map(|b| (b.y0 * VIEW.height).round() as u32)
             .filter(|&row| f64::from(row) < VIEW.height);
         let mut corners_in_gaps = 0;
-        for row in rows {
+        for row in pixels {
             let y_px = f64::from(row);
             assert!(selected(y_px, 1.0).is_some(), "row {row} selects a gap");
             corners_in_gaps += usize::from(selected(y_px, 1e-9).is_none());
@@ -1411,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn gaps_draw_at_their_mean_weight_and_bands_from_their_samples() {
+    fn gaps_draw_at_their_mean_weight_and_rows_from_their_samples() {
         let mut tree = Tree::new(1);
         // The two heaviest children of the root, and the node's end at rank
         // 1000: a quarter of its mass in 998 unknown children.
@@ -1438,8 +1469,8 @@ mod tests {
             .find(|b| b.kind == BoxKind::Gap)
             .unwrap();
         near(gap_.x1 - gap_.x0, 4f64.ln());
-        // An answer of four samples splits the gap into thin gaps: the bands
-        // across them draw a silhouette from the samples.
+        // An answer of four samples splits the gap: each sample, thinner
+        // than a pixel, is drawn in its row at its own width.
         let samples: Vec<_> = (0..4)
             .map(|i| {
                 let below = 0.25 - 0.0625 * f64::from(i);
@@ -1448,15 +1479,11 @@ mod tests {
             .collect();
         tree.insert(ROOT, 0, samples).unwrap();
         let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
-        let bands = frame
-            .boxes
-            .iter()
-            .filter(|b| b.kind == BoxKind::Merged)
-            .count();
-        assert!(0 < bands);
+        let rows_ = rows(&frame);
+        assert_eq!(rows_.len(), 4);
         let width = -(1e-4f64).ln();
-        for band in frame.boxes.iter().filter(|b| b.kind == BoxKind::Merged) {
-            near(band.x1 - band.x0, width);
+        for row in rows_ {
+            near(row.x1 - row.x0, width);
         }
     }
 

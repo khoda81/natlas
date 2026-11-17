@@ -34,6 +34,10 @@ const thin = new IntervalTree(2);
 const comparison = { p: 0, q: 1 };
 thin.insert(ROOT, 0, answer([0.6, 0.39, 0.006, 0.004], undefined, 0, 0));
 thin.insert(ROOT, 1, answer([0.6, 0.39, 0.008, 0.002], [0, 1, 3, 2], 0, 0));
+// A heavy child ending mid-pixel at every ratio, then children thinner than
+// a pixel.
+const midPixel = new IntervalTree(1);
+midPixel.insert(ROOT, 0, answer([0.5, 0.4983, 0.0007, 0.0006, 0.0004], undefined, 0, 0));
 // Known children alternate with one-child gaps, so the tail spans runs.
 const gapped = new IntervalTree(1);
 gapped.insert(ROOT, 0, { runs: Array.from({ length: count / 2 }, (_, i) =>
@@ -49,7 +53,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
   ] as const) {
     for (const phase of [0, 0.2, 0.61]) {
       const camera = cam(phase);
-      const frame = layout(tree, lens, camera, view, { mergePx: 1 / dpr });
+      const frame = layout(tree, lens, camera, view, { rowPx: 1 / dpr });
       const ctx = canvas(dpr).getContext("2d")!;
       draw(ctx, frame, camera, view, lens, palette, state);
       const pixels = ctx.getImageData(Math.round(10 * dpr), 0, 1, Math.floor(view.height * dpr)).data;
@@ -97,9 +101,11 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const background = rgb(palette.scheme.surface);
     const difference = (x: number, y: number, expected: number[]) =>
       Math.max(...expected.map((v, i) => Math.abs(v - pixels[(y * c.width + x) * 4 + i]!)));
-    // Edges as they round to physical pixels: their last column or row.
-    const x = Math.ceil(right * dpr) - 1, y = Math.ceil(bottom * dpr) - 1, step = Math.ceil(narrow * dpr) - 1;
-    const last = Math.ceil(sibling.y1 * view.height * dpr) - 1;
+    // Edges as they round to physical pixels, within float error of a grid
+    // line on it: their last column or row.
+    const lastPixel = (css: number) => Math.ceil(css * dpr - 1e-6) - 1;
+    const x = lastPixel(right), y = lastPixel(bottom), step = lastPixel(narrow);
+    const last = lastPixel(sibling.y1 * view.height);
     const error = Math.max(
       difference(30, y, color), difference(step - 5, y, color), difference(step + 5, y, background),
       difference(step, y + 10, background), difference(step - 1, y + 10, color),
@@ -109,17 +115,18 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
   }
 
   // A node's time branches are one CDF on the timeline drawn across the same
-  // pixels: at the time each lands on, straight across a band between them,
+  // pixels: at the time each lands on, through a row between them,
   // and the time they move over, from where the path is, shaded.
   {
     const at = (rank: number, branch: number | null, y0: number, y1: number): Box => ({ node: ROOT, rank, count: 1,
-      kind: branch === null ? "merged" : "leaf", branch, p: 0.5, q: 0.5, lnMass: Math.log(0.5),
+      kind: branch === null ? "row" : "leaf", branch, p: 0.5, q: 0.5, lnMass: Math.log(0.5),
       x0: 10 / 23, x1: 200 / 23, y0: y0 / view.height, y1: y1 / view.height });
-    const frame = { boxes: [at(0, 0, 10, 40), at(1, null, 40, 50), at(2, 2, 50, 80)] } as Frame;
+    // The first ends mid-pixel: drawn to the next grid line, and shaded there.
+    const frame = { boxes: [at(0, 0, 10, 39.6), at(1, null, 40, 50), at(2, 2, 50, 80)] } as Frame;
     const timeline = { x: (time: number) => time, left: 0, right: view.width };
     const glyph = (_: bigint, branch: number) => ({ text: "", mark: "time" as const, time: { from: 20, to: [60, 100, 140][branch]! } });
     const c = canvas(dpr), ctx = c.getContext("2d")!;
-    // The band holds a known time branch too thin to draw, landing at 100.
+    // The row holds a known time branch too thin to draw, landing at 100.
     const known = () => [{ branch: 0, y0: 10 / view.height, y1: 40 / view.height },
       { branch: 1, y0: 44 / view.height, y1: 46 / view.height }, { branch: 2, y0: 50 / view.height, y1: 80 / view.height }];
     draw(ctx, frame, cam(), view, { p: 0, q: 0 }, palette, { ...state, glyph, timeline, known });
@@ -128,18 +135,40 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const shaded = fill.map((v, i) => v + 0.28 * (ink[i]! - v));
     const pixel = (x: number, y: number) => ctx.getImageData(Math.floor(x * dpr), Math.floor(y * dpr), 1, 1).data;
     const difference = (x: number, y: number, expected: number[]) => Math.max(...expected.map((v, i) => Math.abs(v - pixel(x, y)[i]!)));
-    // Within the band, the line stands at the known branch inside it.
-    const error = Math.max(difference(40, 25, shaded), difference(60, 25, ink), difference(100, 25, fill),
+    // Within the row, the line stands at the known branch inside it.
+    const error = Math.max(difference(40, 25, shaded), difference(40, 39.7, shaded), difference(60, 25, ink), difference(100, 25, fill),
       difference(50, 45, shaded), difference(100, 45, ink), difference(130, 45, fill), difference(140, 65, ink),
       difference(170, 65, fill));
     results.push({ name: "time branches are one CDF on the timeline", dpr, phase: 0, error });
+  }
+
+  // A child ending mid-pixel, then children thinner than a pixel in rows
+  // after it: siblings meet unstroked, so a column through all of them
+  // shows no background, however their edges fall on the grid.
+  for (const phase of [0, 0.2, 0.61, 0.99]) {
+    const camera = cam(phase);
+    const lens = { p: 0, q: 0 };
+    const frame = layout(midPixel, lens, camera, view, { rowPx: 1 / dpr });
+    const ctx = canvas(dpr).getContext("2d")!;
+    draw(ctx, frame, camera, view, lens, palette, state);
+    const fill = rgb(palette.tile(0.5, 0.5, true).fill);
+    const column = Math.floor(10 * dpr), top = Math.ceil((phase + 2) * dpr);
+    const pixels = ctx.getImageData(column, top, 1, Math.floor(view.height * dpr) - top).data;
+    // Short of the node's own last row, where its bottom stroke is.
+    const end = Math.ceil(Math.max(...frame.boxes.map(b => b.y1)) * view.height * dpr - 1e-6) - 1;
+    let error = 0;
+    for (let i = 0; i < pixels.length && top + i / 4 < end; i += 4) {
+      error = Math.max(error, ...fill.map((v, channel) => Math.abs(v - pixels[i + channel]!)));
+    }
+    results.push({ name: "rows after a child ending mid-pixel are never stroked over", dpr, phase, error });
+    frame.dispose();
   }
 
   // Thin children between a bordered one and the background: each physical
   // row must show the box the pointer over it selects.
   for (const phase of [0, 0.2, 0.61, 0.99]) {
     const camera = { ...cam(), anchor: { path: [], digits: digits(0.99) }, a: 0.5 + phase / dpr / view.height };
-    const frame = layout(thin, comparison, camera, view, { mergePx: 1 / dpr });
+    const frame = layout(thin, comparison, camera, view, { rowPx: 1 / dpr });
     const ctx = canvas(dpr).getContext("2d")!;
     draw(ctx, frame, camera, view, comparison, palette, state);
     const column = Math.floor(10 * dpr);
@@ -150,10 +179,14 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       const y = (top + row) / dpr;
       const box = pick(thin, comparison, frame, camera, view, column / dpr, y, 1 / dpr)!.box;
       const drawn = frame.boxes.find(b => b.node === box.node && b.branch === box.branch);
-      // The outline of the node's children: above the first, below the last.
-      const ys = drawn === undefined ? [] : frame.boxes.filter(b => b.node === drawn.node).flatMap(b => [b.y0, b.y1]);
-      const separator = drawn !== undefined && [Math.min(...ys), Math.max(...ys)]
-        .some(edge => Math.ceil(edge * view.height * dpr) - 1 === top + row);
+      // The outline of the node's children: the row above the first, and the
+      // last's own last row, or the row below it where it is one row tall.
+      const group = drawn === undefined ? [] : frame.boxes.filter(b => b.node === drawn.node);
+      const rowOf = (y: number) => Math.ceil(y * view.height * dpr - 1e-6);
+      const lowest = group.reduce((a, b) => (a.y1 < b.y1 ? b : a), group[0]!);
+      const strokes = drawn === undefined ? [] : [rowOf(Math.min(...group.map(b => b.y0))) - 1,
+        rowOf(lowest.y1) - rowOf(lowest.y0) <= 1 ? rowOf(lowest.y1) : rowOf(lowest.y1) - 1];
+      const separator = strokes.includes(top + row);
       const expected = rgb(drawn === undefined || separator ? palette.scheme.surface
         : palette.tile(box.p, box.q, false).fill);
       for (let channel = 0; channel < 3; channel++) {
@@ -164,12 +197,12 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     frame.dispose();
   }
 
-  // A band of known children between gaps: every row selects a branch, and
+  // Rows of known children between gaps: every row selects a branch, and
   // its highlight covers the row the pointer is on.
   for (const phase of [0, 0.2, 0.61]) {
     const camera = cam(phase);
     const lens = { p: 0, q: 0 };
-    const frame = layout(gapped, lens, camera, view, { mergePx: 1 / dpr });
+    const frame = layout(gapped, lens, camera, view, { rowPx: 1 / dpr });
     const column = Math.floor(10 * dpr);
     const ink = rgb(palette.scheme.ink);
     let error = 0;
@@ -181,7 +214,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       const missing = Math.max(...ink.map((v, i) => Math.abs(v - pixel[i]!)));
       error = Math.max(error, hover.box.branch === null ? 255 : missing);
     }
-    results.push({ name: "band pixel selects and highlights a branch", dpr, phase, error });
+    results.push({ name: "a row's pixel selects and highlights a branch", dpr, phase, error });
     frame.dispose();
   }
 }

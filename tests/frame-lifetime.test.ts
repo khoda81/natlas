@@ -8,12 +8,12 @@ const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
 const view = { width: 1234, height: 789 };
 const uniform = (count: number) => answer(Array(count).fill(1 / count), undefined, 0, 0);
 
-it("picks single children out of merged bands, and frames reuse buffers without touching live ones", () => {
+it("picks single children out of rows, and frames reuse buffers without touching live ones", () => {
   const tree = new IntervalTree(1);
   tree.insert(ROOT, 0, uniform(150000));
   const frame = layout(tree, lens, cam, view);
-  // Every row is a band; no branch is drawn alone.
-  expect(frame.boxes.every((box) => box.kind === "merged")).toBe(true);
+  // Every child is thinner than a row; no branch is drawn alone.
+  expect(frame.boxes.every((box) => box.kind === "row")).toBe(true);
   expect(frame.boxes.length).toBeLessThanOrEqual(view.height);
   const y = (74999.5 / 150000) * view.height;
   const picked = pick(tree, lens, frame, cam, view, 100, y, 1)!;

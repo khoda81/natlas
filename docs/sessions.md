@@ -43,7 +43,8 @@ or more is an interval of its own and goes on, while its children start on
 screen. The interval is read at evenly placed points, two a row, each finding
 the child that holds it, the next point the first past that child: every
 child worth a row is found and goes on, and a stretch of thinner ones, drawn
-as bands, is sampled and not gone into, in whatever order the children run:
+in the rows they fall in, is sampled and not gone into, in whatever order
+the children run:
 Monte Carlo sampling of the tree at evenly placed points. Each child's top is
 sent to 1/256 of a row of the interval it was found in, and sent again when
 a later view asks it more precisely. A missing distribution is worth the
@@ -235,8 +236,8 @@ sampling, band refinement); the `Expander`; the browser's connection limit;
 
 Behaviour that changes on purpose: a distribution is computed in priority
 order rather than arrival order; nothing off screen is ever computed; several
-clients on one server take turns. Bands get two samples a row and no
-more, so their estimated width is no longer refined as the horizontal scale
+clients on one server take turns. Thin stretches get two samples a row and
+no more, so their estimated width is no longer refined as the horizontal scale
 grows; a client that wants that says the view covers more rows.
 
 ## Plan

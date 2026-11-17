@@ -6,8 +6,8 @@
 //! reaches. Its worth flows down the tree: an interval of a node splits among
 //! the children it covers in proportion to the mass of each it covers. A
 //! child worth a row or more goes on, as an interval of its own, while its
-//! children start on screen; thinner children, which the picture draws as
-//! bands, are sampled instead. A distribution is worth what waits on it, so
+//! children start on screen; thinner children, which the picture draws in
+//! the pixel rows they fall in, are sampled instead. A distribution is worth what waits on it, so
 //! the most valuable missing one is about the most pixel rows the view lacks.
 //! A path, a flight's, comes before anything else.
 //!
@@ -33,7 +33,7 @@ use crate::tree::{bytes, node_id, Branch, Lens, NodeId, Tree};
 use crate::Result;
 
 /// Samples per row of worth in a stretch of children each thinner than a
-/// row, which the picture draws as bands about a row tall.
+/// row, which the picture draws in the rows they fall in.
 const SAMPLES_PER_ROW: f64 = 2.0;
 
 /// What a client is looking at, in place of what it looked at before.

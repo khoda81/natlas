@@ -14,11 +14,11 @@ big-number arithmetic in the length of its digits: about a millisecond a
 frame for a point remembered 1000 nodes deep while zoomed out to the root.
 
 A node's layout costs one binary search to the first visible child, then one
-step per drawn box: children at least a pixel tall, bands about a pixel tall,
-and gaps. A band's width is estimated from its known children: over a known
-run, from a per-run suffix sum of p (−ln p) when p = q, and from a few of its
-children otherwise, so a frame never visits the children hidden inside a
-band. What the view lacks is asked for as parts to sample: a top, a mass and
+step per known child or gap in view: those at least a pixel tall are boxes,
+and thinner children add to the physical row they fall in, so a frame draws
+at most a box or a row per pixel row of each node. The session sends a thin
+stretch's children at two points a row, so the known children in view stay
+about as many as the rows. What the view lacks is asked for as parts to sample: a top, a mass and
 a count each, so a request stays a few bytes per gap. Picking walks down from the
 origin through the laid-out nodes to the one child under the point.
 

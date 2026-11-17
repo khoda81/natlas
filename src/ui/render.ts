@@ -117,15 +117,25 @@ export function screenRect(box: Box, cam: Camera, view: Viewport): ScreenRect {
 // would select a neighbour over part of a thin box's pixel, and flicker as
 // the pointer moves within it.
 
+// Layout's rows lie on the grid only up to float error: a coordinate within
+// this many physical pixels of a grid line is on it, so a row never rounds
+// to the next.
+const ON_GRID = 1e-6;
+
+/** The grid line a box's edge rounds up to, in CSS pixels. */
+function gridEdge(at: number, scale: number): number {
+  return Math.ceil(at * scale - ON_GRID) / scale;
+}
+
 /** The physical pixels a box shows on, expressed in CSS pixels. */
 function pixelRect(rect: ScreenRect, scale: number): ScreenRect {
-  const edge = (at: number) => Math.ceil(at * scale) / scale;
+  const edge = (at: number) => gridEdge(at, scale);
   return { x0: edge(rect.x0), x1: edge(rect.x1), y0: edge(rect.y0), y1: edge(rect.y1) };
 }
 
 /** The top-left corner of the physical pixel holding a CSS coordinate. */
 export function pixelCorner(at: number, scale: number): number {
-  return Math.floor(at * scale) / scale;
+  return Math.floor(at * scale + ON_GRID) / scale;
 }
 
 export function draw(
@@ -164,16 +174,9 @@ export function draw(
     if (width <= 0 || height <= 0) continue;
     visible = true;
 
-    if (box.kind === "merged") {
-      const start = i;
-      while (i + 1 < frame.boxes.length && joined(frame.boxes[i]!, frame.boxes[i + 1]!)) i++;
-      tail(ctx, frame.boxes, start, i, cam, view, (box) => palette.tile(box.p, box.q, equal).fill, scale);
-      for (let band = start; band <= i; band++) drawn(frame.boxes[band]!, screenRect(frame.boxes[band]!, cam, view));
-      continue;
-    }
-
     // A gap with no estimate yet is unknown, as the background already says:
     // only its label shows. One with an estimate is drawn as a silhouette.
+    // A row, of children each thinner than it, is drawn and never labelled.
     let ink = scheme.inkMuted;
     if (box.kind !== "gap" || Number.isFinite(box.x1)) {
       const tile = palette.tile(box.p, box.q, equal);
@@ -184,12 +187,12 @@ export function draw(
       drawn(box, rect);
     }
 
-    if (box.count !== 0) labels.push({ box, rect, ink });
+    if (box.count !== 0 && box.kind !== "row") labels.push({ box, rect, ink });
   }
   for (const boxes of children.values()) boxes.sort((a, b) => a.rect.y0 - b.rect.y0);
   if (state.timeline !== null) {
     const timeline = state.timeline;
-    timeCdfs(ctx, children, timeline, view, state.known, (node, branch) => state.glyph(node, branch).time,
+    timeCdfs(ctx, children, timeline, view, scale, state.known, (node, branch) => state.glyph(node, branch).time,
       (box) => palette.tile(box.p, box.q, equal).ink);
   }
   outlines(ctx, children, scale, scheme.surface);
@@ -199,7 +202,7 @@ export function draw(
   // it before its own. A box's parent is the box of the branch its node is.
   const parents = new Map<NodeId, Box>();
   for (const box of frame.boxes) {
-    if (box.kind !== "merged" && box.branch !== null) parents.set(state.child(box.node, box.branch), box);
+    if (box.branch !== null) parents.set(state.child(box.node, box.branch), box);
   }
   const carriedBy = new Map<NodeId, readonly Glyph[]>();
   /** The labels the children of ``node`` carry, outermost first. A time
@@ -308,13 +311,14 @@ interface Drawn {
  * across the same pixels: down a run of them, the line stands at the time
  * each known one lands on, however thin, and crosses straight over the
  * unknown ones between; the time they move over, from where the path is,
- * is shaded. Clipped to their boxes and the bands among them: a window onto
+ * is shaded. Clipped to their boxes and the rows among them: a window onto
  * the timeline. ``children`` are each node's in order down. */
 function timeCdfs(
   ctx: CanvasRenderingContext2D,
   children: Map<NodeId, Drawn[]>,
   timeline: Timeline,
   view: Viewport,
+  scale: number,
   known: (node: NodeId) => readonly Known[],
   timeOf: (node: NodeId, branch: number) => { from: number; to: number } | undefined,
   inkOf: (box: Box) => string,
@@ -322,8 +326,8 @@ function timeCdfs(
   // Far-off coordinates lose precision and can stall rasterizing.
   const x = (time: number) => within(timeline.x(time), -OVERSCAN, view.width + OVERSCAN);
   for (const [node, drawn] of children) {
-    // Where time can be drawn: the boxes of time branches, and bands.
-    const windows = drawn.filter(({ box }) => box.branch === null ? box.kind === "merged" : timeOf(node, box.branch) !== undefined);
+    // Where time can be drawn: the boxes of time branches, and rows.
+    const windows = drawn.filter(({ box }) => box.branch === null ? box.kind === "row" : timeOf(node, box.branch) !== undefined);
     if (windows.length === 0) continue;
     const children = known(node);
     let first = 0;
@@ -349,7 +353,11 @@ function timeCdfs(
       if (shown.length === 0) continue;
       ctx.save();
       ctx.beginPath();
-      for (const { rect } of shown) ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
+      // The pixels the boxes are drawn on, whole: their edges rounded.
+      for (const { rect } of shown) {
+        const pixels = pixelRect(rect, scale);
+        ctx.rect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0, pixels.y1 - pixels.y0);
+      }
       ctx.clip();
       ctx.beginPath();
       ctx.rect(-OVERSCAN, top, view.width + 2 * OVERSCAN, bottom - top);
@@ -379,85 +387,33 @@ function timeCdfs(
  * edges, stepping between siblings of different widths. Siblings meet
  * unstroked: where their widths part, the outline already parts them. The
  * strokes are a box's own last column and row, or the row above its top,
- * so a stroke shared by neighbours is one pixel. */
+ * so a stroke shared by neighbours is one pixel; a box one pixel tall keeps
+ * its row, its bottom stroke below it. */
 function outlines(ctx: CanvasRenderingContext2D, children: Map<NodeId, Drawn[]>, scale: number, color: string): void {
   const pixel = 1 / scale;
-  const edge = (at: number) => Math.ceil(at * scale) / scale;
+  const edge = (at: number) => gridEdge(at, scale);
   ctx.fillStyle = color;
   for (const drawn of children.values()) {
-    const rects = drawn.map(({ rect }) => rect);
-    rects.forEach((rect, i) => {
-      const [x0, x1, y0, y1] = [edge(rect.x0), edge(rect.x1), edge(rect.y0), edge(rect.y1)];
+    // Neighbours as they are drawn: on the pixels their edges round to. A
+    // box's edge falls between grid lines and a row's on one, so only
+    // rounded edges tell whether two meet.
+    const rects = drawn
+      .map(({ rect }) => ({ x0: edge(rect.x0), x1: edge(rect.x1), y0: edge(rect.y0), y1: edge(rect.y1) }))
+      .filter((rect) => rect.y0 < rect.y1);
+    rects.forEach(({ x0, x1, y0, y1 }, i) => {
       ctx.fillRect(x1 - pixel, y0, pixel, y1 - y0);
-      // Where the sibling above or below, if it touches, is narrower, or
-      // across the whole box where none does.
+      // Where the sibling above or below, if it meets this one, is
+      // narrower, or across the whole box where none does.
       const above = rects[i - 1], below = rects[i + 1];
-      const top = above !== undefined && above.y1 === rect.y0 ? edge(above.x1) : x0;
+      const top = above !== undefined && above.y1 === y0 ? above.x1 : x0;
       if (top < x1) ctx.fillRect(top, y0 - pixel, x1 - top, pixel);
-      const bottom = below !== undefined && below.y0 === rect.y1 ? edge(below.x1) : x0;
-      if (bottom < x1) ctx.fillRect(bottom, y1 - pixel, x1 - bottom, pixel);
+      const bottom = below !== undefined && below.y0 === y1 ? below.x1 : x0;
+      // The last row above the edge, unless that row is all of the box: a
+      // row of children one pixel tall keeps it, and the stroke goes below.
+      const at = Math.round((y1 - y0) * scale) <= 1 ? y1 : y1 - pixel;
+      if (bottom < x1) ctx.fillRect(bottom, at, x1 - bottom, pixel);
     });
   }
-}
-
-/** Whether ``below`` continues the band silhouette ``above`` ends: only
- * touching sibling bands share one. An unknown interval, a visible child, or
- * another node keeps its own boundary. Touching runs coalesce, so
- * neighbouring bands share one stored edge and touch exactly. */
-function joined(above: Box, below: Box): boolean {
-  return above.kind === "merged" && below.kind === "merged" && above.node === below.node
-    && above.x0 === below.x0 && above.y1 === below.y0;
-}
-
-/** Paint a dense sibling tail once. Separate antialiased rectangles let the
- * background leak through their shared edges. A single contour has only an
- * outside edge; a vertical gradient carries each band's own color without
- * adding interior coverage edges or rounding its probability geometry. */
-function tail(
-  ctx: CanvasRenderingContext2D,
-  boxes: readonly Box[],
-  start: number,
-  end: number,
-  cam: Camera,
-  view: Viewport,
-  fill: (box: Box) => string,
-  scale: number,
-): void {
-  const first = screenRect(boxes[start]!, cam, view);
-  const bottom = screenRect(boxes[end]!, cam, view).y1;
-  // Meet ordinary boxes on their physical-pixel edges. Inside the tail,
-  // keep the measured contour and color boundaries at full precision.
-  const edges = pixelRect({ ...first, y1: bottom }, scale);
-  if (edges.y1 <= edges.y0) return;
-  const initial = fill(boxes[start]!);
-  let previous = initial;
-  let gradient: CanvasGradient | null = null;
-  ctx.beginPath();
-  ctx.moveTo(edges.x0, edges.y0);
-  for (let i = start; i <= end; i++) {
-    const box = boxes[i]!;
-    const rect = screenRect(box, cam, view);
-    ctx.lineTo(rect.x1, i === start ? edges.y0 : Math.min(rect.y0, edges.y1));
-    ctx.lineTo(rect.x1, i === end ? edges.y1 : Math.min(rect.y1, edges.y1));
-    const color = fill(box);
-    if (color !== previous) {
-      if (gradient === null) {
-        gradient = ctx.createLinearGradient(0, first.y0, 0, bottom);
-        gradient.addColorStop(0, initial);
-      }
-      // Paired stops preserve the measured band colors. Interpolating only
-      // the tail's first and last colors would invent values in between.
-      const at = (rect.y0 - first.y0) / (bottom - first.y0);
-      gradient.addColorStop(at, previous);
-      gradient.addColorStop(at, color);
-      previous = color;
-    }
-  }
-  ctx.lineTo(edges.x0, edges.y1);
-  ctx.closePath();
-  if (gradient !== null) gradient.addColorStop(1, previous);
-  ctx.fillStyle = gradient ?? initial;
-  ctx.fill();
 }
 
 /** One piece of a label, never broken across lines: the ellipsis for
@@ -692,7 +648,7 @@ function outline(
   ctx.lineWidth = pixel;
   ctx.globalAlpha = 0.35;
   for (const box of frame.boxes) {
-    if (box.kind === "merged" || !state.ancestors.has(childKey(box.node, box.rank))) continue;
+    if (box.kind === "row" || !state.ancestors.has(childKey(box.node, box.rank))) continue;
     const rect = pixelRect(screenRect(box, cam, view), scale);
     ctx.strokeRect(rect.x0 + pixel / 2, rect.y0 + pixel / 2, Math.max(0, rect.x1 - rect.x0 - pixel), Math.max(0, rect.y1 - rect.y0 - pixel));
   }
@@ -703,21 +659,18 @@ function outline(
   ctx.lineWidth = 2 * pixel;
   if (!state.hover.exact) ctx.setLineDash([5 * pixel, 3 * pixel]);
   // Outline where the frame draws the branch: its own box, or the rows it
-  // touches of the band silhouette holding it. Without a box, the origin.
-  const boxes = frame.boxes;
-  const at = boxes.findIndex(b => b.node === box.node
-    && (b.kind === "merged" ? b.y0 <= box.y0 && box.y1 <= b.y1 : b.rank === box.rank));
+  // falls in, as wide as the widest. Without a box, the origin.
   const exact = screenRect(box, cam, view);
   const own = pixelRect(exact, scale);
   let rect = own;
-  if (at !== -1) {
-    let [first, last] = [at, at];
-    while (0 < first && joined(boxes[first - 1]!, boxes[first]!)) first--;
-    while (last + 1 < boxes.length && joined(boxes[last]!, boxes[last + 1]!)) last++;
+  const drawnAlone = frame.boxes.some(b => b.node === box.node && b.kind !== "row" && b.rank === box.rank);
+  const rows = frame.boxes.filter(b => b.node === box.node && b.kind === "row"
+    && (b.y0 <= box.y0 ? box.y0 < b.y1 : b.y0 < box.y1));
+  if (!drawnAlone && rows.length !== 0) {
     const drawn = pixelRect({
-      ...screenRect(boxes[at]!, cam, view),
-      y0: screenRect(boxes[first]!, cam, view).y0,
-      y1: screenRect(boxes[last]!, cam, view).y1,
+      ...screenRect(rows[0]!, cam, view),
+      x1: Math.max(...rows.map(row => screenRect(row, cam, view).x1)),
+      y1: screenRect(rows[rows.length - 1]!, cam, view).y1,
     }, scale);
     rect = { ...drawn, y0: Math.max(drawn.y0, pixelCorner(exact.y0, scale)), y1: Math.min(drawn.y1, own.y1) };
   }

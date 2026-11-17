@@ -274,10 +274,13 @@ impl Tree {
         let mut cross = 0.0;
         let mut bounded = !p.complete();
         for run in p.runs() {
-            entropy += run.ln_surprisal(0, run.len()).exp();
-            if lens.p != lens.q {
-                for at in 0..run.len() {
-                    let ln_p = run.ln_p(at);
+            for at in 0..run.len() {
+                let ln_p = run.ln_p(at);
+                // p (−ln p) is zero both at p = 0 and at p = 1.
+                if ln_p < 0.0 && f64::NEG_INFINITY < ln_p {
+                    entropy += -ln_p * ln_p.exp();
+                }
+                if lens.p != lens.q {
                     let nats = self.nats_q(id, lens, run.branch(at), ln_p)?;
                     if nats.is_finite() {
                         cross += ln_p.exp() * nats;

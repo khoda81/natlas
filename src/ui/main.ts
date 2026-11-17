@@ -625,7 +625,7 @@ export class App {
     clamp(this.tree!, this.lens, camera);
     const settled = this.geometryKey(camera);
     if (this.geometry?.key === settled) return this.geometry.frame;
-    const frame = layout(this.tree!, this.lens, camera, this.view, { mergePx: 1 / this.pixelRatio });
+    const frame = layout(this.tree!, this.lens, camera, this.view, { rowPx: 1 / this.pixelRatio });
     if (this.geometry?.frame !== this.frame) this.geometry?.frame.dispose();
     this.geometry = { frame, key: settled };
     return frame;
@@ -937,7 +937,7 @@ export class App {
     const tree = this.tree;
     if (tree === null) return;
     // The point becomes the box's top: a child's by name, a gap's or a
-    // band's, which have none, by where it is drawn.
+    // row's, which have none, by where it is drawn.
     if (box.branch === null) {
       aim(tree, this.lens, this.cam, box.y0);
       if (this.cam.a !== box.y0) return;

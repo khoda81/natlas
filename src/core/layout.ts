@@ -46,7 +46,7 @@ export interface Viewport {
 }
 
 /** A child with known children, one without, children not yet known, or children too thin to draw apart. */
-export type BoxKind = "node" | "leaf" | "gap" | "merged";
+export type BoxKind = "node" | "leaf" | "gap" | "row";
 
 export interface Box {
   node: NodeId;
@@ -56,9 +56,9 @@ export interface Box {
   count: number;
   kind: BoxKind;
   branch: Branch | null;
-  /** Conditional probabilities; p-weighted geometric means for a band. */
+  /** Conditional probabilities; for a row, geometric means weighted by what each child covers of it. */
   p: number;
-  /** NaN while unknown; like p, a representative child weight for a band. */
+  /** NaN while unknown; like p, a representative child weight for a row. */
   q: number;
   lnMass: number;
   x0: number;
@@ -85,7 +85,7 @@ export interface Path {
   branches: Branch[];
 }
 
-const KINDS: BoxKind[] = ["node", "leaf", "gap", "merged"];
+const KINDS: BoxKind[] = ["node", "leaf", "gap", "row"];
 
 /** A known child of a laid-out node: its branch and its edges in view heights. */
 export interface Known {
@@ -116,7 +116,7 @@ export class Frame {
   }
 
   /** The known children of ``node`` that reach into the view, top to
-   * bottom, however thin: even those drawn inside a band. */
+   * bottom, however thin: even those drawn in a row with others. */
   known(tree: IntervalTree, lens: Lens, node: NodeId): Known[] {
     const packed = this.raw.known(tree.raw, lens.p, lens.q, node);
     const known: Known[] = [];
@@ -143,8 +143,9 @@ export interface Selection {
 }
 
 export interface LayoutOptions {
-  /** Children thinner than this many CSS pixels join a band; 1 / DPR is one physical pixel. */
-  mergePx: number;
+  /** The height of a physical row in CSS pixels, 1 / DPR: a child thinner
+   * than one is drawn in the rows it falls in. */
+  rowPx: number;
 }
 
 /** ln of the view's height in origin heights: the view spans e^-x of the origin. */
@@ -159,7 +160,7 @@ export function layout(
   view: Viewport,
   options: Partial<LayoutOptions> = {},
 ): Frame {
-  return new Frame(layoutFrame(tree.raw, lens.p, lens.q, cam, view, options.mergePx ?? 1));
+  return new Frame(layoutFrame(tree.raw, lens.p, lens.q, cam, view, options.rowPx ?? 1));
 }
 
 /** Name the camera's point by the deepest node that holds it and covers the

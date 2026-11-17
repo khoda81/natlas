@@ -65,11 +65,13 @@ up a node keeps every digit, so zooming out and back in returns to the very
 same place. An edge is a point too: a run's top, as many digits as the view
 that asked for it needs, plus the f64 sum of the weights above it within the
 run, so a child keeps its place among its neighbours in any order, however
-light it is (see `docs/exact-runs.md`). Each node is laid out from its two edges nearest the point, one binary
-search to the first visible child, and children thinner than a physical pixel
-join bands about a physical pixel tall (see `core/src/layout.rs`). Touching
-bands draw as one silhouette with their individual colors, so internal
-antialiased edges cannot show through as stripes. A physical pixel shows, and
+light it is (see `docs/exact-runs.md`). Each node is laid out from its two
+edges nearest the point, one binary search to the first visible child. A
+child or gap a physical pixel or more tall is a box of its own; thinner
+children are drawn in the physical rows they fall in, each row summing those
+it holds (see `core/src/layout.rs`). A row is only drawing: it never stands
+in for its children, which picking, labels and readings still find one by
+one. A physical pixel shows, and
 the pointer over it selects, the box holding the pixel's top-left corner, so
 hovering a box a pixel or two tall never selects its neighbour. The
 children of each node are outlined together, a physical pixel of background
@@ -131,19 +133,14 @@ order and split heights, and q is read by branch for the children p places.
 Placed branches use the same colors whether their children are known yet.
 
 The session samples stretches of thin children at two points per physical
-pixel row, spread evenly through their mass. Children thinner than a
-physical pixel, with the gaps between them, are drawn as bands about a
-physical pixel tall, borderless silhouettes whose width Σ p (−ln q) / Σ p is
-a Monte Carlo estimate from their known children: exact when p = q and the
-band holds no gap, and close for gaps heaviest first, since children sorted
-by p have nearly equal surprisal side by side; noisier in branch order.
-Touching sibling bands share one contour, filled with a vertical gradient
-whose stops retain each band's color. Both of a band's conditional weights
-are p-weighted geometric means, so its comparison color shows the children's
-mean ln(p/q), while its total path mass is stored separately. Selection
-still resolves a band's individual children: on a band's pixel, the pointer
+pixel row, spread evenly through their mass. A physical row of children each
+thinner than it is drawn as wide as Σ h (−ln q) / Σ h over the known
+children in it, h how much of the row each covers: its area is theirs, a
+Monte Carlo estimate where the session sampled them. Its color is their mean
+ln(p/q), weighted alike, and its path mass is stored separately. A row a
+box's rounded edges reach is the box's. On a row's pixel, the pointer
 selects the known child the pixel holds rather than a gap between children,
-and the highlight outlines the rows of the silhouette that child touches.
+and the highlight outlines the rows that child falls in.
 
 Layout draws what the tree holds and redraws when an answer changes it.
 A server may also say how many of a node's children have weight. A gap then

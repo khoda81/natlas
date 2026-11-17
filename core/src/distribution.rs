@@ -13,7 +13,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
-use std::sync::OnceLock;
 
 use crate::packed::Packed;
 use crate::point::Point;
@@ -52,23 +51,10 @@ pub enum Order {
 }
 
 /// Consecutive ranks from `rank`: their branches, weights and edges.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Run {
     rank: Rank,
     children: Children,
-    /// ln Σ p (−ln p) over the run's children from each edge to the run's
-    /// end, accumulated from the light end: a merged band's area-preserving
-    /// width without visiting its children. Derived when first read: only
-    /// layout reads it, and a server, which builds a run of its whole
-    /// vocabulary per node, never does.
-    ln_surprisal_below: OnceLock<Vec<f64>>,
-}
-
-/// Runs are what they place: the derived sums are not compared.
-impl PartialEq for Run {
-    fn eq(&self, other: &Self) -> bool {
-        (self.rank, &self.children) == (other.rank, &other.children)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -181,11 +167,7 @@ impl Run {
     }
 
     fn of(rank: Rank, children: Children) -> Self {
-        Self {
-            rank,
-            children,
-            ln_surprisal_below: OnceLock::new(),
-        }
+        Self { rank, children }
     }
 
     /// The node's children end at `rank`: nothing is below it. A node
@@ -196,7 +178,6 @@ impl Run {
 
     fn bytes(&self) -> usize {
         use std::mem::size_of;
-        let sums = self.ln_surprisal_below.get().map_or(0, Vec::capacity);
         let children = match &self.children {
             Children::Listed {
                 branches,
@@ -210,24 +191,7 @@ impl Run {
             Children::Packed(packed) => packed.bytes(),
             Children::End => 0,
         };
-        size_of::<Self>() + children + sums * size_of::<f64>()
-    }
-
-    fn ln_surprisal_below(&self) -> &[f64] {
-        self.ln_surprisal_below.get_or_init(|| {
-            let mut sums = vec![f64::NEG_INFINITY; self.len() + 1];
-            for i in (0..self.len()).rev() {
-                let ln_p = self.ln_p(i);
-                // p (−ln p) is zero both at p = 0 and at p = 1.
-                let ln_surprisal = if ln_p < 0.0 && ln_p > f64::NEG_INFINITY {
-                    ln_p + (-ln_p).ln()
-                } else {
-                    f64::NEG_INFINITY
-                };
-                sums[i] = ln_add(sums[i + 1], ln_surprisal);
-            }
-            sums
-        })
+        size_of::<Self>() + children
     }
 
     pub fn rank(&self) -> Rank {
@@ -314,14 +278,6 @@ impl Run {
         }
     }
 
-    /// ln of the mass of children [from, to), as their edges tell it.
-    pub fn ln_mass(&self, from: usize, to: usize) -> f64 {
-        match &self.children {
-            Children::Listed { offsets, .. } => (offsets[to] - offsets[from]).max(0.0).ln(),
-            _ => Point::ln_between(&self.edge(from), &self.edge(to)),
-        }
-    }
-
     /// The top of the child at `at`, rounded down to `bits` bits.
     fn top_at(&self, at: usize, bits: u64) -> Point {
         match &self.children {
@@ -336,12 +292,6 @@ impl Run {
             Children::Packed(packed) => packed.ln_p(at),
             Children::End => unreachable!("the end has no children"),
         }
-    }
-
-    /// ln Σ p (−ln p) over children [from, to).
-    pub fn ln_surprisal(&self, from: usize, to: usize) -> f64 {
-        let sums = self.ln_surprisal_below();
-        ln_between(sums[from], sums[to])
     }
 
     /// The child holding a point the run holds: the last whose top it is at

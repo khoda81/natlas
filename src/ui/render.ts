@@ -45,10 +45,12 @@ const LABEL_PAD = 0.25;
 /** How strongly the labels a box carries from its ancestors show before its own. */
 const CARRIED_ALPHA = 0.6;
 /** Carried labels are framed, in ems: room inside a frame at each side, the
- * space after each frame, and the frame's half height. */
+ * space between a label's pieces, and the frame's half height. */
 const TOKEN_PAD = 0.2;
 const TOKEN_GAP = 0.3;
 const TOKEN_HALF = 0.6;
+/** How far apart, in ems, the lines of a wrapped label are: frames clear each other. */
+const LABEL_LINE = 1.4;
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const GAP_MIN = 4;
 /** A mark's width, and the space after it, in ems. */
@@ -213,28 +215,35 @@ export function draw(
   // the box's left, centered, and slides right past the left screen edge and
   // up or down into view, stopping at the box's own edges. A label reading up
   // a box is centered both ways and slides into view the same way. The labels
-  // a box carries come first, framed and fainter.
+  // a box carries come first, framed and fainter, and a label wraps between
+  // its pieces where lines make it larger.
   for (const { box, rect, ink } of labels) {
     const fit = fitOf(box);
     if (fit === null) continue;
-    const { carried, cut, text, size, vertical, marked } = fit;
+    const { lines, size, vertical } = fit;
     const left = (box.x0 - cam.x) * cam.k;
     const right = left + (box.x1 - box.x0) * cam.k - 2;
     const top = box.y0 * view.height;
     const bottom = box.y1 * view.height;
     const pad = LABEL_PAD * size;
     const span = fit.ems * size;
-    // Where the text starts, and the screen rectangle it covers.
+    // The lines' extent across the text, and the distance from the first's
+    // middle to the last's.
+    const thick = size * (1 + (lines.length - 1) * LABEL_LINE);
+    const reach = (lines.length - 1) * LABEL_LINE * size;
+    // Where the first line starts, and the screen rectangle the label covers.
     let x: number, y: number, covers: ScreenRect;
     if (vertical) {
-      x = within(within((left + right) / 2, size / 2, view.width - size / 2), left + size / 2, right - size / 2);
-      const middle = within(within((top + bottom) / 2, pad + span / 2, view.height - pad - span / 2), top + pad + span / 2, bottom - pad - span / 2);
-      y = middle + span / 2;
-      covers = { x0: x - size / 2, y0: y - span, x1: x + size / 2, y1: y };
+      const middle = within(within((left + right) / 2, thick / 2, view.width - thick / 2), left + thick / 2, right - thick / 2);
+      x = middle - reach / 2;
+      const along = within(within((top + bottom) / 2, pad + span / 2, view.height - pad - span / 2), top + pad + span / 2, bottom - pad - span / 2);
+      y = along + span / 2;
+      covers = { x0: middle - thick / 2, y0: y - span, x1: middle + thick / 2, y1: y };
     } else {
       x = within(pad, left + pad, right - pad - span);
-      y = within(within((top + bottom) / 2, size / 2, view.height - size / 2), top + size / 2, bottom - size / 2);
-      covers = { x0: x, y0: y - size / 2, x1: x + span, y1: y + size / 2 };
+      const middle = within(within((top + bottom) / 2, thick / 2, view.height - thick / 2), top + thick / 2, bottom - thick / 2);
+      y = middle - reach / 2;
+      covers = { x0: x, y0: middle - thick / 2, x1: x + span, y1: middle + thick / 2 };
     }
     if (view.width < covers.x0 || covers.x1 < 0 || view.height < covers.y0 || covers.y1 < 0) continue;
     ctx.save();
@@ -244,31 +253,13 @@ export function draw(
     ctx.translate(x, y);
     if (vertical) ctx.rotate(-Math.PI / 2);
     ctx.font = `${size}px ${FAMILY}`;
-    ctx.fillStyle = ink;
-    ctx.strokeStyle = ink;
-    ctx.lineWidth = Math.max(1, size / 16);
-    ctx.globalAlpha = CARRIED_ALPHA;
-    let at = 0;
-    if (cut) {
-      ctx.fillText(MORE.text, 0, 0);
-      at += cutEms(ctx) * size;
-    }
-    for (const token of carried) {
-      const width = tokenEms(ctx, token) * size;
-      ctx.beginPath();
-      ctx.roundRect(at, -TOKEN_HALF * size, width, 2 * TOKEN_HALF * size, TOKEN_PAD * size);
-      ctx.stroke();
-      const marked = markEms(token) * size;
-      if (token.mark !== undefined) mark(ctx, token.mark, at + TOKEN_PAD * size, 0, size, token.tint ?? ink, ink);
-      ctx.fillStyle = ink;
-      ctx.fillText(token.text, at + TOKEN_PAD * size + marked, 0);
-      at += width + TOKEN_GAP * size;
-    }
-    ctx.globalAlpha = 1;
-    const glyph = box.branch !== null ? state.glyph(box.node, box.branch) : gapGlyph(box);
-    if (glyph.mark !== undefined) mark(ctx, glyph.mark, at, 0, size, glyph.tint ?? ink, ink);
-    ctx.fillStyle = ink;
-    ctx.fillText(text, at + marked * size, 0);
+    lines.forEach((line, row) => {
+      let at = 0;
+      for (const piece of line) {
+        drawPiece(ctx, piece, at, row * LABEL_LINE * size, size, ink);
+        at += (piece.ems + TOKEN_GAP) * size;
+      }
+    });
     ctx.restore();
   }
 
@@ -341,22 +332,27 @@ function tail(
   ctx.fill();
 }
 
-/** A label as drawn: the labels it carries that fit, outermost first, and
- * whether outer ones were cut; its own text, maybe shortened; its size;
- * which way it reads; the ems its own mark takes before its own text; and
- * its whole length in ems. */
+/** One piece of a label, never broken across lines: the ellipsis for
+ * carried labels that did not fit, a carried label, or the box's own; and
+ * the ems it takes, its frame included. */
+interface Piece {
+  kind: "cut" | "carried" | "own";
+  glyph: Glyph;
+  ems: number;
+}
+
+/** A label as drawn: its pieces line by line, its size, which way it
+ * reads, and its widest line's ems. */
 interface Fit {
-  carried: readonly Glyph[];
-  cut: boolean;
-  text: string;
+  lines: Piece[][];
   size: number;
   vertical: boolean;
-  marked: number;
   ems: number;
 }
 
 /** The largest label a box of ``width`` by ``height`` CSS pixels holds:
- * across it, or up it where it is taller than wide and that is larger. The
+ * across it, or up it where it is taller than wide and that is larger, in
+ * as many lines, broken between its pieces, as make it largest. The
  * labels it carries come before its own, as many of the innermost as fit at
  * a readable size, after an ellipsis where outer ones do not; where none
  * does, it is its own alone. A label too long to read at any size the box
@@ -371,35 +367,86 @@ function fitLabel(
   height: number,
   grows: boolean,
 ): Fit | null {
-  const marked = markEms(glyph);
-  const own = measure(ctx, glyph.text) / BASE_SIZE + marked;
   const largest = grows ? LABEL_MAX_SIZE : BASE_SIZE;
-  const size = (across: number, along: number, ems: number) =>
-    Math.min(largest, across * LABEL_FILL, along / (ems + 2 * LABEL_PAD));
-  const fit = (kept: readonly Glyph[], cut: boolean, ems: number): Fit | null => {
-    const sideways = size(height, width, ems);
-    const upward = width < height ? size(width, height, ems) : 0;
-    const best = Math.max(sideways, upward);
-    if (best < LABEL_MIN_SIZE) return null;
-    return { carried: kept, cut, text: glyph.text, size: best, vertical: sideways < upward, marked, ems };
-  };
-  // Outermost first, each carried label is dropped until the rest fit.
-  let ems = own + carried.reduce((sum, token) => sum + tokenEms(ctx, token) + TOKEN_GAP, 0);
-  for (let first = 0; first < carried.length; first++) {
-    const found = fit(carried.slice(first), 0 < first, ems + (0 < first ? cutEms(ctx) : 0));
-    if (found !== null) return found;
-    ems -= tokenEms(ctx, carried[first]!) + TOKEN_GAP;
+  const own: Piece = { kind: "own", glyph, ems: glyphEms(ctx, glyph) };
+  const tokens = carried.map((glyph): Piece => ({ kind: "carried", glyph, ems: 2 * TOKEN_PAD + glyphEms(ctx, glyph) }));
+  const cut: Piece = { kind: "cut", glyph: MORE, ems: glyphEms(ctx, MORE) };
+  // Pieces only add to a label, so where its own does not fit alone, no
+  // carried label fits beside it. Otherwise, outermost first, each carried
+  // label is dropped until the rest fit.
+  const alone = largestFit([own], width, height, largest);
+  if (alone !== null) {
+    for (let first = 0; first < tokens.length; first++) {
+      const kept = [...tokens.slice(first), own];
+      const fit = largestFit(0 < first ? [cut, ...kept] : kept, width, height, largest);
+      if (fit !== null) return fit;
+    }
+    return alone;
   }
-  const alone = fit([], false, own);
-  if (alone !== null) return alone;
   // Ems of text that fit at the smallest readable size.
+  const marked = markEms(glyph);
   const room = (across: number, along: number) =>
     LABEL_MIN_SIZE <= across * LABEL_FILL ? along / LABEL_MIN_SIZE - 2 * LABEL_PAD - marked : 0;
   const across = room(height, width);
   const up = width < height ? room(width, height) : 0;
   const text = shortened(ctx, glyph.text, Math.max(across, up));
   if (text === null) return null;
-  return { carried: [], cut: false, text, size: LABEL_MIN_SIZE, vertical: across < up, marked, ems: measure(ctx, text) / BASE_SIZE + marked };
+  const piece: Piece = { kind: "own", glyph: { ...glyph, text }, ems: glyphEms(ctx, { ...glyph, text }) };
+  return { lines: [[piece]], size: LABEL_MIN_SIZE, vertical: across < up, ems: piece.ems };
+}
+
+/** ``pieces`` as the largest label a box of ``width`` by ``height`` holds at
+ * a readable size, if any. */
+function largestFit(pieces: readonly Piece[], width: number, height: number, largest: number): Fit | null {
+  const sideways = wrap(pieces, height, width, largest);
+  const upward = width < height ? wrap(pieces, width, height, largest) : null;
+  const vertical = upward !== null && sideways.size < upward.size;
+  const best = vertical ? upward : sideways;
+  return best.size < LABEL_MIN_SIZE ? null : { ...best, vertical };
+}
+
+/** The lines, broken only between pieces, at which ``pieces`` are largest
+ * in a box ``across`` pixels by ``along``; that size; and their widest
+ * line's ems.
+ *
+ * Filling each line before starting the next gives the fewest lines no
+ * wider than a limit. Those lines change only at a limit some line could
+ * take its next piece at, so stepping the limit up from the widest piece
+ * through those widths visits every way of breaking that could be largest.
+ * The step's line reaches the new limit, and the widest line never again
+ * falls below it: once no line that wide beats the best, none wider can. */
+function wrap(pieces: readonly Piece[], across: number, along: number, largest: number): Omit<Fit, "vertical"> {
+  let limit = Math.max(...pieces.map((piece) => piece.ems));
+  let best: Omit<Fit, "vertical"> | null = null;
+  for (;;) {
+    const lines: Piece[][] = [[pieces[0]!]];
+    let line = pieces[0]!.ems;
+    let widest = line;
+    let next = Infinity;
+    for (const piece of pieces.slice(1)) {
+      // Summed in the same order every time, so the line that set ``limit``
+      // reaches it exactly.
+      const joined = line + TOKEN_GAP + piece.ems;
+      if (joined <= limit) {
+        lines.at(-1)!.push(piece);
+        line = joined;
+      } else {
+        next = Math.min(next, joined);
+        lines.push([piece]);
+        line = piece.ems;
+      }
+      widest = Math.max(widest, line);
+    }
+    const size = Math.min(largest, (across * LABEL_FILL) / (1 + (lines.length - 1) * LABEL_LINE), along / (widest + 2 * LABEL_PAD));
+    if (best === null || best.size < size) best = { lines, size, ems: widest };
+    if (next === Infinity || along / (next + 2 * LABEL_PAD) <= best.size) return best;
+    limit = next;
+  }
+}
+
+/** The ems a glyph takes: its mark, then its text. */
+function glyphEms(ctx: CanvasRenderingContext2D, glyph: Glyph): number {
+  return markEms(glyph) + measure(ctx, glyph.text) / BASE_SIZE;
 }
 
 /** The ems a glyph's mark takes before its text. */
@@ -407,14 +454,21 @@ function markEms(glyph: Glyph): number {
   return glyph.mark === undefined ? 0 : MARK_WIDTH + (glyph.text === "" ? 0 : MARK_GAP);
 }
 
-/** The ems a carried label's frame takes. */
-function tokenEms(ctx: CanvasRenderingContext2D, glyph: Glyph): number {
-  return 2 * TOKEN_PAD + markEms(glyph) + measure(ctx, glyph.text) / BASE_SIZE;
-}
-
-/** The ems the ellipsis for cut carried labels takes, with the space after it. */
-function cutEms(ctx: CanvasRenderingContext2D): number {
-  return measure(ctx, MORE.text) / BASE_SIZE + TOKEN_GAP;
+/** ``piece`` drawn ``size`` tall from ``x``, centered on ``y``: what the box
+ * carries framed and fainter than its own. */
+function drawPiece(ctx: CanvasRenderingContext2D, { kind, glyph, ems }: Piece, x: number, y: number, size: number, ink: string): void {
+  ctx.globalAlpha = kind === "own" ? 1 : CARRIED_ALPHA;
+  if (kind === "carried") {
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = Math.max(1, size / 16);
+    ctx.beginPath();
+    ctx.roundRect(x, y - TOKEN_HALF * size, ems * size, 2 * TOKEN_HALF * size, TOKEN_PAD * size);
+    ctx.stroke();
+    x += TOKEN_PAD * size;
+  }
+  if (glyph.mark !== undefined) mark(ctx, glyph.mark, x, y, size, glyph.tint ?? ink, ink);
+  ctx.fillStyle = ink;
+  ctx.fillText(glyph.text, x + markEms(glyph) * size, y);
 }
 
 /** The longest start of ``text``, whole characters followed by an

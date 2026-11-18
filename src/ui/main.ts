@@ -17,8 +17,8 @@ import {
   view,
   type Viewport,
 } from "../core/layout";
-import { parse } from "../data/catalog";
-import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest, type Specs } from "../data/source";
+import { modelOf, parse } from "../data/catalog";
+import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, type Held, manifest, type Specs } from "../data/source";
 import { type Branch, IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
 import { glide, moveDepth, panVertical, scale } from "./camera";
@@ -66,13 +66,15 @@ interface Focus {
 /**
  * A flight down ``chain`` to its last node. The camera's point stays the
  * top of ``chain[reached]``, the deepest node placed so far. ``listed`` once
- * the walks have answered; ``time`` is the last frame's.
+ * the walks have answered; ``time`` is the last frame's. Arrived, the camera
+ * becomes ``land`` where there is one.
  */
 interface Flight {
   chain: NodeId[];
   reached: number;
   listed: boolean;
   time: number | null;
+  land: Camera | null;
 }
 
 export class App {
@@ -101,7 +103,8 @@ export class App {
   private readonly glyphs = new Map<string, Glyph>();
   private loading = 0;
   private navigation = 0;
-  private restoring = false;
+  /** The saved view, flown to once its measures' models have loaded. */
+  private saved: SavedView | null = null;
   private readonly result = element<HTMLButtonElement>("search-result");
   private pendingView: { id: string; view: SavedView } | null = null;
   private readonly readout = element<HTMLElement>("readout");
@@ -249,7 +252,9 @@ export class App {
     // Until one is chosen, the first measure the server holds is p and q.
     measures.onHeld = (held) => {
       const [first] = held.measures;
-      if (dataset === this.dataset && this.specs.p === "" && first !== undefined) this.setSpecs({ p: first, q: first });
+      if (dataset !== this.dataset) return;
+      if (this.specs.p === "" && first !== undefined) this.setSpecs({ p: first, q: first });
+      this.restore(held);
     };
     // A recording p names is read once the server says what it is.
     dataset.recordings?.list().then(() => {
@@ -294,13 +299,17 @@ export class App {
     this.setSpecs(this.specs);
     this.reset();
     const saved = this.readView(dataset);
-    if (saved !== null) void this.restore(saved);
+    if (saved !== null) {
+      this.setSpecs({ p: saved.p, q: saved.q });
+      this.cam.k = saved.k;
+      this.saved = saved;
+    }
     void measures.refresh();
   }
 
   private cancelNavigation(): void {
     this.navigation++;
-    this.restoring = false;
+    this.saved = null;
     this.flight = null;
     this.link?.stop();
   }
@@ -318,33 +327,20 @@ export class App {
   }
 
   /**
-   * Open the node the saved view was in at once: it covered the view, so its
-   * children are what the view shows. The saved view itself follows once the
-   * walk down from its origin has placed that node.
+   * Fly to the saved view once the models of its measures have loaded: from
+   * the root, as a search's result is flown to, so the path above its origin
+   * is placed too, and the depth counts from the root.
    */
-  private async restore(saved: SavedView): Promise<void> {
-    this.setSpecs({ p: saved.p, q: saved.q });
+  private restore(held: Held): void {
+    const saved = this.saved;
+    if (saved === null) return;
+    const loaded = new Set(held.models.filter(({ state }) => state === "loaded").map(({ spec }) => spec));
+    const { catalog } = this.dataset!;
+    if (![saved.p, saved.q].every((spec) => loaded.has(modelOf(catalog, spec)))) return;
+    this.saved = null;
     const tree = this.tree!;
     const origin = tree.descend(tree.root, saved.origin);
-    const node = tree.descend(origin, saved.anchor.path);
-    this.open(node, saved.k);
-    const generation = this.navigation;
-    this.restoring = true;
-    try {
-      const placed = await this.walk(origin, node);
-      if (tree !== this.tree || generation !== this.navigation) return;
-      this.focus = null;
-      if (placed) {
-        this.cam = { origin, x: saved.x, k: saved.k, anchor: saved.anchor, a: saved.a };
-      } else {
-        this.setStatus("The saved path is only partly available.");
-      }
-      this.invalidate();
-    } catch (error) {
-      if (generation === this.navigation) this.setStatus(String(error));
-    } finally {
-      if (generation === this.navigation) this.restoring = false;
-    }
+    this.fly(tree.descend(origin, saved.anchor.path), { origin, x: saved.x, k: saved.k, anchor: saved.anchor, a: saved.a });
   }
 
   /**
@@ -358,8 +354,8 @@ export class App {
     const { origin } = this.cam;
     const parent = tree.parent(origin);
     if (parent === null || !(this.cam.x < 0 || frame.originTop > 0 || frame.originBottom < 1)) return;
-    // A flight's or a restore's path comes first: one path at a time.
-    if (this.flight !== null || this.restoring) return;
+    // A flight's path comes first: one path at a time.
+    if (this.flight !== null) return;
     const edge = tree.entry(parent, this.lens, tree.branch(origin));
     if (edge === undefined || !Number.isFinite(edge.natsQ)) {
       void this.place(parent, origin);
@@ -393,9 +389,10 @@ export class App {
    * descent is the progress. A target below the origin is flown to from the
    * view as it is, from the deepest node on both the camera's path and the
    * target's; any other from the root. Where no source can place the path,
-   * ``target`` opens as the origin instead.
+   * ``target`` opens as the origin instead. Arrived, the camera becomes
+   * ``land`` where there is one.
    */
-  private fly(target: NodeId): void {
+  private fly(target: NodeId, land: Camera | null = null): void {
     const tree = this.tree!;
     const above = tree.path(this.cam.origin);
     const path = tree.path(target);
@@ -406,7 +403,7 @@ export class App {
     } else this.open(ROOT);
     const { origin } = this.cam;
     const chain = tree.chain(origin, target);
-    const flight: Flight = { chain, reached: 0, listed: false, time: null };
+    const flight: Flight = { chain, reached: 0, listed: false, time: null, land };
     if (below) {
       // Down the camera's path while the target's goes the same way, and p
       // and q both place it.
@@ -461,7 +458,8 @@ export class App {
     const arrived = flight.reached === chain.length - 1;
     if (arrived && flight.listed && Math.abs(toX - this.cam.x) < 1e-3) {
       this.flight = null;
-      this.showPath(chain.at(-1)!, null);
+      if (flight.land !== null) this.cam = { ...flight.land };
+      else this.showPath(chain.at(-1)!, null);
     }
   }
 
@@ -1124,11 +1122,23 @@ export class App {
     return Math.abs(value) >= 100 ? value.toFixed(0) : value.toPrecision(3);
   }
 
+  /** The camera's depth from the root: the origin's own and the camera's past
+   * it. Widths are never negative, so while the path down to the origin is
+   * not all placed, what is placed of it is a lower bound. */
+  private depth(): string {
+    const { origin, x } = this.cam;
+    const tree = this.tree;
+    if (origin === ROOT || tree === null || this.specs.p === "" || this.specs.q === "") return this.fmt(x);
+    const path = tree.path(origin);
+    const above = reach(tree, this.lens, ROOT, path);
+    return `${above.placed === path.length ? "" : "≥ "}${this.fmt(above.x + x)}`;
+  }
+
   private updateReadout(): void {
     const unit = this.units.name;
     const view = -Math.min(0, -this.cam.x);
     const text =
-      `depth ${this.fmt(this.cam.x)} · view −log v ${this.fmt(view)} · ` +
+      `depth ${this.depth()} · view −log v ${this.fmt(view)} · ` +
       `${(this.cam.k * this.units.nats).toPrecision(3)} px/${unit.slice(0, -1)}`;
     if (text !== this.readoutText) this.readout.textContent = this.readoutText = text;
   }
@@ -1216,7 +1226,7 @@ export class App {
   }
 
   private saveView(): void {
-    if (!this.storage || this.restoring || this.flight || this.dataset === null || this.tree === null) return;
+    if (!this.storage || this.saved !== null || this.flight || this.dataset === null || this.tree === null) return;
     if (this.saveTimer !== null) clearTimeout(this.saveTimer);
     const { origin, x, k, anchor, a } = this.cam;
     this.pendingView = {

@@ -9,6 +9,7 @@ ids shared with every client, and what each client's view lacks.
 from __future__ import annotations
 
 import asyncio
+import gc
 import queue
 import re
 import sys
@@ -17,7 +18,7 @@ import time
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from itertools import zip_longest
 from typing import Any
@@ -34,7 +35,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from catalog import Measure
+from catalog import Catalog, Measure
 from natlas import natlas_pb2 as pb
 
 _PROTO_CONTENT_TYPE = "application/proto"
@@ -51,6 +52,34 @@ class Client:
 
     send: Callable[[bytes], None]
     session: Session = field(default_factory=Session)
+    # What it looks at, as it said it: taken again when a model it names loads.
+    demand: pb.Demand | None = None
+
+
+class _Worker:
+    """One daemon thread doing what it is given in turn. A pass or a model
+    loading never keeps the process from ending: ^C ends it at once."""
+
+    def __init__(self, name: str):
+        self.queue: queue.SimpleQueue[tuple[Future, Callable[[], Any]]] = queue.SimpleQueue()
+        threading.Thread(target=self._run, daemon=True, name=name).start()
+
+    def submit[T](self, work: Callable[[], T]) -> Future[T]:
+        future: Future[T] = Future()
+        self.queue.put((future, work))
+        return future
+
+    def _run(self) -> None:
+        while True:
+            future, work = self.queue.get()
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(work())
+            except BaseException as error:  # noqa: BLE001 (the future holds it)
+                future.set_exception(error)
+            # Holding on to what it did, a model let go would stay in memory.
+            del future, work
 
 
 @dataclass(frozen=True)
@@ -86,30 +115,28 @@ class Model:
     alone decides. A new demand withdraws the queued pass of the client, so
     the next one is chosen from it.
 
-    Measures are numbered as clients first name them. One opens on the
-    model's thread, as a pass does, so it never runs beside one; what waits
-    on it waits until it is open, and fails if it cannot be.
+    Models load when asked to, on a thread of their own, and unload when
+    asked to. Measures are numbered as clients first name them, and open
+    only of a model loaded: one opens on the model's thread, as a pass does,
+    so it never runs beside one. What waits on a measure whose model is
+    loading waits; what waits on one that cannot be opened fails, saying
+    why, and a client that named it is answered once its model loads.
     """
 
-    def __init__(
-        self,
-        root: tuple[int, ...],
-        vocabulary: int,
-        open: Callable[[str], Measure],
-        cache: int = CACHE,
-        order: str = "heaviest",
-    ):
-        # What the model reads before the root's children: a start-of-text token.
-        self.root = root
-        # Branches the model has; every other branch has weight zero.
+    def __init__(self, vocabulary: int, catalog: Catalog, cache: int = CACHE, order: str = "heaviest"):
+        # Branches the models have; every other branch has weight zero.
         self.vocabulary = vocabulary
-        # The measure a spec names, opened however long that takes.
-        self.open_measure = open
-        # Each measure's spec by id, the id of each spec named, and the
-        # measures open and the ones that could not be, by id.
+        self.catalog = catalog
+        # Each model asked for, by spec, as it loads and once it has.
+        self.models: dict[str, Future[Any]] = {}
+        # Each measure's spec and its model's by id, the id of each spec
+        # named, the measures open, those waiting on their model, and why
+        # each closed one closed.
         self.specs: list[str] = []
+        self.model_of: dict[int, str] = {}
         self.ids: dict[str, int] = {}
         self.measures: dict[int, Measure] = {}
+        self.pending: dict[str, list[int]] = {}
         self.failures: dict[int, str] = {}
         # The order each node's children rank in: "heaviest" first, or by
         # "branch", where branches already follow the reading's own order.
@@ -119,14 +146,15 @@ class Model:
         # by (node, measure), hold more than ``cache`` bytes.
         self.cache = cache
         self.kept: OrderedDict[tuple[int, int], int] = OrderedDict()
-        self.held = 0
+        self.kept_bytes = 0
         self.clients: list[Client] = []
         # The client whose turn is next.
         self.turn = 0
         # Passes whose results the scheduler has not taken yet.
         self.passes: dict[Future[list[np.ndarray]], Pass] = {}
         self.inbox: queue.SimpleQueue[tuple[Callable[[], Any], Future]] = queue.SimpleQueue()
-        self.inference = ThreadPoolExecutor(1, thread_name_prefix="inference")
+        self.inference = _Worker("inference")
+        self.loader = _Worker("loader")
         threading.Thread(target=self._run, daemon=True, name="scheduler").start()
 
     def call[T](self, work: Callable[[], T]) -> Future[T]:
@@ -162,35 +190,148 @@ class Model:
         def demanded() -> None:
             p, q = self._measure(demand.p), self._measure(demand.q)
             client.session.demand(self.tree, p, q, view=view, path=path)
+            client.demand = demand
             self._withdraw(client)
 
         return self.call(demanded)
 
+    def held(self) -> Future[dict[str, Any]]:
+        """The models asked for, each loading, loaded or failed, and the
+        measures open."""
+
+        def held() -> dict[str, Any]:
+            def state(model: str, loading: Future[Any]) -> dict[str, str]:
+                if not loading.done():
+                    return {"spec": model, "state": "loading"}
+                if (error := loading.exception()) is not None:
+                    return {"spec": model, "state": "failed", "message": f"{type(error).__name__}: {error}"}
+                return {"spec": model, "state": "loaded"}
+
+            return {
+                "models": [state(model, loading) for model, loading in self.models.items()],
+                "measures": [self.specs[measure] for measure in sorted(self.measures)],
+            }
+
+        return self.call(held)
+
+    def load(self, model: str) -> Future[None]:
+        """Load the model ``model`` names, unless it is loaded or loading.
+        The future fails with ValueError where it names none."""
+
+        def load() -> None:
+            self.catalog.model(model)
+            loading = self.models.get(model)
+            if loading is not None and not (loading.done() and loading.exception() is not None):
+                return
+
+            def loaded() -> Any:
+                print(f"loading {model} …", file=sys.stderr)
+                return self.catalog.load(model)
+
+            future = self.models[model] = self.loader.submit(loaded)
+            future.add_done_callback(lambda future: self.call(lambda: self._loaded(model, future)))
+
+        return self.call(load)
+
+    def unload(self, model: str) -> Future[None]:
+        """Let the model go, closing its measures, and give back its memory."""
+
+        def unload() -> None:
+            if self.models.pop(model, None) is None:
+                return
+            for measure in self.pending.pop(model, []):
+                self._close(measure, f"{model} was unloaded")
+            for measure in [measure for measure in self.measures if self.model_of[measure] == model]:
+                self._close(measure, f"{model} was unloaded")
+            # Once no pass holds it.
+            self.inference.submit(self._release)
+
+        return self.call(unload)
+
+    def open_measure(self, spec: str) -> Future[None]:
+        """Open the measure ``spec`` names. The future fails with ValueError
+        where it names none, or none of a model loaded or loading."""
+
+        def open() -> None:
+            model, _ = self.catalog.parse(spec)
+            if model not in self.models:
+                raise ValueError(f"load {model} first")
+            self._measure(spec)
+
+        return self.call(open)
+
+    def _release(self) -> None:
+        gc.collect()
+        self.catalog.released()
+
+    def _loaded(self, model: str, future: Future[Any]) -> None:
+        if self.models.get(model) is not future:
+            return
+        if (error := future.exception()) is not None:
+            traceback.print_exception(error)
+        for measure in self.pending.pop(model, []):
+            self._open(measure, future)
+        if error is not None:
+            return
+        # Clients waiting on a measure of it, closed while it was not loaded.
+        for client in self.clients:
+            demand = client.demand
+            if demand is not None and any(spec not in self.ids for spec in (demand.p, demand.q)):
+                self.demand(client, demand)
+
     def _measure(self, spec: str) -> int:
         """The id of the measure ``spec`` names, opening it the first time.
-        One that could not be opened opens again when named again."""
+        One that closed opens again when named again."""
         known = self.ids.get(spec)
         if known is not None:
             return known
         measure = self.ids[spec] = len(self.specs)
         self.specs.append(spec)
+        try:
+            model, _ = self.catalog.parse(spec)
+        except ValueError as error:
+            self.model_of[measure] = ""
+            self._close(measure, str(error))
+            return measure
+        self.model_of[measure] = model
+        loading = self.models.get(model)
+        if loading is None:
+            self._close(measure, f"load {model} to read it")
+        elif not loading.done():
+            self.pending.setdefault(model, []).append(measure)
+        else:
+            self._open(measure, loading)
+        return measure
+
+    def _open(self, measure: int, loading: Future[Any]) -> None:
+        """Open a measure of a model that has loaded, or could not."""
+        if (error := loading.exception()) is not None:
+            self._close(measure, f"{self.model_of[measure]} could not be loaded: {type(error).__name__}: {error}")
+            return
+        model, spec = loading.result(), self.specs[measure]
 
         def open() -> Measure:
             print(f"opening {spec} …", file=sys.stderr)
-            return self.open_measure(spec)
+            return self.catalog.open(model, spec)
 
         future = self.inference.submit(open)
         future.add_done_callback(lambda future: self.call(lambda: self._opened(measure, future)))
-        return measure
 
     def _opened(self, measure: int, future: Future[Measure]) -> None:
-        error = future.exception()
-        if error is None:
+        if measure in self.failures:
+            return
+        if (error := future.exception()) is None:
             self.measures[measure] = future.result()
             return
         traceback.print_exception(error)
-        self.failures[measure] = f"{self.specs[measure]}: {type(error).__name__}: {error}"
-        del self.ids[self.specs[measure]]
+        self._close(measure, f"{type(error).__name__}: {error}")
+
+    def _close(self, measure: int, why: str) -> None:
+        """What waits on the measure fails, saying ``why``; named again, it opens anew."""
+        self.measures.pop(measure, None)
+        self.failures[measure] = f"{self.specs[measure]}: {why}"
+        if self.ids.get(self.specs[measure]) == measure:
+            del self.ids[self.specs[measure]]
 
     def learn(self, path: Sequence[int]) -> Future[list[int]]:
         """Learn the ids along ``path``, so demands can name them alone."""
@@ -304,7 +445,7 @@ class Model:
             return None
         longest = self.measures[measure].longest
         if not self._reads(measure, tokens):
-            self._fail(measure, node, f"{len(self.root) + len(tokens)} tokens, but the context holds {longest}")
+            self._fail(measure, node, f"{len(self.measures[measure].start) + len(tokens)} tokens, but the context holds {longest}")
             return None
         nodes, along = [node], tokens
         for branch in ahead:
@@ -319,17 +460,17 @@ class Model:
 
     def _work(self, job: Pass) -> Callable[[], list[np.ndarray]]:
         """What the model runs for a pass."""
-        walk = self.measures[job.measure].walk
+        walk, start = self.measures[job.measure].walk, self.measures[job.measure].start
         reads = []
         for nodes in job.walks:
-            path = self.root + tuple(self.tree.path(nodes[-1]))
+            path = start + tuple(self.tree.path(nodes[-1]))
             reads.append((path, len(path) - len(nodes) + 1))
 
         def work() -> list[np.ndarray]:
             started = time.perf_counter()
             computed = walk(reads)
             elapsed = (time.perf_counter() - started) * 1000
-            depths = sorted({start - len(self.root) for _, start in reads})
+            depths = sorted({first - len(start) for _, first in reads})
             print(
                 f"{self.specs[job.measure]} {len(reads)} paths, depth {depths[0]}–{depths[-1]}: "
                 f"{sum(map(len, job.walks))} computed, {elapsed:.0f} ms",
@@ -342,7 +483,8 @@ class Model:
     def _finish(self, future: Future[list[np.ndarray]]) -> None:
         """Keep what a pass computed, or fail what waits on it."""
         job = self.passes.pop(future)
-        if future.cancelled():
+        # Withdrawn, or of a measure since closed.
+        if future.cancelled() or job.measure not in self.measures:
             return
         error = future.exception()
         if error is None:
@@ -364,7 +506,7 @@ class Model:
     def _reads(self, measure: int, tokens: tuple[int, ...]) -> bool:
         """Whether the measure reads a path this long."""
         longest = self.measures[measure].longest
-        return longest is None or len(self.root) + len(tokens) <= longest
+        return longest is None or len(self.measures[measure].start) + len(tokens) <= longest
 
     def _empty(self, measure: int, tokens: tuple[int, ...]) -> bool:
         """Whether a sequence has no children: finished, or past the vocabulary."""
@@ -374,13 +516,13 @@ class Model:
         rows = [np.ascontiguousarray(row, dtype=np.float32) for row in rows]
         sizes = self.tree.set(nodes, measure, rows, self.order, self.measures[measure].widths)
         for node, size in zip(nodes, sizes, strict=True):
-            self.held += size - self.kept.pop((node, measure), 0)
+            self.kept_bytes += size - self.kept.pop((node, measure), 0)
             self.kept[node, measure] = size
         # Those just computed stay, however large.
-        while self.cache < self.held and len(nodes) < len(self.kept):
+        while self.cache < self.kept_bytes and len(nodes) < len(self.kept):
             (forgotten, of), size = self.kept.popitem(last=False)
             self.tree.forget(forgotten, of)
-            self.held -= size
+            self.kept_bytes -= size
 
 
 def _encode(updates: list[tuple], specs: list[str]) -> bytes:
@@ -491,11 +633,34 @@ def app(
 
         return serve
 
-    served: list = [Route("/manifest.json", manifest_json), WebSocketRoute("/session", session)]
+    async def held(_: Request) -> Response:
+        return JSONResponse(await asyncio.wrap_future(model.held()))
+
+    def changing(change: Callable[[str], Future[None]]):
+        """A request changing what the model holds, by the spec in its path."""
+
+        async def changed(request: Request) -> Response:
+            try:
+                await asyncio.wrap_future(change(request.path_params["spec"]))
+            except ValueError as error:
+                return JSONResponse({"message": str(error)}, status_code=400)
+            return JSONResponse(await asyncio.wrap_future(model.held()))
+
+        return changed
+
+    served: list = [
+        Route("/manifest.json", manifest_json),
+        WebSocketRoute("/session", session),
+        # What the model holds, and loading, unloading and opening by spec.
+        Route("/held", held),
+        Route("/models/{spec:path}", changing(model.load), methods=["POST"]),
+        Route("/models/{spec:path}", changing(model.unload), methods=["DELETE"]),
+        Route("/measures/{spec:path}", changing(model.open_measure), methods=["POST"]),
+    ]
     served += [Route(f"/{path}", file(*content)) for path, content in files.items()]
     served += [Route("/natlas.Natlas/Search", search_rpc, methods=["POST"]), *routes]
     # Any page may read a local research server.
-    cors = Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+    cors = Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
     return Starlette(routes=served, middleware=[cors])
 
 

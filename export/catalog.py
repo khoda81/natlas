@@ -1,8 +1,12 @@
-"""Specs: the names a server gives its measures, and what they may say.
+"""Specs: the names a server gives its models and measures, and what they may say.
 
-A server's branches have one meaning; its measures are what weighs them,
-each named by a spec. A catalog lists the parameters a spec sets, for the
-page to choose them by, and opens the measure a spec names.
+A server's branches have one meaning; its measures are what weighs them.
+A model is weights loaded on a device at a precision, by hand, and a
+measure is a model read one way: conditioned on a recording, at a
+temperature. Every measure of a server can be compared with every other,
+whatever model each is of. A catalog lists the parameters a spec sets, for
+the page to choose them by, loads the model one names and opens a measure
+of it.
 """
 
 from __future__ import annotations
@@ -20,6 +24,8 @@ class Measure(Protocol):
     """Next-token ln weights over the vocabulary, as float32 rows: up to a
     constant, or each child's own where ``widths``."""
 
+    # What the model reads before the root's children: a start-of-text token.
+    start: tuple[int, ...]
     # How many distributions one forward pass computes, and of how many
     # paths at most.
     width: int
@@ -75,58 +81,89 @@ type Parameter = Choice | Number | Text | Recording
 
 
 class Catalog:
-    """What a server's specs may say, and how to open the measure one names.
+    """What a server's specs may say: how to load the model one names, and
+    open a measure of it.
 
-    A spec is path segments: the first is the source, the first parameter's
-    value, and each other is ``name=value`` for one of the rest, its value
-    percent-encoded; a parameter left out has its default. Two specs naming
-    the same measure in other words are two measures that compute alike.
+    A model's spec is each of its parameters' values in turn, as path
+    segments: ``large/cuda/bfloat16``. A measure's spec is its model's, then
+    ``name=value`` for each of its own parameters not at its default, the
+    value percent-encoded: ``large/cuda/bfloat16/temperature=3``. Two specs
+    naming the same measure in other words are two measures that compute
+    alike.
     """
 
-    def __init__(self, parameters: Sequence[Parameter], open: Callable[[dict[str, Any]], Measure], start: str):
-        if not isinstance(parameters[0], Choice):
-            raise ValueError("a catalog's first parameter, the source, is a choice")
+    def __init__(
+        self,
+        models: Sequence[Choice],
+        parameters: Sequence[Parameter],
+        load: Callable[[dict[str, str]], Any],
+        open: Callable[[Any, dict[str, Any]], Measure],
+        presets: Sequence[str] = (),
+        released: Callable[[], None] = lambda: None,
+    ):
+        self.models = models
+        # Told once a model let go is no longer held, to give back its memory.
+        self.released = released
         self.parameters = {parameter.name: parameter for parameter in parameters}
+        self._load = load
         self._open = open
-        # The spec a client starts from.
-        self.start = start
-        self.parse(start)
+        # Models to offer as they are.
+        self.presets = list(presets)
+        for preset in self.presets:
+            self.model(preset)
 
-    def parse(self, spec: str) -> dict[str, Any]:
-        """Each parameter's value under ``spec``; ValueError where it says
-        what none may."""
-        source, *segments = spec.split("/")
-        first, *rest = self.parameters.values()
-        values: dict[str, Any] = {first.name: _value(first, unquote(source))}
-        for segment in segments:
+    def model(self, spec: str) -> dict[str, str]:
+        """Each of the model's parameters under its spec; ValueError where
+        it names none."""
+        segments = [unquote(segment) for segment in spec.split("/")]
+        if len(segments) != len(self.models):
+            raise ValueError(f"{spec!r} is no model: a model is {'/'.join(choice.name for choice in self.models)}")
+        return {choice.name: _value(choice, segment) for choice, segment in zip(self.models, segments, strict=True)}
+
+    def parse(self, spec: str) -> tuple[str, dict[str, Any]]:
+        """The spec of the model a measure's spec names, and each of the
+        measure's own parameters; ValueError where it says what none may."""
+        segments = spec.split("/")
+        model = "/".join(segments[: len(self.models)])
+        self.model(model)
+        values: dict[str, Any] = {}
+        for segment in segments[len(self.models) :]:
             name, equals, value = segment.partition("=")
-            parameter = self.parameters.get(name)
-            if not equals or parameter is None or parameter is first or name in values:
-                raise ValueError(f"{spec!r}: {segment!r} is no parameter, given once, of {', '.join(p.name for p in rest)}")
-            values[name] = _value(parameter, unquote(value))
-        for parameter in rest:
+            if not equals or name not in self.parameters or name in values:
+                raise ValueError(f"{spec!r}: {segment!r} is no parameter, given once, of {', '.join(self.parameters) or 'none'}")
+            values[name] = _value(self.parameters[name], unquote(value))
+        for parameter in self.parameters.values():
             values.setdefault(parameter.name, _default(parameter))
-        return values
+        return model, values
 
-    def open(self, spec: str) -> Measure:
-        """The measure ``spec`` names: slow, loading what it needs."""
-        return self._open(self.parse(spec))
+    def load(self, model: str) -> Any:
+        """The model ``model`` names, loaded: slow."""
+        return self._load(self.model(model))
+
+    def open(self, model: Any, spec: str) -> Measure:
+        """The measure ``spec`` names, of ``model``, loaded."""
+        return self._open(model, self.parse(spec)[1])
 
     def describe(self) -> dict[str, Any]:
-        """For the page: the parameters, in order, and the spec to start from."""
+        """For the page: the model's parameters and the measure's, in order,
+        and the models offered as they are."""
+        return {
+            "models": [_described(choice) for choice in self.models],
+            "parameters": [_described(parameter) for parameter in self.parameters.values()],
+            "presets": self.presets,
+        }
 
-        def described(parameter: Parameter) -> dict[str, Any]:
-            match parameter:
-                case Choice(name, options, default):
-                    return {"name": name, "kind": "choice", "options": list(options), "default": default}
-                case Number(name, default):
-                    return {"name": name, "kind": "number", "default": default}
-                case Text(name):
-                    return {"name": name, "kind": "text"}
-                case Recording(name):
-                    return {"name": name, "kind": "recording"}
 
-        return {"parameters": [described(parameter) for parameter in self.parameters.values()], "start": self.start}
+def _described(parameter: Parameter) -> dict[str, Any]:
+    match parameter:
+        case Choice(name, options, default):
+            return {"name": name, "kind": "choice", "options": list(options), "default": default}
+        case Number(name, default):
+            return {"name": name, "kind": "number", "default": default}
+        case Text(name):
+            return {"name": name, "kind": "text"}
+        case Recording(name):
+            return {"name": name, "kind": "recording"}
 
 
 def _value(parameter: Parameter, text: str) -> Any:

@@ -1,0 +1,22 @@
+# What serve.py offers. Nothing loads until the page asks.
+
+# Models offered as they are: source/device/precision. A Hugging Face model
+# at "auto" precision is as its checkpoint was saved; a .gguf file's is
+# always "auto", as the file stores it.
+presets = ["SmolLM2-360M/cuda/float32"]
+
+# The tokenizer, which gives the branches their meaning; default the first
+# source's. Every source shares it.
+# tokenizer = "HuggingFaceTB/SmolLM2-360M"
+
+# llama.cpp: tokens of context, the deepest node, and layers on the GPU.
+# n_ctx = 8192
+# gpu_layers = -1
+
+# Sources by name: a Hugging Face id, or a .gguf file relative to this file.
+[sources]
+SmolLM2-360M = "HuggingFaceTB/SmolLM2-360M"
+SmolLM2-135M = "HuggingFaceTB/SmolLM2-135M"
+
+# llama.cpp control vectors a .gguf source can be steered by (see steer.py).
+[controls]

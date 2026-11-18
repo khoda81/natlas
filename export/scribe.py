@@ -44,15 +44,17 @@ order, as MuScriptor's encoder writes it. So every path is a transcription
 MuScriptor decodes in full, and its probability is the model's, given that
 it is one, as in natwalk's MuScriptor demo.
 
-Every measure gives the events this one meaning, so any two compare. A
-measure's spec names the model size, and optionally ``audio=ID`` for a
-recording a page uploaded, the model hearing silence without one (so p
-against it shows what the audio told the model), ``at=SECONDS`` where its
-first window starts, ``instruments=NAMES`` for the model told to expect
-those instruments, ``temperature=T``, and ``shape=time-area`` for its time
-shifts drawn as one, keeping their area: ``medium/audio=3f2a9c/at=30``. Under
-silence a path goes on window after window; under a recording, its last
-window's EOS ends it.
+Every measure gives the events this one meaning, so any two compare. Nothing
+loads until a page asks: a model is a size loaded on a device at a precision,
+``large/cuda/float16``, and a measure's spec names its model, then
+optionally ``audio=ID`` for a recording a page uploaded, the model hearing
+silence without one (so p against it shows what the audio told the model),
+``at=SECONDS`` where its first window starts, ``instruments=NAMES`` for the
+model told to expect those instruments, ``temperature=T``, and
+``shape=time-area`` for its time shifts drawn as one, keeping their area:
+``large/cuda/float16/audio=3f2a9c/at=30``. Under silence a path goes on
+window after window; under a recording, its last window's EOS ends it. The
+config file (scribe.toml) lists models to offer as they are.
 
 POST /recordings takes an audio file, any soundfile reads, and says its id;
 GET /recordings lists them, and GET /recordings/ID is one as the model
@@ -67,8 +69,8 @@ import hashlib
 import io
 import json
 import math
-import sys
 import tempfile
+import tomllib
 import wave
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -88,9 +90,11 @@ from muscriptor.events import ChunkBoundary, OpenNoteTracker
 from muscriptor.models.lm import TorchAutocast
 from muscriptor.modules.streaming import increment_steps, init_states
 from muscriptor.tokenizer.mt3 import (
+    MT3Tokenizer,
     instrument_group_from_names,
     resolve_instrument_names,
 )
+from muscriptor.transcription_model import _build_instrument_for_program
 from muscriptor.utils.audio import load_audio
 from service import CACHE, Model, app
 from starlette.requests import Request
@@ -133,8 +137,8 @@ class Windows:
     """How paths run through a recording's windows from ``at`` seconds on:
     ``count`` of them, or endless where it is None, as under silence."""
 
-    def __init__(self, model: TranscriptionModel, at: float, count: int | None, max_events: int):
-        self.tokenizer = model._tokenizer  # noqa: SLF001
+    def __init__(self, tokenizer: MT3Tokenizer, at: float, count: int | None, max_events: int):
+        self.tokenizer = tokenizer
         self.eos = self.tokenizer.eos_id
         self.at = at
         self.count = count
@@ -432,9 +436,9 @@ def time_area(rows: np.ndarray, time: np.ndarray) -> np.ndarray:
     return np.where(shifts, -width, ln_p).astype(np.float32)
 
 
-def labels_file(model: TranscriptionModel) -> bytes:
-    tokenizer = model._tokenizer  # noqa: SLF001
-    instruments = {program: model._instrument_for_program(program).replace("_", " ") for program in range(130)}  # noqa: SLF001
+def labels_file(tokenizer: MT3Tokenizer) -> bytes:
+    name = _build_instrument_for_program(tokenizer)
+    instruments = {program: name(program).replace("_", " ") for program in range(130)}
     return json.dumps(
         {
             "kind": "notes",
@@ -544,16 +548,24 @@ def _load_model(size: str, device: torch.device, dtype: torch.dtype | None) -> T
     return model
 
 
+@dataclass
+class Loaded:
+    """A model size loaded on a device at a precision, and its transcribers
+    by what each hears and expects: the measures that only reshape what one
+    computes, at another temperature or as time-area, share it and its
+    caches."""
+
+    model: TranscriptionModel
+    transcribers: dict[tuple, tuple[Scribe, Windows]] = field(default_factory=dict)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("audio", type=Path, nargs="*", help="recordings to offer from the start, any soundfile reads: wav, mp3, flac, …")
-    parser.add_argument("--at", type=float, default=0.0, help="where the first recording's first 5-second window starts, in seconds")
-    parser.add_argument("--size", default="medium", choices=SIZES, help="the model size to start from")
-    parser.add_argument("--device", default=lm.default_device())
     parser.add_argument(
-        "--dtype",
-        choices=lm.DTYPES,
-        help="precision of transformer weights and KV caches. Omit to use MuScriptor's device default",
+        "--config",
+        type=Path,
+        default=Path(__file__).with_name("scribe.toml"),
+        help="the models to offer as they are and recordings to offer from the start (default scribe.toml beside this script)",
     )
     parser.add_argument("--max-events", type=int, default=MAX_EVENTS, help="per window, counting its prologue and EOS")
     parser.add_argument("--slots", type=int, default=2, help="KV caches per transcriber, each holding one window")
@@ -561,40 +573,36 @@ def main() -> None:
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8421)
     args = parser.parse_args()
+    try:
+        config = tomllib.loads(args.config.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        parser.error(f"{args.config}: {error}")
 
-    device = torch.device(args.device)
-    dtype = lm.DTYPES[args.dtype] if args.dtype is not None else None
-    models: dict[str, TranscriptionModel] = {}
-
-    def model_for(size: str) -> TranscriptionModel:
-        if size not in models:
-            print(f"loading muscriptor-{size} …", file=sys.stderr)
-            models[size] = _load_model(size, device, dtype)
-        return models[size]
-
-    # Every size reads the same events: the first loaded names them.
-    primary = model_for(args.size)
+    # Every size reads the same events, so the meaning needs no model.
+    tokenizer = MT3Tokenizer()
     recordings = Recordings()
-    offered = []
-    for audio in args.audio:
+    for audio in config.get("recordings", []):
+        path = (args.config.parent / Path(audio).expanduser()).resolve()
         try:
-            offered.append(recordings.add(audio.name, audio.read_bytes()))
+            recordings.add(path.name, path.read_bytes())
         except (OSError, ValueError) as error:
-            parser.error(str(error))
-    time = Windows(primary, 0.0, None, args.max_events).kinds == "shift"
-    # A transcriber by what it hears and expects, shared by the measures
-    # that only reshape what it computes, so they share its caches too.
-    scribes: dict[tuple, tuple[Scribe, Windows]] = {}
+            parser.error(f"{args.config}: {error}")
+    time = Windows(tokenizer, 0.0, None, args.max_events).kinds == "shift"
 
-    def scribe(size: str, audio: str | None, at: float, instruments: str) -> tuple[Scribe, Windows]:
-        key = (size, audio, at, instruments)
-        if key not in scribes:
+    def load(values: dict) -> Loaded:
+        device = torch.device(values["device"])
+        dtype = None if values["dtype"] == "auto" else lm.DTYPES[values["dtype"]]
+        return Loaded(_load_model(values["size"], device, dtype))
+
+    def transcriber(loaded: Loaded, audio: str | None, at: float, instruments: str) -> tuple[Scribe, Windows]:
+        key = (audio, at, instruments)
+        if key not in loaded.transcribers:
+            device = loaded.model._device  # noqa: SLF001
             expect = None
             if instruments:
-                names = resolve_instrument_names(instruments.split(","))
-                expect = instrument_group_from_names(names)
+                expect = instrument_group_from_names(resolve_instrument_names(instruments.split(",")))
             if audio is None:
-                windows = Windows(primary, at, None, args.max_events)
+                windows = Windows(tokenizer, at, None, args.max_events)
                 silence = torch.zeros(1, WINDOW_SAMPLES, device=device)
 
                 def hear(_: int) -> torch.Tensor:
@@ -605,18 +613,18 @@ def main() -> None:
                 if not 0 <= start < samples.shape[-1]:
                     raise ValueError(f"at {at:g} s is outside the recording's {samples.shape[-1] / SAMPLE_RATE:.1f} s")
                 heard = samples[:, start:].to(device)
-                windows = Windows(primary, at, math.ceil(heard.shape[-1] / WINDOW_SAMPLES), args.max_events)
+                windows = Windows(tokenizer, at, math.ceil(heard.shape[-1] / WINDOW_SAMPLES), args.max_events)
 
                 def hear(index: int) -> torch.Tensor:
                     chunk = heard[:, index * WINDOW_SAMPLES : (index + 1) * WINDOW_SAMPLES]
                     return F.pad(chunk, (0, WINDOW_SAMPLES - chunk.shape[-1]))
 
-            scribes[key] = (Scribe(model_for(size), windows, hear, expect, args.slots), windows)
-        return scribes[key]
+            loaded.transcribers[key] = (Scribe(loaded.model, windows, hear, expect, args.slots), windows)
+        return loaded.transcribers[key]
 
-    def open(values: dict) -> lm.Measure:
-        transcriber, windows = scribe(values["size"], values["audio"], values["at"], values["instruments"])
-        walk = lm.tempered(transcriber.walk, values["temperature"])
+    def open(loaded: Loaded, values: dict) -> lm.Measure:
+        scribe, windows = transcriber(loaded, values["audio"], values["at"], values["instruments"])
+        walk = lm.tempered(scribe.walk, values["temperature"])
         widths = values["shape"] == "time-area"
         if widths:
             plain = walk
@@ -625,28 +633,30 @@ def main() -> None:
                 return [time_area(rows, time) for rows in plain(walks)]
 
         # The start token carries the audio: paths are read whole.
-        return lm.Measure(walk, transcriber.width, transcriber.paths, None, windows.ends, widths)
+        return lm.Measure(scribe.start, walk, scribe.width, scribe.paths, None, windows.ends, widths)
 
-    start = args.size
-    if offered:
-        start += f"/audio={offered[0]}" + (f"/at={args.at:g}" if args.at else "")
-    catalog = Catalog(
-        [
-            Choice("size", SIZES, args.size),
-            Recording("audio"),
-            Number("at", 0.0),
-            Text("instruments"),
-            Number("temperature", 1.0),
-            Choice("shape", ("none", "time-area"), "none"),
-        ],
-        open,
-        start,
-    )
+    try:
+        catalog = Catalog(
+            [Choice("size", SIZES, "medium"), Choice("device", lm.devices(), lm.devices()[0]), Choice("dtype", ("auto", *lm.DTYPES), "auto")],
+            [
+                Recording("audio"),
+                Number("at", 0.0),
+                Text("instruments"),
+                Number("temperature", 1.0),
+                Choice("shape", ("none", "time-area"), "none"),
+            ],
+            load,
+            open,
+            config.get("presets", []),
+            released=torch.cuda.empty_cache,
+        )
+    except ValueError as error:
+        parser.error(f"{args.config}: {error}")
     manifest = [{"name": "scribe", "title": "MuScriptor · live", "labels": "labels.json", "catalog": catalog.describe()}]
     # MuScriptor's vocabulary is musical already: time shifts and pitches
     # ascending, so children keep its order.
-    model = Model((primary._model.initial_token_id,), primary._tokenizer.num_tokens, catalog.open, round(args.cache * 2**30), "branch")  # noqa: SLF001
-    files = {"labels.json": (labels_file(primary), "application/json")}
+    model = Model(tokenizer.num_tokens, catalog, round(args.cache * 2**30), "branch")
+    files = {"labels.json": (labels_file(tokenizer), "application/json")}
     uvicorn.run(app(model, manifest, files, routes=recordings.routes()), host=args.host, port=args.port, access_log=False)
 
 

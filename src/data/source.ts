@@ -146,6 +146,55 @@ export class Recordings {
   }
 }
 
+/** A model a server was asked to load, as it is now. */
+export interface Loaded {
+  spec: string;
+  state: "loading" | "loaded" | "failed";
+  /** Why it failed. */
+  message?: string;
+}
+
+/** What a server holds: the models asked for, and the measures open. */
+export interface Held {
+  models: Loaded[];
+  measures: string[];
+}
+
+/** What a server holds, and where it can be told to load and unload
+ * models and open measures. */
+export interface Holdings {
+  held(): Promise<Held>;
+  change?: {
+    load(model: string): Promise<Held>;
+    unload(model: string): Promise<Held>;
+    open(spec: string): Promise<Held>;
+  };
+}
+
+/** A live server's models and measures. */
+export class LiveHoldings implements Holdings {
+  constructor(private readonly base: string) {}
+
+  async held(): Promise<Held> {
+    const response = await fetch(new URL("held", this.base));
+    if (!response.ok) throw new Error(`could not ask what the server holds: ${response.status}`);
+    return (await response.json()) as Held;
+  }
+
+  readonly change = {
+    load: (model: string) => this.send("POST", `models/${model}`),
+    unload: (model: string) => this.send("DELETE", `models/${model}`),
+    open: (spec: string) => this.send("POST", `measures/${spec}`),
+  };
+
+  private async send(method: string, path: string): Promise<Held> {
+    const response = await fetch(new URL(path, this.base), { method });
+    const body = (await response.json().catch(() => ({ message: `${response.status}` }))) as Held & { message?: string };
+    if (!response.ok) throw new Error(body.message);
+    return body;
+  }
+}
+
 /** A demand as one WebSocket frame: bytes of their own buffer. */
 function encode({ specs, view, path }: Demand): Uint8Array<ArrayBuffer> {
   return new Uint8Array(toBinary(DemandSchema, create(DemandSchema, {
@@ -253,7 +302,7 @@ export interface DatasetEntry {
   title: string;
   /** A JSON array of label bytes in base64, indexed by branch, or a notes file. */
   labels?: string;
-  /** A live server's measures: what their specs may say. */
+  /** A live server's models and measures: what their specs may say. */
   catalog?: Catalog;
   /** A recording's measures, each a snapshot file. */
   measures?: { name: string; file: string }[];
@@ -269,6 +318,7 @@ export interface Dataset {
   catalog: Catalog;
   server: Server;
   labels: Labels;
+  holdings: Holdings;
   /** Those a live server holds, where its specs name recordings. */
   recordings: Recordings | null;
   searchable: boolean;
@@ -308,6 +358,7 @@ function dataset(
   catalog: Catalog,
   server: Server,
   labels: Labels,
+  holdings: Holdings,
   recordings: Recordings | null = null,
 ): Dataset {
   const searchable = labels instanceof TextLabels && labels.searchable;
@@ -318,6 +369,7 @@ function dataset(
     catalog,
     server,
     labels,
+    holdings,
     recordings,
     searchable,
     async search(text, signal) {
@@ -335,14 +387,14 @@ export async function fetchDataset(entry: DatasetEntry): Promise<Dataset> {
       : parseLabels(await (await fetchOk(new URL(entry.labels, base))).text());
   if (entry.catalog !== undefined) {
     const recordings = entry.catalog.parameters.some(({ kind }) => kind === "recording") ? new Recordings(base) : null;
-    return dataset(JSON.stringify([entry.name, base]), entry.name, entry.title, entry.catalog, new LiveServer(base), labels, recordings);
+    return dataset(JSON.stringify([entry.name, base]), entry.name, entry.title, entry.catalog, new LiveServer(base), labels, new LiveHoldings(base), recordings);
   }
   const measures = entry.measures ?? [];
   const snapshots = await Promise.all(measures.map(async ({ name, file }) =>
     ({ name, snapshot: new Uint8Array(await (await fetchOk(new URL(file, base))).arrayBuffer()) })));
   const server = new RecordedServer(snapshots, labels instanceof TextLabels ? labels : TextLabels.none());
   const id = JSON.stringify([entry.name, ...measures.map(({ file }) => new URL(file, base).href)]);
-  return dataset(id, entry.name, entry.title, named(measures.map(({ name }) => name)), server, labels);
+  return recorded(id, entry.name, entry.title, measures.map(({ name }) => name), server, labels);
 }
 
 /** Dropped files: each .pb is one measure, a .json holds the labels. */
@@ -359,7 +411,14 @@ export async function droppedDataset(files: File[]): Promise<Dataset> {
     const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }));
-  return dataset(JSON.stringify([name, ...hashes]), name, name, named(measures.map(({ name }) => name)), server, labels);
+  return recorded(JSON.stringify([name, ...hashes]), name, name, measures.map(({ name }) => name), server, labels);
+}
+
+/** A recording: its measures, each its own model, all loaded. */
+function recorded(id: string, name: string, title: string, names: string[], server: Server, labels: Labels): Dataset {
+  const specs = names.map(encodeURIComponent);
+  const held = { models: specs.map((spec) => ({ spec, state: "loaded" as const })), measures: specs };
+  return dataset(id, name, title, named(names), server, labels, { held: async () => held });
 }
 
 /** A labels file, read by its kind. */

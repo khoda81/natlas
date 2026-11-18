@@ -1,0 +1,8 @@
+# What scribe.py offers. Nothing loads until the page asks: these are models
+# offered as they are, each size/device/precision, "auto" being MuScriptor's
+# own precision for the device.
+presets = ["medium/cuda/auto", "large/cuda/float16", "small/cpu/float32"]
+
+# Recordings offered from the start, any file soundfile reads, relative to
+# this file. The page uploads others.
+recordings = []

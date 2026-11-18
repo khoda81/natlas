@@ -3,14 +3,16 @@
 A measure is a model's next-token ln weights over the whole vocabulary, up
 to a constant, given the tokens so far, as a float32 numpy row; walking a path
 gives them after every prefix in turn, and one call walks several paths.
-A spec names one of the models offered, all sharing the first one's
-tokenizer, and optionally ``temperature=T``, ``context=N`` for the model
-seeing only the last N tokens, and ``control=NAME`` for a .gguf model
+A model is one of the sources offered, all sharing one tokenizer, loaded on
+a device at a precision: ``SmolLM2-360M/cuda/float32``. A measure's spec
+names its model, then optionally ``temperature=T``, ``context=N`` for the
+model seeing only the last N tokens, and ``control=NAME`` for a .gguf model
 steered by one of the llama.cpp control vectors offered (see steer.py):
-``Qwen3-4B-Q6_K/temperature=1.6``.
+``Qwen3-4B-Q6_K/cuda/auto/temperature=1.6``.
 
-A model is a Hugging Face id, run by transformers, or a .gguf file, run by
-llama.cpp, named by its last path component.
+A source is a Hugging Face id, run by transformers, or a .gguf file, run by
+llama.cpp, whose weights are as the file stores them: its precision is
+``auto``, as a Hugging Face model's is the one its checkpoint was saved in.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import json
 import math
 import re
 import time
+import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +40,8 @@ type Walk = Callable[[Sequence[tuple[Sequence[int], int]]], list[np.ndarray]]
 
 @dataclass(frozen=True)
 class Measure:
+    # What the model reads before the root's children: a start-of-text token.
+    start: tuple[int, ...]
     walk: Walk
     # How many distributions one forward pass computes, and of how many
     # paths at most.
@@ -65,8 +70,11 @@ def stepwise(ln_weights: Callable[[Sequence[int]], np.ndarray], walks: Sequence[
     return [np.stack([ln_weights(tokens[:end]) for end in range(start, len(tokens) + 1)]) for tokens, start in walks]
 
 
-def default_device() -> str:
-    return "cuda" if torch.cuda.is_available() else "cpu"
+def devices() -> tuple[str, ...]:
+    """Where a model can load: each GPU, then the CPU."""
+    count = torch.cuda.device_count()
+    gpus = ("cuda",) if count == 1 else tuple(f"cuda:{index}" for index in range(count))
+    return (*gpus, "cpu")
 
 
 # Half precision saves memory on large models but can be slower: a GTX 1660 Ti
@@ -77,7 +85,7 @@ DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.
 def load(model_id: str, device: str, dtype: str = "float32"):
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=DTYPES[dtype])
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=DTYPES.get(dtype, "auto"))
     return model.to(device).eval()
 
 
@@ -210,12 +218,7 @@ class LlamaCpp:
         self.vocabulary = self.llm.n_vocab()
         # llama.cpp names a BPE vocabulary's token 11 its BOS even where none
         # is added, as in Qwen's: there the model reads EOS before a text.
-        bos = self.llm.token_bos() if self.llm._model.add_bos_token() else -1  # noqa: SLF001
-        eos = self.llm.token_eos()
-        if bos < 0 and eos < 0:
-            raise ValueError(f"{path} has no start- or end-of-text token to begin a text with")
-        self.start = (bos if bos >= 0 else eos,)
-        self.eos = frozenset({eos} if eos >= 0 else ())
+        self.start, self.eos = _llama_ends(self.llm, path)
         self.reader = _Reader(context, self.vocabulary)
         self.width = self.paths = self.reader.width()
         self.longest = self.context
@@ -258,6 +261,42 @@ class LlamaCpp:
 
     def token_bytes(self) -> list[bytes]:
         return [self.llm.detokenize([token], special=True) for token in range(self.vocabulary)]
+
+
+def _llama_ends(llm, path: Path) -> tuple[tuple[int, ...], frozenset[int]]:
+    """What a llama.cpp model reads before a text, and the tokens that end one.
+    llama.cpp names a BPE vocabulary's token 11 its BOS even where none is
+    added, as in Qwen's: there the model reads EOS before a text."""
+    bos = llm.token_bos() if llm._model.add_bos_token() else -1  # noqa: SLF001
+    eos = llm.token_eos()
+    if bos < 0 and eos < 0:
+        raise ValueError(f"{path} has no start- or end-of-text token to begin a text with")
+    return (bos if bos >= 0 else eos,), frozenset({eos} if eos >= 0 else ())
+
+
+class Vocabulary:
+    """A source's tokenizer, read without its weights: what a server's
+    branches mean, every model it offers sharing it."""
+
+    def __init__(self, source: str):
+        if source.endswith(".gguf"):
+            from llama_cpp import Llama
+
+            path = Path(source).expanduser()
+            llm = Llama(str(path), vocab_only=True, verbose=False)
+            self.size = llm.n_vocab()
+            self.start, self.eos = _llama_ends(llm, path)
+            self.encode = lambda text: llm.tokenize(text.encode(), add_bos=False, special=True)
+            self.token_bytes = lambda: [llm.detokenize([token], special=True) for token in range(self.size)]
+        else:
+            from transformers import AutoConfig, AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(source)
+            self.size = max(len(tokenizer), int(AutoConfig.from_pretrained(source).vocab_size))
+            self.start = start_of_text(tokenizer)
+            self.eos = frozenset() if tokenizer.eos_token_id is None else frozenset({int(tokenizer.eos_token_id)})
+            self.encode = lambda text: [int(token) for token in tokenizer.encode(text, add_special_tokens=False)]
+            self.token_bytes = lambda: token_bytes(tokenizer, self.size)
 
 
 # Tokens of context llama-cpp-python's own Llama keeps, which nothing here
@@ -494,62 +533,58 @@ def measure(language: Language, temperature: float = 1.0, context: float | None 
         # A window longer than the model reads fails on paths that long.
         longest = None if language.longest is None or n <= language.longest else language.longest
     eos = language.eos
-    return Measure(tempered(walk, temperature), width, language.paths, longest, lambda tokens: bool(tokens) and tokens[-1] in eos)
+    return Measure(language.start, tempered(walk, temperature), width, language.paths, longest, lambda tokens: bool(tokens) and tokens[-1] in eos)
 
 
-def model_name(model: str) -> str:
-    """What a spec calls a Hugging Face id or a .gguf file."""
-    return Path(model).stem if model.endswith(".gguf") else model.split("/")[-1]
+def catalog(
+    sources: dict[str, str],
+    vocabulary: Vocabulary,
+    controls: dict[str, Path],
+    presets: Sequence[str] = (),
+    tokenizer: str | None = None,
+    context: int = 8192,
+    gpu_layers: int = -1,
+) -> Catalog:
+    """Every source offered, loaded on any device at any precision, read at
+    any temperature and context, and steered by any control vector offered
+    where it is a .gguf file. A .gguf model reads ``context`` tokens at most,
+    with ``gpu_layers`` of its layers on a GPU (-1 for all)."""
+    # Each loaded .gguf model's steered copies, by control: let go with it.
+    steered: weakref.WeakKeyDictionary[LlamaCpp, dict[str, LlamaCpp]] = weakref.WeakKeyDictionary()
 
+    def load(values: dict) -> Language:
+        source, device, dtype = sources[values["model"]], values["device"], values["dtype"]
+        if source.endswith(".gguf"):
+            if dtype != "auto":
+                raise ValueError("a .gguf file's weights are as it stores them: its dtype is auto")
+            language: Language = LlamaCpp(Path(source).expanduser(), context, 0 if device == "cpu" else gpu_layers)
+        else:
+            language = Transformers(source, device, dtype, tokenizer)
+        if language.vocabulary != vocabulary.size:
+            raise ValueError(f"{source} has {language.vocabulary} tokens, where the server's tokenizer has {vocabulary.size}")
+        return language
 
-class Languages:
-    """The models offered, by name: the first opened at once, since its
-    tokenizer is every one's, the rest when first used, and each kept."""
-
-    def __init__(self, models: Sequence[str], open: Callable[[str], Language]):
-        self.models: dict[str, str] = {}
-        for model in models:
-            if model_name(model) in self.models:
-                raise ValueError(f"two models are called {model_name(model)}")
-            self.models[model_name(model)] = model
-        self._open = open
-        self.first = open(models[0])
-        self.opened: dict[str, Language] = {model_name(models[0]): self.first}
-
-    def __getitem__(self, name: str) -> Language:
-        if name not in self.opened:
-            language = self._open(self.models[name])
-            if language.vocabulary != self.first.vocabulary:
-                raise ValueError(
-                    f"{name} has {language.vocabulary} tokens and {self.first.name} {self.first.vocabulary}: they share no tokenizer"
-                )
-            self.opened[name] = language
-        return self.opened[name]
-
-
-def catalog(languages: Languages, controls: Sequence[Path] = ()) -> Catalog:
-    """Every model offered, at any temperature and context, steered by any
-    control vector offered where it is a .gguf model."""
-    vectors = {path.stem: path for path in controls}
-    steered: dict[tuple[str, str], LlamaCpp] = {}
-
-    def open(values: dict) -> Measure:
-        language = languages[values["model"]]
+    def open(language: Language, values: dict) -> Measure:
         control = values.get("control", "none")
         if control != "none":
             if not isinstance(language, LlamaCpp):
                 raise ValueError("control vectors need a .gguf model")
-            key = (values["model"], control)
-            if key not in steered:
-                steered[key] = language.controlled(vectors[control])
-            language = steered[key]
+            copies = steered.setdefault(language, {})
+            if control not in copies:
+                copies[control] = language.controlled(controls[control])
+            language = copies[control]
         return measure(language, values["temperature"], values["context"])
 
-    names = tuple(languages.models)
-    parameters = [Choice("model", names, names[0]), Number("temperature", 1.0), Number("context", None)]
-    if vectors:
-        parameters.append(Choice("control", ("none", *vectors), "none"))
-    return Catalog(parameters, open, names[0])
+    def released() -> None:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    names = tuple(sources)
+    models = [Choice("model", names, names[0]), Choice("device", devices(), devices()[0]), Choice("dtype", ("auto", *DTYPES), "auto")]
+    parameters = [Number("temperature", 1.0), Number("context", None)]
+    if controls:
+        parameters.append(Choice("control", ("none", *controls), "none"))
+    return Catalog(models, parameters, load, open, presets, released)
 
 
 def start_of_text(tokenizer) -> tuple[int, ...]:

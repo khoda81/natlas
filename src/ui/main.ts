@@ -24,7 +24,7 @@ import type { Glyph, Reading } from "../readings/reading";
 import { glide, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, serializeView, viewKey } from "./view-state";
 import { Palette } from "./color";
-import { describe, heard, MeasurePicker } from "./measures";
+import { describe, heard, Measures } from "./measures";
 import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, rulerCaption, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
@@ -106,7 +106,7 @@ export class App {
   private readonly readout = element<HTMLElement>("readout");
   private readonly status = element<HTMLElement>("status");
   /** Choosing p and q, from the dataset's catalog. */
-  private pickers: { p: MeasurePicker; q: MeasurePicker } | null = null;
+  private measures: Measures | null = null;
   private readonly unitsButton = element<HTMLButtonElement>("units");
 
   private tree: IntervalTree | null = null;
@@ -237,18 +237,21 @@ export class App {
     const failed = (error: unknown) => {
       if (dataset === this.dataset) this.setStatus(String(error));
     };
-    const picker = (label: "p" | "q") => new MeasurePicker(label, dataset.catalog, dataset.recordings,
-      (spec) => this.setSpecs({ ...this.specs, [label]: spec }), failed);
-    this.pickers = { p: picker("p"), q: picker("q") };
-    element("p").replaceChildren(this.pickers.p.element);
-    element("q").replaceChildren(this.pickers.q.element);
-    const [source, ...rest] = dataset.catalog.parameters;
-    element("lens").hidden = rest.length === 0 && source?.kind === "choice" && source.options.length <= 1;
+    const measures = this.measures = new Measures(dataset.catalog, dataset.holdings, dataset.recordings,
+      (which, spec) => this.setSpecs({ ...this.specs, [which]: spec }), failed);
+    element("p").replaceChildren(measures.p);
+    element("q").replaceChildren(measures.q);
+    element("models").replaceChildren(measures.toggle, measures.element);
+    element("lens").hidden = measures.toggle.hidden && dataset.catalog.models[0]!.options.length <= 1;
+    // Until one is chosen, the first measure the server holds is p and q.
+    measures.onHeld = (held) => {
+      const [first] = held.measures;
+      if (dataset === this.dataset && this.specs.p === "" && first !== undefined) this.setSpecs({ p: first, q: first });
+    };
     // A recording p names is read once the server says what it is.
     dataset.recordings?.list().then(() => {
       if (dataset !== this.dataset) return;
-      this.pickers!.p.set(this.specs.p);
-      this.pickers!.q.set(this.specs.q);
+      measures.set(this.specs);
       this.read();
     }, failed);
     this.editing = false;
@@ -285,10 +288,11 @@ export class App {
     this.details.replaceChildren();
     this.inspect.hidden = true;
     this.specs = { p: "", q: "" };
-    this.setSpecs({ p: dataset.catalog.start, q: dataset.catalog.start });
+    this.setSpecs(this.specs);
     this.reset();
     const saved = this.readView(dataset);
     if (saved !== null) void this.restore(saved);
+    void measures.refresh();
   }
 
   private cancelNavigation(): void {
@@ -479,7 +483,7 @@ export class App {
   }
 
   private setSpecs(specs: Specs): void {
-    if (this.pickers === null) return;
+    if (this.measures === null) return;
     this.cancelNavigation();
     this.focus = null;
     this.result.hidden = true;
@@ -487,8 +491,7 @@ export class App {
     // Digits are fractions of p's mass: under another p only the path holds.
     if (p) this.cam.anchor = top(this.cam.anchor.path);
     this.specs = specs;
-    this.pickers.p.set(specs.p);
-    this.pickers.q.set(specs.q);
+    this.measures.set(specs);
     if (p) this.read();
     this.found = null;
     this.searchGeneration++;
@@ -564,7 +567,7 @@ export class App {
     this.frame = frame;
     if (previous !== null && previous !== frame) previous.dispose();
     // What the camera looks at, at the picture's finest: physical rows.
-    this.link?.look(this.specs, view(tree, this.lens, this.cam, this.view, this.view.height * this.pixelRatio));
+    if (this.specs.p !== "" && this.specs.q !== "") this.link?.look(this.specs, view(tree, this.lens, this.cam, this.view, this.view.height * this.pixelRatio));
     this.reachOut(frame);
     this.updateHover();
     const ancestors = new Set<string>();
@@ -613,6 +616,7 @@ export class App {
   /** What the view says while the origin has no children to draw. */
   private originNote(tree: IntervalTree): { text: string; loading: boolean } | null {
     const { origin } = this.cam;
+    if (this.specs.p === "" || this.specs.q === "") return { text: "Load a model and make a measure of it, under models… above", loading: false };
     const specs = [...new Set([this.specs.p, this.specs.q])];
     if (tree.ended(origin, this.lens.p)) return { text: "The sequence ends here · press 0 for the root", loading: false };
     if (specs.some((spec) => this.link!.lacks(origin, tree.measure(spec)))) {
@@ -840,7 +844,7 @@ export class App {
       const [audio] = files;
       if (files.length === 1 && audio!.type.startsWith("audio/") && this.dataset?.recordings != null) {
         this.setStatus(`Uploading ${audio!.name} …`);
-        this.pickers!.p.hear(audio!).then(() => this.setStatus(""), (error: unknown) => this.setStatus(String(error)));
+        this.measures!.hear(audio!).then(() => this.setStatus(""), (error: unknown) => this.setStatus(String(error)));
         return;
       }
       const generation = ++this.loading;

@@ -14,12 +14,13 @@
 # natwalk = { path = "../../natwalk", editable = true }
 # ///
 
-"""Export a language-model tree: natwalk discovers it with the first model, the q measures follow.
+"""Export a language-model tree: natwalk discovers it with p, the q measures follow.
 
-A q measure is a spec (see lm.py) of any --model, all sharing the first
-one's tokenizer: ``Qwen3-0.6B`` or ``Qwen3-1.7B/temperature=1.6``. Every
-discovered node retains a complete vocabulary distribution in memory, so keep
---nodes moderate.
+p and each q are measure specs (see lm.py) of the sources a config names, as
+serve.py reads it: ``Qwen3-1.7B/cuda/float32`` or
+``Qwen3-0.6B/cuda/float32/temperature=1.6``. p's source is a Hugging Face
+model, which natwalk searches with. Every discovered node retains a complete
+vocabulary distribution in memory, so keep --nodes moderate.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import argparse
 import importlib.util
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 import lm
@@ -58,32 +60,36 @@ def main() -> None:
         nargs="?",
         default="The most interesting consequence of information theory is",
     )
-    parser.add_argument(
-        "--model",
-        action="append",
-        help="Hugging Face model, repeatable; natwalk searches with the first (default Qwen/Qwen3-1.7B and Qwen/Qwen3-0.6B)",
-    )
-    parser.add_argument("--q", action="append", help="q measure's spec, repeatable (default each other model)")
-    parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B", help="tokenizer shared by all models")
+    parser.add_argument("--config", type=Path, required=True, help="the sources, as serve.py reads them")
+    parser.add_argument("--p", required=True, help="the measure natwalk searches with")
+    parser.add_argument("--q", action="append", default=[], help="q measure's spec, repeatable")
     parser.add_argument("--nodes", type=int, default=600)
-    parser.add_argument("--device", default=lm.default_device())
-    parser.add_argument("--dtype", choices=lm.DTYPES, default="float32")
     parser.add_argument("--name", help="dataset file stem; default derives from the measures")
     args = parser.parse_args()
-    models = args.model or ["Qwen/Qwen3-1.7B", "Qwen/Qwen3-0.6B"]
-    specs = args.q or [lm.model_name(model) for model in models[1:]]
 
     hf_app = _hf_app()
-    device = args.device
-    languages = lm.Languages(models, lambda model: lm.Transformers(model, device, args.dtype, tokenizer=args.tokenizer))
-    language = languages.first
-    catalog = lm.catalog(languages)
+    config = tomllib.loads(args.config.read_text())
+    sources = config["sources"]
+    tokenizer = config.get("tokenizer")
+    vocabulary = lm.Vocabulary(tokenizer or next(iter(sources.values())))
+    catalog = lm.catalog(sources, vocabulary, {}, tokenizer=tokenizer)
+    names = [args.p, *args.q]
+    loaded = {}
+    for spec in names:
+        model, _ = catalog.parse(spec)
+        if model not in loaded:
+            loaded[model] = catalog.load(model)
+    measures = [catalog.open(loaded[catalog.parse(spec)[0]], spec) for spec in names]
+    language = loaded[catalog.parse(args.p)[0]]
+    if not isinstance(language, lm.Transformers):
+        parser.error("natwalk searches with a Hugging Face model")
+    device = str(language.device)
     # The tree's root is the empty text; natwalk searches from the prompt down.
     root = language.start
     prompt = tuple(language.encode(args.prompt))
     eos = tuple(language.eos)
 
-    print(f"discovering {args.nodes} nodes with {models[0]} …", file=sys.stderr)
+    print(f"discovering {args.nodes} nodes with {args.p} …", file=sys.stderr)
     cursor = hf_app.HFCursor(
         language.model,
         root + prompt,
@@ -106,9 +112,7 @@ def main() -> None:
     def along(measure: lm.Measure):
         return lambda path: np.exp(measure.log_probs(root + tuple(path))).tolist()
 
-    print(f"evaluating {', '.join(specs)} on the discovered tree …", file=sys.stderr)
-    names = [catalog.start, *specs]
-    measures = [catalog.open(spec) for spec in names]
+    print(f"evaluating {', '.join(args.q)} on the discovered tree …", file=sys.stderr)
     recorded = snapshots(
         tree,
         extra=tuple(weights(measure) for measure in measures[1:]),
@@ -117,7 +121,7 @@ def main() -> None:
     )
     write(
         args.name or "-".join(_slug(name) for name in names),
-        f"{args.prompt} · {lm.model_name(models[0])}",
+        f"{args.prompt} · {args.p}",
         language.token_bytes(),
         names,
         recorded,

@@ -131,33 +131,13 @@ body {
   display: none;
 }
 
-.measure {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.measure-options {
-  color: var(--ink-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.measure-options.set {
-  color: var(--ink);
-}
-
-/* What else a measure's spec says: a field a line, beside the button. */
+/* The models loaded and a new measure's parameters, beside p and q. */
 .measure-panel {
   position: fixed;
   inset: auto;
   margin: 0;
   padding: 8px 10px;
-  display: grid;
-  grid-template-columns: auto auto;
-  gap: 6px 10px;
-  align-items: center;
+  max-width: min(520px, calc(100vw - 16px));
   color: var(--ink);
   background: var(--surface);
   border: 1px solid var(--rule);
@@ -165,21 +145,65 @@ body {
   box-shadow: var(--shadow);
 }
 
-.measure-panel:not(:popover-open) {
-  display: none;
-}
-
-.measure-panel label {
-  display: contents;
-}
-
-.measure-panel label > span {
+.measure-panel h3 {
+  margin: 4px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--ink-muted);
 }
 
-.measure-panel input {
+.measure-panel h3 + * {
+  margin-bottom: 6px;
+}
+
+.measure-model {
+  display: grid;
+  grid-template-columns: 1fr minmax(0, auto) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 2px 0;
+}
+
+.measure-state {
+  color: var(--ink-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 24ch;
+}
+
+.measure-model.failed .measure-state {
+  color: var(--ink);
+}
+
+.measure-presets,
+.measure-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.measure-form {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 6px 10px;
+  align-items: center;
+  justify-content: start;
+}
+
+.measure-form label {
+  display: contents;
+}
+
+.measure-form label > span {
+  color: var(--ink-muted);
+}
+
+.measure-form input {
   width: 12ch;
 }
+
 
 .readout {
   color: var(--ink-muted);

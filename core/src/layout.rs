@@ -919,7 +919,14 @@ pub fn view(tree: &Tree, lens: Lens, cam: &Camera, viewport: Viewport, rows: f64
     } = place_chain(tree, lens, cam)?;
     let right = cam.x + viewport.width / cam.k;
     let covers = |&(top, bottom): &(f64, f64)| top <= 0.0 && 1.0 <= bottom;
-    let (depth, top, ln_height, rows) = match spans.iter().rposition(covers) {
+    // A node is placed only where q is known above it: the view is told
+    // from the deepest one the client can place, so the source tells what
+    // places the rest, though p's mass may all go one way.
+    let known = placed
+        .iter()
+        .position(|at| !at.x.is_finite())
+        .unwrap_or(placed.len());
+    let (depth, top, ln_height, rows) = match spans[..known].iter().rposition(covers) {
         Some(depth) => {
             let at = &placed[depth];
             let point = (depth == nodes.len() - 1).then(|| Point::new(&cam.anchor.digits));
@@ -1580,6 +1587,20 @@ mod tests {
             let row = rows.iter().find(|row| row.0 <= top && top < row.1).unwrap();
             assert!(row.2 <= width && width <= row.3, "{row:?}");
         }
+    }
+
+    #[test]
+    fn a_view_is_told_from_the_deepest_node_q_places() {
+        // All of p's mass goes to branch 0, and q is unknown at the root: the
+        // child holds the view, but where its children start is q's to say.
+        let mut tree = Tree::new();
+        tree.set(ROOT, 0, weights(&[1.0])).unwrap();
+        let lens = Lens { p: 0, q: 1 };
+        let camera = cam(ROOT, 0.0, at(&[0], &[]), 0.0);
+        assert_eq!(view(&tree, lens, &camera, VIEW, 100.0).unwrap().node, ROOT);
+        tree.set(ROOT, 1, weights(&[1.0])).unwrap();
+        let child = tree.child(ROOT, 0).unwrap();
+        assert_eq!(view(&tree, lens, &camera, VIEW, 100.0).unwrap().node, child);
     }
 
     #[test]

@@ -11,7 +11,6 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "export"))
 from muscriptor.tokenizer.mt3 import MT3Tokenizer  # noqa: E402
@@ -27,7 +26,7 @@ def token(kind: str, value: int = 0) -> int:
 
 
 def windows(at: float = 5.0, count: int | None = 3) -> scribe.Windows:
-    return scribe.Windows(SimpleNamespace(_tokenizer=TOKENIZER), at, count, scribe.MAX_EVENTS)
+    return scribe.Windows(TOKENIZER, at, count, scribe.MAX_EVENTS)
 
 
 class TimeAreaTests(unittest.TestCase):

@@ -62,6 +62,7 @@ let liveLabels: TextLabels | null = null;
 function setup(count: number, zipf: boolean, deep = false, real = false) {
   const dataset: Dataset = { id: "benchmark", name: "benchmark", title: `Frame benchmark · ${count.toLocaleString()} branches`,
     catalog: named(zipf ? ["p", "q"] : ["p"]), recordings: null,
+    holdings: { held: async () => ({ models: [], measures: zipf ? ["p", "q"] : ["p"] }) },
     // A server that never answers, like a busy live model.
     server: { connect: () => ({ demand() {}, close() {} }) },
     labels: real ? liveLabels! : labels, searchable: true, search: async () => [0] };
@@ -73,10 +74,8 @@ function setup(count: number, zipf: boolean, deep = false, real = false) {
     ? run(live!.listing.lnWeights.map(Math.exp), live!.listing.branches, 0, 0)
     : run(weights.map((w) => w / total), branches, 0, 0);
   driver.tree.insert(0n, driver.tree.measure("p"), { runs: [root] });
-  if (zipf) {
-    driver.tree.insert(0n, driver.tree.measure("q"), { runs: [{ ...root, branches: branches.toReversed() }] });
-    driver.setSpecs({ p: "p", q: "q" });
-  }
+  if (zipf) driver.tree.insert(0n, driver.tree.measure("q"), { runs: [{ ...root, branches: branches.toReversed() }] });
+  driver.setSpecs({ p: "p", q: zipf ? "q" : "p" });
   if (deep) {
     let node = 0n;
     for (let depth = 0; depth < 80; depth++) {

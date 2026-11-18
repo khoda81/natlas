@@ -291,7 +291,7 @@ export function draw(
     lines.forEach((line, row) => {
       let at = 0;
       for (const piece of line) {
-        drawPiece(ctx, piece, at, row * LABEL_LINE * size, size, ink);
+        drawPiece(ctx, piece, at, row * LABEL_LINE * size, size, ink, scheme.surface);
         at += (piece.ems + TOKEN_GAP) * size;
       }
     });
@@ -530,17 +530,21 @@ function markEms(glyph: Glyph): number {
 }
 
 /** ``piece`` drawn ``size`` tall from ``x``, centered on ``y``: what the box
- * carries framed and fainter than its own. */
-function drawPiece(ctx: CanvasRenderingContext2D, { kind, glyph, ems }: Piece, x: number, y: number, size: number, ink: string): void {
-  ctx.globalAlpha = kind === "own" ? 1 : CARRIED_ALPHA;
+ * carries framed and fainter than its own. A frame is filled with ``back``,
+ * opaque, so what is under it, such as shaded time, never shows through. */
+function drawPiece(ctx: CanvasRenderingContext2D, { kind, glyph, ems }: Piece, x: number, y: number, size: number, ink: string, back: string): void {
   if (kind === "carried") {
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = back;
     ctx.strokeStyle = ink;
     ctx.lineWidth = Math.max(1, size / 16);
     ctx.beginPath();
     ctx.roundRect(x, y - TOKEN_HALF * size, ems * size, 2 * TOKEN_HALF * size, TOKEN_PAD * size);
+    ctx.fill();
+    ctx.globalAlpha = CARRIED_ALPHA;
     ctx.stroke();
     x += TOKEN_PAD * size;
-  }
+  } else ctx.globalAlpha = kind === "own" ? 1 : CARRIED_ALPHA;
   if (glyph.mark !== undefined) mark(ctx, glyph.mark, x, y, size, glyph.tint ?? ink, ink);
   ctx.fillStyle = ink;
   ctx.fillText(glyph.text, x + markEms(glyph) * size, y);

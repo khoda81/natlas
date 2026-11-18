@@ -1,7 +1,10 @@
-// Box colors. With p = q, every box has one fill, and its labels one ink:
-// width already shows the weight. Otherwise color shows the per-slot log
-// ratio ln(p / q) on a blue-gray-red diverging ramp, red where q
-// under-weights the slot.
+// The canvas's colors, each thing its own: the background for empty space,
+// quiet tiles, a gray line around each node's children, ink for labels and
+// time, and one saturated color, the hover's, which nothing else uses.
+// With p = q every box has one fill, and its labels one ink: width already
+// shows the weight. Otherwise a box's color shows the per-slot log ratio
+// ln(p / q) on a blue-gray-red diverging ramp, red where q under-weights the
+// slot.
 
 type Rgb = readonly [number, number, number];
 
@@ -13,6 +16,10 @@ export interface Scheme {
   inkOnLight: string;
   /** Every box's fill with p = q. */
   tile: string;
+  /** The line around each node's children, apart from tiles and background. */
+  stroke: string;
+  /** The hovered branch and the path to it. */
+  hover: string;
   diverging: string[];
 }
 
@@ -22,7 +29,9 @@ const LIGHT: Scheme = {
   inkMuted: "#52514e",
   inkOnDark: "#f0efec",
   inkOnLight: "#0b0b0b",
-  tile: "#9ec5f4",
+  tile: "#e4e8ed",
+  stroke: "#a3abb6",
+  hover: "#c26a00",
   diverging: ["#1c5cab", "#5598e7", "#b7d3f6", "#f0efec", "#f6c4c1", "#e34948", "#a92b2b"],
 };
 
@@ -32,7 +41,9 @@ const DARK: Scheme = {
   inkMuted: "#c3c2b7",
   inkOnDark: "#f0efec",
   inkOnLight: "#0b0b0b",
-  tile: "#256abf",
+  tile: "#30343b",
+  stroke: "#5f6773",
+  hover: "#f0a040",
   diverging: ["#9ec5f4", "#5598e7", "#2f5f9e", "#383835", "#8a3535", "#e34948", "#f4a3a1"],
 };
 

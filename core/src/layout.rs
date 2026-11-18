@@ -24,6 +24,9 @@ use crate::Result;
 
 /// View heights within which a node's edge is at the view's.
 const FIT: f64 = 1e-12;
+/// Physical pixels within which a coordinate is on a grid line, as the
+/// renderer rounds: rows lie on the grid only up to float error.
+const ON_GRID: f64 = 1e-6;
 
 /// A point at or below a camera's origin: the node `path` leads to from the
 /// origin, and the fraction of that node's p mass above the point, as digits
@@ -1017,7 +1020,12 @@ pub fn pick(
     if !(0.0..view.width).contains(&x_px) || !(0.0..view.height).contains(&y_px) {
         return Ok(None);
     }
-    let (x, y) = (cam.x + x_px / cam.k, y_px / view.height);
+    // The pixel's corner, as drawing has it: an edge within float error past
+    // a grid line is on it, so the corner is past the edge too.
+    let (x, y) = (
+        cam.x + x_px / cam.k,
+        (y_px + ON_GRID * pixel_px) / view.height,
+    );
     // Outside every known child, the origin itself.
     let origin = PickResult {
         r#box: LayoutBox {

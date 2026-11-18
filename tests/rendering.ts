@@ -98,7 +98,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     draw(ctx, frame, cam(), view, { p: 0, q: 0 }, palette, state);
     const pixels = ctx.getImageData(0, 0, c.width, c.height).data;
     const color = rgb(palette.tile(0.5, 0.5, true).fill);
-    const background = rgb(palette.scheme.surface);
+    const stroke = rgb(palette.scheme.stroke);
     const difference = (x: number, y: number, expected: number[]) =>
       Math.max(...expected.map((v, i) => Math.abs(v - pixels[(y * c.width + x) * 4 + i]!)));
     // Edges as they round to physical pixels, within float error of a grid
@@ -107,10 +107,10 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const x = lastPixel(right), y = lastPixel(bottom), step = lastPixel(narrow);
     const last = lastPixel(sibling.y1 * view.height);
     const error = Math.max(
-      difference(30, y, color), difference(step - 5, y, color), difference(step + 5, y, background),
-      difference(step, y + 10, background), difference(step - 1, y + 10, color),
-      difference(30, last, background), difference(30, last + 1, color),
-      difference(x - 1, 30, color), difference(x, 30, background), difference(x + 1, 30, color));
+      difference(30, y, color), difference(step - 5, y, color), difference(step + 5, y, stroke),
+      difference(step, y + 10, stroke), difference(step - 1, y + 10, color),
+      difference(30, last, stroke), difference(30, last + 1, color),
+      difference(x - 1, 30, color), difference(x, 30, stroke), difference(x + 1, 30, color));
     results.push({ name: "strokes outline each node's children, never between siblings", dpr, phase, error });
   }
 
@@ -144,7 +144,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
 
   // A child ending mid-pixel, then children thinner than a pixel in rows
   // after it: siblings meet unstroked, so a column through all of them
-  // shows no background, however their edges fall on the grid.
+  // shows no stroke, however their edges fall on the grid.
   for (const phase of [0, 0.2, 0.61, 0.99]) {
     const camera = cam(phase);
     const lens = { p: 0, q: 0 };
@@ -164,6 +164,25 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     frame.dispose();
   }
 
+  // A time branch shows the label its parent was too small for, though
+  // never its own: its time is on the timeline, here off to the right.
+  {
+    const child = state.child(ROOT, 5);
+    const leaf = (node: bigint, branch: number, x1: number, y0: number, y1: number): Box => ({ node, rank: 0, count: 1,
+      kind: "leaf", branch, p: 0.5, q: 0.5, lnMass: Math.log(0.5), x0: 0, x1: x1 / 23, y0: y0 / view.height, y1: y1 / view.height });
+    const frame = { boxes: [leaf(ROOT, 5, 3, 10, 200), { ...leaf(child, 0, 260, 10, 200), x0: 3 / 23 }] } as Frame;
+    const timeline = { x: (time: number) => time, left: 0, right: view.width };
+    const glyph = (node: bigint) => node === ROOT ? { text: "piano" } : { text: "9 s", mark: "time" as const, time: { from: 1000, to: 1000 } };
+    const c = canvas(dpr), ctx = c.getContext("2d")!;
+    draw(ctx, frame, cam(), view, { p: 0, q: 0 }, palette, { ...state, glyph, timeline });
+    // Carried labels are framed and faint: any pixel far from the tile.
+    const fill = rgb(palette.tile(0.5, 0.5, true).fill);
+    const pixels = ctx.getImageData(Math.ceil(10 * dpr), Math.ceil(20 * dpr), Math.floor(200 * dpr), Math.floor(160 * dpr)).data;
+    let inked = 0;
+    for (let i = 0; i < pixels.length; i += 4) inked += Number(60 < Math.max(...fill.map((v, k) => Math.abs(v - pixels[i + k]!))));
+    results.push({ name: "a time branch shows what it carries", dpr, phase: 0, error: inked === 0 ? 255 : 0 });
+  }
+
   // Thin children between a bordered one and the background: each physical
   // row must show the box the pointer over it selects.
   for (const phase of [0, 0.2, 0.61, 0.99]) {
@@ -181,13 +200,13 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       const drawn = frame.boxes.find(b => b.node === box.node && b.branch === box.branch);
       // The outline of the node's children: the row above the first, and the
       // last's own last row, or the row below it where it is one row tall.
-      const group = drawn === undefined ? [] : frame.boxes.filter(b => b.node === drawn.node);
+      const group = frame.boxes.filter(b => b.node === ROOT);
       const rowOf = (y: number) => Math.ceil(y * view.height * dpr - 1e-6);
       const lowest = group.reduce((a, b) => (a.y1 < b.y1 ? b : a), group[0]!);
-      const strokes = drawn === undefined ? [] : [rowOf(Math.min(...group.map(b => b.y0))) - 1,
+      const strokes = [rowOf(Math.min(...group.map(b => b.y0))) - 1,
         rowOf(lowest.y1) - rowOf(lowest.y0) <= 1 ? rowOf(lowest.y1) : rowOf(lowest.y1) - 1];
       const separator = strokes.includes(top + row);
-      const expected = rgb(drawn === undefined || separator ? palette.scheme.surface
+      const expected = rgb(separator ? palette.scheme.stroke : drawn === undefined ? palette.scheme.surface
         : palette.tile(box.p, box.q, false).fill);
       for (let channel = 0; channel < 3; channel++) {
         error = Math.max(error, Math.abs(expected[channel]! - pixels[row * 4 + channel]!));
@@ -204,7 +223,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const lens = { p: 0, q: 0 };
     const frame = layout(gapped, lens, camera, view, { rowPx: 1 / dpr });
     const column = Math.floor(10 * dpr);
-    const ink = rgb(palette.scheme.ink);
+    const ink = rgb(palette.scheme.hover);
     let error = 0;
     for (let row = 20; row < 60; row++) {
       const hover = pick(gapped, lens, frame, camera, view, column / dpr, row / dpr, 1 / dpr)!;

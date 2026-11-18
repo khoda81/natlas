@@ -195,7 +195,7 @@ export function draw(
     timeCdfs(ctx, children, timeline, view, scale, state.known, (node, branch) => state.glyph(node, branch).time,
       (box) => palette.tile(box.p, box.q, equal).ink);
   }
-  outlines(ctx, children, scale, scheme.surface);
+  outlines(ctx, children, scale, scheme.stroke);
 
   // A box whose label is too small to draw hands it, after the labels it
   // carries itself, to each of its children; they carry it until one draws
@@ -212,12 +212,11 @@ export function draw(
     if (glyphs === undefined) {
       const parent = parents.get(node);
       const glyph = parent && state.glyph(parent.node, parent.branch!);
-      glyphs = parent === undefined || glyph === undefined
+      // A time window shows what it carries, never its own label.
+      glyphs = parent === undefined || glyph === undefined || fitOf(parent) !== null
         ? []
         : windowed(glyph)
         ? carried(parent.node)
-        : fitOf(parent) !== null
-        ? []
         : [...carried(parent.node), glyph];
       carriedBy.set(node, glyphs);
     }
@@ -234,7 +233,7 @@ export function draw(
         : [gapGlyph(box), []];
       const width = (box.x1 - box.x0) * cam.k - 2;
       const height = (box.y1 - box.y0) * view.height;
-      fits.set(box, fit = fitLabel(ctx, before, glyph, width, height, box.branch !== null));
+      fits.set(box, fit = fitLabel(ctx, before, windowed(glyph) ? null : glyph, width, height, box.branch !== null));
     }
     return fit;
   };
@@ -247,8 +246,6 @@ export function draw(
   // a box carries come first, framed and fainter, and a label wraps between
   // its pieces where lines make it larger.
   for (const { box, rect, ink } of labels) {
-    // A time branch reads as its node's CDF on the timeline.
-    if (box.branch !== null && windowed(state.glyph(box.node, box.branch))) continue;
     const fit = fitOf(box);
     if (fit === null) continue;
     const { lines, size, vertical } = fit;
@@ -297,7 +294,7 @@ export function draw(
   const note = state.note ?? (visible ? null : { text: "No continuation discovered here · press 0 for the root", sweep: null });
   if (note !== null) drawNote(ctx, view, palette, note.text, note.sweep);
 
-  outline(ctx, frame, cam, view, state, scheme.ink);
+  outline(ctx, frame, cam, view, state, scheme.hover);
   ruler(ctx, cam, view, state.units, palette);
 }
 
@@ -442,19 +439,29 @@ interface Fit {
  * does, it is its own alone. A label too long to read at any size the box
  * allows keeps as much of its start as fits at the smallest readable size;
  * one that keeps nothing is not drawn. Gap labels, which do not ``grow``,
- * stay at the base size. */
+ * stay at the base size. A box without a label of its own, a ``glyph`` of
+ * null, shows only what it carries. */
 function fitLabel(
   ctx: CanvasRenderingContext2D,
   carried: readonly Glyph[],
-  glyph: Glyph,
+  glyph: Glyph | null,
   width: number,
   height: number,
   grows: boolean,
 ): Fit | null {
   const largest = grows ? LABEL_MAX_SIZE : BASE_SIZE;
-  const own: Piece = { kind: "own", glyph, ems: glyphEms(ctx, glyph) };
   const tokens = carried.map((glyph): Piece => ({ kind: "carried", glyph, ems: 2 * TOKEN_PAD + glyphEms(ctx, glyph) }));
   const cut: Piece = { kind: "cut", glyph: MORE, ems: glyphEms(ctx, MORE) };
+  if (glyph === null) {
+    // Without a label of its own, as many of the innermost it carries as fit.
+    for (let first = 0; first < tokens.length; first++) {
+      const kept = tokens.slice(first);
+      const fit = largestFit(0 < first ? [cut, ...kept] : kept, width, height, largest);
+      if (fit !== null) return fit;
+    }
+    return null;
+  }
+  const own: Piece = { kind: "own", glyph, ems: glyphEms(ctx, glyph) };
   // Pieces only add to a label, so where its own does not fit alone, no
   // carried label fits beside it. Otherwise, outermost first, each carried
   // label is dropped until the rest fit.
@@ -644,22 +651,19 @@ function outline(
   if (state.hover === null) return;
   const scale = ctx.getTransform().a;
   const pixel = 1 / scale;
-  ctx.strokeStyle = ink;
-  ctx.lineWidth = pixel;
-  ctx.globalAlpha = 0.35;
+  ctx.strokeStyle = ctx.fillStyle = ink;
+  // The path down to it, faint and thin.
+  ctx.globalAlpha = 0.5;
   for (const box of frame.boxes) {
     if (box.kind === "row" || !state.ancestors.has(childKey(box.node, box.rank))) continue;
-    const rect = pixelRect(screenRect(box, cam, view), scale);
-    ctx.strokeRect(rect.x0 + pixel / 2, rect.y0 + pixel / 2, Math.max(0, rect.x1 - rect.x0 - pixel), Math.max(0, rect.y1 - rect.y0 - pixel));
+    frameRect(ctx, pixelRect(screenRect(box, cam, view), scale), pixel, false);
   }
   ctx.globalAlpha = 1;
   // A gap has no box to outline; the inspector still describes it.
   const box = state.hover.box;
   if (box.kind === "gap") return;
-  ctx.lineWidth = 2 * pixel;
-  if (!state.hover.exact) ctx.setLineDash([5 * pixel, 3 * pixel]);
-  // Outline where the frame draws the branch: its own box, or the rows it
-  // falls in, as wide as the widest. Without a box, the origin.
+  // Where the frame draws the branch: its own box, or the rows it falls
+  // in, as wide as the widest. Without a box, the origin.
   const exact = screenRect(box, cam, view);
   const own = pixelRect(exact, scale);
   let rect = own;
@@ -674,7 +678,22 @@ function outline(
     }, scale);
     rect = { ...drawn, y0: Math.max(drawn.y0, pixelCorner(exact.y0, scale)), y1: Math.min(drawn.y1, own.y1) };
   }
-  ctx.strokeRect(rect.x0 + pixel, rect.y0 + pixel, Math.max(0, rect.x1 - rect.x0 - 2 * pixel), Math.max(0, rect.y1 - rect.y0 - 2 * pixel));
+  // Dashed where the branch is known but its continuation is not.
+  frameRect(ctx, rect, 2 * pixel, !state.hover.exact);
+}
+
+/** A frame ``width`` thick just inside a box's pixels, alike on every
+ * side; a box too small to hold one is filled. */
+function frameRect(ctx: CanvasRenderingContext2D, rect: ScreenRect, width: number, dashed: boolean): void {
+  const [w, h] = [rect.x1 - rect.x0, rect.y1 - rect.y0];
+  if (w <= 0 || h <= 0) return;
+  if (w <= 2 * width || h <= 2 * width) {
+    ctx.fillRect(rect.x0, rect.y0, w, h);
+    return;
+  }
+  ctx.lineWidth = width;
+  if (dashed) ctx.setLineDash([3 * width, 2 * width]);
+  ctx.strokeRect(rect.x0 + width / 2, rect.y0 + width / 2, w - width, h - width);
   ctx.setLineDash([]);
 }
 

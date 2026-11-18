@@ -12,9 +12,9 @@ it("picks single children out of rows, and frames reuse buffers without touching
   const tree = new IntervalTree(1);
   tree.insert(ROOT, 0, uniform(150000));
   const frame = layout(tree, lens, cam, view);
-  // Every child is thinner than a row; no branch is drawn alone.
-  expect(frame.boxes.every((box) => box.kind === "row")).toBe(true);
-  expect(frame.boxes.length).toBeLessThanOrEqual(view.height);
+  // Every child is thinner than a row: no box, and at most a span a row.
+  expect(frame.boxes.length).toBe(0);
+  expect(frame.spans.length).toBeLessThanOrEqual(view.height);
   const y = (74999.5 / 150000) * view.height;
   const picked = pick(tree, lens, frame, cam, view, 100, y, 1)!;
   expect(picked.box.branch).toBe(74999);

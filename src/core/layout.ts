@@ -47,7 +47,7 @@ export interface Viewport {
 }
 
 /** A child with known children, one without, children not yet known, or children too thin to draw apart. */
-export type BoxKind = "node" | "leaf" | "gap" | "row";
+export type BoxKind = "node" | "leaf" | "gap";
 
 export interface Box {
   node: NodeId;
@@ -57,9 +57,9 @@ export interface Box {
   count: number;
   kind: BoxKind;
   branch: Branch | null;
-  /** Conditional probabilities; for a row, geometric means weighted by what each child covers of it. */
+  /** Conditional probabilities. */
   p: number;
-  /** NaN while unknown; like p, a representative child weight for a row. */
+  /** NaN while unknown. */
   q: number;
   lnMass: number;
   x0: number;
@@ -86,7 +86,22 @@ export interface Path {
   branches: Branch[];
 }
 
-const KINDS: BoxKind[] = ["node", "leaf", "gap", "row"];
+const KINDS: BoxKind[] = ["node", "leaf", "gap"];
+
+/** Physical rows of one node's children drawn alike, from ``y0`` to ``y1``
+ * view heights: from ``x0``, where the children start, every pixel wholly
+ * inside them up to ``fill`` is filled, and every pixel from there to
+ * ``reach``, where the widest ends, holds an edge of them and is outline, as
+ * is the column at ``x0``. Where ``fill`` is ``x0``, an edge of the node's
+ * children, or a hole in them, falls in every row: outline throughout. */
+export interface Span {
+  node: NodeId;
+  y0: number;
+  y1: number;
+  x0: number;
+  fill: number;
+  reach: number;
+}
 
 /** A known child of a laid-out node: its branch and its edges in view heights. */
 export interface Known {
@@ -98,7 +113,10 @@ const boxBuffers: Box[][] = [];
 
 /** Rust owns the full frame. Only visible rectangles cross the Wasm boundary. */
 export class Frame {
+  /** Each child and gap a physical row or more tall: labelled and picked. */
   readonly boxes: Box[];
+  /** What is painted: every node's children as spans of rows. */
+  readonly spans: Span[];
   private disposed = false;
 
   constructor(readonly raw: LayoutFrame) {
@@ -114,10 +132,16 @@ export class Frame {
       b.x0 = packed[i + 7]!; b.x1 = packed[i + 8]!; b.y0 = packed[i + 9]!; b.y1 = packed[i + 10]!;
     }
     this.boxes.length = packed.length / 11;
+    const spans = raw.spans();
+    const spanNodes = raw.spanNodes();
+    this.spans = [];
+    for (let i = 0, span = 0; i < spans.length; i += 5, span++) {
+      this.spans.push({ node: spanNodes[span]!, y0: spans[i]!, y1: spans[i + 1]!, x0: spans[i + 2]!, fill: spans[i + 3]!, reach: spans[i + 4]! });
+    }
   }
 
   /** The known children of ``node`` that reach into the view, top to
-   * bottom, however thin: even those drawn in a row with others. */
+   * bottom, however thin: even those drawn only in a span. */
   known(tree: IntervalTree, lens: Lens, node: NodeId): Known[] {
     const packed = this.raw.known(tree.raw, lens.p, lens.q, node);
     const known: Known[] = [];

@@ -67,18 +67,17 @@ that asked for it needs, plus the f64 sum of the weights above it within the
 run, so a child keeps its place among its neighbours in any order, however
 light it is (see `docs/exact-runs.md`). Each node is laid out from its two
 edges nearest the point, one binary search to the first visible child. A
-child or gap a physical pixel or more tall is a box of its own; thinner
-children are drawn in the physical rows they fall in, each row summing those
-it holds (see `core/src/layout.rs`). A row is only drawing: it never stands
-in for its children, which picking, labels and readings still find one by
-one. A physical pixel shows, and
-the pointer over it selects, the box holding the pixel's top-left corner, so
-hovering a box a pixel or two tall never selects its neighbour. The
-children of each node are outlined together, a physical pixel of background
-at any size: where they start, above the first, below the last, and along
-their right edges as they step; siblings part where their widths do, never
-by a line between them. The tests pin exact geometry 80
-halvings deep and beside children 2^−3000 of their parent.
+physical pixel is the half-open square from its corner, and shows one of
+three things: the outline where any edge of a node's children falls in it,
+where they start, the node's top and bottom, a child's end or a step between
+two of different widths; their fill where it lies wholly inside them; and
+the background elsewhere (see `core/src/layout.rs`). Siblings of one width
+meet without a line, so a run of them reads as one. Nothing rounds, so
+nothing flickers as the view moves. A child or gap a pixel or more tall is a
+box too, labelled and picked; the pointer selects the child holding the
+pixel's top-left corner, however thin. The tests pin exact geometry 80
+halvings deep and beside children 2^−3000 of their parent, and compare every
+painted pixel with the rule computed from the children's edges.
 
 | input | motion |
 |---|---|

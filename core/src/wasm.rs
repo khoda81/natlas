@@ -385,7 +385,6 @@ impl LayoutFrame {
                     layout::BoxKind::Node => 0.0,
                     layout::BoxKind::Leaf => 1.0,
                     layout::BoxKind::Gap => 2.0,
-                    layout::BoxKind::Row => 3.0,
                 },
                 b.branch.map_or(-1.0, f64::from),
                 b.p,
@@ -415,6 +414,22 @@ impl LayoutFrame {
             .into_iter()
             .flat_map(|(branch, y0, y1)| [f64::from(branch), y0, y1])
             .collect())
+    }
+
+    /// Each span's node, parallel to `spans`.
+    #[wasm_bindgen(js_name = spanNodes)]
+    pub fn span_nodes(&self) -> Vec<u64> {
+        self.inner.spans.iter().map(|span| span.node).collect()
+    }
+
+    /// Five f64s per span: its rows' top and bottom in view heights, and
+    /// where its children start, its fill ends and its outline reaches.
+    pub fn spans(&self) -> Vec<f64> {
+        self.inner
+            .spans
+            .iter()
+            .flat_map(|span| [span.y0, span.y1, span.x0, span.fill, span.reach])
+            .collect()
     }
 
     #[wasm_bindgen(js_name = originTop)]

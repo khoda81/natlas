@@ -22,7 +22,7 @@ import { type Branch, IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
 import { glide, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, serializeView, viewKey } from "./view-state";
-import { DIVERGING_NATS, Palette } from "./color";
+import { Palette } from "./color";
 import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, rulerCaption, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
@@ -102,7 +102,6 @@ export class App {
   private readonly result = element<HTMLButtonElement>("search-result");
   private pendingView: { id: string; view: SavedView } | null = null;
   private readonly readout = element<HTMLElement>("readout");
-  private readonly legend = element<HTMLElement>("legend");
   private readonly status = element<HTMLElement>("status");
   private readonly pSelect = element<HTMLSelectElement>("p");
   private readonly qSelect = element<HTMLSelectElement>("q");
@@ -148,7 +147,6 @@ export class App {
     this.watchPixelRatio();
     matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
       this.palette = Palette.current();
-      this.updateLegend();
       this.invalidate();
     });
     this.bindPointer();
@@ -474,7 +472,6 @@ export class App {
     this.found = null;
     this.searchGeneration++;
     this.where.classList.remove("found");
-    this.updateLegend();
     this.invalidate();
   }
 
@@ -552,7 +549,7 @@ export class App {
     // The reading's time, from the page's pixels to the canvas's.
     const timeline = this.reading?.timeline?.() ?? null;
     const canvasLeft = timeline === null ? 0 : this.canvas.getBoundingClientRect().left;
-    draw(this.ctx, frame, this.cam, this.view, this.lens, this.palette, {
+    draw(this.ctx, frame, this.cam, this.view, this.palette, {
       known: (node) => frame.known(tree, this.lens, node),
       timeline: timeline && {
         x: (time) => timeline.x(time) - canvasLeft,
@@ -1143,24 +1140,7 @@ export class App {
     this.inspect.hidden = false;
   }
 
-  private updateLegend(): void {
-    // With p = q, color says nothing: every box has one fill.
-    const equal = this.lens.p === this.lens.q;
-    this.legend.hidden = equal;
-    if (equal) return;
-    const gradient = `linear-gradient(to right, ${this.palette.scheme.diverging.join(", ")})`;
-    const [low, high] = [`p/q ≤ e^−${DIVERGING_NATS}`, `p/q ≥ e^${DIVERGING_NATS}`];
-    this.legend.innerHTML = "";
-    const swatch = document.createElement("span");
-    swatch.className = "swatch";
-    swatch.style.background = gradient;
-    const lowText = document.createElement("span");
-    lowText.textContent = low;
-    const highText = document.createElement("span");
-    highText.textContent = high;
-    this.legend.append(lowText, swatch, highText);
-    this.legend.title = "Color is ln(p/q) per slot: red where q under-weights it. Area is cross-entropy.";
-  }
+
 
   // Remember the camera as it is: its point is named by the deepest node
   // covering the view, which a reload opens first.

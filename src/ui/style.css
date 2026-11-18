@@ -131,21 +131,6 @@ body {
   display: none;
 }
 
-.legend {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--ink-muted);
-  font-size: 12px;
-}
-
-.swatch {
-  display: inline-block;
-  width: 72px;
-  height: 8px;
-  border-radius: 4px;
-}
-
 .readout {
   color: var(--ink-muted);
   font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

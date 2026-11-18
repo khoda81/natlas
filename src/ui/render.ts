@@ -2,7 +2,7 @@
 
 import { decimalTicks, layoutTicks } from "@qbar/qbar";
 import type { Palette } from "./color";
-import type { Box, Camera, Frame, Known, Lens, Selection, Viewport } from "../core/layout";
+import type { Box, Camera, Frame, Known, Selection, Viewport } from "../core/layout";
 import type { NodeId } from "../core/tree";
 import type { Glyph, Mark, Timeline } from "../readings/reading";
 
@@ -143,59 +143,66 @@ export function draw(
   frame: Frame,
   cam: Camera,
   view: Viewport,
-  lens: Lens,
   palette: Palette,
   state: DrawState,
 ): void {
   const scale = ctx.getTransform().a;
   if (textWidths.get(ctx)?.scale !== scale) textWidths.set(ctx, { scale, widths: new Map() });
   const { scheme } = palette;
-  const equal = lens.p === lens.q;
 
   ctx.fillStyle = scheme.surface;
   ctx.fillRect(0, 0, view.width, view.height + RULER_HEIGHT);
   ctx.font = FONT;
   ctx.textBaseline = "middle";
 
-  // Each node's children as drawn, whose outline is stroked over them.
-  const children = new Map<NodeId, Drawn[]>();
-  const drawn = (box: Box, rect: ScreenRect) => {
-    const boxes = children.get(box.node);
-    if (boxes === undefined) children.set(box.node, [{ box, rect }]);
-    else boxes.push({ box, rect });
-  };
-  const labels: { box: Box; rect: ScreenRect; ink: string }[] = [];
-  let visible = false;
-  for (let i = 0; i < frame.boxes.length; i++) {
-    const box = frame.boxes[i]!;
-    const rect = screenRect(box, cam, view);
-    const width = rect.x1 - rect.x0;
-    const height = rect.y1 - rect.y0;
-    if (width <= 0 || height <= 0) continue;
-    visible = true;
-
-    // A gap with no estimate yet is unknown, as the background already says:
-    // only its label shows. One with an estimate is drawn as a silhouette.
-    // A row, of children each thinner than it, is drawn and never labelled.
-    let ink = scheme.inkMuted;
-    if (box.kind !== "gap" || Number.isFinite(box.x1)) {
-      const tile = palette.tile(box.p, box.q, equal);
-      ink = tile.ink;
-      ctx.fillStyle = tile.fill;
-      const pixels = pixelRect(rect, scale);
-      ctx.fillRect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0, pixels.y1 - pixels.y0);
-      drawn(box, rect);
+  // Every node's children as spans of physical rows: the pixels wholly
+  // inside them filled, then the time on them, then their outline over both.
+  const pixel = 1 / scale;
+  const column = (x: number) => Math.floor(within((x - cam.x) * cam.k, -OVERSCAN, view.width + OVERSCAN) * scale + ON_GRID) / scale;
+  const row = (y: number) => Math.round(within(y, -1, 2) * view.height * scale) / scale;
+  const spans = new Map<NodeId, Painted[]>();
+  for (const span of frame.spans) {
+    const painted = { y0: row(span.y0), y1: row(span.y1), left: column(span.x0),
+      fill: span.x0 < span.fill ? column(span.fill) : null, reach: column(span.reach) + pixel };
+    if (painted.y1 <= painted.y0) continue;
+    const node = spans.get(span.node);
+    if (node === undefined) spans.set(span.node, [painted]);
+    else node.push(painted);
+  }
+  // Each layer one path, filled once: a call a span would cost more than
+  // the pixels.
+  ctx.beginPath();
+  for (const node of spans.values()) {
+    for (const { y0, y1, left, fill } of node) {
+      if (fill !== null && left + pixel < fill) ctx.rect(left + pixel, y0, fill - left - pixel, y1 - y0);
     }
-
-    if (box.count !== 0 && box.kind !== "row") labels.push({ box, rect, ink });
   }
-  for (const boxes of children.values()) boxes.sort((a, b) => a.rect.y0 - b.rect.y0);
+  ctx.fillStyle = scheme.tile;
+  ctx.fill();
   if (state.timeline !== null) {
-    const timeline = state.timeline;
-    timeCdfs(ctx, children, timeline, view, scale, state.known, (node, branch) => state.glyph(node, branch).time,
-      (box) => palette.tile(box.p, box.q, equal).ink);
+    timeCdfs(ctx, spans, state.timeline, view, state.known, (node, branch) => state.glyph(node, branch).time, palette.ink);
   }
-  outlines(ctx, children, scale, scheme.stroke);
+  ctx.beginPath();
+  for (const node of spans.values()) {
+    for (const { y0, y1, left, fill, reach } of node) {
+      ctx.rect(left, y0, pixel, y1 - y0);
+      const from = fill ?? left;
+      if (from < reach) ctx.rect(from, y0, reach - from, y1 - y0);
+    }
+  }
+  ctx.fillStyle = scheme.stroke;
+  ctx.fill();
+
+  // Labels on the boxes: a gap no width is known for is the background's.
+  const labels: { box: Box; rect: ScreenRect; ink: string }[] = [];
+  let visible = spans.size !== 0;
+  for (const box of frame.boxes) {
+    const rect = screenRect(box, cam, view);
+    if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0) continue;
+    visible = true;
+    const ink = box.kind === "gap" && !Number.isFinite(box.x1) ? scheme.inkMuted : palette.ink;
+    if (box.count !== 0) labels.push({ box, rect, ink });
+  }
 
   // A box whose label is too small to draw hands it, after the labels it
   // carries itself, to each of its children; they carry it until one draws
@@ -298,34 +305,35 @@ export function draw(
   ruler(ctx, cam, view, state.units, palette);
 }
 
-/** A box drawn, and where on screen. */
-interface Drawn {
-  box: Box;
-  rect: ScreenRect;
+/** A span as painted, in CSS pixels on the physical grid: its rows, the
+ * column its children start at, where its fill ends, if it has one, and
+ * just past where its outline reaches. */
+interface Painted {
+  y0: number;
+  y1: number;
+  left: number;
+  fill: number | null;
+  reach: number;
 }
 
 /** Each node's time branches as one CDF on the timeline drawn above them,
  * across the same pixels: down a run of them, the line stands at the time
  * each known one lands on, however thin, and crosses straight over the
  * unknown ones between; the time they move over, from where the path is,
- * is shaded. Clipped to their boxes and the rows among them: a window onto
- * the timeline. ``children`` are each node's in order down. */
+ * is shaded. Clipped to the node's children in those rows: a window onto
+ * the timeline. */
 function timeCdfs(
   ctx: CanvasRenderingContext2D,
-  children: Map<NodeId, Drawn[]>,
+  spans: Map<NodeId, Painted[]>,
   timeline: Timeline,
   view: Viewport,
-  scale: number,
   known: (node: NodeId) => readonly Known[],
   timeOf: (node: NodeId, branch: number) => { from: number; to: number } | undefined,
-  inkOf: (box: Box) => string,
+  ink: string,
 ): void {
   // Far-off coordinates lose precision and can stall rasterizing.
   const x = (time: number) => within(timeline.x(time), -OVERSCAN, view.width + OVERSCAN);
-  for (const [node, drawn] of children) {
-    // Where time can be drawn: the boxes of time branches, and rows.
-    const windows = drawn.filter(({ box }) => box.branch === null ? box.kind === "row" : timeOf(node, box.branch) !== undefined);
-    if (windows.length === 0) continue;
+  for (const [node, painted] of spans) {
     const children = known(node);
     let first = 0;
     while (first < children.length) {
@@ -343,23 +351,19 @@ function timeCdfs(
         const to = x(timeOf(node, branch)!.to);
         line.push([to, y0 * view.height], [to, y1 * view.height]);
       }
+      first = last + 1;
       const from = x(start.from);
       const [top, bottom] = [line[0]![1], line[line.length - 1]![1]];
-      const shown = windows.filter(({ rect }) => top < rect.y1 && rect.y0 < bottom);
-      first = last + 1;
+      const shown = painted.filter((span) => top < span.y1 && span.y0 < bottom);
       if (shown.length === 0) continue;
       ctx.save();
       ctx.beginPath();
-      // The pixels the boxes are drawn on, whole: their edges rounded.
-      for (const { rect } of shown) {
-        const pixels = pixelRect(rect, scale);
-        ctx.rect(pixels.x0, pixels.y0, pixels.x1 - pixels.x0, pixels.y1 - pixels.y0);
-      }
+      for (const span of shown) ctx.rect(span.left, span.y0, span.reach - span.left, span.y1 - span.y0);
       ctx.clip();
       ctx.beginPath();
       ctx.rect(-OVERSCAN, top, view.width + 2 * OVERSCAN, bottom - top);
       ctx.clip();
-      ctx.fillStyle = ctx.strokeStyle = inkOf(shown[0]!.box);
+      ctx.fillStyle = ctx.strokeStyle = ink;
       ctx.beginPath();
       ctx.moveTo(from, top);
       for (const [px, py] of line) ctx.lineTo(px, py);
@@ -378,40 +382,6 @@ function timeCdfs(
   }
 }
 
-/** The outline of each node's children taken together, a physical pixel of
- * the background: the line where they start, which is their parent's own
- * right edge, one above the first and one below the last, and their right
- * edges, stepping between siblings of different widths. Siblings meet
- * unstroked: where their widths part, the outline already parts them. The
- * strokes are a box's own last column and row, or the row above its top,
- * so a stroke shared by neighbours is one pixel; a box one pixel tall keeps
- * its row, its bottom stroke below it. */
-function outlines(ctx: CanvasRenderingContext2D, children: Map<NodeId, Drawn[]>, scale: number, color: string): void {
-  const pixel = 1 / scale;
-  const edge = (at: number) => gridEdge(at, scale);
-  ctx.fillStyle = color;
-  for (const drawn of children.values()) {
-    // Neighbours as they are drawn: on the pixels their edges round to. A
-    // box's edge falls between grid lines and a row's on one, so only
-    // rounded edges tell whether two meet.
-    const rects = drawn
-      .map(({ rect }) => ({ x0: edge(rect.x0), x1: edge(rect.x1), y0: edge(rect.y0), y1: edge(rect.y1) }))
-      .filter((rect) => rect.y0 < rect.y1);
-    rects.forEach(({ x0, x1, y0, y1 }, i) => {
-      ctx.fillRect(x1 - pixel, y0, pixel, y1 - y0);
-      // Where the sibling above or below, if it meets this one, is
-      // narrower, or across the whole box where none does.
-      const above = rects[i - 1], below = rects[i + 1];
-      const top = above !== undefined && above.y1 === y0 ? above.x1 : x0;
-      if (top < x1) ctx.fillRect(top, y0 - pixel, x1 - top, pixel);
-      const bottom = below !== undefined && below.y0 === y1 ? below.x1 : x0;
-      // The last row above the edge, unless that row is all of the box: a
-      // row of children one pixel tall keeps it, and the stroke goes below.
-      const at = Math.round((y1 - y0) * scale) <= 1 ? y1 : y1 - pixel;
-      if (bottom < x1) ctx.fillRect(bottom, at, x1 - bottom, pixel);
-    });
-  }
-}
 
 /** One piece of a label, never broken across lines: the ellipsis for
  * carried labels that did not fit, a carried label, or the box's own; and
@@ -655,29 +625,18 @@ function outline(
   // The path down to it, faint and thin.
   ctx.globalAlpha = 0.5;
   for (const box of frame.boxes) {
-    if (box.kind === "row" || !state.ancestors.has(childKey(box.node, box.rank))) continue;
+    if (!state.ancestors.has(childKey(box.node, box.rank))) continue;
     frameRect(ctx, pixelRect(screenRect(box, cam, view), scale), pixel, false);
   }
   ctx.globalAlpha = 1;
   // A gap has no box to outline; the inspector still describes it.
   const box = state.hover.box;
   if (box.kind === "gap") return;
-  // Where the frame draws the branch: its own box, or the rows it falls
-  // in, as wide as the widest. Without a box, the origin.
+  // Its own pixels: a child thinner than a pixel, the row of pixels it is in.
   const exact = screenRect(box, cam, view);
   const own = pixelRect(exact, scale);
-  let rect = own;
-  const drawnAlone = frame.boxes.some(b => b.node === box.node && b.kind !== "row" && b.rank === box.rank);
-  const rows = frame.boxes.filter(b => b.node === box.node && b.kind === "row"
-    && (b.y0 <= box.y0 ? box.y0 < b.y1 : b.y0 < box.y1));
-  if (!drawnAlone && rows.length !== 0) {
-    const drawn = pixelRect({
-      ...screenRect(rows[0]!, cam, view),
-      x1: Math.max(...rows.map(row => screenRect(row, cam, view).x1)),
-      y1: screenRect(rows[rows.length - 1]!, cam, view).y1,
-    }, scale);
-    rect = { ...drawn, y0: Math.max(drawn.y0, pixelCorner(exact.y0, scale)), y1: Math.min(drawn.y1, own.y1) };
-  }
+  const top = pixelCorner(exact.y0, scale);
+  const rect = { ...own, y0: top, y1: Math.max(own.y1, top + pixel) };
   // Dashed where the branch is known but its continuation is not.
   frameRect(ctx, rect, 2 * pixel, !state.hover.exact);
 }

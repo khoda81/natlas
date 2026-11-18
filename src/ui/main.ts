@@ -507,7 +507,16 @@ export class App {
     const dataset = this.dataset!;
     const { catalog, recordings } = dataset;
     const p = { values: parse(catalog, this.specs.p), recording: heard(catalog, this.specs.p, recordings) };
-    this.reading = dataset.labels.read(this.tree!, () => this.invalidate(), p);
+    const tree = this.tree!;
+    this.reading = dataset.labels.read(tree, {
+      changed: () => this.invalidate(),
+      go: (path) => {
+        if (tree === this.tree) this.fly(tree.descend(tree.root, path));
+      },
+      failed: (error) => {
+        if (tree === this.tree) this.setStatus(String(error));
+      },
+    }, p);
     this.glyphs.clear();
     this.shown = "";
     this.invalidate();

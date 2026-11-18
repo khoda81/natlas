@@ -7,7 +7,7 @@
 // which the panel draws and can play.
 
 import { clock, DRUM_PROGRAM, pitchName, tint } from "./music";
-import { type Glyph, type Labels, type Measure, type Reading, States } from "./reading";
+import { type Glyph, type Labels, type Measure, type Page, type Reading, States } from "./reading";
 import { ScorePanel } from "./roll";
 import type { IntervalTree, Branch, NodeId } from "../core/tree";
 
@@ -81,6 +81,9 @@ export interface Transcript {
   touched: Set<Note | Hit>;
 }
 
+/** What a transcript file says it is. */
+const PATH_KIND = "natlas.transcript";
+
 const START: Score = { window: 0, tick: 0, program: null, velocity: null, prologue: true, spoiled: false, ended: false };
 export class NoteLabels implements Labels {
   private readonly instruments: Map<number, string>;
@@ -122,6 +125,24 @@ export class NoteLabels implements Labels {
     if (type === "program") return { ...score, program: value };
     if (type === "velocity") return { ...score, velocity: value };
     return score;
+  }
+
+  /** ``path`` as a transcript file: its events by name, which outlive the labels' numbering. */
+  pathFile(path: readonly Branch[]): string {
+    return JSON.stringify({ kind: PATH_KIND, events: path.map((branch) => this.event(branch)) });
+  }
+
+  /** The path a transcript file writes, refusing a file of anything else or
+   * of an event these labels do not have. */
+  parsePath(json: string): Branch[] {
+    const file = JSON.parse(json) as { kind?: unknown; events?: unknown } | null;
+    if (file?.kind !== PATH_KIND || !Array.isArray(file.events)) throw new Error("not a natlas transcript file");
+    const branches = new Map(this.file.events.map(([type, value], branch) => [`${type}:${value}`, branch]));
+    return file.events.map((event: unknown) => {
+      const branch = Array.isArray(event) && event.length === 2 ? branches.get(`${event[0]}:${event[1]}`) : undefined;
+      if (branch === undefined) throw new Error(`this transcriber writes no event ${JSON.stringify(event)}`);
+      return branch;
+    });
   }
 
   instrument(program: number): string {
@@ -250,23 +271,23 @@ export class NoteLabels implements Labels {
     return { notes: notes.filter((note) => note.end !== note.start), hits, score, now, touched };
   }
 
-  read(tree: IntervalTree, changed: () => void, p: Measure): Reading {
+  read(tree: IntervalTree, page: Page, p: Measure): Reading {
     const at = Number(p.values.get("at") || 0);
     const heard = p.recording === null
       ? { ...SILENCE, at }
       : { at, windows: Math.ceil((p.recording.seconds - at) / this.file.window), audio: p.recording.url };
-    return new NoteLabels(this.file, heard).reading(tree, changed);
+    return new NoteLabels(this.file, heard).reading(tree, page);
   }
 
-  private reading(tree: IntervalTree, changed: () => void): Reading {
+  private reading(tree: IntervalTree, page: Page): Reading {
     const scores = new States<Score>(tree, START, (score, branch) => this.after(score, branch));
-    const panel = new ScorePanel(this, changed);
+    const panel = new ScorePanel(this, page);
     return {
       glyph: (node: NodeId, branch: Branch) => this.glyph(scores.at(node), branch),
       show: (element: HTMLElement, node: NodeId, branch: Branch | null) => {
         const path = tree.path(node);
         if (branch !== null) path.push(branch);
-        panel.show(element, this.transcribe(path));
+        panel.show(element, path);
       },
       key: (event: KeyboardEvent) => {
         if (event.key !== " ") return false;

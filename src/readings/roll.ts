@@ -3,9 +3,11 @@
 // and plays them alone or over the recording.
 
 import { durationTicks, layoutTicks, type DurationStep } from "@qbar/qbar";
+import type { Branch } from "../core/tree";
+import { midi } from "./midi";
 import { clock, DRUM_PROGRAM, pitchName, pitchTicks, tint } from "./music";
 import type { Hit, Note, NoteLabels, Transcript } from "./notes";
-import type { Timeline } from "./reading";
+import type { Page, Timeline } from "./reading";
 
 type Playing = "notes" | "audio" | "both";
 
@@ -58,6 +60,8 @@ export class ScorePanel {
   private readonly followButton = document.createElement("button");
   private readonly pitchButton = document.createElement("button");
   private readonly buttons = new Map<Playing, HTMLButtonElement>();
+  /** The path shown, and the transcript it writes. */
+  private path: readonly Branch[] = [];
   private transcript: Transcript | null = null;
   /** Pitches seen: the range only grows, so the roll holds still between hovers. */
   private low = Infinity;
@@ -84,7 +88,7 @@ export class ScorePanel {
   constructor(
     private readonly labels: NoteLabels,
     /** Told when the time axis moves, which time glyphs elsewhere follow. */
-    private readonly changed: () => void,
+    private readonly page: Page,
   ) {
     this.view = { start: 0, span: 2 * labels.span };
     this.root.className = "score";
@@ -115,7 +119,35 @@ export class ScorePanel {
     this.pitchButton.addEventListener("click", () => this.followPitch());
     this.legend.className = "score-legend";
     this.time.className = "score-time";
-    bar.append(this.followButton, this.pitchButton, this.legend, this.time);
+    const action = (text: string, title: string, act: () => void) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = text;
+      button.title = title;
+      button.addEventListener("click", act);
+      return button;
+    };
+    const file = document.createElement("input");
+    file.type = "file";
+    file.accept = ".json,application/json";
+    file.hidden = true;
+    file.addEventListener("change", () => {
+      const [chosen] = file.files ?? [];
+      file.value = "";
+      chosen?.text().then((json) => this.page.go(labels.parsePath(json))).catch((error: unknown) => this.page.failed(error));
+    });
+    bar.append(
+      this.followButton,
+      this.pitchButton,
+      this.legend,
+      this.time,
+      action("⤓ path", "save this transcription's events, to open again here", () =>
+        save(new Blob([labels.pathFile(this.path)], { type: "application/json" }), "transcript.json")),
+      action("⤓ midi", "save this transcription as a MIDI file, timed as the recording", () =>
+        save(new Blob([midi(this.transcript!, (tick) => labels.seconds(tick), (program) => labels.instrument(program))], { type: "audio/midi" }), "transcript.mid")),
+      action("⤒ open", "open a saved transcription: the view flies down its path", () => file.click()),
+      file,
+    );
 
     this.frame.className = "score-frame";
     this.frame.style.height = `${storedHeight()}px`;
@@ -131,7 +163,9 @@ export class ScorePanel {
     this.setFollow(true);
   }
 
-  show(panel: HTMLElement, transcript: Transcript): void {
+  show(panel: HTMLElement, path: readonly Branch[]): void {
+    const transcript = this.labels.transcribe(path);
+    this.path = path;
     this.transcript = transcript;
     for (const note of transcript.notes) {
       this.low = Math.min(this.low, note.pitch);
@@ -381,7 +415,7 @@ export class ScorePanel {
     const axis = `${view.start} ${view.span} ${right} ${this.canvas.getBoundingClientRect().left}`;
     if (axis !== this.axis) {
       this.axis = axis;
-      this.changed();
+      this.page.changed();
     }
     if (this.canvas.width !== Math.round(width * ratio)) this.canvas.width = Math.round(width * ratio);
     if (this.canvas.height !== Math.round(height * ratio)) this.canvas.height = Math.round(height * ratio);
@@ -659,6 +693,16 @@ export class ScorePanel {
     };
     frame = requestAnimationFrame(tick);
   }
+}
+
+/** Hand ``blob`` to the viewer as a file named ``name``. */
+function save(blob: Blob, name: string): void {
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = name;
+  link.click();
+  // The download reads the URL after the click returns.
+  setTimeout(() => URL.revokeObjectURL(link.href));
 }
 
 function storedHeight(): number {

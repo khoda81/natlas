@@ -23,6 +23,12 @@ const path = [program(24), pitch(52), tie, shift(5), velocity(0), pitch(52), vel
 
 describe("NoteLabels", () => {
 
+  it("saves a path as its events and opens it again, refusing what it does not write", () => {
+    expect(labels.parsePath(labels.pathFile(path))).toEqual(path);
+    expect(() => labels.parsePath(JSON.stringify({ kind: "natlas.transcript", events: [["pitch", 999]] }))).toThrow("no event");
+    expect(() => labels.parsePath(JSON.stringify({ events: [] }))).toThrow("not a natlas transcript");
+  });
+
   it("reads a path as notes, the prologue's carried in from the start", () => {
     const { notes, score } = labels.transcribe(path);
     expect(notes).toEqual([

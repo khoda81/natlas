@@ -31,10 +31,18 @@ export interface Measure {
   recording: { url: URL; seconds: number } | null;
 }
 
+/** What a reading may tell the page it is read on. */
+export interface Page {
+  /** What glyphs show changed without the tree: a timeline that moved. */
+  changed(): void;
+  /** Fly the view down a path from the root. */
+  go(path: readonly Branch[]): void;
+  failed(error: unknown): void;
+}
+
 export interface Labels {
-  /** Paths as ``p`` reads them. ``changed`` is told when what glyphs show
-   * changes without the tree: a timeline that moved. */
-  read(tree: IntervalTree, changed: () => void, p: Measure): Reading;
+  /** Paths as ``p`` reads them, on ``page``. */
+  read(tree: IntervalTree, page: Page, p: Measure): Reading;
 }
 
 export interface Reading {

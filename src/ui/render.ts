@@ -62,7 +62,7 @@ const MARK_WIDTH = 0.8;
 const MARK_GAP = 0.3;
 const MORE: Glyph = { text: "…" };
 /** How strongly a time window shades the time its event moves over. */
-const TIME_ALPHA = 0.28;
+const TIME_ALPHA = 0.16;
 /** The width of a time CDF's line, in CSS pixels. */
 const TIME_LINE = 2;
 export const RULER_HEIGHT = 22;

@@ -128,7 +128,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const known = () => frame.known(tree, { p: 0, q: 0 }, ROOT);
     const c = canvas(dpr), ctx = c.getContext("2d")!;
     draw(ctx, frame, camera, view, palette, { ...state, glyph, timeline, known });
-    const shaded = fill.map((v, i) => v + 0.28 * (ink[i]! - v));
+    const shaded = fill.map((v, i) => v + 0.16 * (ink[i]! - v));
     const pixels = ctx.getImageData(0, 0, c.width, c.height).data;
     const at = (x: number, y: number) => 4 * (Math.floor(y * dpr) * c.width + Math.floor(x * dpr));
     const error = Math.max(differs(pixels, at(40, 70), shaded), differs(pixels, at(60, 70), ink),

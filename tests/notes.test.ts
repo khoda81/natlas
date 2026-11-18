@@ -22,9 +22,6 @@ const [program, pitch, tie, shift, velocity, drum, eos] = [
 const path = [program(24), pitch(52), tie, shift(5), velocity(0), pitch(52), velocity(1), pitch(48), shift(28), velocity(0), pitch(48)];
 
 describe("NoteLabels", () => {
-  it("draws a node's time branches as one: the vocabulary's run of shifts", () => {
-    expect(labels.timeGroups()).toEqual([[shift(0), shift(1000) + 1]]);
-  });
 
   it("reads a path as notes, the prologue's carried in from the start", () => {
     const { notes, score } = labels.transcribe(path);

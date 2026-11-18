@@ -214,20 +214,6 @@ impl Tree {
         self.inner.insert(id, measure, runs).map_err(js_error)
     }
 
-    /// Ranges of branches drawn together, each from `starts[i]` up to
-    /// `ends[i]`, in place of any before: in a node, a group's children are
-    /// drawn as wide as their mean, so they read as one.
-    #[wasm_bindgen(js_name = setGroups)]
-    pub fn set_groups(&mut self, starts: Vec<u32>, ends: Vec<u32>) {
-        self.inner.set_groups(
-            starts
-                .into_iter()
-                .zip(ends)
-                .map(|(start, end)| start..end)
-                .collect(),
-        );
-    }
-
     /// Whether `measure` has said anything of the node's children.
     pub fn has(&self, id: u64, measure: usize) -> std::result::Result<bool, JsError> {
         Ok(self

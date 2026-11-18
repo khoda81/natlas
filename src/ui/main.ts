@@ -215,7 +215,6 @@ export class App {
     this.dataset = dataset;
     this.tree = tree;
     this.reading = dataset.labels.read(tree, () => this.invalidate());
-    tree.setGroups(this.reading.groups?.() ?? []);
     this.link = new Link(tree, dataset.server);
     let failing = false;
     this.link.onError = (error) => {

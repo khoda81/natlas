@@ -558,7 +558,7 @@ impl Sent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::Order;
+    use crate::distribution::{Order, Scale};
     use crate::tree::{child_hash, ROOT};
 
     const P: Lens = Lens { p: 0, q: 0 };
@@ -866,7 +866,7 @@ mod tests {
         tree.set(
             ROOT,
             0,
-            Distribution::from_weights(&weights, Order::Branch).unwrap(),
+            Distribution::from_weights(&weights, Order::Branch, Scale::Relative).unwrap(),
         )
         .unwrap();
         let d = tree.distribution(ROOT, 0).unwrap().unwrap();

@@ -44,6 +44,9 @@ class Measure:
     paths: int
     # The most tokens a path it reads may hold, or None where nothing says.
     longest: int | None
+    # Whether its rows are each child's own ln weight, -ln of the width it
+    # is drawn at, rather than ln weights up to a constant.
+    widths: bool = False
 
     def log_probs(self, tokens: Sequence[int]) -> np.ndarray:
         """The float64 log-probabilities after ``tokens``: normalizing in
@@ -461,8 +464,9 @@ def open_language(spec: str, device: str, dtype: str = "float32", tokenizer: str
     return Transformers(spec, device, dtype, tokenizer)
 
 
-def measures(own: Language, specs: Sequence[str], other: Callable[[str], Language]) -> list[Measure]:
-    """The model itself, then one measure per spec; ``other`` opens a model a spec names."""
+def measures(own: Language, specs: Sequence[str], other: Callable[[str], Language | Measure]) -> list[Measure]:
+    """The model itself, then one measure per spec; ``other`` opens a model
+    a spec names, or makes a measure of its own."""
 
     def of(language: Language, name: str, temperature: float = 1.0) -> Measure:
         def walk(walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
@@ -493,7 +497,7 @@ def measures(own: Language, specs: Sequence[str], other: Callable[[str], Languag
             steered = own.controlled(Path(value).expanduser())
             return of(steered, steered.name)
         language = other(spec)
-        return of(language, language.name)
+        return language if isinstance(language, Measure) else of(language, language.name)
 
     return [of(own, own.name), *(measure(spec) for spec in specs)]
 

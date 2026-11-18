@@ -17,6 +17,7 @@
 
 use num_bigint::BigUint;
 
+use crate::distribution::Scale;
 use crate::point::{self, Point};
 use crate::tree::Branch;
 
@@ -52,12 +53,14 @@ pub(crate) struct Packed {
     lo: i64,
     /// The sum of every weight, W, in the same units.
     total: BigUint,
-    ln_total: f64,
+    /// What a child's ln weight less is its conditional weight: the
+    /// heaviest's and the sum's, or none where the weights are absolute.
+    ln_norm: f64,
 }
 
 impl Packed {
     /// Children in the measure's order: at least one, each weight finite.
-    pub(crate) fn new(children: &[(f32, Branch)]) -> Self {
+    pub(crate) fn new(children: &[(f32, Branch)], scale: Scale) -> Self {
         assert!(!children.is_empty() && children.iter().all(|(weight, _)| weight.is_finite()));
         let len = children.len();
         let max_branch = children
@@ -118,7 +121,10 @@ impl Packed {
             add(&mut sum, fixed(weight, max), lo);
         }
         let total = whole(&sum);
-        let ln_total = point::ln(&total, lo);
+        let ln_norm = match scale {
+            Scale::Relative => f64::from(max) + point::ln(&total, lo),
+            Scale::Absolute => 0.0,
+        };
         Self {
             len,
             branches,
@@ -131,7 +137,7 @@ impl Packed {
             limbs,
             lo,
             total,
-            ln_total,
+            ln_norm,
         }
     }
 
@@ -199,7 +205,7 @@ impl Packed {
 
     /// ln of the child's weight, conditional on the node.
     pub(crate) fn ln_p(&self, at: usize) -> f64 {
-        f64::from(self.ln_weight(at)) - f64::from(self.max) - self.ln_total
+        f64::from(self.ln_weight(at)) - self.ln_norm
     }
 
     /// The exact sum of the weights above rank `at`, from the kept sum
@@ -458,7 +464,7 @@ mod tests {
                 )
             })
             .collect();
-        let packed = Packed::new(&children);
+        let packed = Packed::new(&children, Scale::Relative);
         for (at, &(weight_, branch)) in children.iter().enumerate() {
             assert_eq!((packed.branch(at), packed.ln_weight(at)), (branch, weight_));
         }
@@ -474,7 +480,7 @@ mod tests {
             .map(|i| (-(f64::from(i % 97) * 0.37) as f32, i))
             .collect();
         children[600].0 = -60.0;
-        let packed = Packed::new(&children);
+        let packed = Packed::new(&children, Scale::Relative);
         let total: f64 = children
             .iter()
             .map(|&(weight, _)| f64::from(weight).exp())

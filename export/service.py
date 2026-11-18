@@ -36,8 +36,8 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 
 class Measure(Protocol):
-    """Next-token ln weights over the vocabulary, up to a constant, as
-    float32 rows."""
+    """Next-token ln weights over the vocabulary, as float32 rows: up to a
+    constant, or each child's own where ``widths``."""
 
     name: str
     # How many distributions one forward pass computes, and of how many
@@ -46,6 +46,9 @@ class Measure(Protocol):
     paths: int
     # The most tokens a path it reads may hold, or None where nothing says.
     longest: int | None
+    # Whether its rows are each child's own ln weight, -ln of the width it
+    # is drawn at, rather than ln weights up to a constant.
+    widths: bool
 
     def walk(self, walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
         """For each walk (tokens, start), the rows after tokens[:k] for every
@@ -343,7 +346,7 @@ class Model:
 
     def _keep(self, measure: int, nodes: list[int], rows: list[np.ndarray]) -> None:
         rows = [np.ascontiguousarray(row, dtype=np.float32) for row in rows]
-        sizes = self.tree.set(nodes, measure, rows, self.order)
+        sizes = self.tree.set(nodes, measure, rows, self.order, self.measures[measure].widths)
         for node, size in zip(nodes, sizes, strict=True):
             self.held += size - self.kept.pop((node, measure), 0)
             self.kept[node, measure] = size

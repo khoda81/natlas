@@ -2,8 +2,6 @@
 //! hashed ids, and what each measure says of a node's children.
 
 use std::collections::HashMap;
-use std::ops::Range;
-use std::sync::Mutex;
 
 use serde::Serialize;
 
@@ -85,13 +83,6 @@ pub struct Statistics {
 pub struct Tree {
     nodes: HashMap<NodeId, Node>,
     measures: usize,
-    /// Ranges of branches a reading draws together: in a node, each group's
-    /// known children are drawn as wide as their mean, so they read as one.
-    groups: Vec<Range<Branch>>,
-    /// Each group's width in a node, by (node, lens, group), once found:
-    /// kept beside the distributions it is found from, and forgotten with
-    /// any change to the node's.
-    widths: Mutex<HashMap<(NodeId, Lens, usize), Option<f64>>>,
 }
 
 impl Tree {
@@ -99,8 +90,6 @@ impl Tree {
         let mut tree = Self {
             nodes: HashMap::new(),
             measures,
-            groups: Vec::new(),
-            widths: Mutex::default(),
         };
         tree.insert_node(ROOT, None);
         tree
@@ -228,9 +217,6 @@ impl Tree {
                 true
             }
         };
-        if changed {
-            self.changed(id);
-        }
         Ok(changed)
     }
 
@@ -238,92 +224,13 @@ impl Tree {
     pub fn set(&mut self, id: NodeId, measure: usize, distribution: Distribution) -> Result<()> {
         self.check_measure(measure)?;
         self.node_mut(id)?.distributions[measure] = Some(distribution);
-        self.changed(id);
         Ok(())
     }
 
     pub fn forget(&mut self, id: NodeId, measure: usize) -> Result<()> {
         self.check_measure(measure)?;
         self.node_mut(id)?.distributions[measure] = None;
-        self.changed(id);
         Ok(())
-    }
-
-    /// What is known of the node changed: its groups' widths with it.
-    fn changed(&mut self, id: NodeId) {
-        let widths = self
-            .widths
-            .get_mut()
-            .expect("no width is found while poisoned");
-        widths.retain(|&(node, ..), _| node != id);
-    }
-
-    /// The ranges of branches a reading draws together, in place of any
-    /// before.
-    pub fn set_groups(&mut self, groups: Vec<Range<Branch>>) {
-        self.groups = groups;
-        self.widths
-            .get_mut()
-            .expect("no width is found while poisoned")
-            .clear();
-    }
-
-    /// The width a child of `id` is drawn at: −ln q, or for a child in a
-    /// group, the group's known children's mean −ln q weighted by p, so the
-    /// group keeps its area as one. Infinite while unknown.
-    pub fn width(&self, id: NodeId, lens: Lens, branch: Branch, ln_p: f64) -> Result<f64> {
-        let Some(group) = self.group(branch) else {
-            return self.nats_q(id, lens, branch, ln_p);
-        };
-        let key = (id, lens, group);
-        let found = self
-            .widths
-            .lock()
-            .expect("no width is found while poisoned")
-            .get(&key)
-            .copied();
-        let width = match found {
-            Some(width) => width,
-            None => {
-                let width = self.group_width(id, lens, group)?;
-                self.widths
-                    .lock()
-                    .expect("no width is found while poisoned")
-                    .insert(key, width);
-                width
-            }
-        };
-        width.map_or_else(|| self.nats_q(id, lens, branch, ln_p), Ok)
-    }
-
-    /// The group a branch is in, if any.
-    pub fn group(&self, branch: Branch) -> Option<usize> {
-        self.groups.iter().position(|range| range.contains(&branch))
-    }
-
-    /// The mean −ln q of a group's known children of `id`, weighted by p;
-    /// none where none of them has a known width.
-    fn group_width(&self, id: NodeId, lens: Lens, group: usize) -> Result<Option<f64>> {
-        let Some(p) = self.distribution(id, lens.p)? else {
-            return Ok(None);
-        };
-        let range = &self.groups[group];
-        let (mut mass, mut area) = (0.0, 0.0);
-        for run in p.runs() {
-            for at in 0..run.len() {
-                let branch = run.branch(at);
-                if !range.contains(&branch) {
-                    continue;
-                }
-                let ln_p = run.ln_p(at);
-                let nats = self.nats_q(id, lens, branch, ln_p)?;
-                if nats.is_finite() {
-                    let weight = ln_p.exp();
-                    (mass, area) = (mass + weight, area + weight * nats);
-                }
-            }
-        }
-        Ok((0.0 < mass).then(|| area / mass))
     }
 
     /// −ln q of a child of `id`, infinite while unknown: an unknown width

@@ -38,9 +38,6 @@ export interface Reading {
   key?(event: KeyboardEvent): boolean;
   /** Where its time is on the page now, while it shows it. */
   timeline?(): Timeline | null;
-  /** Ranges of branches, each [start, end), it draws as one: a node's
-   * children in a group are drawn at their mean width. */
-  groups?(): (readonly [Branch, Branch])[];
 }
 
 /** Reader state after each node path, reconstructed from the nearest known ancestor. */

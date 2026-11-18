@@ -332,8 +332,7 @@ fn item_box(
             Point::ln_between(&top, &bottom)
         }
     };
-    // Its −ln q, and the width it is drawn at: a group's, for a child in one.
-    let (kind, branch, nats, width) = match item {
+    let (kind, branch, nats) = match item {
         Item::Child { run, at } => {
             let branch = d.runs()[run].branch(at);
             let expanded = tree
@@ -344,17 +343,11 @@ fn item_box(
             } else {
                 BoxKind::Leaf
             };
-            let nats = tree.nats_q(node, lens, branch, ln_p)?;
-            (
-                kind,
-                Some(branch),
-                nats,
-                tree.width(node, lens, branch, ln_p)?,
-            )
+            (kind, Some(branch), tree.nats_q(node, lens, branch, ln_p)?)
         }
         Item::Gap { before } => {
             let nats = gap_nats(tree, lens, node, d, before, ln_p, rank, d.item_end(item))?;
-            (BoxKind::Gap, None, nats, nats)
+            (BoxKind::Gap, None, nats)
         }
     };
     Ok(LayoutBox {
@@ -371,7 +364,7 @@ fn item_box(
         },
         ln_mass: placed.ln_mass + ln_p,
         x0: placed.x,
-        x1: placed.x + width,
+        x1: placed.x + nats,
         y0,
         y1,
     })
@@ -381,8 +374,7 @@ fn item_box(
 /// samples tell more: with q = p and their number known, that of their mean
 /// weight, since children heaviest first are nearly alike side by side;
 /// otherwise the mean surprisal of the known children beside the gap.
-/// Infinite with neither. Between two children of one group, the group's
-/// width: the gap is drawn as part of it.
+/// Infinite with neither.
 #[allow(clippy::too_many_arguments)]
 fn gap_nats(
     tree: &Tree,
@@ -409,12 +401,6 @@ fn gap_nats(
         .get(before)
         .filter(|run| !run.is_empty())
         .map(|run| (run, 0));
-    if let (Some((a, i)), Some((b, j))) = (above, below) {
-        let group = tree.group(a.branch(i));
-        if group.is_some() && group == tree.group(b.branch(j)) {
-            return tree.width(node, lens, a.branch(i), a.ln_p(i));
-        }
-    }
     let (mut sum, mut known) = (0.0, 0.0);
     for (run, at) in above.into_iter().chain(below) {
         let nats = tree.nats_q(node, lens, run.branch(at), run.ln_p(at))?;
@@ -471,7 +457,6 @@ fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Ste
         let ln_extent = Point::ln_between(&top, &bottom);
         let ln_p = p.runs()[run].ln_p(at);
         let nats_q = tree.nats_q(node, lens, branch, ln_p)?;
-        let width = tree.width(node, lens, branch, ln_p)?;
         steps.nodes.push(child_hash(node, branch));
         steps.entries.push(ChainEntry {
             branch,
@@ -481,7 +466,7 @@ fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Ste
         });
         steps.edges.push((top, bottom));
         steps.ln_masses.push(steps.ln_masses[i] + ln_extent);
-        steps.xs.push(steps.xs[i] + width);
+        steps.xs.push(steps.xs[i] + nats_q);
     }
     Ok(steps)
 }
@@ -625,7 +610,7 @@ impl Layout<'_> {
             let width = match found {
                 Item::Child { run, at } => {
                     let r = &d.runs()[run];
-                    tree.width(node, self.lens, r.branch(at), r.ln_p(at))?
+                    tree.nats_q(node, self.lens, r.branch(at), r.ln_p(at))?
                 }
                 Item::Gap { before } => {
                     let ln_mass = (y1 - y0).ln() - placed.ln_scale;
@@ -987,8 +972,8 @@ fn view_top(placed: &Placed, point: Option<&Point>, a: f64) -> Option<Point> {
 
 /// Where the node `path` leads to from an origin sits, as layout places it:
 /// ln of its p mass below the origin, and where its children start, in nats
-/// right of the origin's, the widths of groups included. As far as p places
-/// the path: `placed` of its branches.
+/// right of the origin's. As far as p places the path: `placed` of its
+/// branches.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Reach {
@@ -1216,7 +1201,7 @@ fn pixel_child(heights: &mut Heights, item: Item, y: f64, bottom: f64) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::{Distribution, Order, Run};
+    use crate::distribution::{Distribution, Order, Run, Scale};
     use crate::tree::ROOT;
     use std::f64::consts::LN_2;
 
@@ -1279,6 +1264,12 @@ mod tests {
     #[test]
     fn heights_split_by_p_in_p_order_and_widths_follow_q() {
         let (tree, _) = chain_tree(&[0.25, 0.5, 0.25], &[]);
+        // Reaching a child places it as layout draws it, as far as p places
+        // the path.
+        let at = reach(&tree, LENS, ROOT, &[1, 7]).unwrap();
+        assert_eq!(at.placed, 1);
+        near(at.x, 2f64.ln());
+        near(at.ln_mass, 0.5f64.ln());
         let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let spans: Vec<_> = frame
             .boxes
@@ -1425,43 +1416,6 @@ mod tests {
         // and from the gap to the last child.
         near_all(&rows[2..3], &[(798.0, 799.0, heavy, gap)]);
         assert!((rows[3].2 - last).abs() < 1e-6 && (rows[3].3 - last).abs() < 1e-6);
-    }
-
-    #[test]
-    fn a_group_is_drawn_at_its_mean_width_and_its_subtrees_start_there() {
-        // Branches 1 and 2 are a group; 0 is not.
-        let (mut tree, _) = chain_tree(&[0.5, 0.3, 0.2], &[]);
-        #[allow(clippy::single_range_in_vec_init)]
-        tree.set_groups(vec![1..3]);
-        let child = tree.child(ROOT, 2).unwrap();
-        tree.set(child, 0, weights(&[0.5, 0.5])).unwrap();
-        let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
-        let width = (0.3 * -0.3f64.ln() + 0.2 * -0.2f64.ln()) / 0.5;
-        let of = |node: NodeId, branch: Branch| {
-            frame
-                .boxes
-                .iter()
-                .find(|b| b.node == node && b.branch == Some(branch))
-                .unwrap()
-        };
-        near(of(ROOT, 0).x1, 2f64.ln());
-        for branch in [1, 2] {
-            let b = of(ROOT, branch);
-            near(b.x1, width);
-            // Its color and q stay its own.
-            near(b.q, [0.0, 0.3, 0.2][branch as usize]);
-        }
-        // The group's area is its children's, and a subtree keeps its size
-        // where it starts.
-        near(0.5 * width, 0.3 * -0.3f64.ln() + 0.2 * -0.2f64.ln());
-        near(of(child, 0).x0, width);
-        near(of(child, 0).y1 - of(child, 0).y0, 0.1);
-        // Reaching a node places it as layout draws it, its group's width
-        // included; and as far as p places the path.
-        let at = reach(&tree, LENS, ROOT, &[2, 0]).unwrap();
-        near(at.x, width + 2f64.ln());
-        near(at.ln_mass, (0.2f64 * 0.5).ln());
-        assert_eq!(reach(&tree, LENS, ROOT, &[2, 0, 1]).unwrap().placed, 2);
     }
 
     #[test]
@@ -1828,7 +1782,7 @@ mod tests {
         tree.set(
             ended,
             0,
-            Distribution::from_weights(&[], Order::Heaviest).unwrap(),
+            Distribution::from_weights(&[], Order::Heaviest, Scale::Relative).unwrap(),
         )
         .unwrap();
         let camera = cam(ROOT, 0.0, top(&[]), 0.0);

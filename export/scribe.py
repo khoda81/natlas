@@ -399,6 +399,24 @@ class Scribe:
                 state["offsets"].fill_(position)
 
 
+def time_area(rows: np.ndarray, time: np.ndarray) -> np.ndarray:
+    """Widths that draw each row's time shifts as one: every shift the row
+    gives weight is as wide as their mean -ln p, weighted by p, so together
+    they keep their area; every other event keeps its own -ln p. Rows of ln
+    weights up to a constant in, each child's own ln weight out."""
+    rows = rows.astype(np.float64)
+    top = rows.max(axis=1, keepdims=True)
+    finite = np.isfinite(rows)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ln_p = rows - (top + np.log(np.exp(rows - top).sum(axis=1, keepdims=True)))
+        p = np.where(finite, np.exp(ln_p), 0.0)
+        shifts = time[None, :] & finite & (0 < p)
+        mass = np.where(shifts, p, 0.0).sum(axis=1, keepdims=True)
+        area = np.where(shifts, -p * ln_p, 0.0).sum(axis=1, keepdims=True)
+        width = area / mass
+    return np.where(shifts, -width, ln_p).astype(np.float32)
+
+
 def labels_file(model: TranscriptionModel, windows: Windows) -> bytes:
     tokenizer = model._tokenizer  # noqa: SLF001
     instruments = {program: model._instrument_for_program(program).replace("_", " ") for program in range(130)}  # noqa: SLF001
@@ -454,7 +472,7 @@ def main() -> None:
         "--q",
         action="append",
         default=[],
-        help="further measure, repeatable: a model size, silence, instruments:NAMES or temperature:T",
+        help="further measure, repeatable: a model size, silence, instruments:NAMES, temperature:T, or time-area: the model with its time shifts drawn as one, keeping their area",
     )
     parser.add_argument("--device", default=lm.default_device())
     parser.add_argument(
@@ -501,16 +519,23 @@ def main() -> None:
 
     own = scribe(args.p, f"muscriptor-{args.p}")
 
-    def other(spec: str) -> Scribe:
+    def other(spec: str) -> Scribe | lm.Measure:
         kind, _, value = spec.partition(":")
         if spec in SIZES:
             return scribe(spec, f"muscriptor-{spec}")
+        if spec == "time-area":
+            time = windows.kinds == "shift"
+
+            def walk(walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
+                return [time_area(rows, time) for rows in own.walk(walks)]
+
+            return lm.Measure(f"{own.name} · time as one", walk, own.width, own.paths, own.longest, widths=True)
         if spec == "silence":
             return scribe(args.p, f"{own.name} · silence", silent)
         if kind == "instruments":
             names = resolve_instrument_names(value.split(","))
             return scribe(args.p, f"{own.name} · expecting {', '.join(names)}", expect=instrument_group_from_names(names))
-        raise SystemExit(f"unknown measure {spec!r}: give a model size, silence, instruments:NAMES or temperature:T")
+        raise SystemExit(f"unknown measure {spec!r}: give a model size, silence, instruments:NAMES, temperature:T or time-area")
 
     measures = lm.measures(own, args.q, other)
     seconds = recording.shape[-1] / SAMPLE_RATE

@@ -19,8 +19,10 @@ is a piano roll of the path to the hovered box.
 
 ![MuScriptor hearing the recording against MuScriptor hearing silence](docs/music-silence.png)
 
-The same model with q hearing silence instead: red boxes are events the audio
-made likelier, and their extra width is what it told the model, KL(p‖q).
+The same model with q hearing silence instead: each box is as tall as p and
+as wide as −ln q, so an event the audio made likelier is drawn wider than p
+alone would draw it, and the area beyond what p alone would draw is what the audio told the
+model, KL(p‖q).
 
 ## The picture
 
@@ -269,7 +271,11 @@ chunked decoder gives that transcription.
 The measures are the model (`--p small|medium|large`) and each `--q`: another
 size hearing the same audio, `silence` for the model hearing nothing (p
 against it shows what the audio told the model), `instruments:piano,drums`
-for the model told what to expect, or `temperature:T`. Each measure keeps a
+for the model told what to expect, `temperature:T`, or `time-area`: the
+model itself with all of a node's time shifts as wide as their mean −ln p,
+weighted by p, so they read as one branch keeping their area. A measure's
+rows may be widths rather than probabilities: each child's own −ln q, as
+given, whatever they sum to. Each measure keeps a
 few KV caches (`--slots`), one per window in reach, stepped back to the prefix
 a request shares with what they hold.
 

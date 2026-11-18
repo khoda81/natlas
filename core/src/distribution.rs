@@ -41,6 +41,16 @@ pub fn ln_between(top: f64, bottom: f64) -> f64 {
     }
 }
 
+/// What a measure's ln weights are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scale {
+    /// Up to a constant, as a model's logits: each node's are normalized.
+    Relative,
+    /// Each child's ln weight conditional on the node, as given: a measure
+    /// that sets widths, its −ln q whatever it sums to.
+    Absolute,
+}
+
 /// The order a measure ranks a node's children in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Order {
@@ -410,9 +420,9 @@ impl Distribution {
     }
 
     /// Every branch's ln weight, indexed by branch, as a measure computes it:
-    /// complete, up to a constant, as an f32 like a model's logits, ranked
-    /// in `order`. Weightless branches have no rank.
-    pub fn from_weights(ln_weights: &[f32], order: Order) -> Result<Self> {
+    /// complete, as an f32 like a model's logits, on its `scale`, ranked in
+    /// `order`. Weightless branches have no rank.
+    pub fn from_weights(ln_weights: &[f32], order: Order, scale: Scale) -> Result<Self> {
         if ln_weights.iter().any(|weight| weight.is_nan()) {
             return Err("a weight is not a number".into());
         }
@@ -435,7 +445,7 @@ impl Distribution {
         }
         // One run of distinct branches: nothing for `from_runs` to check.
         Ok(Self {
-            runs: vec![Run::of(0, Children::Packed(Packed::new(&children)))],
+            runs: vec![Run::of(0, Children::Packed(Packed::new(&children, scale)))],
             rank: Ranks::Packed,
         })
     }
@@ -888,7 +898,7 @@ mod tests {
             0.2f64.ln(),
         ]
         .map(|weight| weight as f32);
-        let d = Distribution::from_weights(&weights, Order::Heaviest).unwrap();
+        let d = Distribution::from_weights(&weights, Order::Heaviest, Scale::Relative).unwrap();
         let run = &d.runs()[0];
         assert_eq!(run.branches().as_ref(), [1, 3, 0, 5, 4]);
         let ranks: Vec<_> = (0..7).map(|branch| d.rank(branch)).collect();
@@ -908,16 +918,31 @@ mod tests {
         assert!(d.complete());
         // By branch, the tiny child sits between heavy ones, with an extent
         // of its own.
-        let d = Distribution::from_weights(&weights, Order::Branch).unwrap();
+        let d = Distribution::from_weights(&weights, Order::Branch, Scale::Relative).unwrap();
         assert_eq!(d.runs()[0].branches().as_ref(), [0, 1, 3, 4, 5]);
         let (top, bottom) = d.item_edges(Item::Child { run: 0, at: 3 });
         assert!(top < bottom);
         assert_eq!(d.locate(&top), Some(Item::Child { run: 0, at: 3 }));
-        assert!(Distribution::from_weights(&[], Order::Branch)
-            .unwrap()
-            .ended());
-        assert!(Distribution::from_weights(&[f32::NAN], Order::Branch).is_err());
-        assert!(Distribution::from_weights(&[f32::INFINITY], Order::Branch).is_err());
+        assert!(
+            Distribution::from_weights(&[], Order::Branch, Scale::Relative)
+                .unwrap()
+                .ended()
+        );
+        assert!(Distribution::from_weights(&[f32::NAN], Order::Branch, Scale::Relative).is_err());
+        // Absolute weights are each child's own, whatever they sum to: a
+        // measure of widths.
+        let widths =
+            Distribution::from_weights(&[-1.0, -1.0, -3.0], Order::Branch, Scale::Absolute)
+                .unwrap();
+        assert_eq!(
+            (0..3)
+                .map(|at| widths.runs()[0].ln_p(at))
+                .collect::<Vec<_>>(),
+            [-1.0, -1.0, -3.0]
+        );
+        assert!(
+            Distribution::from_weights(&[f32::INFINITY], Order::Branch, Scale::Relative).is_err()
+        );
     }
 
     #[test]
@@ -926,7 +951,7 @@ mod tests {
         // them tells apart, in branch order.
         let mut weights = vec![-1.0f32; 10];
         weights[5] = -90.0;
-        let d = Distribution::from_weights(&weights, Order::Branch).unwrap();
+        let d = Distribution::from_weights(&weights, Order::Branch, Scale::Relative).unwrap();
         let all: Vec<_> = (0..10).map(|at| (0, at)).collect();
         // Coarse: one run, its top the node's.
         let coarse = d.answer(&all, 16);

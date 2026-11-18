@@ -52,6 +52,7 @@ def node_id(path):
 
 class Measure:
     name = "fixture"
+    widths = False
 
     def __init__(self, weights=(0.6, 0.25, 0.1, 0.049, 0.001), width=1, paths=1, longest=None):
         self.weights = np.array(weights, dtype=np.float64)
@@ -222,6 +223,12 @@ class CoreTests(unittest.TestCase):
             self.assertAlmostEqual(int.from_bytes(top, "big") / 256 ** len(top), above, delta=256 ** -len(top))
             above += sum(math.exp(ln) for ln in ln_weights)
         self.assertAlmostEqual(above, 1.0)
+        # Widths are each child's own ln weight, whatever they sum to.
+        tree.set([0], 0, [np.array([-1.0, -1.0, -3.0], np.float32)], "branch", widths=True)
+        session = Session()
+        session.demand(tree, 0, 0, view=(0, b"", 0.0, 10.0, 0.1))
+        ((*_, runs, _),) = session.step(tree)
+        self.assertEqual([round(ln, 6) for _, _, ln_weights, _ in runs for ln in ln_weights], [-1.0, -1.0, -3.0])
         # By branch, the same weights in branch order.
         tree.set([0], 0, [np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32))], "branch")
         session = Session()

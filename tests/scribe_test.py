@@ -30,6 +30,22 @@ def windows(at: float = 5.0, count: int = 3) -> scribe.Windows:
     return scribe.Windows(SimpleNamespace(_tokenizer=TOKENIZER), at, count, scribe.MAX_EVENTS)
 
 
+class TimeAreaTests(unittest.TestCase):
+    def test_time_shifts_share_a_width_that_keeps_their_area(self):
+        import numpy as np
+
+        # Two shifts of p 0.5 and 0.1, a pitch of 0.4, and a masked shift.
+        time = np.array([True, True, False, True])
+        rows = np.log(np.array([[0.5, 0.1, 0.4, 0.0]]))
+        with np.errstate(divide="ignore"):
+            widths = scribe.time_area(rows.astype(np.float32), time)[0]
+        width = -(0.5 * np.log(0.5) + 0.1 * np.log(0.1)) / 0.6
+        np.testing.assert_allclose(widths[:3], [-width, -width, np.log(0.4)], rtol=1e-6)
+        self.assertEqual(widths[3], -np.inf)
+        # Their area, p times width, is theirs.
+        self.assertAlmostEqual(0.6 * width, -(0.5 * np.log(0.5) + 0.1 * np.log(0.1)), places=6)
+
+
 class ValidTests(unittest.TestCase):
     def allowed(self, path: list[int], at: float = 5.0, count: int = 3) -> set[tuple[str, int]]:
         mask = windows(at, count).valid(tuple(path))

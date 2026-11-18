@@ -5,7 +5,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::distribution::{Distribution, Order, Run};
+use crate::distribution::{Distribution, Order, Run, Scale};
 use crate::session::{Demand, Path, Session, Update, View};
 use crate::tree::{Lens, Tree};
 
@@ -65,16 +65,25 @@ impl PythonTree {
     /// Set the children of each of `nodes` under `measure` from its row of
     /// `ln_weights`: every branch's ln weight up to a constant, a float32
     /// buffer indexed by branch, as a measure computes them, ranked in
-    /// `order`: "heaviest" first or by "branch". Says about how many bytes
-    /// each holds. The rows are packed on every core, without the GIL and
-    /// before the tree is borrowed.
+    /// `order`: "heaviest" first or by "branch". `widths` where they are each
+    /// child's own ln weight, −ln of the width it is drawn at, rather than up
+    /// to a constant. Says about how many bytes each holds. The rows are
+    /// packed on every core, without the GIL and before the tree is
+    /// borrowed.
+    #[pyo3(signature = (nodes, measure, ln_weights, order, widths=false))]
     fn set(
         slf: &Bound<'_, Self>,
         nodes: Vec<u64>,
         measure: usize,
         ln_weights: Vec<PyBuffer<f32>>,
         order: &str,
+        widths: bool,
     ) -> PyResult<Vec<usize>> {
+        let scale = if widths {
+            Scale::Absolute
+        } else {
+            Scale::Relative
+        };
         let order = match order {
             "heaviest" => Order::Heaviest,
             "branch" => Order::Branch,
@@ -92,7 +101,7 @@ impl PythonTree {
             .iter()
             .map(|row| row.to_vec(py))
             .collect::<PyResult<Vec<_>>>()?;
-        let distributions = py.detach(|| packed(&rows, order)).map_err(error)?;
+        let distributions = py.detach(|| packed(&rows, order, scale)).map_err(error)?;
         let mut tree = slf.borrow_mut();
         nodes
             .into_iter()
@@ -111,7 +120,7 @@ impl PythonTree {
 }
 
 /// Each row's distribution, rows shared out among the cores in order.
-fn packed(rows: &[Vec<f32>], order: Order) -> Result<Vec<Distribution>, String> {
+fn packed(rows: &[Vec<f32>], order: Order, scale: Scale) -> Result<Vec<Distribution>, String> {
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     let share = rows.len().div_ceil(cores).max(1);
     std::thread::scope(|scope| {
@@ -121,7 +130,7 @@ fn packed(rows: &[Vec<f32>], order: Order) -> Result<Vec<Distribution>, String> 
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|row| Distribution::from_weights(row, order))
+                        .map(|row| Distribution::from_weights(row, order, scale))
                         .collect::<Result<Vec<_>, String>>()
                 })
             })

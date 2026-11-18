@@ -10,6 +10,7 @@ import {
   layout,
   logView,
   pick,
+  reach,
   type Selection,
   settle,
   top,
@@ -17,7 +18,7 @@ import {
   type Viewport,
 } from "../core/layout";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "../data/source";
-import { IntervalTree, type NodeId, ROOT } from "../core/tree";
+import { type Branch, IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
 import { glide, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, serializeView, viewKey } from "./view-state";
@@ -50,23 +51,23 @@ const element = <T extends HTMLElement>(id: string) => document.getElementById(i
 
 /** A glide to depth ``to.x`` with the camera's point ``to.a`` view heights
  * down, begun at ``start``, ``eased`` of the way there so far. */
+/** A focus animation, toward a fixed camera, or toward a node standing
+ * like the root wherever layout places it on each frame: a group's width
+ * may change as its children arrive. */
 interface Focus {
-  to: { x: number; a: number };
+  to: { x: number; a: number } | { node: NodeId };
   start: number;
   eased: number;
 }
 
 /**
  * A flight down ``chain`` to its last node. The camera's point stays the
- * top of ``chain[reached]``, the deepest node placed so far, whose ln p mass
- * and right edge below the origin are ``lnMass`` and ``x1``. ``listed`` once
+ * top of ``chain[reached]``, the deepest node placed so far. ``listed`` once
  * the walks have answered; ``time`` is the last frame's.
  */
 interface Flight {
   chain: NodeId[];
   reached: number;
-  lnMass: number;
-  x1: number;
   listed: boolean;
   time: number | null;
 }
@@ -341,7 +342,8 @@ export class App {
       void this.place(parent, origin);
       return;
     }
-    this.cam.x += edge.natsQ;
+    // The origin's own width as layout draws it, a group's where it is in one.
+    this.cam.x += reach(tree, this.lens, parent, [tree.branch(origin)]).x;
     this.cam.anchor = { path: [tree.branch(origin), ...this.cam.anchor.path], digits: this.cam.anchor.digits };
     this.cam.origin = parent;
     // The root's left edge is the start of everything.
@@ -381,7 +383,7 @@ export class App {
     } else this.open(ROOT);
     const { origin } = this.cam;
     const chain = tree.chain(origin, target);
-    const flight: Flight = { chain, reached: 0, lnMass: 0, x1: 0, listed: false, time: null };
+    const flight: Flight = { chain, reached: 0, listed: false, time: null };
     if (below) {
       // Down the camera's path while the target's goes the same way, and p
       // and q both place it.
@@ -390,8 +392,6 @@ export class App {
       while (flight.reached < Math.min(anchor.length, chain.length - 1) && anchor[flight.reached] === tree.branch(chain[flight.reached + 1]!)) {
         const edge = tree.entry(chain[flight.reached]!, this.lens, anchor[flight.reached]!);
         if (edge === undefined || !Number.isFinite(edge.natsQ)) break;
-        flight.lnMass += edge.lnP;
-        flight.x1 += edge.natsQ;
         flight.reached++;
       }
       // The point moves to that node's top, where the view shows it now.
@@ -417,22 +417,23 @@ export class App {
     const tree = this.tree!;
     const { chain } = flight;
     const from = flight.reached;
+    // The node ``depth`` down the flight's chain, as layout places it.
+    const placed = (depth: number) => reach(tree, this.lens, chain[0]!, chain.slice(1, depth + 1).map((node) => tree.branch(node)));
     while (flight.reached < chain.length - 1) {
       const node = chain[flight.reached]!;
       const edge = tree.entry(node, this.lens, tree.branch(chain[flight.reached + 1]!));
       if (edge === undefined || !Number.isFinite(edge.natsQ)) break;
       // The point moves from this node's top to its child's, keeping the picture.
-      this.cam.a += Math.exp(flight.lnMass - logView(this.cam)) * edge.before;
-      flight.lnMass += edge.lnP;
-      flight.x1 += edge.natsQ;
+      this.cam.a += Math.exp(placed(flight.reached).lnMass - logView(this.cam)) * edge.before;
       flight.reached++;
     }
     if (from < flight.reached) this.cam.anchor = top(chain.slice(1, flight.reached + 1).map((node) => tree.branch(node)));
     const dt = flight.time === null ? 0 : Math.min(MAX_FRAME_MS, time - flight.time);
     flight.time = time;
     const close = this.reducedMotion.matches ? 1 : 1 - Math.exp(-dt / FLIGHT_MS);
-    const toX = rootLike(flight.lnMass, flight.x1);
-    const height = Math.exp(flight.lnMass + toX);
+    const there = placed(flight.reached);
+    const toX = rootLike(there.lnMass, there.x);
+    const height = Math.exp(there.lnMass + toX);
     glide(this.cam, { x: toX, a: 0.5 - height / 2 }, close);
     const arrived = flight.reached === chain.length - 1;
     if (arrived && flight.listed && Math.abs(toX - this.cam.x) < 1e-3) {
@@ -948,19 +949,37 @@ export class App {
       this.cam.a = box.y0;
     }
     // Standing like the root: as tall as the view where its width allows,
-    // centred.
-    const x = rootLike(box.lnMass, box.x1);
-    const height = Math.exp(box.lnMass + x);
-    this.focus = { to: { x, a: 0.5 - height / 2 }, start: performance.now(), eased: 0 };
+    // centred; a child wherever layout places it on each frame.
+    const to = box.branch === null ? standing(box.lnMass, box.x1) : { node: tree.child(box.node, box.branch) };
+    this.focus = { to, start: performance.now(), eased: 0 };
     this.invalidate();
+  }
+
+  /** Where ``node`` stands like the root, as layout places it now: none
+   * once the origin no longer reaches it. */
+  private standingAt(node: NodeId): { x: number; a: number } | null {
+    const tree = this.tree!;
+    let path: Branch[];
+    try {
+      path = tree.chain(this.cam.origin, node).slice(1).map((child) => tree.branch(child));
+    } catch {
+      return null;
+    }
+    const at = reach(tree, this.lens, this.cam.origin, path);
+    return at.placed === path.length ? standing(at.lnMass, at.x) : null;
   }
 
   private stepFocus(time: number): void {
     const focus = this.focus!;
     const t = Math.min(1, Math.max(0, (time - focus.start) / FOCUS_MS));
     const eased = t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
+    const to = "node" in focus.to ? this.standingAt(focus.to.node) : focus.to;
+    if (to === null) {
+      this.focus = null;
+      return;
+    }
     // This frame's share of what was left.
-    glide(this.cam, focus.to, focus.eased < 1 ? (eased - focus.eased) / (1 - focus.eased) : 1);
+    glide(this.cam, to, focus.eased < 1 ? (eased - focus.eased) / (1 - focus.eased) : 1);
     focus.eased = eased;
     if (t === 1) this.focus = null;
   }
@@ -1206,6 +1225,13 @@ export class App {
 }
 
 /** Depth at which a box of ln p mass fills the view, or its children start, if sooner. */
+/** The camera that stands a node of ``lnMass`` below the origin, its
+ * children starting at ``x1``, like the root: its point at the node's top. */
+function standing(lnMass: number, x1: number): { x: number; a: number } {
+  const x = rootLike(lnMass, x1);
+  return { x, a: 0.5 - Math.exp(lnMass + x) / 2 };
+}
+
 function rootLike(lnMass: number, x1: number): number {
   return Math.min(-lnMass, x1);
 }

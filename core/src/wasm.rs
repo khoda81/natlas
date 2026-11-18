@@ -509,6 +509,18 @@ pub fn extent(
     to_js(&layout::extent(&tree.inner, Lens { p, q }, &camera, depth).map_err(js_error)?)
 }
 
+/// Where the node `path` leads to from `origin` sits, as layout places it.
+#[wasm_bindgen]
+pub fn reach(
+    tree: &Tree,
+    p: usize,
+    q: usize,
+    origin: u64,
+    path: Vec<u32>,
+) -> std::result::Result<JsValue, JsError> {
+    to_js(&layout::reach(&tree.inner, Lens { p, q }, origin, &path).map_err(js_error)?)
+}
+
 /// Return the clamped camera `a`; the input camera is not mutated.
 #[wasm_bindgen(js_name = clampPosition)]
 pub fn clamp_position(

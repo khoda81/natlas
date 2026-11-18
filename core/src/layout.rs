@@ -912,6 +912,28 @@ fn view_top(placed: &Placed, point: Option<&Point>, a: f64) -> Option<Point> {
     }
 }
 
+/// Where the node `path` leads to from an origin sits, as layout places it:
+/// ln of its p mass below the origin, and where its children start, in nats
+/// right of the origin's, the widths of groups included. As far as p places
+/// the path: `placed` of its branches.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Reach {
+    pub ln_mass: f64,
+    pub x: f64,
+    pub placed: usize,
+}
+
+pub fn reach(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Reach> {
+    let steps = steps(tree, lens, origin, path)?;
+    let placed = steps.entries.len();
+    Ok(Reach {
+        ln_mass: steps.ln_masses[placed],
+        x: steps.xs[placed],
+        placed,
+    })
+}
+
 /// The edges in view heights of the node `depth` steps down the camera's
 /// path from its origin, as far as p places that path.
 pub fn extent(tree: &Tree, lens: Lens, cam: &Camera, depth: usize) -> Result<Extent> {
@@ -1373,6 +1395,12 @@ mod tests {
         near(0.5 * width, 0.3 * -0.3f64.ln() + 0.2 * -0.2f64.ln());
         near(of(child, 0).x0, width);
         near(of(child, 0).y1 - of(child, 0).y0, 0.1);
+        // Reaching a node places it as layout draws it, its group's width
+        // included; and as far as p places the path.
+        let at = reach(&tree, LENS, ROOT, &[2, 0]).unwrap();
+        near(at.x, width + 2f64.ln());
+        near(at.ln_mass, (0.2f64 * 0.5).ln());
+        assert_eq!(reach(&tree, LENS, ROOT, &[2, 0, 1]).unwrap().placed, 2);
     }
 
     #[test]

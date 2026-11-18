@@ -7,6 +7,7 @@ import {
   clampPosition,
   extent as measureExtent,
   layout as layoutFrame,
+  reach as reachOf,
   settle as settleAnchor,
   type LayoutFrame,
   view as viewOf,
@@ -187,6 +188,20 @@ export function view(tree: IntervalTree, lens: Lens, cam: Camera, viewport: View
 
 /** The interval edges in view heights of the node ``depth`` steps down the
  * camera's path from its origin, as far as p places that path. */
+/** Where the node ``path`` leads to from ``origin`` sits, as layout places
+ * it: ln of its p mass below the origin, and where its children start, in
+ * nats right of the origin's, as far as p places the path: ``placed`` of its
+ * branches. */
+export interface Reach {
+  lnMass: number;
+  x: number;
+  placed: number;
+}
+
+export function reach(tree: IntervalTree, lens: Lens, origin: NodeId, path: readonly Branch[]): Reach {
+  return reachOf(tree.raw, lens.p, lens.q, origin, Uint32Array.from(path)) as Reach;
+}
+
 export function extent(tree: IntervalTree, lens: Lens, cam: Camera, depth: number): { top: number; bottom: number } {
   return measureExtent(tree.raw, lens.p, lens.q, cam, depth) as { top: number; bottom: number };
 }

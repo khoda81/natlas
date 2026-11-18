@@ -128,14 +128,16 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const known = () => frame.known(tree, { p: 0, q: 0 }, ROOT);
     const c = canvas(dpr), ctx = c.getContext("2d")!;
     draw(ctx, frame, camera, view, palette, { ...state, glyph, timeline, known });
-    const shaded = fill.map((v, i) => v + 0.16 * (ink[i]! - v));
+    // Shaded time is ink over the window's own base, which the rest of it shows.
+    const base = rgb(palette.scheme.window);
+    const shaded = base.map((v, i) => v + 0.16 * (ink[i]! - v));
     const pixels = ctx.getImageData(0, 0, c.width, c.height).data;
     const at = (x: number, y: number) => 4 * (Math.floor(y * dpr) * c.width + Math.floor(x * dpr));
     const error = Math.max(differs(pixels, at(40, 70), shaded), differs(pixels, at(60, 70), ink),
-      differs(pixels, at(100, 70), fill), differs(pixels, at(120, 250), shaded), differs(pixels, at(140, 250), ink),
-      differs(pixels, at(148, 250), fill),
+      differs(pixels, at(100, 70), base), differs(pixels, at(120, 250), shaded), differs(pixels, at(140, 250), ink),
+      differs(pixels, at(148, 250), base),
       // Behind 30 the intervals back to 24 and to 12 shaded as the trail says, and before it nothing.
-      differs(pixels, at(27, 70), shaded), differs(pixels, at(18, 250), shaded), differs(pixels, at(8, 70), fill));
+      differs(pixels, at(27, 70), shaded), differs(pixels, at(18, 250), shaded), differs(pixels, at(8, 70), base));
     results.push({ name: "time branches are one CDF on the timeline", dpr, phase: 0, error });
     frame.dispose();
   }

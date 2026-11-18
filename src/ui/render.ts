@@ -180,7 +180,7 @@ export function draw(
   ctx.fillStyle = scheme.tile;
   ctx.fill();
   if (state.timeline !== null) {
-    timeCdfs(ctx, spans, state.timeline, view, state.known, (node, branch) => state.glyph(node, branch).time, palette.ink);
+    timeCdfs(ctx, spans, state.timeline, view, state.known, (node, branch) => state.glyph(node, branch).time, scheme.window, palette.ink);
   }
   ctx.beginPath();
   for (const node of spans.values()) {
@@ -321,8 +321,8 @@ interface Painted {
  * each known one lands on, however thin, and crosses straight over the
  * unknown ones between. The time they move over, from where the path is,
  * and behind it each interval between the times the path stood at before,
- * are shaded as the reading says. Clipped to the node's children in those
- * rows: a window onto the timeline. */
+ * are shaded as the reading says, over a base of their own. Clipped to the
+ * node's children in those rows: a window onto the timeline. */
 function timeCdfs(
   ctx: CanvasRenderingContext2D,
   spans: Map<NodeId, Painted[]>,
@@ -330,6 +330,7 @@ function timeCdfs(
   view: Viewport,
   known: (node: NodeId) => readonly Known[],
   timeOf: (node: NodeId, branch: number) => { from: number; to: number; shaded: boolean; trail: Trail | null } | undefined,
+  base: string,
   ink: string,
 ): void {
   // Far-off coordinates lose precision and can stall rasterizing.
@@ -364,6 +365,8 @@ function timeCdfs(
       ctx.beginPath();
       ctx.rect(-OVERSCAN, top, view.width + 2 * OVERSCAN, bottom - top);
       ctx.clip();
+      ctx.fillStyle = base;
+      ctx.fill();
       ctx.fillStyle = ctx.strokeStyle = ink;
       ctx.beginPath();
       // Back from ``from``, each interval the trail shades. Time only moves

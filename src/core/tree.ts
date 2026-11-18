@@ -101,6 +101,14 @@ export class IntervalTree {
     return [...this.raw.chain(origin, id)];
   }
 
+  /** Ranges of branches, each [start, end), drawn together: in a node, a
+   * group's children are drawn as wide as their mean, so they read as one. */
+  setGroups(groups: readonly (readonly [Branch, Branch])[]): void {
+    this.raw.setGroups(Uint32Array.from(groups, ([start]) => start), Uint32Array.from(groups, ([, end]) => end));
+    this.revision++;
+    for (const listener of this.listeners) listener();
+  }
+
   /** Whether `measure` has said anything of the node's children. */
   has(id: NodeId, measure: number): boolean {
     return this.raw.has(id, measure);

@@ -166,6 +166,19 @@ export class NoteLabels implements Labels {
     }
   }
 
+  /** The runs of shift events in the vocabulary, as branch ranges: a
+   * node's time branches, drawn as one. */
+  timeGroups(): [Branch, Branch][] {
+    const groups: [Branch, Branch][] = [];
+    this.file.events.forEach(([type], branch) => {
+      if (type !== "shift") return;
+      const last = groups[groups.length - 1];
+      if (last !== undefined && last[1] === branch) last[1] = branch + 1;
+      else groups.push([branch, branch + 1]);
+    });
+    return groups;
+  }
+
   /** The notes a path writes, as MuScriptor's own decoder reads its windows in turn. */
   transcribe(path: readonly Branch[]): Transcript {
     let score = START;
@@ -261,6 +274,7 @@ export class NoteLabels implements Labels {
         return true;
       },
       timeline: () => panel.timeline(),
+      groups: () => this.timeGroups(),
     };
   }
 }

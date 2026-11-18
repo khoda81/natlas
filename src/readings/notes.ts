@@ -7,7 +7,7 @@
 // which the panel draws and can play.
 
 import { clock, DRUM_PROGRAM, pitchName, tint } from "./music";
-import { type Glyph, type Labels, type Measure, type Page, type Reading, States } from "./reading";
+import { type Glyph, type Labels, type Measure, type Page, type Reading, States, type Trail } from "./reading";
 import { ScorePanel } from "./roll";
 import type { IntervalTree, Branch, NodeId } from "../core/tree";
 
@@ -53,6 +53,8 @@ export interface Score {
   spoiled: boolean;
   /** The last window's EOS came. */
   ended: boolean;
+  /** Where time stood before it came to where it is now. */
+  trail: Trail | null;
 }
 
 /** Times are shift steps from the first window's start. */
@@ -84,7 +86,7 @@ export interface Transcript {
 /** What a transcript file says it is. */
 const PATH_KIND = "natlas.transcript";
 
-const START: Score = { window: 0, tick: 0, program: null, velocity: null, prologue: true, spoiled: false, ended: false };
+const START: Score = { window: 0, tick: 0, program: null, velocity: null, prologue: true, spoiled: false, ended: false, trail: null };
 export class NoteLabels implements Labels {
   private readonly instruments: Map<number, string>;
   private readonly drums: Map<number, string>;
@@ -112,7 +114,7 @@ export class NoteLabels implements Labels {
     const [type, value] = this.event(branch);
     if (type === "EOS") {
       if (score.window + 1 >= this.heard.windows) return { ...score, ended: true };
-      return { ...START, window: score.window + 1 };
+      return { ...START, window: score.window + 1, trail: this.moved(score, (score.window + 1) * this.span) };
     }
     if (score.prologue) {
       if (type === "tie") return { ...score, prologue: false, velocity: null };
@@ -121,10 +123,16 @@ export class NoteLabels implements Labels {
       return score;
     }
     if (score.spoiled) return score;
-    if (type === "shift") return value > 0 ? { ...score, tick: value } : score;
+    if (type === "shift") return value > 0 ? { ...score, tick: value, trail: this.moved(score, score.window * this.span + value) } : score;
     if (type === "program") return { ...score, program: value };
     if (type === "velocity") return { ...score, velocity: value };
     return score;
+  }
+
+  /** The trail of time moved from ``score`` to ``to``: where it stood joins it. */
+  private moved(score: Score, to: number): Trail | null {
+    const at = score.window * this.span + score.tick;
+    return at === to ? score.trail : { at, before: score.trail };
   }
 
   /** ``path`` as a transcript file: its events by name, which outlive the labels' numbering. */
@@ -170,7 +178,7 @@ export class NoteLabels implements Labels {
         const seconds = this.seconds(start + value);
         // Under a second, in milliseconds: shifts are steps of 10 ms.
         const text = seconds < 1 ? `${Math.round(seconds * 1000)} ms` : clock(seconds);
-        return { text, mark: "time", time: { from: start + score.tick, to: start + value } };
+        return { text, mark: "time", time: { from: start + score.tick, to: start + value, trail: score.trail } };
       }
       case "tie":
         return { text: "tie", mark: "tie" };

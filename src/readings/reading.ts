@@ -10,9 +10,16 @@ export interface Glyph {
   text: string;
   mark?: Mark;
   tint?: string;
-  /** Where the event moves time from and to, in the reading's time: what a
-   * timeline shows in place of the text. */
-  time?: { from: number; to: number };
+  /** Where the event moves time from and to, in the reading's time, and
+   * where it stood before ``from``: what a timeline shows in place of the text. */
+  time?: { from: number; to: number; trail: Trail | null };
+}
+
+/** The times a path's time stood at, newest first. A path's is its
+ * parent's with at most one more, which it shares. */
+export interface Trail {
+  at: number;
+  before: Trail | null;
 }
 
 /** Where a reading draws its time across the page. */

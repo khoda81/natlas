@@ -50,10 +50,14 @@ describe("NoteLabels", () => {
     expect(labels.glyph(at(path.slice(0, 5)), pitch(52))).toMatchObject({ text: "E3", mark: "offset" });
     expect(labels.glyph(at(path.slice(0, 7)), pitch(48))).toMatchObject({ text: "C3", mark: "onset" });
     expect(labels.glyph(at([]), program(24))).toMatchObject({ text: "acoustic guitar", mark: "instrument" });
-    // A shift moves time from where the path is to where it says, in shift steps.
-    expect(labels.glyph(at([]), shift(123))).toEqual({ text: "31.23 s", mark: "time", time: { from: 0, to: 123 } });
-    expect(labels.glyph(at([eos]), shift(123))).toEqual({ text: "36.23 s", mark: "time", time: { from: 500, to: 623 } });
-    expect(labels.glyph(at(path.slice(0, 4)), shift(28))).toMatchObject({ time: { from: 5, to: 28 } });
+    // A shift moves time from where the path is to where it says, in shift
+    // steps; the trail is where time stood before, newest first.
+    expect(labels.glyph(at([]), shift(123))).toEqual({ text: "31.23 s", mark: "time", time: { from: 0, to: 123, trail: null } });
+    expect(labels.glyph(at([eos]), shift(123))).toEqual({ text: "36.23 s", mark: "time", time: { from: 500, to: 623, trail: { at: 0, before: null } } });
+    expect(labels.glyph(at(path.slice(0, 4)), shift(28))).toMatchObject({ time: { from: 5, to: 28, trail: { at: 0, before: null } } });
+    // A shift to where time already is leaves no trail; an EOS from a window's end neither.
+    expect(at([...path.slice(0, 4), shift(5), shift(28)]).trail).toEqual({ at: 5, before: { at: 0, before: null } });
+    expect(at([...path.slice(0, 4), shift(500), eos]).trail).toEqual({ at: 5, before: { at: 0, before: null } });
     expect(labels.glyph(at([]), eos)).toEqual({ text: "⇥ 35 s", mark: "end" });
     expect(labels.glyph(at([eos, eos]), eos)).toEqual({ text: "end", mark: "end" });
   });

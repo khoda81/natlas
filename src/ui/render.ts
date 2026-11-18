@@ -4,7 +4,7 @@ import { decimalTicks, layoutTicks } from "@qbar/qbar";
 import type { Palette } from "./color";
 import type { Box, Camera, Frame, Known, Selection, Viewport } from "../core/layout";
 import type { NodeId } from "../core/tree";
-import type { Glyph, Mark, Timeline } from "../readings/reading";
+import type { Glyph, Mark, Timeline, Trail } from "../readings/reading";
 
 export interface Units {
   name: string;
@@ -320,15 +320,16 @@ interface Painted {
  * across the same pixels: down a run of them, the line stands at the time
  * each known one lands on, however thin, and crosses straight over the
  * unknown ones between; the time they move over, from where the path is,
- * is shaded. Clipped to the node's children in those rows: a window onto
- * the timeline. */
+ * is shaded, and behind it every other interval between the times the path
+ * stood at before. Clipped to the node's children in those rows: a window
+ * onto the timeline. */
 function timeCdfs(
   ctx: CanvasRenderingContext2D,
   spans: Map<NodeId, Painted[]>,
   timeline: Timeline,
   view: Viewport,
   known: (node: NodeId) => readonly Known[],
-  timeOf: (node: NodeId, branch: number) => { from: number; to: number } | undefined,
+  timeOf: (node: NodeId, branch: number) => { from: number; to: number; trail: Trail | null } | undefined,
   ink: string,
 ): void {
   // Far-off coordinates lose precision and can stall rasterizing.
@@ -365,6 +366,17 @@ function timeCdfs(
       ctx.clip();
       ctx.fillStyle = ctx.strokeStyle = ink;
       ctx.beginPath();
+      // Back from ``from``, the interval just behind it clear, the one
+      // before that shaded, and so on. Time only moves on, so the rest of
+      // the trail lies left of the view once one time does.
+      let newer = from;
+      let shaded = false;
+      for (let trail = start.trail; trail !== null && -OVERSCAN < newer; trail = trail.before) {
+        const older = x(trail.at);
+        if (shaded) ctx.rect(older, top, newer - older, bottom - top);
+        shaded = !shaded;
+        newer = older;
+      }
       ctx.moveTo(from, top);
       for (const [px, py] of line) ctx.lineTo(px, py);
       ctx.lineTo(from, bottom);

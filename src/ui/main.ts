@@ -17,12 +17,14 @@ import {
   view,
   type Viewport,
 } from "../core/layout";
-import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest } from "../data/source";
+import { parse } from "../data/catalog";
+import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, manifest, type Specs } from "../data/source";
 import { type Branch, IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
 import { glide, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, serializeView, viewKey } from "./view-state";
 import { Palette } from "./color";
+import { describe, heard, MeasurePicker } from "./measures";
 import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, rulerCaption, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
@@ -103,15 +105,16 @@ export class App {
   private pendingView: { id: string; view: SavedView } | null = null;
   private readonly readout = element<HTMLElement>("readout");
   private readonly status = element<HTMLElement>("status");
-  private readonly pSelect = element<HTMLSelectElement>("p");
-  private readonly qSelect = element<HTMLSelectElement>("q");
+  /** Choosing p and q, from the dataset's catalog. */
+  private pickers: { p: MeasurePicker; q: MeasurePicker } | null = null;
   private readonly unitsButton = element<HTMLButtonElement>("units");
 
   private tree: IntervalTree | null = null;
   private link: Link | null = null;
   private dataset: Dataset | null = null;
   private reading: Reading | null = null;
-  private lens: Lens = { p: 0, q: 0 };
+  /** The measures in view, by spec. */
+  private specs: Specs = { p: "", q: "" };
   private cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
   private view: Viewport = { width: 1, height: 1 };
   private pixelRatio = 1;
@@ -152,9 +155,7 @@ export class App {
     this.bindPointer();
     this.bindKeys();
     this.bindEditor();
-    this.pSelect.addEventListener("change", () => this.setLens({ ...this.lens, p: Number(this.pSelect.value) }));
-    this.qSelect.addEventListener("change", () => this.setLens({ ...this.lens, q: Number(this.qSelect.value) }));
-    element("swap").addEventListener("click", () => this.setLens({ p: this.lens.q, q: this.lens.p }));
+    element("swap").addEventListener("click", () => this.setSpecs({ p: this.specs.q, q: this.specs.p }));
     this.unitsButton.textContent = rulerCaption(this.units);
     this.unitsButton.addEventListener("click", () => this.toggleUnits());
     element("help-toggle").addEventListener("click", () => this.toggleHelp());
@@ -197,6 +198,11 @@ export class App {
     }
   }
 
+  /** The measures in view, by their numbers in the tree. */
+  private get lens(): Lens {
+    return { p: this.tree!.measure(this.specs.p), q: this.tree!.measure(this.specs.q) };
+  }
+
   private setDataset(dataset: Dataset): void {
     this.flushView();
     this.loading++;
@@ -211,10 +217,9 @@ export class App {
     this.nodeStatistics = null;
     this.glyphs.clear();
     this.cancelNavigation();
-    const tree = new IntervalTree(dataset.measures.length);
+    const tree = new IntervalTree();
     this.dataset = dataset;
     this.tree = tree;
-    this.reading = dataset.labels.read(tree, () => this.invalidate());
     this.link = new Link(tree, dataset.server);
     let failing = false;
     this.link.onError = (error) => {
@@ -229,10 +234,23 @@ export class App {
       this.invalidate();
     });
     element("title").textContent = dataset.title;
-    for (const select of [this.pSelect, this.qSelect]) {
-      select.replaceChildren(...dataset.measures.map((name, index) => new Option(name, String(index))));
-    }
-    element("lens").hidden = dataset.measures.length <= 1;
+    const failed = (error: unknown) => {
+      if (dataset === this.dataset) this.setStatus(String(error));
+    };
+    const picker = (label: "p" | "q") => new MeasurePicker(label, dataset.catalog, dataset.recordings,
+      (spec) => this.setSpecs({ ...this.specs, [label]: spec }), failed);
+    this.pickers = { p: picker("p"), q: picker("q") };
+    element("p").replaceChildren(this.pickers.p.element);
+    element("q").replaceChildren(this.pickers.q.element);
+    const [source, ...rest] = dataset.catalog.parameters;
+    element("lens").hidden = rest.length === 0 && source?.kind === "choice" && source.options.length <= 1;
+    // A recording p names is read once the server says what it is.
+    dataset.recordings?.list().then(() => {
+      if (dataset !== this.dataset) return;
+      this.pickers!.p.set(this.specs.p);
+      this.pickers!.q.set(this.specs.q);
+      this.read();
+    }, failed);
     this.editing = false;
     this.draft = null;
     this.shownText = "";
@@ -266,7 +284,8 @@ export class App {
     this.pathPanel.hidden = this.where.hidden = !dataset.searchable;
     this.details.replaceChildren();
     this.inspect.hidden = true;
-    this.setLens({ p: 0, q: 0 });
+    this.specs = { p: "", q: "" };
+    this.setSpecs({ p: dataset.catalog.start, q: dataset.catalog.start });
     this.reset();
     const saved = this.readView(dataset);
     if (saved !== null) void this.restore(saved);
@@ -297,7 +316,7 @@ export class App {
    * walk down from its origin has placed that node.
    */
   private async restore(saved: SavedView): Promise<void> {
-    this.setLens({ p: saved.p, q: saved.q });
+    this.setSpecs({ p: saved.p, q: saved.q });
     const tree = this.tree!;
     const origin = tree.descend(tree.root, saved.origin);
     const node = tree.descend(origin, saved.anchor.path);
@@ -459,18 +478,32 @@ export class App {
     this.invalidate();
   }
 
-  private setLens(lens: Lens): void {
+  private setSpecs(specs: Specs): void {
+    if (this.pickers === null) return;
     this.cancelNavigation();
     this.focus = null;
     this.result.hidden = true;
+    const p = specs.p !== this.specs.p;
     // Digits are fractions of p's mass: under another p only the path holds.
-    if (lens.p !== this.lens.p) this.cam.anchor = top(this.cam.anchor.path);
-    this.lens = lens;
-    this.pSelect.value = String(lens.p);
-    this.qSelect.value = String(lens.q);
+    if (p) this.cam.anchor = top(this.cam.anchor.path);
+    this.specs = specs;
+    this.pickers.p.set(specs.p);
+    this.pickers.q.set(specs.q);
+    if (p) this.read();
     this.found = null;
     this.searchGeneration++;
     this.where.classList.remove("found");
+    this.invalidate();
+  }
+
+  /** Read paths as p does: a reading may follow what p hears. */
+  private read(): void {
+    const dataset = this.dataset!;
+    const { catalog, recordings } = dataset;
+    const p = { values: parse(catalog, this.specs.p), recording: heard(catalog, this.specs.p, recordings) };
+    this.reading = dataset.labels.read(this.tree!, () => this.invalidate(), p);
+    this.glyphs.clear();
+    this.shown = "";
     this.invalidate();
   }
 
@@ -531,7 +564,7 @@ export class App {
     this.frame = frame;
     if (previous !== null && previous !== frame) previous.dispose();
     // What the camera looks at, at the picture's finest: physical rows.
-    this.link?.look(this.lens, view(tree, this.lens, this.cam, this.view, this.view.height * this.pixelRatio));
+    this.link?.look(this.specs, view(tree, this.lens, this.cam, this.view, this.view.height * this.pixelRatio));
     this.reachOut(frame);
     this.updateHover();
     const ancestors = new Set<string>();
@@ -580,14 +613,15 @@ export class App {
   /** What the view says while the origin has no children to draw. */
   private originNote(tree: IntervalTree): { text: string; loading: boolean } | null {
     const { origin } = this.cam;
-    const measures = [...new Set([this.lens.p, this.lens.q])];
+    const specs = [...new Set([this.specs.p, this.specs.q])];
     if (tree.ended(origin, this.lens.p)) return { text: "The sequence ends here · press 0 for the root", loading: false };
-    if (measures.some((measure) => this.link!.lacks(origin, measure))) {
+    if (specs.some((spec) => this.link!.lacks(origin, tree.measure(spec)))) {
       return { text: "This recording does not continue here · press 0 for the root", loading: false };
     }
-    const waiting = measures.filter((measure) => !tree.has(origin, measure));
+    const waiting = specs.filter((spec) => !tree.has(origin, tree.measure(spec)));
     if (waiting.length === 0) return null;
-    return { text: `Loading ${waiting.map((measure) => this.dataset!.measures[measure]).join(" and ")} …`, loading: true };
+    const { catalog, recordings } = this.dataset!;
+    return { text: `Loading ${waiting.map((spec) => describe(catalog, spec, recordings)).join(" and ")} …`, loading: true };
   }
 
   /** Draw the previous view over this one, fading and growing as if passed through. */
@@ -780,7 +814,7 @@ export class App {
           case "b":
             return this.toggleUnits(), true;
           case "s":
-            return this.setLens({ p: this.lens.q, q: this.lens.p }), true;
+            return this.setSpecs({ p: this.specs.q, q: this.specs.p }), true;
           case "?":
             return this.toggleHelp(), true;
           case "Escape":
@@ -802,6 +836,13 @@ export class App {
       event.preventDefault();
       const files = [...(event.dataTransfer?.files ?? [])];
       if (files.length === 0) return;
+      // A recording dropped on a server whose measures hear one is what p hears.
+      const [audio] = files;
+      if (files.length === 1 && audio!.type.startsWith("audio/") && this.dataset?.recordings != null) {
+        this.setStatus(`Uploading ${audio!.name} …`);
+        this.pickers!.p.hear(audio!).then(() => this.setStatus(""), (error: unknown) => this.setStatus(String(error)));
+        return;
+      }
       const generation = ++this.loading;
       try {
         const dataset = await droppedDataset(files);
@@ -898,7 +939,7 @@ export class App {
       this.result.classList.add("busy");
     }
     try {
-      const path = this.found?.text === text ? this.found.path : await dataset.search(text, this.lens.p);
+      const path = this.found?.text === text ? this.found.path : await dataset.search(text);
       if (generation !== this.searchGeneration || dataset !== this.dataset) return;
       this.result.classList.remove("busy");
       this.found = { text, path: [...path] };
@@ -1091,13 +1132,13 @@ export class App {
 
     const last = box.branch === null ? "…" : this.glyph(box.node, box.branch).text;
     const { p, q } = this.lens;
-    const names = this.dataset?.measures ?? [];
+    const name = (spec: string) => describe(this.dataset!.catalog, spec, this.dataset!.recordings);
     const known = !Number.isNaN(box.q);
     const rows: [string, string][] = [
-      [`p · ${names[p]}`, `${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
+      [`p · ${name(this.specs.p)}`, `${box.p.toPrecision(4)}  (${this.fmt(-Math.log(box.p))})`],
     ];
     if (p !== q || box.kind === "gap") {
-      rows.push([`q · ${names[q]}`, known ? `${box.q.toPrecision(4)}  (${this.fmt(-Math.log(box.q))})` : "not yet known"]);
+      rows.push([`q · ${name(this.specs.q)}`, known ? `${box.q.toPrecision(4)}  (${this.fmt(-Math.log(box.q))})` : "not yet known"]);
     }
     rows.push(["p · −log q", known ? this.fmt(-box.p * Math.log(box.q)) : "not yet known"]);
     rows.push([this.cam.origin === tree.root ? "−log P (path)" : "−log P (from origin)", this.fmt(-box.lnMass)]);
@@ -1148,7 +1189,7 @@ export class App {
     if (!this.storage) return null;
     try {
       const raw = localStorage.getItem(viewKey(dataset.id));
-      return raw === null ? null : parseView(raw, dataset.measures.length);
+      return raw === null ? null : parseView(raw);
     } catch (error) {
       this.storage = false;
       console.warn("Could not read the saved natlas view", error);
@@ -1162,7 +1203,7 @@ export class App {
     const { origin, x, k, anchor, a } = this.cam;
     this.pendingView = {
       id: this.dataset.id,
-      view: { origin: this.tree.path(origin), anchor, x, k, a, ...this.lens },
+      view: { origin: this.tree.path(origin), anchor, x, k, a, ...this.specs },
     };
     this.saveTimer = window.setTimeout(() => this.flushView(), SAVE_MS);
   }

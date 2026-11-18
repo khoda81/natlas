@@ -5,11 +5,12 @@ import { TextLabels } from "../src/readings/labels";
 import { type Camera, type Frame, top, type Viewport } from "../src/core/layout";
 import type { IntervalTree, Lens } from "../src/core/tree";
 import { digits, run } from "./build";
-import type { Dataset } from "../src/data/source";
+import { named } from "../src/data/catalog";
+import type { Dataset, Specs } from "../src/data/source";
 
 interface Driver {
   setDataset(dataset: Dataset): void;
-  setLens(lens: Lens): void;
+  setSpecs(specs: Specs): void;
   render(time: number): void;
   invalidate(): void;
   resize(): void;
@@ -60,7 +61,7 @@ let liveLabels: TextLabels | null = null;
 
 function setup(count: number, zipf: boolean, deep = false, real = false) {
   const dataset: Dataset = { id: "benchmark", name: "benchmark", title: `Frame benchmark · ${count.toLocaleString()} branches`,
-    measures: zipf ? ["p", "q"] : ["p"],
+    catalog: named(zipf ? ["p", "q"] : ["p"]), recordings: null,
     // A server that never answers, like a busy live model.
     server: { connect: () => ({ demand() {}, close() {} }) },
     labels: real ? liveLabels! : labels, searchable: true, search: async () => [0] };
@@ -71,16 +72,16 @@ function setup(count: number, zipf: boolean, deep = false, real = false) {
   const root = real
     ? run(live!.listing.lnWeights.map(Math.exp), live!.listing.branches, 0, 0)
     : run(weights.map((w) => w / total), branches, 0, 0);
-  driver.tree.insert(0n, 0, { runs: [root] });
+  driver.tree.insert(0n, driver.tree.measure("p"), { runs: [root] });
   if (zipf) {
-    driver.tree.insert(0n, 1, { runs: [{ ...root, branches: branches.toReversed() }] });
-    driver.setLens({ p: 0, q: 1 });
+    driver.tree.insert(0n, driver.tree.measure("q"), { runs: [{ ...root, branches: branches.toReversed() }] });
+    driver.setSpecs({ p: "p", q: "q" });
   }
   if (deep) {
     let node = 0n;
     for (let depth = 0; depth < 80; depth++) {
       node = driver.tree.child(node, depth % 3);
-      driver.tree.insert(node, 0, { runs: [run([0.6, 0.3, 0.1])] });
+      driver.tree.insert(node, driver.tree.measure("p"), { runs: [run([0.6, 0.3, 0.1])] });
     }
     const path = Array.from({ length: 80 }, (_, depth) => depth % 3);
     driver.cam = { origin: 0n, x: 125, k: 140, anchor: { path, digits: digits(0.6) }, a: 0.4 };

@@ -14,10 +14,10 @@
 # natwalk = { path = "../../natwalk", editable = true }
 # ///
 
-"""Export a language-model tree: natwalk discovers it with model p, the q measures follow.
+"""Export a language-model tree: natwalk discovers it with the first model, the q measures follow.
 
-A q measure is another model sharing p's tokenizer, ``context:N`` for p seeing
-only the last N tokens, or ``temperature:T`` for p at temperature T. Every
+A q measure is a spec (see lm.py) of any --model, all sharing the first
+one's tokenizer: ``Qwen3-0.6B`` or ``Qwen3-1.7B/temperature=1.6``. Every
 discovered node retains a complete vocabulary distribution in memory, so keep
 --nodes moderate.
 """
@@ -58,30 +58,32 @@ def main() -> None:
         nargs="?",
         default="The most interesting consequence of information theory is",
     )
-    parser.add_argument("--p", default="Qwen/Qwen3-1.7B", help="model that natwalk searches with")
     parser.add_argument(
-        "--q",
+        "--model",
         action="append",
-        help="q measure, repeatable: a model id, context:N, or temperature:T "
-        "(default Qwen/Qwen3-0.6B)",
+        help="Hugging Face model, repeatable; natwalk searches with the first (default Qwen/Qwen3-1.7B and Qwen/Qwen3-0.6B)",
     )
+    parser.add_argument("--q", action="append", help="q measure's spec, repeatable (default each other model)")
     parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B", help="tokenizer shared by all models")
     parser.add_argument("--nodes", type=int, default=600)
     parser.add_argument("--device", default=lm.default_device())
     parser.add_argument("--dtype", choices=lm.DTYPES, default="float32")
     parser.add_argument("--name", help="dataset file stem; default derives from the measures")
     args = parser.parse_args()
-    specs = args.q or ["Qwen/Qwen3-0.6B"]
+    models = args.model or ["Qwen/Qwen3-1.7B", "Qwen/Qwen3-0.6B"]
+    specs = args.q or [lm.model_name(model) for model in models[1:]]
 
     hf_app = _hf_app()
     device = args.device
-    language = lm.Transformers(args.p, device, args.dtype, tokenizer=args.tokenizer)
+    languages = lm.Languages(models, lambda model: lm.Transformers(model, device, args.dtype, tokenizer=args.tokenizer))
+    language = languages.first
+    catalog = lm.catalog(languages)
     # The tree's root is the empty text; natwalk searches from the prompt down.
     root = language.start
     prompt = tuple(language.encode(args.prompt))
     eos = tuple(language.eos)
 
-    print(f"discovering {args.nodes} nodes with {args.p} …", file=sys.stderr)
+    print(f"discovering {args.nodes} nodes with {models[0]} …", file=sys.stderr)
     cursor = hf_app.HFCursor(
         language.model,
         root + prompt,
@@ -105,19 +107,19 @@ def main() -> None:
         return lambda path: np.exp(measure.log_probs(root + tuple(path))).tolist()
 
     print(f"evaluating {', '.join(specs)} on the discovered tree …", file=sys.stderr)
-    measures = lm.measures(language, specs, lambda spec: lm.open_language(spec, device, args.dtype))
+    names = [catalog.start, *specs]
+    measures = [catalog.open(spec) for spec in names]
     recorded = snapshots(
         tree,
         extra=tuple(weights(measure) for measure in measures[1:]),
         start=prompt,
         ancestry=tuple(along(measure) for measure in measures),
     )
-    stem = "-".join(_slug(part.split("/")[-1]) for part in (args.p, *specs))
     write(
-        args.name or stem,
-        f"{args.prompt} · {args.p}",
+        args.name or "-".join(_slug(name) for name in names),
+        f"{args.prompt} · {lm.model_name(models[0])}",
         language.token_bytes(),
-        [measure.name for measure in measures],
+        names,
         recorded,
     )
 

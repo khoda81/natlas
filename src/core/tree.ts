@@ -55,10 +55,19 @@ export class IntervalTree {
   private readonly parents = new Map<NodeId, NodeId | null>([[ROOT, null]]);
   private readonly branches = new Map<NodeId, Branch>([[ROOT, -1]]);
   private readonly paths = new Map<NodeId, Branch[]>();
+  /** Each measure's number in this tree, by spec, given as it appears. */
+  private readonly measures = new Map<string, number>();
 
-  constructor(readonly measures: number) {
-    this.raw = new Tree(measures);
+  constructor() {
+    this.raw = new Tree();
     this.root = this.raw.root();
+  }
+
+  /** The number this tree gives the measure ``spec`` names. */
+  measure(spec: string): number {
+    let measure = this.measures.get(spec);
+    if (measure === undefined) this.measures.set(spec, measure = this.measures.size);
+    return measure;
   }
 
   child(parent: NodeId, branch: Branch): NodeId {

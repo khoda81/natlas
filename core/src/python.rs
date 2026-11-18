@@ -28,10 +28,8 @@ struct PythonSession {
 #[pymethods]
 impl PythonTree {
     #[new]
-    fn new(measures: usize) -> Self {
-        Self {
-            inner: Tree::new(measures),
-        }
+    fn new() -> Self {
+        Self { inner: Tree::new() }
     }
 
     /// The nodes from `node` down `path`, inclusive. A node this tree never

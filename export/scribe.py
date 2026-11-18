@@ -14,14 +14,14 @@
 # natlas-core = { path = "../core" }
 # ///
 
-"""Serve MuScriptor's tree of transcriptions of a recording to natlas, live.
+"""Serve MuScriptor's tree of transcriptions of recordings to natlas, live.
 
 MuScriptor transcribes music 5 seconds at a time, writing each window as
 MIDI-like events: a tie prologue naming the notes sustained into the window,
 then time shifts, instruments, note-ons and note-offs, pitches and drum hits,
-then EOS. A path here is one transcription of the whole recording from --at
-on, scrolling through the windows as ``TranscriptionModel.transcribe`` does
-with its prelude forcing:
+then EOS. A path here is one transcription of the whole recording from a
+time on, scrolling through the windows as ``TranscriptionModel.transcribe``
+does with its prelude forcing:
 
 * within a window, an event has MuScriptor's probability given that window's
   audio and the window's events so far, among the events that keep the path
@@ -29,7 +29,7 @@ with its prelude forcing:
 * EOS is the model's own decision; it ends the window and moves to the next;
 * a later window's tie prologue is forced from the notes the path leaves
   sounding, so those events have probability one; so is the first window's,
-  an empty one, when --at is 0 and nothing sounds before the recording;
+  an empty one, when it starts at 0 and nothing sounds before the recording;
 * a window that reaches MuScriptor's generation limit gets a forced EOS;
 * the last window's EOS ends the path.
 
@@ -44,21 +44,31 @@ order, as MuScriptor's encoder writes it. So every path is a transcription
 MuScriptor decodes in full, and its probability is the model's, given that
 it is one, as in natwalk's MuScriptor demo.
 
-The measures are the model itself, then each --q: another model size hearing
-the same recording, ``silence`` for the model hearing nothing (so p against
-it shows what the audio told the model), ``instruments:NAMES`` for the model
-told to expect those instruments, or ``temperature:T``. GET /labels.json
-describes the events, and GET /audio.wav is the recording from --at on.
+Every measure gives the events this one meaning, so any two compare. A
+measure's spec names the model size, and optionally ``audio=ID`` for a
+recording a page uploaded, the model hearing silence without one (so p
+against it shows what the audio told the model), ``at=SECONDS`` where its
+first window starts, ``instruments=NAMES`` for the model told to expect
+those instruments, ``temperature=T``, and ``shape=time-area`` for its time
+shifts drawn as one, keeping their area: ``medium/audio=3f2a9c/at=30``. Under
+silence a path goes on window after window; under a recording, its last
+window's EOS ends it.
+
+POST /recordings takes an audio file, any soundfile reads, and says its id;
+GET /recordings lists them, and GET /recordings/ID is one as the model
+hears it. GET /labels.json describes the events.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import io
 import json
 import math
 import sys
+import tempfile
 import wave
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -70,7 +80,9 @@ import lm
 import numpy as np
 import torch
 import torch.nn.functional as F
+import anyio.to_thread
 import uvicorn
+from catalog import Catalog, Choice, Number, Recording, Text
 from muscriptor import TranscriptionModel
 from muscriptor.events import ChunkBoundary, OpenNoteTracker
 from muscriptor.models.lm import TorchAutocast
@@ -79,7 +91,11 @@ from muscriptor.tokenizer.mt3 import (
     instrument_group_from_names,
     resolve_instrument_names,
 )
-from service import CACHE, Model, _slug, app
+from muscriptor.utils.audio import load_audio
+from service import CACHE, Model, app
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 SAMPLE_RATE = 16_000
 WINDOW_SECONDS = 5
@@ -114,9 +130,10 @@ class Window:
 
 
 class Windows:
-    """How paths run through the recording's windows; the same for every measure."""
+    """How paths run through a recording's windows from ``at`` seconds on:
+    ``count`` of them, or endless where it is None, as under silence."""
 
-    def __init__(self, model: TranscriptionModel, at: float, count: int, max_events: int):
+    def __init__(self, model: TranscriptionModel, at: float, count: int | None, max_events: int):
         self.tokenizer = model._tokenizer  # noqa: SLF001
         self.eos = self.tokenizer.eos_id
         self.at = at
@@ -130,7 +147,7 @@ class Windows:
         self.entered: OrderedDict[tuple[int, ...], tuple[Window, OpenNoteTracker]] = OrderedDict()
 
     def ends(self, path: tuple[int, ...]) -> bool:
-        return path.count(self.eos) >= self.count
+        return self.count is not None and self.count <= path.count(self.eos)
 
     def locate(self, path: tuple[int, ...]) -> tuple[Window, tuple[int, ...]]:
         """The window ``path`` ends in, and the events written in it so far, its prologue first."""
@@ -192,7 +209,7 @@ class Windows:
         return None
 
     def _boundary(self, index: int) -> ChunkBoundary:
-        following = self.at + (index + 1) * WINDOW_SECONDS if index + 1 < self.count else None
+        following = self.at + (index + 1) * WINDOW_SECONDS if self.count is None or index + 1 < self.count else None
         return ChunkBoundary(self.at + index * WINDOW_SECONDS, following)
 
     def _state(self, before: tuple[int, ...]) -> tuple[Window, OpenNoteTracker]:
@@ -239,7 +256,7 @@ class _Slot:
 
 
 class Scribe:
-    """MuScriptor transcribing a recording: each event's log-probability given the path before it.
+    """MuScriptor transcribing what it hears: each event's log-probability given the path before it.
 
     A few KV caches, one per window in reach, each stepped back to the prefix
     a request shares with what it holds, so walking down a path costs one
@@ -252,13 +269,11 @@ class Scribe:
     def __init__(
         self,
         model: TranscriptionModel,
-        name: str,
         windows: Windows,
         hear: Callable[[int], torch.Tensor],
         expect: str | None = None,
         slots: int = 2,
     ):
-        self.name = name
         self.model = model
         self.lm = model._model  # noqa: SLF001
         self.device = model._device  # noqa: SLF001
@@ -417,7 +432,7 @@ def time_area(rows: np.ndarray, time: np.ndarray) -> np.ndarray:
     return np.where(shifts, -width, ln_p).astype(np.float32)
 
 
-def labels_file(model: TranscriptionModel, windows: Windows) -> bytes:
+def labels_file(model: TranscriptionModel) -> bytes:
     tokenizer = model._tokenizer  # noqa: SLF001
     instruments = {program: model._instrument_for_program(program).replace("_", " ") for program in range(130)}  # noqa: SLF001
     return json.dumps(
@@ -425,14 +440,80 @@ def labels_file(model: TranscriptionModel, windows: Windows) -> bytes:
             "kind": "notes",
             "frameRate": tokenizer.frame_rate,
             "window": WINDOW_SECONDS,
-            "windows": windows.count,
-            "at": windows.at,
-            "audio": "audio.wav",
             "events": [[event.type, event.value] for event in tokenizer._vocab],  # noqa: SLF001
             "instruments": instruments,
             "drums": DRUMS,
         }
     ).encode()
+
+
+@dataclass(frozen=True)
+class Recorded:
+    """An uploaded recording, as the model hears it: mono at 16 kHz."""
+
+    name: str
+    samples: torch.Tensor
+
+    @property
+    def seconds(self) -> float:
+        return self.samples.shape[-1] / SAMPLE_RATE
+
+
+class Recordings:
+    """The recordings uploaded, by an id hashed from their bytes, so the
+    same file is the same recording however often it comes."""
+
+    def __init__(self):
+        self.held: dict[str, Recorded] = {}
+
+    def add(self, name: str, content: bytes) -> str:
+        """Decode a file and keep it; ValueError where it is no audio."""
+        id = hashlib.sha256(content).hexdigest()[:12]
+        if id not in self.held:
+            with tempfile.NamedTemporaryFile(suffix=Path(name).suffix) as file:
+                file.write(content)
+                file.flush()
+                try:
+                    samples = load_audio(file.name, target_sr=SAMPLE_RATE)
+                except Exception as error:
+                    raise ValueError(f"{name} is no audio soundfile reads: {error}") from error
+            if samples.shape[-1] == 0:
+                raise ValueError(f"{name} holds no sound")
+            self.held[id] = Recorded(name, samples)
+        return id
+
+    def __getitem__(self, id: str) -> Recorded:
+        if id not in self.held:
+            raise ValueError(f"no recording {id} on the server: upload it again")
+        return self.held[id]
+
+    def listed(self, id: str) -> dict:
+        recorded = self.held[id]
+        return {"id": id, "name": recorded.name, "seconds": recorded.seconds}
+
+    def routes(self) -> list[Route]:
+        async def upload(request: Request) -> Response:
+            name = request.query_params.get("name", "recording")
+            try:
+                id = await anyio.to_thread.run_sync(self.add, name, await request.body())
+            except ValueError as error:
+                return JSONResponse({"message": str(error)}, status_code=400)
+            return JSONResponse(self.listed(id))
+
+        async def listing(_: Request) -> Response:
+            return JSONResponse([self.listed(id) for id in self.held])
+
+        async def audio(request: Request) -> Response:
+            recorded = self.held.get(request.path_params["id"])
+            if recorded is None:
+                return Response(status_code=404)
+            return Response(await anyio.to_thread.run_sync(wav_file, recorded.samples), media_type="audio/wav")
+
+        return [
+            Route("/recordings", upload, methods=["POST"]),
+            Route("/recordings", listing),
+            Route("/recordings/{id}", audio),
+        ]
 
 
 def wav_file(samples: torch.Tensor) -> bytes:
@@ -465,15 +546,9 @@ def _load_model(size: str, device: torch.device, dtype: torch.dtype | None) -> T
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("audio", type=Path, help="any file soundfile reads: wav, mp3, flac, …")
-    parser.add_argument("--at", type=float, default=0.0, help="where the first 5-second window starts, in seconds")
-    parser.add_argument("--p", default="medium", choices=SIZES, help="the model size")
-    parser.add_argument(
-        "--q",
-        action="append",
-        default=[],
-        help="further measure, repeatable: a model size, silence, instruments:NAMES, temperature:T, or time-area: the model with its time shifts drawn as one, keeping their area",
-    )
+    parser.add_argument("audio", type=Path, nargs="*", help="recordings to offer from the start, any soundfile reads: wav, mp3, flac, …")
+    parser.add_argument("--at", type=float, default=0.0, help="where the first recording's first 5-second window starts, in seconds")
+    parser.add_argument("--size", default="medium", choices=SIZES, help="the model size to start from")
     parser.add_argument("--device", default=lm.default_device())
     parser.add_argument(
         "--dtype",
@@ -481,13 +556,11 @@ def main() -> None:
         help="precision of transformer weights and KV caches. Omit to use MuScriptor's device default",
     )
     parser.add_argument("--max-events", type=int, default=MAX_EVENTS, help="per window, counting its prologue and EOS")
-    parser.add_argument("--slots", type=int, default=2, help="KV caches per measure, each holding one window")
+    parser.add_argument("--slots", type=int, default=2, help="KV caches per transcriber, each holding one window")
     parser.add_argument("--cache", type=float, default=CACHE / 2**30, help=f"GiB of memory for the distributions it keeps, default {CACHE / 2**30:g}")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8421)
     args = parser.parse_args()
-    if any(spec.startswith("context:") for spec in args.q):
-        parser.error("context:N would cut the start token, which carries the audio")
 
     device = torch.device(args.device)
     dtype = lm.DTYPES[args.dtype] if args.dtype is not None else None
@@ -499,62 +572,82 @@ def main() -> None:
             models[size] = _load_model(size, device, dtype)
         return models[size]
 
-    primary = model_for(args.p)
-    wav = primary._load_wav(args.audio, None)  # noqa: SLF001
-    start = round(args.at * SAMPLE_RATE)
-    if start >= wav.shape[-1]:
-        parser.error(f"--at {args.at:g} is past the audio's end at {wav.shape[-1] / SAMPLE_RATE:.1f} s")
-    recording = wav[:, start:]
-    windows = Windows(primary, args.at, math.ceil(recording.shape[-1] / WINDOW_SAMPLES), args.max_events)
+    # Every size reads the same events: the first loaded names them.
+    primary = model_for(args.size)
+    recordings = Recordings()
+    offered = []
+    for audio in args.audio:
+        try:
+            offered.append(recordings.add(audio.name, audio.read_bytes()))
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+    time = Windows(primary, 0.0, None, args.max_events).kinds == "shift"
+    # A transcriber by what it hears and expects, shared by the measures
+    # that only reshape what it computes, so they share its caches too.
+    scribes: dict[tuple, tuple[Scribe, Windows]] = {}
 
-    def heard(index: int) -> torch.Tensor:
-        chunk = recording[:, index * WINDOW_SAMPLES : (index + 1) * WINDOW_SAMPLES]
-        return F.pad(chunk, (0, WINDOW_SAMPLES - chunk.shape[-1]))
+    def scribe(size: str, audio: str | None, at: float, instruments: str) -> tuple[Scribe, Windows]:
+        key = (size, audio, at, instruments)
+        if key not in scribes:
+            expect = None
+            if instruments:
+                names = resolve_instrument_names(instruments.split(","))
+                expect = instrument_group_from_names(names)
+            if audio is None:
+                windows = Windows(primary, at, None, args.max_events)
+                silence = torch.zeros(1, WINDOW_SAMPLES, device=device)
 
-    def silent(_: int) -> torch.Tensor:
-        return torch.zeros_like(recording[:, :WINDOW_SAMPLES])
+                def hear(_: int) -> torch.Tensor:
+                    return silence
+            else:
+                samples = recordings[audio].samples
+                start = round(at * SAMPLE_RATE)
+                if not 0 <= start < samples.shape[-1]:
+                    raise ValueError(f"at {at:g} s is outside the recording's {samples.shape[-1] / SAMPLE_RATE:.1f} s")
+                heard = samples[:, start:].to(device)
+                windows = Windows(primary, at, math.ceil(heard.shape[-1] / WINDOW_SAMPLES), args.max_events)
 
-    def scribe(size: str, name: str, hear: Callable[[int], torch.Tensor] = heard, expect: str | None = None) -> Scribe:
-        return Scribe(model_for(size), name, windows, hear, expect, args.slots)
+                def hear(index: int) -> torch.Tensor:
+                    chunk = heard[:, index * WINDOW_SAMPLES : (index + 1) * WINDOW_SAMPLES]
+                    return F.pad(chunk, (0, WINDOW_SAMPLES - chunk.shape[-1]))
 
-    own = scribe(args.p, f"muscriptor-{args.p}")
+            scribes[key] = (Scribe(model_for(size), windows, hear, expect, args.slots), windows)
+        return scribes[key]
 
-    def other(spec: str) -> Scribe | lm.Measure:
-        kind, _, value = spec.partition(":")
-        if spec in SIZES:
-            return scribe(spec, f"muscriptor-{spec}")
-        if spec == "time-area":
-            time = windows.kinds == "shift"
+    def open(values: dict) -> lm.Measure:
+        transcriber, windows = scribe(values["size"], values["audio"], values["at"], values["instruments"])
+        walk = lm.tempered(transcriber.walk, values["temperature"])
+        widths = values["shape"] == "time-area"
+        if widths:
+            plain = walk
 
             def walk(walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
-                return [time_area(rows, time) for rows in own.walk(walks)]
+                return [time_area(rows, time) for rows in plain(walks)]
 
-            return lm.Measure(f"{own.name} · time as one", walk, own.width, own.paths, own.longest, widths=True)
-        if spec == "silence":
-            return scribe(args.p, f"{own.name} · silence", silent)
-        if kind == "instruments":
-            names = resolve_instrument_names(value.split(","))
-            return scribe(args.p, f"{own.name} · expecting {', '.join(names)}", expect=instrument_group_from_names(names))
-        raise SystemExit(f"unknown measure {spec!r}: give a model size, silence, instruments:NAMES, temperature:T or time-area")
+        # The start token carries the audio: paths are read whole.
+        return lm.Measure(walk, transcriber.width, transcriber.paths, None, windows.ends, widths)
 
-    measures = lm.measures(own, args.q, other)
-    seconds = recording.shape[-1] / SAMPLE_RATE
-    manifest = [
-        {
-            "name": f"scribe-{_slug(args.audio.stem)}-{args.at:g}",
-            "title": f"{args.audio.stem} · {args.at:g}–{args.at + seconds:.0f} s · live",
-            "labels": "labels.json",
-            "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
-        }
-    ]
+    start = args.size
+    if offered:
+        start += f"/audio={offered[0]}" + (f"/at={args.at:g}" if args.at else "")
+    catalog = Catalog(
+        [
+            Choice("size", SIZES, args.size),
+            Recording("audio"),
+            Number("at", 0.0),
+            Text("instruments"),
+            Number("temperature", 1.0),
+            Choice("shape", ("none", "time-area"), "none"),
+        ],
+        open,
+        start,
+    )
+    manifest = [{"name": "scribe", "title": "MuScriptor · live", "labels": "labels.json", "catalog": catalog.describe()}]
     # MuScriptor's vocabulary is musical already: time shifts and pitches
     # ascending, so children keep its order.
-    model = Model(own.start, windows.ends, own.vocabulary, measures, round(args.cache * 2**30), "branch")
-    files = {
-        "labels.json": (labels_file(primary, windows), "application/json"),
-        "audio.wav": (wav_file(recording), "audio/wav"),
-    }
-    uvicorn.run(app(model, manifest, files), host=args.host, port=args.port, access_log=False)
+    model = Model((primary._model.initial_token_id,), primary._tokenizer.num_tokens, catalog.open, round(args.cache * 2**30), "branch")  # noqa: SLF001
+    files = {"labels.json": (labels_file(primary), "application/json")}
+    uvicorn.run(app(model, manifest, files, routes=recordings.routes()), host=args.host, port=args.port, access_log=False)
 
 
 if __name__ == "__main__":

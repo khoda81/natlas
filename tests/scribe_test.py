@@ -26,7 +26,7 @@ def token(kind: str, value: int = 0) -> int:
     return TOKENIZER._token_index[(kind, value)]  # noqa: SLF001
 
 
-def windows(at: float = 5.0, count: int = 3) -> scribe.Windows:
+def windows(at: float = 5.0, count: int | None = 3) -> scribe.Windows:
     return scribe.Windows(SimpleNamespace(_tokenizer=TOKENIZER), at, count, scribe.MAX_EVENTS)
 
 
@@ -47,7 +47,7 @@ class TimeAreaTests(unittest.TestCase):
 
 
 class ValidTests(unittest.TestCase):
-    def allowed(self, path: list[int], at: float = 5.0, count: int = 3) -> set[tuple[str, int]]:
+    def allowed(self, path: list[int], at: float = 5.0, count: int | None = 3) -> set[tuple[str, int]]:
         mask = windows(at, count).valid(tuple(path))
         return {(event.type, event.value) for event, ok in zip(TOKENIZER._vocab, mask, strict=True) if ok}  # noqa: SLF001
 
@@ -98,6 +98,15 @@ class ValidTests(unittest.TestCase):
         self.assertNotIn(("shift", 500), shifted)
         last = [token("tie"), EOS, token("tie"), EOS, token("tie")]
         self.assertIn(("shift", 700), self.allowed(last))
+
+    def test_under_silence_windows_go_on_and_each_keeps_its_time(self):
+        endless = windows(count=None)
+        path = (token("tie"), EOS) * 5
+        self.assertFalse(endless.ends(path))
+        self.assertTrue(windows().ends(path[:6]))
+        shifted = self.allowed([*path, token("tie")], count=None)
+        self.assertIn(("shift", 499), shifted)
+        self.assertNotIn(("shift", 500), shifted)
 
     def test_a_forced_later_prologue_leaves_its_instrument_set(self):
         played = [token("tie"), token("program", 24), token("velocity", 1), token("pitch", 60), EOS]

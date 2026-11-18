@@ -2,6 +2,7 @@
 // distribution geometry: text renders token bytes, music renders event paths.
 
 import type { IntervalTree, Branch, NodeId } from "../core/tree";
+import type { Values } from "../data/catalog";
 
 export type Mark = "onset" | "offset" | "tie" | "hit" | "time" | "instrument" | "end";
 
@@ -23,10 +24,17 @@ export interface Timeline {
   right: number;
 }
 
+/** The measure p, as a reading sees it: what its spec says, and the
+ * recording it hears where it hears one. */
+export interface Measure {
+  values: Values;
+  recording: { url: URL; seconds: number } | null;
+}
+
 export interface Labels {
-  /** ``changed`` is told when what glyphs show changes without the tree:
-   * a timeline that moved. */
-  read(tree: IntervalTree, changed: () => void): Reading;
+  /** Paths as ``p`` reads them. ``changed`` is told when what glyphs show
+   * changes without the tree: a timeline that moved. */
+  read(tree: IntervalTree, changed: () => void, p: Measure): Reading;
 }
 
 export interface Reading {

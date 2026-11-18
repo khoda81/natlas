@@ -9,7 +9,7 @@ const view = { width: 1234, height: 789 };
 const uniform = (count: number) => answer(Array(count).fill(1 / count), undefined, 0, 0);
 
 it("picks single children out of rows, and frames reuse buffers without touching live ones", () => {
-  const tree = new IntervalTree(1);
+  const tree = new IntervalTree();
   tree.insert(ROOT, 0, uniform(150000));
   const frame = layout(tree, lens, cam, view);
   // Every child is thinner than a row: no box, and at most a span a row.

@@ -3,14 +3,14 @@
 A measure is a model's next-token ln weights over the whole vocabulary, up
 to a constant, given the tokens so far, as a float32 numpy row; walking a path
 gives them after every prefix in turn, and one call walks several paths.
-Besides the model itself, a measure spec
-names another model sharing its tokenizer, ``context:N`` for the model seeing
-only the last N tokens, ``temperature:T`` for the model at temperature T, or
-``control:FILE`` for a .gguf model steered by a llama.cpp control vector (see
-steer.py).
+A spec names one of the models offered, all sharing the first one's
+tokenizer, and optionally ``temperature=T``, ``context=N`` for the model
+seeing only the last N tokens, and ``control=NAME`` for a .gguf model
+steered by one of the llama.cpp control vectors offered (see steer.py):
+``Qwen3-4B-Q6_K/temperature=1.6``.
 
 A model is a Hugging Face id, run by transformers, or a .gguf file, run by
-llama.cpp.
+llama.cpp, named by its last path component.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from typing import Protocol
 
 import numpy as np
 import torch
+from catalog import Catalog, Choice, Number
 
 # For each walk (tokens, start), the ln weights after tokens[:k] for every k
 # from start through len(tokens), a float32 row each, in order.
@@ -36,7 +37,6 @@ type Walk = Callable[[Sequence[tuple[Sequence[int], int]]], list[np.ndarray]]
 
 @dataclass(frozen=True)
 class Measure:
-    name: str
     walk: Walk
     # How many distributions one forward pass computes, and of how many
     # paths at most.
@@ -44,6 +44,8 @@ class Measure:
     paths: int
     # The most tokens a path it reads may hold, or None where nothing says.
     longest: int | None
+    # Whether a path is finished, with no children.
+    ends: Callable[[tuple[int, ...]], bool]
     # Whether its rows are each child's own ln weight, -ln of the width it
     # is drawn at, rather than ln weights up to a constant.
     widths: bool = False
@@ -464,42 +466,90 @@ def open_language(spec: str, device: str, dtype: str = "float32", tokenizer: str
     return Transformers(spec, device, dtype, tokenizer)
 
 
-def measures(own: Language, specs: Sequence[str], other: Callable[[str], Language | Measure]) -> list[Measure]:
-    """The model itself, then one measure per spec; ``other`` opens a model
-    a spec names, or makes a measure of its own."""
+def tempered(walk: Walk, temperature: float) -> Walk:
+    """``walk`` at another temperature: its ln weights divided by it."""
+    if not 0 < temperature:
+        raise ValueError(f"a temperature is positive, not {temperature:g}")
+    if temperature == 1:
+        return walk
+    return lambda walks: [rows / np.float32(temperature) for rows in walk(walks)]
 
-    def of(language: Language, name: str, temperature: float = 1.0) -> Measure:
+
+def measure(language: Language, temperature: float = 1.0, context: float | None = None) -> Measure:
+    """The model at ``temperature``, seeing only the last ``context`` tokens
+    where that is given."""
+    walk, width, longest = language.walk, language.width, language.longest
+    if context is not None:
+        n = int(context)
+        if n != context or n < 1:
+            raise ValueError(f"a context is a count of tokens, not {context:g}")
+
         def walk(walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
-            return [rows / np.float32(temperature) for rows in language.walk(walks)]
+            # Each position reads its own window, a path of its own.
+            windows = [tokens[:end][-n:] for tokens, start in walks for end in range(start, len(tokens) + 1)]
+            rows = iter([rows[0] for rows in language.walk([(tokens, len(tokens)) for tokens in windows])])
+            return [np.stack([next(rows) for _ in range(start, len(tokens) + 1)]) for tokens, start in walks]
 
-        return Measure(name, walk, language.width, language.paths, language.longest)
+        width = language.paths
+        # A window longer than the model reads fails on paths that long.
+        longest = None if language.longest is None or n <= language.longest else language.longest
+    eos = language.eos
+    return Measure(tempered(walk, temperature), width, language.paths, longest, lambda tokens: bool(tokens) and tokens[-1] in eos)
 
-    def measure(spec: str) -> Measure:
-        kind, _, value = spec.partition(":")
-        if kind == "context":
-            n = int(value)
 
-            def window(walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
-                # Each position reads its own window, a path of its own.
-                windows = [tokens[:end][-n:] for tokens, start in walks for end in range(start, len(tokens) + 1)]
-                rows = iter([rows[0] for rows in own.walk([(tokens, len(tokens)) for tokens in windows])])
-                return [np.stack([next(rows) for _ in range(start, len(tokens) + 1)]) for tokens, start in walks]
+def model_name(model: str) -> str:
+    """What a spec calls a Hugging Face id or a .gguf file."""
+    return Path(model).stem if model.endswith(".gguf") else model.split("/")[-1]
 
-            # A window longer than the model reads fails on paths that long.
-            longest = None if own.longest is None or n <= own.longest else own.longest
-            return Measure(f"{own.name} · last {n} tokens", window, own.paths, own.paths, longest)
-        if kind == "temperature":
-            t = float(value)
-            return of(own, f"{own.name} · T={t:g}", t)
-        if kind == "control":
-            if not isinstance(own, LlamaCpp):
+
+class Languages:
+    """The models offered, by name: the first opened at once, since its
+    tokenizer is every one's, the rest when first used, and each kept."""
+
+    def __init__(self, models: Sequence[str], open: Callable[[str], Language]):
+        self.models: dict[str, str] = {}
+        for model in models:
+            if model_name(model) in self.models:
+                raise ValueError(f"two models are called {model_name(model)}")
+            self.models[model_name(model)] = model
+        self._open = open
+        self.first = open(models[0])
+        self.opened: dict[str, Language] = {model_name(models[0]): self.first}
+
+    def __getitem__(self, name: str) -> Language:
+        if name not in self.opened:
+            language = self._open(self.models[name])
+            if language.vocabulary != self.first.vocabulary:
+                raise ValueError(
+                    f"{name} has {language.vocabulary} tokens and {self.first.name} {self.first.vocabulary}: they share no tokenizer"
+                )
+            self.opened[name] = language
+        return self.opened[name]
+
+
+def catalog(languages: Languages, controls: Sequence[Path] = ()) -> Catalog:
+    """Every model offered, at any temperature and context, steered by any
+    control vector offered where it is a .gguf model."""
+    vectors = {path.stem: path for path in controls}
+    steered: dict[tuple[str, str], LlamaCpp] = {}
+
+    def open(values: dict) -> Measure:
+        language = languages[values["model"]]
+        control = values.get("control", "none")
+        if control != "none":
+            if not isinstance(language, LlamaCpp):
                 raise ValueError("control vectors need a .gguf model")
-            steered = own.controlled(Path(value).expanduser())
-            return of(steered, steered.name)
-        language = other(spec)
-        return language if isinstance(language, Measure) else of(language, language.name)
+            key = (values["model"], control)
+            if key not in steered:
+                steered[key] = language.controlled(vectors[control])
+            language = steered[key]
+        return measure(language, values["temperature"], values["context"])
 
-    return [of(own, own.name), *(measure(spec) for spec in specs)]
+    names = tuple(languages.models)
+    parameters = [Choice("model", names, names[0]), Number("temperature", 1.0), Number("context", None)]
+    if vectors:
+        parameters.append(Choice("control", ("none", *vectors), "none"))
+    return Catalog(parameters, open, names[0])
 
 
 def start_of_text(tokenizer) -> tuple[int, ...]:

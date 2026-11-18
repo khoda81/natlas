@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file natlas/natlas.proto.
  */
 export const file_natlas_natlas: GenFile = /*@__PURE__*/
-  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMiQwoIQ2hpbGRyZW4SGQoEcnVucxgBIAMoCzILLm5hdGxhcy5SdW4SEgoFY291bnQYAiABKA1IAIgBAUIICgZfY291bnQiRgoDUnVuEgwKBHJhbmsYASABKA0SEAoIYnJhbmNoZXMYAiADKA0SEgoKbG5fd2VpZ2h0cxgDIAMoARILCgN0b3AYBCABKAwicgoGRGVtYW5kEgkKAXAYASABKA0SCQoBcRgCIAEoDRIfCgR2aWV3GAMgASgLMgwubmF0bGFzLlZpZXdIAIgBARIfCgRwYXRoGAQgASgLMgwubmF0bGFzLlBhdGhIAYgBAUIHCgVfdmlld0IHCgVfcGF0aCJRCgRWaWV3EgwKBG5vZGUYASABKAYSCwoDdG9wGAIgASgMEhEKCWxuX2hlaWdodBgDIAEoARIMCgRyb3dzGAQgASgBEg0KBXJpZ2h0GAUgASgBIiYKBFBhdGgSDAoEbm9kZRgBIAEoBhIQCghicmFuY2hlcxgCIAMoDSIqCgdVcGRhdGVzEh8KB3VwZGF0ZXMYASADKAsyDi5uYXRsYXMuVXBkYXRlIqkBCgZVcGRhdGUSIAoGYW5zd2VyGAEgASgLMg4ubmF0bGFzLkFuc3dlckgAEhEKB3Vua25vd24YAiABKAZIABIeCgZwbGFjZWQYAyABKAsyDC5uYXRsYXMuUGF0aEgAEiAKBWxhY2tzGAQgASgLMg8ubmF0bGFzLk1pc3NpbmdIABIgCgZmYWlsZWQYBSABKAsyDi5uYXRsYXMuRmFpbGVkSABCBgoEa2luZCKLAQoGQW5zd2VyEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhITCgZwYXJlbnQYAyABKAZIAIgBARITCgZicmFuY2gYBCABKA1IAYgBARIiCghjaGlsZHJlbhgFIAEoCzIQLm5hdGxhcy5DaGlsZHJlbkIJCgdfcGFyZW50QgkKB19icmFuY2giKAoHTWlzc2luZxIPCgdtZWFzdXJlGAEgASgNEgwKBG5vZGUYAiABKAYiOAoGRmFpbGVkEg8KB21lYXN1cmUYASABKA0SDAoEbm9kZRgCIAEoBhIPCgdtZXNzYWdlGAMgASgJIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIj0KCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEiIKCGNoaWxkcmVuGAMgASgLMhAubmF0bGFzLkNoaWxkcmVuMkEKBk5hdGxhcxI3CgZTZWFyY2gSFS5uYXRsYXMuU2VhcmNoUmVxdWVzdBoWLm5hdGxhcy5TZWFyY2hSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("ChNuYXRsYXMvbmF0bGFzLnByb3RvEgZuYXRsYXMiQwoIQ2hpbGRyZW4SGQoEcnVucxgBIAMoCzILLm5hdGxhcy5SdW4SEgoFY291bnQYAiABKA1IAIgBAUIICgZfY291bnQiRgoDUnVuEgwKBHJhbmsYASABKA0SEAoIYnJhbmNoZXMYAiADKA0SEgoKbG5fd2VpZ2h0cxgDIAMoARILCgN0b3AYBCABKAwicgoGRGVtYW5kEgkKAXAYASABKAkSCQoBcRgCIAEoCRIfCgR2aWV3GAMgASgLMgwubmF0bGFzLlZpZXdIAIgBARIfCgRwYXRoGAQgASgLMgwubmF0bGFzLlBhdGhIAYgBAUIHCgVfdmlld0IHCgVfcGF0aCJRCgRWaWV3EgwKBG5vZGUYASABKAYSCwoDdG9wGAIgASgMEhEKCWxuX2hlaWdodBgDIAEoARIMCgRyb3dzGAQgASgBEg0KBXJpZ2h0GAUgASgBIiYKBFBhdGgSDAoEbm9kZRgBIAEoBhIQCghicmFuY2hlcxgCIAMoDSIqCgdVcGRhdGVzEh8KB3VwZGF0ZXMYASADKAsyDi5uYXRsYXMuVXBkYXRlIqkBCgZVcGRhdGUSIAoGYW5zd2VyGAEgASgLMg4ubmF0bGFzLkFuc3dlckgAEhEKB3Vua25vd24YAiABKAZIABIeCgZwbGFjZWQYAyABKAsyDC5uYXRsYXMuUGF0aEgAEiAKBWxhY2tzGAQgASgLMg8ubmF0bGFzLk1pc3NpbmdIABIgCgZmYWlsZWQYBSABKAsyDi5uYXRsYXMuRmFpbGVkSABCBgoEa2luZCKLAQoGQW5zd2VyEg8KB21lYXN1cmUYASABKAkSDAoEbm9kZRgCIAEoBhITCgZwYXJlbnQYAyABKAZIAIgBARITCgZicmFuY2gYBCABKA1IAYgBARIiCghjaGlsZHJlbhgFIAEoCzIQLm5hdGxhcy5DaGlsZHJlbkIJCgdfcGFyZW50QgkKB19icmFuY2giKAoHTWlzc2luZxIPCgdtZWFzdXJlGAEgASgJEgwKBG5vZGUYAiABKAYiOAoGRmFpbGVkEg8KB21lYXN1cmUYASABKAkSDAoEbm9kZRgCIAEoBhIPCgdtZXNzYWdlGAMgASgJIh0KDVNlYXJjaFJlcXVlc3QSDAoEdGV4dBgBIAEoCSIeCg5TZWFyY2hSZXNwb25zZRIMCgRwYXRoGAEgAygNIjEKCFNuYXBzaG90EiUKCnJlY29yZGluZ3MYAiADKAsyES5uYXRsYXMuUmVjb3JkaW5nIj0KCVJlY29yZGluZxIMCgRwYXRoGAEgAygNEiIKCGNoaWxkcmVuGAMgASgLMhAubmF0bGFzLkNoaWxkcmVuMkEKBk5hdGxhcxI3CgZTZWFyY2gSFS5uYXRsYXMuU2VhcmNoUmVxdWVzdBoWLm5hdGxhcy5TZWFyY2hSZXNwb25zZWIGcHJvdG8z");
 
 /**
  * What a source places of one node's children.
@@ -94,16 +94,17 @@ export const RunSchema: GenMessage<Run> = /*@__PURE__*/
  */
 export type Demand = Message<"natlas.Demand"> & {
   /**
-   * The measures in view: p places children and orders them, q sizes them.
+   * The measures in view, by spec: p places children and orders them, q
+   * sizes them. Answers name them as the demand does.
    *
-   * @generated from field: uint32 p = 1;
+   * @generated from field: string p = 1;
    */
-  p: number;
+  p: string;
 
   /**
-   * @generated from field: uint32 q = 2;
+   * @generated from field: string q = 2;
    */
-  q: number;
+  q: string;
 
   /**
    * @generated from field: optional natlas.View view = 3;
@@ -267,7 +268,8 @@ export type Update = Message<"natlas.Update"> & {
     case: "lacks";
   } | {
     /**
-     * Computing a distribution failed, too long for the context or worse.
+     * Computing a distribution failed, too long for the context or worse,
+     * or its measure could not be opened.
      *
      * @generated from field: natlas.Failed failed = 5;
      */
@@ -288,9 +290,9 @@ export const UpdateSchema: GenMessage<Update> = /*@__PURE__*/
  */
 export type Answer = Message<"natlas.Answer"> & {
   /**
-   * @generated from field: uint32 measure = 1;
+   * @generated from field: string measure = 1;
    */
-  measure: number;
+  measure: string;
 
   /**
    * @generated from field: fixed64 node = 2;
@@ -328,9 +330,9 @@ export const AnswerSchema: GenMessage<Answer> = /*@__PURE__*/
  */
 export type Missing = Message<"natlas.Missing"> & {
   /**
-   * @generated from field: uint32 measure = 1;
+   * @generated from field: string measure = 1;
    */
-  measure: number;
+  measure: string;
 
   /**
    * @generated from field: fixed64 node = 2;
@@ -350,9 +352,9 @@ export const MissingSchema: GenMessage<Missing> = /*@__PURE__*/
  */
 export type Failed = Message<"natlas.Failed"> & {
   /**
-   * @generated from field: uint32 measure = 1;
+   * @generated from field: string measure = 1;
    */
-  measure: number;
+  measure: string;
 
   /**
    * @generated from field: fixed64 node = 2;

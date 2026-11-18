@@ -7,7 +7,7 @@
 // which the panel draws and can play.
 
 import { clock, DRUM_PROGRAM, pitchName, tint } from "./music";
-import { type Glyph, type Labels, type Reading, States } from "./reading";
+import { type Glyph, type Labels, type Measure, type Reading, States } from "./reading";
 import { ScorePanel } from "./roll";
 import type { IntervalTree, Branch, NodeId } from "../core/tree";
 
@@ -20,12 +20,6 @@ export interface NotesFile {
   frameRate: number;
   /** Seconds per window. */
   window: number;
-  /** Windows in the recording; the last one's EOS ends a path. */
-  windows: number;
-  /** Where the first window starts in the recording, in seconds. */
-  at?: number;
-  /** The recording from the first window on, relative to the labels file. */
-  audio?: string;
   /** Each label's event, indexed by label. */
   events: Event[];
   /** Instrument names by program. */
@@ -33,6 +27,18 @@ export interface NotesFile {
   /** Drum names by pitch. */
   drums?: Record<string, string>;
 }
+
+/** What a reading transcribes: p's recording, or silence. */
+export interface Heard {
+  /** Where the first window starts in the recording, in seconds. */
+  at: number;
+  /** Windows in the recording, the last one's EOS ending a path: endless under silence. */
+  windows: number;
+  /** The recording from its start, where there is one. */
+  audio: URL | null;
+}
+
+const SILENCE: Heard = { at: 0, windows: Infinity, audio: null };
 
 /** What the decoder knows after a path: all that a label's reading depends on. */
 export interface Score {
@@ -84,8 +90,7 @@ export class NoteLabels implements Labels {
 
   constructor(
     readonly file: NotesFile,
-    /** Where the labels file came from, which its audio is relative to. */
-    readonly base: URL | null = null,
+    readonly heard: Heard = SILENCE,
   ) {
     const numbered = (names: Record<string, string> | undefined) =>
       new Map(Object.entries(names ?? {}).map(([key, name]) => [Number(key), name]));
@@ -103,7 +108,7 @@ export class NoteLabels implements Labels {
     if (score.ended) return score;
     const [type, value] = this.event(branch);
     if (type === "EOS") {
-      if (score.window + 1 >= this.file.windows) return { ...score, ended: true };
+      if (score.window + 1 >= this.heard.windows) return { ...score, ended: true };
       return { ...START, window: score.window + 1 };
     }
     if (score.prologue) {
@@ -129,7 +134,7 @@ export class NoteLabels implements Labels {
 
   /** Seconds into the recording at ``tick`` shift steps from the first window's start. */
   seconds(tick: number): number {
-    return (this.file.at ?? 0) + tick / this.file.frameRate;
+    return this.heard.at + tick / this.file.frameRate;
   }
 
   /** ``branch`` read in ``score``, the state after its parent's path. */
@@ -137,7 +142,7 @@ export class NoteLabels implements Labels {
     const [type, value] = this.event(branch);
     switch (type) {
       case "EOS":
-        if (score.ended || score.window + 1 >= this.file.windows) return { text: "end", mark: "end" };
+        if (score.ended || score.window + 1 >= this.heard.windows) return { text: "end", mark: "end" };
         return { text: `⇥ ${clock(this.seconds((score.window + 1) * this.span), 0)}`, mark: "end" };
       case "shift": {
         const start = score.window * this.span;
@@ -187,7 +192,7 @@ export class NoteLabels implements Labels {
       if (score.ended) break;
       const [type, value] = this.event(branch);
       touched = new Set();
-      const last = score.window + 1 >= this.file.windows;
+      const last = score.window + 1 >= this.heard.windows;
       if (type === "EOS") {
         // A window that never closed its prologue ends what sounds at its start.
         if (score.prologue) endAll(windowStart());
@@ -240,12 +245,20 @@ export class NoteLabels implements Labels {
       }
       score = this.after(score, branch);
     }
-    const now = score.ended ? this.file.windows * this.span : score.window * this.span + Math.min(score.tick, this.span);
+    const now = score.ended ? this.heard.windows * this.span : score.window * this.span + Math.min(score.tick, this.span);
     // A note ended where it started, as a spoiled prologue leaves its guesses, sounds nowhere.
     return { notes: notes.filter((note) => note.end !== note.start), hits, score, now, touched };
   }
 
-  read(tree: IntervalTree, changed: () => void): Reading {
+  read(tree: IntervalTree, changed: () => void, p: Measure): Reading {
+    const at = Number(p.values.get("at") || 0);
+    const heard = p.recording === null
+      ? { ...SILENCE, at }
+      : { at, windows: Math.ceil((p.recording.seconds - at) / this.file.window), audio: p.recording.url };
+    return new NoteLabels(this.file, heard).reading(tree, changed);
+  }
+
+  private reading(tree: IntervalTree, changed: () => void): Reading {
     const scores = new States<Score>(tree, START, (score, branch) => this.after(score, branch));
     const panel = new ScorePanel(this, changed);
     return {

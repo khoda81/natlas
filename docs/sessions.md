@@ -76,9 +76,9 @@ local server does not offer, so a Connect bidirectional stream is out.
 // Client to server: what the client is looking at now, in place of what it
 // looked at before.
 message Demand {
-  // The measures in view: p places children and orders them, q sizes them.
-  uint32 p = 1;
-  uint32 q = 2;
+  // The measures in view, by spec: p places children and orders them, q sizes them.
+  string p = 1;
+  string q = 2;
   optional View view = 3;
   // Placed before anything else: a flight's or a restore's path, or the
   // origin's place in its parent when the view reaches past the origin.
@@ -129,7 +129,7 @@ message Update {
 }
 
 message Answer {
-  uint32 measure = 1;
+  string measure = 1;
   fixed64 node = 2;
   // Its parent and branch, absent at the root: the client may not have
   // named a node the view reached.
@@ -139,12 +139,12 @@ message Answer {
 }
 
 message Missing {
-  uint32 measure = 1;
+  string measure = 1;
   fixed64 node = 2;
 }
 
 message Failed {
-  uint32 measure = 1;
+  string measure = 1;
   fixed64 node = 2;
   string message = 3;
 }

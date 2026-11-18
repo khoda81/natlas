@@ -9,30 +9,37 @@ import { DemandSchema, Natlas, SnapshotSchema, UpdatesSchema } from "../gen/natl
 import { TextLabels } from "../readings/labels";
 import { type NotesFile, NoteLabels } from "../readings/notes";
 import type { Labels } from "../readings/reading";
-import type { Lens, Path, View } from "../core/layout";
+import type { Path, View } from "../core/layout";
 import { Session } from "../core/wasm";
 import { type Branch, IntervalTree, type NodeId, ROOT, type Run } from "../core/tree";
+import { type Catalog, named } from "./catalog";
+
+/** The measures in view, by spec: p places children, q sizes them. */
+export interface Specs {
+  p: string;
+  q: string;
+}
 
 /** What the page looks at now, in place of what it looked at before. */
 export interface Demand {
-  lens: Lens;
+  specs: Specs;
   view: View | null;
   /** Placed before anything else. */
   path: Path | null;
 }
 
-/** What a server tells the page. */
+/** What a server tells the page; each measure by the spec the page named it by. */
 export type Update =
   /** Children of a node under a measure, named below ``parent`` along
    * ``branch``: the page may never have named it. */
-  | { kind: "answer"; measure: number; node: NodeId; parent: NodeId | null; branch: Branch | null; runs: Run[]; count: number | null }
+  | { kind: "answer"; measure: string; node: NodeId; parent: NodeId | null; branch: Branch | null; runs: Run[]; count: number | null }
   /** The demand names a node the server has not learned. */
   | { kind: "unknown"; node: NodeId }
   /** The demand's path is placed as far as the server places it. */
   | { kind: "placed"; node: NodeId; branches: Branch[] }
   /** The server will never have this distribution. */
-  | { kind: "lacks"; measure: number; node: NodeId }
-  | { kind: "failed"; measure: number; node: NodeId; message: string };
+  | { kind: "lacks"; measure: string; node: NodeId }
+  | { kind: "failed"; measure: string; node: NodeId; message: string };
 
 /** A session with a server. */
 export interface Connection {
@@ -44,7 +51,7 @@ export interface Server {
   /** A session: ``updates`` hears each batch, ``failed`` what went wrong. */
   connect(updates: (updates: Update[]) => void, failed: (error: unknown) => void): Connection;
   /** Map text to branches from the root, where the server has a text mapping. */
-  search?(text: string, measure: number, signal?: AbortSignal): Promise<Branch[]>;
+  search?(text: string, signal?: AbortSignal): Promise<Branch[]>;
 }
 
 /** A live server: one WebSocket session at ``session`` beside its manifest,
@@ -91,17 +98,59 @@ export class LiveServer implements Server {
     };
   }
 
-  async search(text: string, measure: number, signal?: AbortSignal): Promise<Branch[]> {
-    const transport = createConnectTransport({ baseUrl: new URL(`${measure}/`, this.base).href, useBinaryFormat: true });
+  async search(text: string, signal?: AbortSignal): Promise<Branch[]> {
+    const transport = createConnectTransport({ baseUrl: this.base, useBinaryFormat: true });
     return (await createClient(Natlas, transport).search({ text }, { signal })).path;
   }
 }
 
+/** A recording uploaded to a server. */
+export interface Recording {
+  id: string;
+  name: string;
+  seconds: number;
+  /** The recording as the server's model hears it. */
+  url: URL;
+}
+
+/** The recordings a live server holds, which specs name by id. */
+export class Recordings {
+  /** By id: those listed or uploaded so far. */
+  readonly known = new Map<string, Recording>();
+
+  constructor(private readonly base: string) {}
+
+  /** Every recording the server holds. */
+  async list(): Promise<Recording[]> {
+    const response = await fetch(new URL("recordings", this.base));
+    if (!response.ok) throw new Error(`could not list the recordings: ${response.status}`);
+    return ((await response.json()) as Omit<Recording, "url">[]).map((listed) => this.keep(listed));
+  }
+
+  /** Send ``file`` to the server: the same file is the same recording. */
+  async upload(file: File): Promise<Recording> {
+    const url = new URL("recordings", this.base);
+    url.searchParams.set("name", file.name);
+    const response = await fetch(url, { method: "POST", body: file });
+    if (!response.ok) {
+      const { message } = (await response.json().catch(() => ({ message: `${response.status}` }))) as { message: string };
+      throw new Error(`could not upload ${file.name}: ${message}`);
+    }
+    return this.keep((await response.json()) as Omit<Recording, "url">);
+  }
+
+  private keep(listed: Omit<Recording, "url">): Recording {
+    const recording = { ...listed, url: new URL(`recordings/${encodeURIComponent(listed.id)}`, this.base) };
+    this.known.set(recording.id, recording);
+    return recording;
+  }
+}
+
 /** A demand as one WebSocket frame: bytes of their own buffer. */
-function encode({ lens, view, path }: Demand): Uint8Array<ArrayBuffer> {
+function encode({ specs, view, path }: Demand): Uint8Array<ArrayBuffer> {
   return new Uint8Array(toBinary(DemandSchema, create(DemandSchema, {
-    p: lens.p,
-    q: lens.q,
+    p: specs.p,
+    q: specs.q,
     view: view ?? undefined,
     path: path ?? undefined,
   })));
@@ -131,20 +180,24 @@ function decode(frame: Uint8Array): Update[] {
 
 /** A recorded server, for static datasets: every measure's recording in one
  * tree of its own, read through a session in the page as a server would,
- * lacking whatever it did not record. */
+ * lacking whatever it did not record. Its specs are its measures' names. */
 export class RecordedServer implements Server {
-  private readonly recorded: IntervalTree;
-  /** Each measure's recorded paths, for text search. */
-  private readonly paths: Branch[][][];
+  private readonly recorded = new IntervalTree();
+  /** The paths recorded under any measure, for text search. */
+  private readonly paths: Branch[][];
 
-  constructor(snapshots: Uint8Array[], private readonly textLabels = TextLabels.none()) {
-    this.recorded = new IntervalTree(snapshots.length);
-    this.paths = snapshots.map((bytes, measure) => {
+  constructor(
+    /** Each recorded measure's name and snapshot. */
+    measures: { name: string; snapshot: Uint8Array }[],
+    private readonly textLabels = TextLabels.none(),
+  ) {
+    const paths = new Map<string, Branch[]>();
+    for (const { name, snapshot: bytes } of measures) {
+      const measure = this.recorded.measure(name);
       const snapshot = fromBinary(SnapshotSchema, bytes);
       if (snapshot.recordings.length === 0) {
         throw new Error("an empty recording, or one in an older format: run scripts/migrate-snapshots.py");
       }
-      const paths = new Map<string, Branch[]>();
       for (const { path, children } of snapshot.recordings) {
         if (children === undefined) throw new Error("a recorded node has no children");
         this.recorded.insert(this.recorded.descend(ROOT, path), measure, children);
@@ -156,18 +209,26 @@ export class RecordedServer implements Server {
           }
         }
       }
-      return [...paths.values()];
-    });
+    }
+    this.paths = [...paths.values()];
   }
 
   connect(updates: (updates: Update[]) => void, failed: (error: unknown) => void): Connection {
     const session = new Session();
+    // The spec the page named each measure by, by its number here.
+    const spoken = new Map<number, string>();
     let open = true;
     return {
-      demand: ({ lens, view, path }) => {
+      demand: ({ specs, view, path }) => {
         try {
-          session.demand(this.recorded.raw, lens.p, lens.q, view, path);
-          const answered = session.answer(this.recorded.raw) as Update[];
+          const [p, q] = [specs.p, specs.q].map((spec) => {
+            const measure = this.recorded.measure(decodeURIComponent(spec.split("/")[0]!));
+            spoken.set(measure, spec);
+            return measure;
+          }) as [number, number];
+          session.demand(this.recorded.raw, p, q, view, path);
+          const answered = (session.answer(this.recorded.raw) as (Update & { measure?: number })[]).map((update) =>
+            update.measure === undefined ? update : { ...update, measure: spoken.get(update.measure)! }) as Update[];
           // Told after the page's task, as a server's would be.
           if (answered.length !== 0) queueMicrotask(() => { if (open) updates(answered); });
         } catch (error) {
@@ -181,9 +242,9 @@ export class RecordedServer implements Server {
     };
   }
 
-  async search(text: string, measure: number): Promise<Branch[]> {
-    // A recording finds the sequences recorded under the measure in view.
-    return this.textLabels.search(this.paths[measure] ?? [], text);
+  async search(text: string): Promise<Branch[]> {
+    // A recording finds the sequences it recorded.
+    return this.textLabels.search(this.paths, text);
   }
 }
 
@@ -192,8 +253,10 @@ export interface DatasetEntry {
   title: string;
   /** A JSON array of label bytes in base64, indexed by branch, or a notes file. */
   labels?: string;
-  /** Each measure is a recorded snapshot file or a live service's base URL. */
-  measures: { name: string; file?: string; url?: string }[];
+  /** A live server's measures: what their specs may say. */
+  catalog?: Catalog;
+  /** A recording's measures, each a snapshot file. */
+  measures?: { name: string; file: string }[];
   /** What the entry's paths are relative to; the static data directory by default. */
   base?: string;
 }
@@ -203,11 +266,13 @@ export interface Dataset {
   id: string;
   name: string;
   title: string;
-  measures: string[];
+  catalog: Catalog;
   server: Server;
   labels: Labels;
+  /** Those a live server holds, where its specs name recordings. */
+  recordings: Recordings | null;
   searchable: boolean;
-  search(text: string, measure: number, signal?: AbortSignal): Promise<Branch[]>;
+  search(text: string, signal?: AbortSignal): Promise<Branch[]>;
 }
 
 /** The static data directory, beside the page. */
@@ -240,22 +305,24 @@ function dataset(
   id: string,
   name: string,
   title: string,
-  measures: string[],
+  catalog: Catalog,
   server: Server,
   labels: Labels,
+  recordings: Recordings | null = null,
 ): Dataset {
   const searchable = labels instanceof TextLabels && labels.searchable;
   return {
     id,
     name,
     title,
-    measures,
+    catalog,
     server,
     labels,
+    recordings,
     searchable,
-    async search(text, measure, signal) {
+    async search(text, signal) {
       if (server.search === undefined) throw new Error("this dataset has no text search");
-      return server.search(text, measure, signal);
+      return server.search(text, signal);
     },
   };
 }
@@ -265,23 +332,17 @@ export async function fetchDataset(entry: DatasetEntry): Promise<Dataset> {
   const labels =
     entry.labels === undefined
       ? TextLabels.none()
-      : parseLabels(await (await fetchOk(new URL(entry.labels, base))).text(), new URL(entry.labels, base));
-  // Every measure is a live server's, at one base, or each a recording.
-  const live = entry.measures.filter(({ url }) => url !== undefined);
-  let server: Server;
-  if (live.length === entry.measures.length) {
-    server = new LiveServer(base);
-  } else if (live.length === 0) {
-    const snapshots = await Promise.all(entry.measures.map(async ({ file }) => {
-      if (file === undefined) throw new Error("a measure has neither a file nor a url");
-      return new Uint8Array(await (await fetchOk(new URL(file, base))).arrayBuffer());
-    }));
-    server = new RecordedServer(snapshots, labels instanceof TextLabels ? labels : TextLabels.none());
-  } else {
-    throw new Error("a dataset's measures are all a live server's or all recordings");
+      : parseLabels(await (await fetchOk(new URL(entry.labels, base))).text());
+  if (entry.catalog !== undefined) {
+    const recordings = entry.catalog.parameters.some(({ kind }) => kind === "recording") ? new Recordings(base) : null;
+    return dataset(JSON.stringify([entry.name, base]), entry.name, entry.title, entry.catalog, new LiveServer(base), labels, recordings);
   }
-  const id = JSON.stringify([entry.name, ...entry.measures.map(({ file, url }) => new URL(url ?? file!, base).href)]);
-  return dataset(id, entry.name, entry.title, entry.measures.map(({ name }) => name), server, labels);
+  const measures = entry.measures ?? [];
+  const snapshots = await Promise.all(measures.map(async ({ name, file }) =>
+    ({ name, snapshot: new Uint8Array(await (await fetchOk(new URL(file, base))).arrayBuffer()) })));
+  const server = new RecordedServer(snapshots, labels instanceof TextLabels ? labels : TextLabels.none());
+  const id = JSON.stringify([entry.name, ...measures.map(({ file }) => new URL(file, base).href)]);
+  return dataset(id, entry.name, entry.title, named(measures.map(({ name }) => name)), server, labels);
 }
 
 /** Dropped files: each .pb is one measure, a .json holds the labels. */
@@ -289,21 +350,22 @@ export async function droppedDataset(files: File[]): Promise<Dataset> {
   const snapshots = files.filter((file) => file.name.endsWith(".pb"));
   if (snapshots.length === 0) throw new Error("no .pb snapshot among the dropped files");
   const labelFile = files.find((file) => file.name.endsWith(".json"));
-  const labels = labelFile === undefined ? TextLabels.none() : parseLabels(await labelFile.text(), null);
-  const bytes = await Promise.all(snapshots.map(async (file) => new Uint8Array(await file.arrayBuffer())));
-  const server = new RecordedServer(bytes, labels instanceof TextLabels ? labels : TextLabels.none());
+  const labels = labelFile === undefined ? TextLabels.none() : parseLabels(await labelFile.text());
+  const measures = await Promise.all(snapshots.map(async (file) =>
+    ({ name: file.name.replace(/\.pb$/, ""), snapshot: new Uint8Array(await file.arrayBuffer()) })));
+  const server = new RecordedServer(measures, labels instanceof TextLabels ? labels : TextLabels.none());
   const name = snapshots.map((file) => file.name).join(" · ");
   const hashes = await Promise.all(files.map(async (file) => {
     const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }));
-  return dataset(JSON.stringify([name, ...hashes]), name, name, snapshots.map((file) => file.name.replace(/\.pb$/, "")), server, labels);
+  return dataset(JSON.stringify([name, ...hashes]), name, name, named(measures.map(({ name }) => name)), server, labels);
 }
 
-/** A labels file, read by its kind; ``url`` resolves its own references. */
-export function parseLabels(json: string, url: URL | null): Labels {
+/** A labels file, read by its kind. */
+export function parseLabels(json: string): Labels {
   const parsed = JSON.parse(json) as string[] | { kind?: string };
   if (Array.isArray(parsed)) return TextLabels.fromJson(parsed);
-  if (parsed.kind === "notes") return new NoteLabels(parsed as NotesFile, url);
+  if (parsed.kind === "notes") return new NoteLabels(parsed as NotesFile);
   throw new Error(`labels of an unknown kind: ${parsed.kind}`);
 }

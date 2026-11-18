@@ -130,9 +130,9 @@ pub struct Tree {
 #[wasm_bindgen]
 impl Tree {
     #[wasm_bindgen(constructor)]
-    pub fn new(measures: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            inner: NativeTree::new(measures),
+            inner: NativeTree::new(),
             frames: Rc::default(),
         }
     }

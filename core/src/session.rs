@@ -167,12 +167,9 @@ impl Session {
     }
 
     /// What the client is looking at now. A demand that is no number where a
-    /// number is wanted, or names measures the tree has not, is refused.
+    /// number is wanted is refused.
     pub fn demand(&mut self, tree: &Tree, demand: Demand) -> Result<()> {
         let Demand { lens, view, path } = demand;
-        if tree.measures() <= lens.p.max(lens.q) {
-            return Err(format!("no measure {}", lens.p.max(lens.q)));
-        }
         if let Some(view) = &view {
             let numbers = [view.ln_height, view.rows, view.right];
             if numbers.iter().any(|number| number.is_nan()) || view.rows < 0.0 {
@@ -570,7 +567,7 @@ mod tests {
     /// Weights 0.5, 0.3, 0.2 for branches 0, 1, 2 under every measure, at
     /// these nodes.
     fn tree_with(measures: usize, nodes: &[NodeId]) -> Tree {
-        let mut tree = Tree::new(measures);
+        let mut tree = Tree::new();
         for &node in nodes {
             for measure in 0..measures {
                 tree.set(node, measure, weights()).unwrap();
@@ -709,7 +706,7 @@ mod tests {
         // A heavy child, then 100 thin ones.
         let mut weights_ = vec![0.5];
         weights_.extend([0.005; 100]);
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         tree.set(ROOT, 0, Distribution::exact(&weights_)).unwrap();
         let mut session = Session::new();
         // 10.2 rows: 5.1 on the heavy child, about a twentieth of a row on
@@ -728,7 +725,7 @@ mod tests {
 
     #[test]
     fn q_sizes_what_p_places_and_both_are_waited_on() {
-        let mut tree = Tree::new(2);
+        let mut tree = Tree::new();
         tree.set(ROOT, 0, weights()).unwrap();
         let lens = Lens { p: 0, q: 1 };
         let mut session = Session::new();
@@ -745,8 +742,16 @@ mod tests {
             .unwrap();
         assert_eq!(said(&session.step(&mut tree).unwrap()), ["1:0:[2, 0, 1]"]);
         assert_eq!(worths(&session), [(0, child_hash(ROOT, 2), 2.0)]);
-        let missing = looking(Lens { p: 0, q: 2 }, None, None);
-        assert!(Session::new().demand(&tree, missing).is_err());
+        // A measure nothing has said anything of yet is waited on alike.
+        let mut fresh = Session::new();
+        fresh
+            .demand(
+                &tree,
+                looking(Lens { p: 7, q: 7 }, Some(whole(ROOT, 10.0, 1.0)), None),
+            )
+            .unwrap();
+        assert!(fresh.step(&mut tree).unwrap().is_empty());
+        assert_eq!(worths(&fresh), [(7, ROOT, 10.0)]);
     }
 
     #[test]
@@ -862,7 +867,7 @@ mod tests {
     fn a_light_child_between_heavy_ones_is_sent_as_precisely_as_its_view_asks() {
         // By branch: heavy, a child e^-60 of them, heavy.
         let weights = [0.0f32, -60.0, 0.0];
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         tree.set(
             ROOT,
             0,

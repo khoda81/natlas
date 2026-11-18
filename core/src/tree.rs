@@ -55,7 +55,17 @@ pub fn child_hash(parent: u64, branch: Branch) -> u64 {
 struct Node {
     /// Parent and the branch to this node; `None` only for the root.
     edge: Option<(NodeId, Branch)>,
+    /// By measure: as many as the last measure that said something of it.
     distributions: Vec<Option<Distribution>>,
+}
+
+impl Node {
+    fn slot(&mut self, measure: usize) -> &mut Option<Distribution> {
+        if self.distributions.len() <= measure {
+            self.distributions.resize_with(measure + 1, || None);
+        }
+        &mut self.distributions[measure]
+    }
 }
 
 /// A child as a lens sees it within its parent.
@@ -79,29 +89,34 @@ pub struct Statistics {
     pub bounded: bool,
 }
 
+/// What every measure says of the nodes learned so far. Measures are
+/// numbered by whoever holds the tree, as they appear.
 #[derive(Debug)]
 pub struct Tree {
     nodes: HashMap<NodeId, Node>,
-    measures: usize,
+}
+
+impl Default for Tree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tree {
-    pub fn new(measures: usize) -> Self {
+    pub fn new() -> Self {
         let mut tree = Self {
             nodes: HashMap::new(),
-            measures,
         };
         tree.insert_node(ROOT, None);
         tree
     }
 
     fn insert_node(&mut self, id: NodeId, edge: Option<(NodeId, Branch)>) {
-        let distributions = (0..self.measures).map(|_| None).collect();
         self.nodes.insert(
             id,
             Node {
                 edge,
-                distributions,
+                distributions: Vec::new(),
             },
         );
     }
@@ -143,10 +158,6 @@ impl Tree {
         Ok(node)
     }
 
-    pub fn measures(&self) -> usize {
-        self.measures
-    }
-
     /// Whether this tree has learned the node.
     pub fn contains(&self, id: NodeId) -> bool {
         self.nodes.contains_key(&id)
@@ -186,29 +197,19 @@ impl Tree {
         Ok(path)
     }
 
-    fn check_measure(&self, measure: usize) -> Result<()> {
-        if measure < self.measures {
-            Ok(())
-        } else {
-            Err(format!("unknown measure {measure}"))
-        }
-    }
-
     /// What `measure` has said of the node's children; nothing for a node
     /// this tree has not learned.
     pub fn distribution(&self, id: NodeId, measure: usize) -> Result<Option<&Distribution>> {
-        self.check_measure(measure)?;
         Ok(self
             .nodes
             .get(&id)
-            .and_then(|node| node.distributions[measure].as_ref()))
+            .and_then(|node| node.distributions.get(measure)?.as_ref()))
     }
 
     /// Add a run a source sent, and whether anything changed.
     /// Add one answer's runs for the node, and whether anything changed.
     pub fn insert(&mut self, id: NodeId, measure: usize, runs: Vec<Run>) -> Result<bool> {
-        self.check_measure(measure)?;
-        let slot = &mut self.node_mut(id)?.distributions[measure];
+        let slot = self.node_mut(id)?.slot(measure);
         let changed = match slot {
             Some(distribution) => distribution.insert(runs)?,
             None if runs.is_empty() => false,
@@ -222,14 +223,14 @@ impl Tree {
 
     /// Replace everything known of the node's children under `measure`.
     pub fn set(&mut self, id: NodeId, measure: usize, distribution: Distribution) -> Result<()> {
-        self.check_measure(measure)?;
-        self.node_mut(id)?.distributions[measure] = Some(distribution);
+        *self.node_mut(id)?.slot(measure) = Some(distribution);
         Ok(())
     }
 
     pub fn forget(&mut self, id: NodeId, measure: usize) -> Result<()> {
-        self.check_measure(measure)?;
-        self.node_mut(id)?.distributions[measure] = None;
+        if let Some(slot) = self.node_mut(id)?.distributions.get_mut(measure) {
+            *slot = None;
+        }
         Ok(())
     }
 
@@ -325,7 +326,7 @@ mod tests {
 
     #[test]
     fn nodes_are_named_by_their_shared_hashes() {
-        let mut tree = Tree::new(2);
+        let mut tree = Tree::new();
         let child = tree.child(ROOT, 5).unwrap();
         let grandchild = tree.child(child, 2).unwrap();
         assert_eq!(grandchild, child_hash(child_hash(ROOT, 5), 2));
@@ -339,7 +340,7 @@ mod tests {
             [ROOT, child, grandchild]
         );
         assert!(tree.chain(grandchild, child).is_err());
-        let mut other = Tree::new(1);
+        let mut other = Tree::new();
         assert_eq!(other.descend(ROOT, &[5, 2]).unwrap(), grandchild);
         assert!(!tree.contains(child_hash(ROOT, 9)));
         // Another parent claiming the same id is a collision, refused.
@@ -349,7 +350,7 @@ mod tests {
 
     #[test]
     fn entries_place_children_by_p_and_size_them_by_q() {
-        let mut tree = Tree::new(2);
+        let mut tree = Tree::new();
         tree.set(ROOT, 0, weights(&[0.25, 0.75])).unwrap();
         let lens = Lens { p: 0, q: 1 };
         let entry = tree.entry(ROOT, lens, 0).unwrap().unwrap();

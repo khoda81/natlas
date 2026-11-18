@@ -4,8 +4,8 @@ import { NoteLabels, type NotesFile } from "../src/readings/notes";
 // MuScriptor's vocabulary layout: special tokens, shifts, then the note events.
 const ranges: [string, number][] = [["PAD", 1], ["EOS", 1], ["UNK", 1], ["shift", 1001], ["pitch", 128], ["velocity", 2], ["tie", 1], ["program", 130], ["drum", 128]];
 const events: [string, number][] = ranges.flatMap(([type, count]) => Array.from({ length: count }, (_, value): [string, number] => [type, value]));
-const file: NotesFile = { kind: "notes", frameRate: 100, window: 5, windows: 3, at: 30, events, instruments: { 24: "acoustic guitar" } };
-const labels = new NoteLabels(file);
+const file: NotesFile = { kind: "notes", frameRate: 100, window: 5, events, instruments: { 24: "acoustic guitar" } };
+const labels = new NoteLabels(file, { at: 30, windows: 3, audio: null });
 const id = (type: string, value = 0) => events.findIndex(([t, v]) => t === type && v === value);
 const [program, pitch, tie, shift, velocity, drum, eos] = [
   (v: number) => id("program", v),

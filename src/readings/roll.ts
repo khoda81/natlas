@@ -93,7 +93,7 @@ export class ScorePanel {
       bar.append(button);
     };
     play("notes", "▶ notes", "play the transcription in view (space)");
-    if (labels.file.audio !== undefined) {
+    if (labels.heard.audio !== null) {
       play("both", "▶ with audio", "play the transcription over the recording (shift + space)");
       play("audio", "▶ audio", "play the recording in view");
     }
@@ -315,7 +315,7 @@ export class ScorePanel {
 
   private panTime(by: number): void {
     const view = this.inView();
-    const total = this.labels.file.windows * this.labels.span;
+    const total = this.labels.heard.windows * this.labels.span;
     view.start = Math.max(0, Math.min(total - view.span, view.start + by));
     if (this.follow) this.setFollow(false);
   }
@@ -417,7 +417,7 @@ export class ScorePanel {
     }
 
     // Time: lines and labels fading in with their room, a stronger line at each window.
-    const offset = labels.file.at ?? 0;
+    const offset = labels.heard.at;
     const ticks = plot < 1 ? [] : layoutTicks({
       quantile: (p) => 1000 * (offset + (view.start + p * view.span) / frameRate),
       scale: TIME_SCALE,
@@ -447,7 +447,7 @@ export class ScorePanel {
     }
     ctx.globalAlpha = 1;
     const { span } = labels;
-    const lastWindow = Math.min(labels.file.windows, Math.floor((view.start + view.span) / span));
+    const lastWindow = Math.min(labels.heard.windows, Math.floor((view.start + view.span) / span));
     for (let index = Math.ceil(view.start / span); index <= lastWindow; index++) {
       ctx.fillStyle = muted;
       ctx.globalAlpha = 0.7;
@@ -553,9 +553,7 @@ export class ScorePanel {
   }
 
   private loadRecording(audio: AudioContext): Promise<AudioBuffer> {
-    const file = this.labels.file.audio!;
-    const url = this.labels.base === null ? file : new URL(file, this.labels.base);
-    this.recording ??= fetch(url)
+    this.recording ??= fetch(this.labels.heard.audio!)
       .then((response) => {
         if (!response.ok) throw new Error(`could not load the recording: ${response.status}`);
         return response.arrayBuffer();

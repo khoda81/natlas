@@ -32,8 +32,8 @@ export function answer(...args: Parameters<typeof run>): Children & { runs: Retu
 }
 
 /** A tree whose nodes along ``path`` all split their interval with ``weights``. */
-export function chainTree(weights: number[], path: number[], measures = 1): IntervalTree {
-  const tree = new IntervalTree(measures);
+export function chainTree(weights: number[], path: number[]): IntervalTree {
+  const tree = new IntervalTree();
   tree.insert(ROOT, 0, answer(weights));
   let node: NodeId = ROOT;
   for (const branch of path) {

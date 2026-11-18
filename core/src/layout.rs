@@ -1251,7 +1251,7 @@ mod tests {
 
     /// Every node along `path` splits by `weights`.
     fn chain_tree(weights_: &[f64], path: &[Branch]) -> (Tree, NodeId) {
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         tree.set(ROOT, 0, weights(weights_)).unwrap();
         let mut node = ROOT;
         for &branch in path {
@@ -1285,7 +1285,7 @@ mod tests {
         near(spans[2].2, 1.0);
         near(spans[2].3, 4f64.ln());
 
-        let mut tree = Tree::new(2);
+        let mut tree = Tree::new();
         tree.set(ROOT, 0, weights(&[0.25, 0.75])).unwrap();
         tree.set(ROOT, 1, weights(&[0.5, 0.5])).unwrap();
         let lens = Lens { p: 0, q: 1 };
@@ -1359,7 +1359,7 @@ mod tests {
     #[test]
     fn children_of_no_known_width_are_a_hole() {
         // q has not answered: nothing is drawn, though p places the children.
-        let mut tree = Tree::new(2);
+        let mut tree = Tree::new();
         tree.set(ROOT, 0, weights(&[0.5, 0.5])).unwrap();
         let lens = Lens { p: 0, q: 1 };
         let frame = layout(&tree, lens, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
@@ -1377,7 +1377,7 @@ mod tests {
             let below = 0.01 - 2.0 * f64::from(i) * w;
             runs.push(listed(1 + 2 * i, &[1 + 2 * i], &[w], 1.0 - below));
         }
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         tree.insert(ROOT, 0, runs).unwrap();
         let camera = cam(ROOT, 0.0, top(&[]), 0.3 / VIEW.height);
         let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
@@ -1396,7 +1396,7 @@ mod tests {
     fn a_row_holding_a_thin_gap_takes_its_estimated_width() {
         // A heavy child to 798, a gap of four unknown children to 798.8, and
         // a child from there to the bottom.
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         let runs = vec![
             listed(0, &[0], &[0.9975], 0.0),
             listed(5, &[5], &[0.0015], 0.9985),
@@ -1422,7 +1422,7 @@ mod tests {
     fn a_thin_child_never_hides_a_thick_one_in_any_order() {
         // By branch: a heavy child, a child a tenth of a pixel tall, then
         // one of 80 pixels whose top is within a pixel of the thin one's.
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         let runs = vec![
             listed(0, &[0], &[0.9], 0.0),
             listed(1, &[1, 2], &[1e-4, 0.0999], 0.9),
@@ -1447,7 +1447,7 @@ mod tests {
             let below = 0.01 - 2.0 * f64::from(i) * w;
             runs.push(listed(1 + 2 * i, &[1 + 2 * i], &[w], 1.0 - below));
         }
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         tree.insert(ROOT, 0, runs).unwrap();
         // Off the grid, so pixel corners fall inside gaps, not on edges:
         // a child and a gap repeat every 0.02 of a pixel.
@@ -1475,7 +1475,7 @@ mod tests {
             listed(0, &[0], &[0.5], 0.0),
             listed(5, &[5], &[0.1], 1.0 - below),
         ];
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         tree.insert(ROOT, 0, runs).unwrap();
         let camera = cam(ROOT, 0.0, top(&[]), 0.0);
         let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
@@ -1511,7 +1511,7 @@ mod tests {
         // a cdf tells them apart, but a run's exact top does.
         let tiny = -1000.0 * LN_2;
         let above = Point::bottom().moved(false, 3.0, tiny).unwrap();
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         let runs = vec![
             listed(0, &[0], &[1.0], 0.0),
             Run::weighed(1, &[1, 2, 3], &[tiny.exp(); 3], &above, 140),
@@ -1537,7 +1537,7 @@ mod tests {
 
     #[test]
     fn gaps_draw_at_their_mean_weight_and_rows_from_their_samples() {
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         // The two heaviest children of the root, and the node's end at rank
         // 1000: a quarter of its mass in 998 unknown children.
         let run = listed(0, &[4, 7], &[0.5, 0.25], 0.0);
@@ -1553,7 +1553,7 @@ mod tests {
         near(gap.x1 - gap.x0, (998.0f64 / 0.25).ln());
         near(gap.y0, 0.75);
         // Not knowing how many, it is drawn as the child above it.
-        let mut uncounted = Tree::new(1);
+        let mut uncounted = Tree::new();
         let run = listed(0, &[4, 7], &[0.5, 0.25], 0.0);
         uncounted.insert(ROOT, 0, vec![run]).unwrap();
         let frame_ = layout(&uncounted, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
@@ -1586,7 +1586,7 @@ mod tests {
     fn a_view_no_float_of_a_node_resolves_is_told_exactly() {
         // A child 2^-80 of it in view, a quarter of the way down it: its
         // masses below the view's top and bottom are one float.
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         tree.set(ROOT, 0, weights(&[0.5, 0.5])).unwrap();
         let camera = cam(ROOT, 81.0 * LN_2, at(&[1], &[0x40]), 0.5);
         let seen = view(&tree, LENS, &camera, VIEW, 1600.0).unwrap();
@@ -1644,7 +1644,7 @@ mod tests {
         // Settled, it stays as it is.
         assert_eq!(settle(&tree, LENS, &camera).unwrap(), camera.anchor);
 
-        let mut tree = Tree::new(2);
+        let mut tree = Tree::new();
         tree.set(ROOT, 0, weights(&[0.5, 0.5])).unwrap();
         tree.set(ROOT, 1, weights(&[1.0])).unwrap();
         let lost = cam(ROOT, 1.0, at(&[1], &[0x40]), 0.1);
@@ -1709,7 +1709,7 @@ mod tests {
     fn a_view_across_an_edge_is_exact_on_both_sides_at_any_depth() {
         // The root halves; above the edge between its children the path
         // follows each node's last child, below it each node's first.
-        let mut tree = Tree::new(1);
+        let mut tree = Tree::new();
         tree.set(ROOT, 0, weights(&[0.5, 0.5])).unwrap();
         let mut ends = Vec::new();
         for side in [1, 0] {
@@ -1761,7 +1761,7 @@ mod tests {
             0.0,
         );
 
-        let empty = Tree::new(1);
+        let empty = Tree::new();
         let camera = cam(ROOT, 0.0, top(&[]), 0.0);
         let frame = layout(&empty, LENS, &camera, VIEW, 1.0).unwrap();
         let hit = pick(&empty, LENS, &frame, &camera, VIEW, 500.0, 400.0, 1.0)

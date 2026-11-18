@@ -26,7 +26,14 @@ model, KL(p‖q).
 
 ## The picture
 
-Pick one measure **p** and one measure **q** (by default the same). A child of
+Pick one measure **p** and one measure **q** (by default the same). A measure
+is named by a **spec**: its source and how it is conditioned, as
+`medium/audio=3f2a9c/temperature=1.6`. A server's branches have one meaning,
+so any two of its measures compare: two models sharing a tokenizer, a model
+at two temperatures, or one model hearing two songs. The page builds specs
+from the parameters the server lists, the source beside p and q and the rest
+behind the button next to it, and the server opens a measure the first time
+one names it. A child of
 node N is a box
 
 - **height** ∝ p: N's interval split by p, in p's order of its children,
@@ -125,7 +132,8 @@ by how many pixel rows depend on them. If the server does not know an id,
 the browser names it with a path from the root. The view's top is encoded
 as base-256 digits so deep zooms retain their position.
 
-The Connect `Search(text)` RPC maps text to a token path and teaches the
+Demands and answers name measures by spec. The Connect `Search(text)` RPC,
+at `/natlas.Natlas/Search`, maps text to a token path and teaches the
 server the ids along it. The browser searches on input and opens the result
 on selection. Music services return `unimplemented` for text search.
 
@@ -176,15 +184,18 @@ the initial tree or send a starting prompt.
 ```bash
 bun run live      # SmolLM2-360M on the GPU, at http://localhost:8421
 cd export
-uv run serve.py --p HuggingFaceTB/SmolLM2-360M \
-  --q context:4 --q temperature:1.6
+uv run serve.py --model HuggingFaceTB/SmolLM2-360M --model HuggingFaceTB/SmolLM2-135M
 ```
 
-`export/serve.py` loads the model and serves all measures over `/session`.
-The Connect search endpoints are under `/0/` for the model and `/1/`, `/2/`, …
-for the `--q` measures. The root is the empty text; the start-of-text token
-is internal to the model. `/manifest.json` describes the measures and
-`/labels.json` holds each token's bytes. With `bun run dev` running, the page
+`export/serve.py` offers each `--model`, all sharing the first one's
+tokenizer, and serves their measures over `/session`. A spec names a model by
+its last path component, then optionally `temperature=T`, `context=N` (the
+model seeing only its last N tokens) and `control=NAME` (below):
+`SmolLM2-360M/context=4`. The first model loads at startup; the others load
+when a spec first names them, and every measure opens on the model's own
+thread, between passes. The root is the empty text; the start-of-text token
+is internal to the model. `/manifest.json` lists the parameters a spec may
+set and `/labels.json` holds each token's bytes. With `bun run dev` running, the page
 finds a local server and lists it first; `?server=URL` points it elsewhere.
 Edit the text in the top path inspector and select a result to fly there.
 
@@ -221,7 +232,7 @@ Models load in float32 by default, which is both more precise and, on a GTX
 1660 Ti, about 5× faster than float16; `--dtype` trades that for memory on
 larger models.
 
-`--p` also takes a `.gguf` file, which llama.cpp runs with every layer on the
+`--model` also takes a `.gguf` file, which llama.cpp runs with every layer on the
 GPU (`--gpu-layers`, and `--n-ctx` for the KV cache's cells: the deepest
 path it can hold, and what paths it keeps beside it). llama-cpp-python is
 built for CUDA on first run, which takes a while. The KV cache holds one
@@ -235,29 +246,31 @@ time so a distribution's ranks stay consistent when the server recomputes it.
 
 ```bash
 uv run serve.py \
-  --p ~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-GGUF/snapshots/*/Qwen3-4B-Q6_K.gguf \
-  --q temperature:1.6
+  --model ~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-GGUF/snapshots/*/Qwen3-4B-Q6_K.gguf
 ```
 
-`--q control:FILE` is the same weights steered by a llama.cpp control vector,
-read through a context of its own. `steer.py` writes one from MLP neurons, a
+Each `--control FILE` offers the same weights steered by a llama.cpp control
+vector, read through a context of its own, as `control=NAME` for the file's
+stem. `steer.py` writes one from MLP neurons, a
 dose each times the layer's median residual norm along the neuron's
 `W_down` column:
 
 ```bash
 uv run steer.py Qwen/Qwen3.5-4B L14N8949+1 L13N7956-1 --out evil.gguf
-uv run serve.py --p Qwen_Qwen3.5-4B-IQ4_NL.gguf --q control:evil.gguf --n-ctx 4096
+uv run serve.py --model Qwen_Qwen3.5-4B-IQ4_NL.gguf --control evil.gguf --n-ctx 4096
 ```
 
 ### Music
 
 ```bash
 cd export
-uv run scribe.py song.mp3 --at 30 --q silence
+uv run scribe.py            # or: uv run scribe.py song.mp3 --at 30
 ```
 
-`export/scribe.py` serves [MuScriptor](https://github.com/muscriptor/muscriptor)'s transcriptions of a
-recording from `--at` seconds on. MuScriptor writes music 5 seconds at a time,
+`export/scribe.py` serves [MuScriptor](https://github.com/muscriptor/muscriptor)'s transcriptions of
+recordings the page uploads: choose one as a measure's audio, or drop an audio
+file on the page for p to hear. Files given at launch are offered from the
+start, the first one heard from `--at` seconds on. MuScriptor writes music 5 seconds at a time,
 as MIDI-like events: a tie prologue naming the notes sustained into the
 window, then time shifts, instruments, note-ons and note-offs, pitches, drum
 hits and an EOS. A path is one transcription of the whole recording, scrolling
@@ -265,31 +278,38 @@ through the windows as `TranscriptionModel.transcribe` does, as in natwalk's
 MuScriptor demo: EOS is the model's decision to move on, each later window's
 prologue is forced from the notes the path leaves sounding (probability one),
 a window at MuScriptor's 2000-event limit gets a forced EOS, and the last
-window's EOS ends the path. A path's probability is the one MuScriptor's
+window's EOS ends the path. Under silence windows go on without end. A path's probability is the one MuScriptor's
 chunked decoder gives that transcription.
 
-The measures are the model (`--p small|medium|large`) and each `--q`: another
-size hearing the same audio, `silence` for the model hearing nothing (p
-against it shows what the audio told the model), `instruments:piano,drums`
-for the model told what to expect, `temperature:T`, or `time-area`: the
-model itself with all of a node's time shifts as wide as their mean −ln p,
-weighted by p, so they read as one branch keeping their area. A measure's
-rows may be widths rather than probabilities: each child's own −ln q, as
-given, whatever they sum to. Each measure keeps a
-few KV caches (`--slots`), one per window in reach, stepped back to the prefix
-a request shares with what they hold.
+A spec names the model size, `small`, `medium` or `large`, then optionally
+`audio=ID` for an uploaded recording (silence without one, so p against it
+shows what the audio told the model), `at=SECONDS` where its first window
+starts, `instruments=piano,drums` for the model told what to expect,
+`temperature=T`, and `shape=time-area`: all of a node's time shifts as wide
+as their mean −ln p, weighted by p, so they read as one branch keeping their
+area. A measure's rows may be widths rather than probabilities: each child's
+own −ln q, as given, whatever they sum to. Each transcriber, one per size,
+recording, start and instruments, keeps a few KV caches (`--slots`), one per
+window in reach, stepped back to the prefix a request shares with what they
+hold; measures differing only in temperature or shape share one.
+
+`POST /recordings?name=FILE` takes an audio file soundfile reads and says its
+id, hashed from its bytes, so the same file is the same recording;
+`GET /recordings` lists them and `GET /recordings/ID` is one at 16 kHz, as the
+model hears it. Recordings live in the server's memory.
 
 `--dtype` sets the transformer weight and KV cache precision for all measures.
 Choose `float32`, `float16`, or `bfloat16`. When omitted, MuScriptor uses its
 device default. CUDA uses FP16 autocast for the initial pass of each window.
 
 ```bash
-bun run scribe -- --p large --device cuda --dtype float16 song.mp3
+bun run scribe -- --size large --device cuda --dtype float16 song.mp3
 ```
 
 Its `/labels.json` is a notes file rather than an array of bytes:
-`{"kind": "notes", "frameRate", "window", "windows", "at", "audio", "events":
-[[type, value], …], "instruments", "drums"}`. The client reads its kind and
+`{"kind": "notes", "frameRate", "window", "events": [[type, value], …],
+"instruments", "drums"}`; how many windows a path has, where the first
+starts and the audio come from p's recording. The client reads its kind and
 draws each box as its event: a note head for a note-on and a ring for a
 note-off in the instrument's color, a tie, a drum ×, a clock with the time in
 the recording for a shift, a stop for an EOS. The panel above the canvas
@@ -301,7 +321,7 @@ zooming either stops following it, so the view holds still; ⇥ and ↕ follow,
 or a double-click, follow again. Pitches are named as they have room, C
 first, then G, E, the rest of C major and the black keys. Hovering a
 note names it. Space plays the transcription in view, shift + space plays it
-over the recording (`/audio.wav`).
+over p's recording.
 
 ## Data
 
@@ -316,16 +336,17 @@ Snapshots, with or without a labels file, can also be dropped onto the page.
 bun run data      # Zen of Python character n-grams, no ML needed
 cd export
 uv run hf.py      # Qwen3-1.7B as p, Qwen3-0.6B as q
-uv run hf.py --p HuggingFaceTB/SmolLM2-360M --tokenizer HuggingFaceTB/SmolLM2-360M \
-  --q context:4 --q temperature:1.6
+uv run hf.py --model HuggingFaceTB/SmolLM2-360M --tokenizer HuggingFaceTB/SmolLM2-360M \
+  --q SmolLM2-360M/context=4 --q SmolLM2-360M/temperature=1.6
 ```
 
 Both use natwalk's own search to discover the tree, then evaluate the other
 measures on the same paths, each listed in its own order down to the bit
 below its coverage. `hf.py` roots the tree at the empty text too: it records
 the path down to the prompt where natwalk's discovery begins. The browser
-chooses its own anchor through text search or its saved view. A q measure is another model with the same
-tokenizer, `context:N` (p seeing only its last N tokens) or `temperature:T`.
+chooses its own anchor through text search or its saved view. A q measure is
+a spec, as `serve.py` reads them, of any `--model`; a recording's measures
+are named by their specs.
 
 ## Development
 

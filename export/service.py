@@ -1,8 +1,9 @@
 """Model-independent integer-sequence cache, scheduler and session transport.
 
-Language and music adapters supply the measures; the Rust core owns their
-cached distributions, the hashed node ids shared with every client, and what
-each client's view lacks.
+Language and music adapters supply a catalog: what their specs may say, and
+how to open the measure one names. Measures open the first time a client
+asks for one; the Rust core owns their cached distributions, the hashed node
+ids shared with every client, and what each client's view lacks.
 """
 
 from __future__ import annotations
@@ -19,12 +20,11 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from itertools import zip_longest
-from typing import Any, Protocol
+from typing import Any
 
 import anyio.to_thread
 import numpy as np
 from google.protobuf.message import DecodeError
-from natlas import natlas_pb2 as pb
 from natlas_core import Session, Tree
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -34,27 +34,8 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-
-class Measure(Protocol):
-    """Next-token ln weights over the vocabulary, as float32 rows: up to a
-    constant, or each child's own where ``widths``."""
-
-    name: str
-    # How many distributions one forward pass computes, and of how many
-    # paths at most.
-    width: int
-    paths: int
-    # The most tokens a path it reads may hold, or None where nothing says.
-    longest: int | None
-    # Whether its rows are each child's own ln weight, -ln of the width it
-    # is drawn at, rather than ln weights up to a constant.
-    widths: bool
-
-    def walk(self, walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
-        """For each walk (tokens, start), the rows after tokens[:k] for every
-        k from ``start`` through len(tokens)."""
-        ...
-
+from catalog import Measure
+from natlas import natlas_pb2 as pb
 
 _PROTO_CONTENT_TYPE = "application/proto"
 # Memory for distributions a server keeps by default, across its measures.
@@ -74,9 +55,9 @@ class Client:
 
 @dataclass(frozen=True)
 class Pass:
-    """One forward pass under ``measure``: for each walk, the distributions
-    of its nodes, each the child of the one before; and the clients waiting
-    on them, whose new demands withdraw it."""
+    """One forward pass under ``measure``, by id: for each walk, the
+    distributions of its nodes, each the child of the one before; and the
+    clients waiting on them, whose new demands withdraw it."""
 
     measure: int
     walks: tuple[tuple[int, ...], ...]
@@ -104,28 +85,36 @@ class Model:
     client in turn, from the next client in turn on; within a client, worth
     alone decides. A new demand withdraws the queued pass of the client, so
     the next one is chosen from it.
+
+    Measures are numbered as clients first name them. One opens on the
+    model's thread, as a pass does, so it never runs beside one; what waits
+    on it waits until it is open, and fails if it cannot be.
     """
 
     def __init__(
         self,
         root: tuple[int, ...],
-        ends: Callable[[tuple[int, ...]], bool],
         vocabulary: int,
-        measures: list[Measure],
+        open: Callable[[str], Measure],
         cache: int = CACHE,
         order: str = "heaviest",
     ):
         # What the model reads before the root's children: a start-of-text token.
         self.root = root
-        # Whether a path is finished, with no children.
-        self.ends = ends
         # Branches the model has; every other branch has weight zero.
         self.vocabulary = vocabulary
-        self.measures = measures
+        # The measure a spec names, opened however long that takes.
+        self.open_measure = open
+        # Each measure's spec by id, the id of each spec named, and the
+        # measures open and the ones that could not be, by id.
+        self.specs: list[str] = []
+        self.ids: dict[str, int] = {}
+        self.measures: dict[int, Measure] = {}
+        self.failures: dict[int, str] = {}
         # The order each node's children rank in: "heaviest" first, or by
         # "branch", where branches already follow the reading's own order.
         self.order = order
-        self.tree = Tree(len(measures))
+        self.tree = Tree()
         # Which distributions to forget first: the oldest, once those kept,
         # by (node, measure), hold more than ``cache`` bytes.
         self.cache = cache
@@ -171,10 +160,37 @@ class Model:
         path = (demand.path.node, list(demand.path.branches)) if demand.HasField("path") else None
 
         def demanded() -> None:
-            client.session.demand(self.tree, demand.p, demand.q, view=view, path=path)
+            p, q = self._measure(demand.p), self._measure(demand.q)
+            client.session.demand(self.tree, p, q, view=view, path=path)
             self._withdraw(client)
 
         return self.call(demanded)
+
+    def _measure(self, spec: str) -> int:
+        """The id of the measure ``spec`` names, opening it the first time.
+        One that could not be opened opens again when named again."""
+        known = self.ids.get(spec)
+        if known is not None:
+            return known
+        measure = self.ids[spec] = len(self.specs)
+        self.specs.append(spec)
+
+        def open() -> Measure:
+            print(f"opening {spec} …", file=sys.stderr)
+            return self.open_measure(spec)
+
+        future = self.inference.submit(open)
+        future.add_done_callback(lambda future: self.call(lambda: self._opened(measure, future)))
+        return measure
+
+    def _opened(self, measure: int, future: Future[Measure]) -> None:
+        error = future.exception()
+        if error is None:
+            self.measures[measure] = future.result()
+            return
+        traceback.print_exception(error)
+        self.failures[measure] = f"{self.specs[measure]}: {type(error).__name__}: {error}"
+        del self.ids[self.specs[measure]]
 
     def learn(self, path: Sequence[int]) -> Future[list[int]]:
         """Learn the ids along ``path``, so demands can name them alone."""
@@ -203,7 +219,7 @@ class Model:
     def _step(self, client: Client) -> None:
         updates = client.session.step(self.tree)
         if updates:
-            client.send(_encode(updates))
+            client.send(_encode(updates, self.specs))
 
     def _withdraw(self, client: Client) -> None:
         """Withdraw the client's queued pass; its result is taken, and the
@@ -236,10 +252,21 @@ class Model:
         need no pass."""
         count = len(self.clients)
         order = [self.clients[(self.turn + offset) % count] for offset in range(count)]
-        waits = {client: [blocked for blocked in client.session.blocked() if blocked[:2] not in reserved] for client in order}
+        # What waits on a measure that could not be opened fails; on one
+        # still opening it waits.
+        settled = False
+        for client in order:
+            for measure, node, *_ in client.session.blocked():
+                if measure in self.failures:
+                    client.session.failed(measure, node, self.failures[measure])
+                    settled = True
+        waits = {
+            client: [blocked for blocked in client.session.blocked() if blocked[:2] not in reserved and blocked[0] in self.measures]
+            for client in order
+        }
         first = next((index for index, client in enumerate(order) if waits[client]), None)
         if first is None:
-            return None, False
+            return None, settled
         self.turn = (self.turn + first + 1) % count
         order = order[first:] + order[:first]
         measure = waits[order[0]][0][0]
@@ -247,7 +274,6 @@ class Model:
         width, paths = self.measures[measure].width, self.measures[measure].paths
         walks: list[tuple[int, ...]] = []
         clients: set[Client] = set()
-        settled = False
         for client, (_, node, _, ahead) in (taken for turn in turns for taken in turn if taken is not None):
             room = width - sum(map(len, walks))
             if room == 0 or len(walks) == paths:
@@ -273,7 +299,7 @@ class Model:
         held nor on their way. None where it needs no pass, as a node with no
         children or one deeper than the measure reads, settled at once."""
         tokens = tuple(self.tree.path(node))
-        if self._empty(tokens):
+        if self._empty(measure, tokens):
             self._keep(measure, [node], [np.empty(0, np.float32)])
             return None
         longest = self.measures[measure].longest
@@ -283,7 +309,7 @@ class Model:
         nodes, along = [node], tokens
         for branch in ahead:
             along += (branch,)
-            if self._empty(along) or not self._reads(measure, along):
+            if self._empty(measure, along) or not self._reads(measure, along):
                 break
             (_, child) = self.tree.walk(nodes[-1], [branch])
             if (measure, child) in reserved or self.tree.has(child, measure):
@@ -305,7 +331,7 @@ class Model:
             elapsed = (time.perf_counter() - started) * 1000
             depths = sorted({start - len(self.root) for _, start in reads})
             print(
-                f"m{job.measure} {len(reads)} paths, depth {depths[0]}–{depths[-1]}: "
+                f"{self.specs[job.measure]} {len(reads)} paths, depth {depths[0]}–{depths[-1]}: "
                 f"{sum(map(len, job.walks))} computed, {elapsed:.0f} ms",
                 file=sys.stderr,
             )
@@ -340,9 +366,9 @@ class Model:
         longest = self.measures[measure].longest
         return longest is None or len(self.root) + len(tokens) <= longest
 
-    def _empty(self, tokens: tuple[int, ...]) -> bool:
+    def _empty(self, measure: int, tokens: tuple[int, ...]) -> bool:
         """Whether a sequence has no children: finished, or past the vocabulary."""
-        return self.ends(tokens) or any(self.vocabulary <= branch for branch in tokens)
+        return self.measures[measure].ends(tokens) or any(self.vocabulary <= branch for branch in tokens)
 
     def _keep(self, measure: int, nodes: list[int], rows: list[np.ndarray]) -> None:
         rows = [np.ascontiguousarray(row, dtype=np.float32) for row in rows]
@@ -357,14 +383,14 @@ class Model:
             self.held -= size
 
 
-def _encode(updates: list[tuple]) -> bytes:
-    """A session's updates as one Updates frame."""
+def _encode(updates: list[tuple], specs: list[str]) -> bytes:
+    """A session's updates as one Updates frame, each measure by its spec."""
     frame = pb.Updates()
     for update in updates:
         match update:
             case ("answer", measure, node, parent, branch, runs, count):
                 answer = frame.updates.add().answer
-                answer.measure, answer.node = measure, node
+                answer.measure, answer.node = specs[measure], node
                 if parent is not None:
                     answer.parent, answer.branch = parent, branch
                 answer.children.runs.extend(
@@ -378,9 +404,9 @@ def _encode(updates: list[tuple]) -> bytes:
             case ("placed", node, branches):
                 frame.updates.add().placed.CopyFrom(pb.Path(node=node, branches=branches))
             case ("lacks", measure, node):
-                frame.updates.add().lacks.CopyFrom(pb.Missing(measure=measure, node=node))
+                frame.updates.add().lacks.CopyFrom(pb.Missing(measure=specs[measure], node=node))
             case ("failed", measure, node, message):
-                frame.updates.add().failed.CopyFrom(pb.Failed(measure=measure, node=node, message=message))
+                frame.updates.add().failed.CopyFrom(pb.Failed(measure=specs[measure], node=node, message=message))
     return frame.SerializeToString()
 
 
@@ -389,8 +415,10 @@ def app(
     manifest: list[dict],
     files: dict[str, tuple[bytes, str]],
     search: Callable[[str], Sequence[int]] | None = None,
+    routes: Sequence[Route] = (),
 ) -> Starlette:
-    """The session endpoint, manifest, files, and optional text-to-path search."""
+    """The session endpoint, manifest, files, optional text-to-path search,
+    and any routes of the server's own."""
 
     async def session(websocket: WebSocket) -> None:
         await websocket.accept()
@@ -463,12 +491,12 @@ def app(
 
         return serve
 
-    routes: list = [Route("/manifest.json", manifest_json), WebSocketRoute("/session", session)]
-    routes += [Route(f"/{path}", file(*served)) for path, served in files.items()]
-    routes += [Route(f"/{index}/natlas.Natlas/Search", search_rpc, methods=["POST"]) for index in range(len(model.measures))]
+    served: list = [Route("/manifest.json", manifest_json), WebSocketRoute("/session", session)]
+    served += [Route(f"/{path}", file(*content)) for path, content in files.items()]
+    served += [Route("/natlas.Natlas/Search", search_rpc, methods=["POST"]), *routes]
     # Any page may read a local research server.
     cors = Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
-    return Starlette(routes=routes, middleware=[cors])
+    return Starlette(routes=served, middleware=[cors])
 
 
 def _slug(text: str) -> str:

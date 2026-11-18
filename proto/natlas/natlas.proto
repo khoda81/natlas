@@ -6,6 +6,14 @@ package natlas;
 // interval tree that a server measures on demand, under one or more measures:
 // comparing two means asking one server for the same nodes under each.
 //
+// A measure gives each node's children their weights. It is named by a
+// spec, a string the server reads: its source and how it is conditioned,
+// as `medium/audio=3f2a9c/temperature=1.6`, path segments whose first is
+// the source and each other a parameter, its value percent-encoded. The
+// server lists what its specs may say beside the session; any two of them
+// can be compared, since every measure of a server gives its branches one
+// meaning.
+//
 // A node is a sequence, and its children are its 2^32 one-integer
 // extensions: its branches. Every branch exists; one a server never lists has
 // weight zero. What a branch denotes is agreed outside this protocol.
@@ -67,9 +75,10 @@ message Run {
 
 // What the client is looking at now, in place of what it looked at before.
 message Demand {
-  // The measures in view: p places children and orders them, q sizes them.
-  uint32 p = 1;
-  uint32 q = 2;
+  // The measures in view, by spec: p places children and orders them, q
+  // sizes them. Answers name them as the demand does.
+  string p = 1;
+  string q = 2;
   optional View view = 3;
   // Placed before anything else: a flight's or a restore's path, or the
   // origin's place in its parent when the view reaches past the origin. A
@@ -119,13 +128,14 @@ message Update {
     // The source will never have this distribution: a recording that did
     // not record it.
     Missing lacks = 4;
-    // Computing a distribution failed, too long for the context or worse.
+    // Computing a distribution failed, too long for the context or worse,
+    // or its measure could not be opened.
     Failed failed = 5;
   }
 }
 
 message Answer {
-  uint32 measure = 1;
+  string measure = 1;
   fixed64 node = 2;
   // Its parent and branch, absent at the root: the client may not have
   // named a node the view reached.
@@ -135,12 +145,12 @@ message Answer {
 }
 
 message Missing {
-  uint32 measure = 1;
+  string measure = 1;
   fixed64 node = 2;
 }
 
 message Failed {
-  uint32 measure = 1;
+  string measure = 1;
   fixed64 node = 2;
   string message = 3;
 }

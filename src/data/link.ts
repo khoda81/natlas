@@ -2,13 +2,13 @@
 // into the tree. The server works out what the view lacks and in what order;
 // the page only says what it looks at, and which path to place first.
 
-import type { Lens, Path, View } from "../core/layout";
+import type { Path, View } from "../core/layout";
 import { type Branch, type IntervalTree, type NodeId, ROOT } from "../core/tree";
-import type { Connection, Demand, Server, Update } from "./source";
+import type { Connection, Demand, Server, Specs, Update } from "./source";
 
 export class Link {
   private readonly connection: Connection;
-  private lens: Lens | null = null;
+  private specs: Specs | null = null;
   private view: View | null = null;
   /** The path to place first, and what waits on it: true once placed,
    * false where the server places no more of it, null if another path took
@@ -27,9 +27,9 @@ export class Link {
     this.connection = server.connect((updates) => this.take(updates), (error) => this.onError(error));
   }
 
-  /** What the page looks at now, through ``lens``. */
-  look(lens: Lens, view: View | null): void {
-    this.lens = lens;
+  /** What the page looks at now, under the measures ``specs`` names. */
+  look(specs: Specs, view: View | null): void {
+    this.specs = specs;
     this.view = view;
     this.tell();
   }
@@ -64,8 +64,8 @@ export class Link {
   /** Say what the page looks at, if that changed. A node the server has not
    * learned is named down a path from the root, which teaches it. */
   private tell(): void {
-    const lens = this.lens;
-    if (lens === null) return;
+    const specs = this.specs;
+    if (specs === null) return;
     let path = this.path?.path ?? null;
     if (path !== null && this.unknown.has(path.node)) {
       path = { node: ROOT, branches: [...this.tree.path(path.node), ...path.branches] };
@@ -73,7 +73,7 @@ export class Link {
     if (path === null && this.view !== null && this.unknown.has(this.view.node)) {
       path = { node: ROOT, branches: this.tree.path(this.view.node) };
     }
-    const demand: Demand = { lens, view: this.view, path };
+    const demand: Demand = { specs, view: this.view, path };
     const said = JSON.stringify(demand, (_, value: unknown) =>
       typeof value === "bigint" ? `${value}` : value instanceof Uint8Array ? [...value] : value);
     if (said === this.said) return;
@@ -91,7 +91,7 @@ export class Link {
             const named = this.tree.child(update.parent, update.branch);
             if (named !== update.node) throw new Error(`the server named node ${update.node} as ${named}`);
           }
-          this.tree.insert(update.node, update.measure, { runs: update.runs, count: update.count ?? undefined });
+          this.tree.insert(update.node, this.tree.measure(update.measure), { runs: update.runs, count: update.count ?? undefined });
           break;
         }
         case "unknown":
@@ -111,7 +111,7 @@ export class Link {
           break;
         }
         case "lacks":
-          this.lacking.add(`${update.measure}:${update.node}`);
+          this.lacking.add(`${this.tree.measure(update.measure)}:${update.node}`);
           break;
         case "failed":
           this.onError(new Error(update.message));
@@ -123,7 +123,7 @@ export class Link {
 
   /** Whether p places every branch of the path. */
   private placed({ node, branches }: Path): boolean {
-    const lens = this.lens!;
+    const lens = { p: this.tree.measure(this.specs!.p), q: this.tree.measure(this.specs!.q) };
     for (const branch of branches) {
       if (this.tree.entry(node, lens, branch) === undefined) return false;
       node = this.tree.child(node, branch);

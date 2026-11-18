@@ -29,7 +29,7 @@ describe("layout", () => {
   });
 
   it("draws p's heights and q's widths", () => {
-    const tree = new IntervalTree(2);
+    const tree = new IntervalTree();
     tree.insert(ROOT, 0, answer([0.5, 0.5]));
     tree.insert(ROOT, 1, answer([0.25, 0.75]));
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
@@ -49,7 +49,7 @@ describe("layout", () => {
   });
 
   it("keeps the origin selectable before anything arrives, and looks at all of it", () => {
-    const tree = new IntervalTree(1);
+    const tree = new IntervalTree();
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
     const frame = layout(tree, lens, cam, view);
     expect(pick(tree, lens, frame, cam, view, 500, 400, 1)).toMatchObject({ box: { node: ROOT }, exact: false });
@@ -59,7 +59,7 @@ describe("layout", () => {
   });
 
   it("splits heights by p in p's order and sizes widths by -ln q", () => {
-    const tree = new IntervalTree(1);
+    const tree = new IntervalTree();
     tree.insert(ROOT, 0, answer([0.5, 0.25, 0.25], [7, 3, 9]));
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
     const near = (value: number) => expect.closeTo(value, 12);
@@ -71,7 +71,7 @@ describe("layout", () => {
   });
 
   it("counts the children in a gap where the source says where the node ends, and draws them at their mean weight", () => {
-    const tree = new IntervalTree(1);
+    const tree = new IntervalTree();
     tree.insert(ROOT, 0, { ...answer([0.5, 0.25], [4, 7]), count: 9 });
     const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
     const gap = layout(tree, lens, cam, view).boxes.find((box) => box.kind === "gap")!;
@@ -155,7 +155,7 @@ describe("layout", () => {
   });
 
   it("ends the anchor's path at what p places", () => {
-    const tree = chainTree([0.5, 0.5], [1, 0], 2);
+    const tree = chainTree([0.5, 0.5], [1, 0]);
     tree.insert(ROOT, 1, answer([1]));
     const cam: Camera = { origin: ROOT, x: 1, k: 100, anchor: { path: [1, 0], digits: digits(0.5) }, a: 0.4 };
     settle(tree, { p: 1, q: 1 }, cam);

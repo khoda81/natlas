@@ -26,23 +26,23 @@ const differs = (pixels: Uint8ClampedArray, at: number, expected: number[]) =>
 /** Every branch of a distribution, given once and ending the node. */
 const complete = (weights: number[], branches?: number[]) => answer(weights, branches, 0, 0);
 const count = 10000;
-const uniform = new IntervalTree(1);
+const uniform = new IntervalTree();
 uniform.insert(ROOT, 0, complete(Array(count).fill(1 / count)));
-const varying = new IntervalTree(2);
+const varying = new IntervalTree();
 const weights = Array.from({ length: count }, (_, i) => 1 + 0.9 * Math.cos(i / (count - 1) * Math.PI));
 const total = weights.reduce((a, b) => a + b, 0);
 const p = weights.map(w => w / total);
 varying.insert(ROOT, 0, complete(p));
 varying.insert(ROOT, 1, complete(p, p.map((_, i) => count - 1 - i)));
 // Thick children of distinct widths, and steps between them.
-const steps = new IntervalTree(1);
+const steps = new IntervalTree();
 steps.insert(ROOT, 0, complete([0.5, 0.3, 0.15, 0.05]));
 // A heavy child ending mid-pixel at every ratio, then children thinner than
 // a pixel.
-const midPixel = new IntervalTree(1);
+const midPixel = new IntervalTree();
 midPixel.insert(ROOT, 0, complete([0.5, 0.4983, 0.0007, 0.0006, 0.0004]));
 // Known children alternate with one-child gaps, so the tail spans runs.
-const gapped = new IntervalTree(1);
+const gapped = new IntervalTree();
 gapped.insert(ROOT, 0, { runs: Array.from({ length: count / 2 }, (_, i) =>
   run([1 / count], [2 * i], 2 * i, 1 - (2 * i + 1) / count)) });
 
@@ -115,7 +115,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
   // pixels: at the time each lands on, even one too thin to draw, and the
   // time they move over, from where the path is, shaded.
   {
-    const tree = new IntervalTree(1);
+    const tree = new IntervalTree();
     // 136 pixels, a fraction of one, and the rest; wider than the view, but
     // the last, 153 pixels.
     tree.insert(ROOT, 0, complete([0.4, 0.0004, 0.5996]));
@@ -139,7 +139,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
   // A time branch shows the label its parent was too small for, though
   // never its own: its time is on the timeline, here off to the right.
   {
-    const tree = new IntervalTree(1);
+    const tree = new IntervalTree();
     tree.insert(ROOT, 0, complete([0.98, 0.02]));
     tree.insert(tree.child(ROOT, 0), 0, complete([0.5, 0.5]));
     const camera = cam(0, 300);

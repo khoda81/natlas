@@ -4,7 +4,7 @@ import { answer } from "./build";
 
 describe("IntervalTree", () => {
   it("names nodes by their branches from the root, alike in every tree", () => {
-    const tree = new IntervalTree(2);
+    const tree = new IntervalTree();
     const child = tree.child(ROOT, 5);
     const grandchild = tree.child(child, 2);
     expect(tree.child(ROOT, 5)).toBe(child);
@@ -13,11 +13,11 @@ describe("IntervalTree", () => {
     expect(tree.path(grandchild)).toEqual([5, 2]);
     expect(tree.chain(ROOT, grandchild)).toEqual([ROOT, child, grandchild]);
     expect(tree.descend(ROOT, [5, 2])).toBe(grandchild);
-    expect(new IntervalTree(1).descend(ROOT, [5, 2])).toBe(grandchild);
+    expect(new IntervalTree().descend(ROOT, [5, 2])).toBe(grandchild);
   });
 
   it("places children by p in p's order and sizes them by q, unknown until q says", () => {
-    const tree = new IntervalTree(2);
+    const tree = new IntervalTree();
     tree.insert(ROOT, 0, answer([0.75, 0.25], [9, 4]));
     const lens = { p: 0, q: 1 };
     expect(tree.entry(ROOT, lens, 4)).toEqual({ rank: 1, before: expect.closeTo(0.75, 12), lnP: expect.closeTo(Math.log(0.25), 12), natsQ: Infinity });
@@ -29,7 +29,7 @@ describe("IntervalTree", () => {
   });
 
   it("tells a node without children from one not yet asked, and notifies only on change", () => {
-    const tree = new IntervalTree(1);
+    const tree = new IntervalTree();
     let changes = 0;
     tree.subscribe(() => changes++);
     expect(tree.has(ROOT, 0)).toBe(false);

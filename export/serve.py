@@ -21,21 +21,24 @@
 # config-settings-package = { llama-cpp-python = { "cmake.define.GGML_CUDA" = "ON", "cmake.define.CMAKE_CUDA_ARCHITECTURES" = "75" } }
 # ///
 
-"""Serve a language model's integer-sequence distribution to natlas, live.
+"""Serve language models' integer-sequence distributions to natlas, live.
 
-The root is the empty sequence; the model reads its start-of-text token
+The root is the empty sequence; a model reads its start-of-text token
 internally before that path. Every other node is a complete token path from
-the root, and its children are the next tokens. Every measure is one Natlas
-service under its own URL prefix, /0/ for the model itself and /1/, /2/, …
-for the --q measures. The browser sends demands and receives updates over
-the /session WebSocket. Search uses Connect unary. GET /manifest.json
-describes the measures and GET /labels.json holds the token bytes.
+the root, and its children are the next tokens. A measure is named by a spec
+(see lm.py) the page builds from the catalog in GET /manifest.json: any
+--model, which all share the first one's tokenizer, at any temperature or
+context, steered by any --control vector. The browser sends demands and
+receives updates over the /session WebSocket; a measure opens the first time
+one names it. Search uses Connect unary. GET /labels.json holds the token
+bytes.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 import lm
 import uvicorn
@@ -45,14 +48,14 @@ from service import CACHE, Model, _slug, app
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--p", default="HuggingFaceTB/SmolLM2-360M", help="the model: a Hugging Face id or a .gguf file")
     parser.add_argument(
-        "--q",
+        "--model",
         action="append",
-        default=[],
-        help="further measure, repeatable: a model id sharing p's tokenizer, context:N, temperature:T, or control:FILE",
+        help="a model offered, repeatable: a Hugging Face id or a .gguf file; the first is opened at once "
+        "and its tokenizer is every one's (default HuggingFaceTB/SmolLM2-360M)",
     )
-    parser.add_argument("--tokenizer", help="default: p's own")
+    parser.add_argument("--control", action="append", default=[], type=Path, help="a llama.cpp control vector offered, repeatable")
+    parser.add_argument("--tokenizer", help="the first model's tokenizer, where not its own")
     parser.add_argument("--device", default=lm.default_device())
     parser.add_argument("--dtype", choices=lm.DTYPES, default="float32")
     parser.add_argument("--n-ctx", type=int, default=8192, help="llama.cpp: tokens of context, the deepest node")
@@ -67,39 +70,32 @@ def main() -> None:
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8421)
     args = parser.parse_args()
+    models = args.model or ["HuggingFaceTB/SmolLM2-360M"]
 
-    print(f"loading {args.p} …", file=sys.stderr)
-
-    def open_language(spec: str) -> lm.Language:
+    def open_language(model: str) -> lm.Language:
+        print(f"loading {model} …", file=sys.stderr)
         llama = {"context": args.n_ctx, "gpu_layers": args.gpu_layers}
-        return lm.open_language(spec, args.device, args.dtype, args.tokenizer if spec == args.p else None, **llama)
+        language = lm.open_language(model, args.device, args.dtype, args.tokenizer if model == models[0] else None, **llama)
+        print(f"{model}: {language.width} distributions a pass, of {language.paths} paths at most", file=sys.stderr)
+        return language
 
-    language = open_language(args.p)
-    measures = lm.measures(language, args.q, open_language)
-    for measure in measures:
-        print(f"{measure.name}: {measure.width} distributions a pass, of {measure.paths} paths at most", file=sys.stderr)
-    labels = labels_json(language.token_bytes())
-
+    try:
+        languages = lm.Languages(models, open_language)
+    except ValueError as error:
+        parser.error(str(error))
+    catalog = lm.catalog(languages, args.control)
+    language = languages.first
     manifest = [
         {
-            "name": f"live-{_slug(language.name.split('/')[-1])}",
-            "title": f"{language.name} · live",
+            "name": f"live-{_slug(lm.model_name(models[0]))}",
+            "title": f"{', '.join(languages.models)} · live",
             "labels": "labels.json",
-            "measures": [{"name": measure.name, "url": f"{index}/"} for index, measure in enumerate(measures)],
+            "catalog": catalog.describe(),
         }
     ]
-    model = Model(
-        language.start,
-        lambda path: bool(path) and path[-1] in language.eos,
-        language.vocabulary,
-        measures,
-        round(args.cache * 2**30),
-        args.order,
-    )
-    files = {"labels.json": (labels.encode(), "application/json")}
-    uvicorn.run(
-        app(model, manifest, files, search=language.encode), host=args.host, port=args.port, access_log=False
-    )
+    model = Model(language.start, language.vocabulary, catalog.open, round(args.cache * 2**30), args.order)
+    files = {"labels.json": (labels_json(language.token_bytes()).encode(), "application/json")}
+    uvicorn.run(app(model, manifest, files, search=language.encode), host=args.host, port=args.port, access_log=False)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,9 @@ export interface SavedView {
   x: number;
   k: number;
   a: number;
-  p: number;
-  q: number;
+  /** The measures in view, by spec. */
+  p: string;
+  q: string;
 }
 
 const isPath = (path: unknown): path is number[] =>
@@ -21,12 +22,11 @@ export function serializeView({ anchor, ...view }: SavedView): string {
   return JSON.stringify({ ...view, path: anchor.path, digits });
 }
 
-export function parseView(raw: string, measures: number): SavedView | null {
+export function parseView(raw: string): SavedView | null {
   try {
     const value = JSON.parse(raw) as Partial<Omit<SavedView, "anchor"> & { path: number[]; digits: string }> | null;
     const { origin, path, digits, x, k, a, p, q } = value ?? {};
-    const isMeasure = (measure: unknown): measure is number =>
-      typeof measure === "number" && Number.isInteger(measure) && 0 <= measure && measure < measures;
+    const isMeasure = (measure: unknown): measure is string => typeof measure === "string";
     if (
       !isPath(origin) || !isPath(path) ||
       typeof digits !== "string" || !/^([0-9a-f]{2})*$/.test(digits) ||
@@ -44,5 +44,5 @@ export function parseView(raw: string, measures: number): SavedView | null {
 }
 
 export function viewKey(dataset: string): string {
-  return `natlas.view:4:${encodeURIComponent(dataset)}`;
+  return `natlas.view:5:${encodeURIComponent(dataset)}`;
 }

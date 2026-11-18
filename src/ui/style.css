@@ -131,6 +131,56 @@ body {
   display: none;
 }
 
+.measure {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.measure-options {
+  color: var(--ink-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.measure-options.set {
+  color: var(--ink);
+}
+
+/* What else a measure's spec says: a field a line, beside the button. */
+.measure-panel {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 8px 10px;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 6px 10px;
+  align-items: center;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.measure-panel:not(:popover-open) {
+  display: none;
+}
+
+.measure-panel label {
+  display: contents;
+}
+
+.measure-panel label > span {
+  color: var(--ink-muted);
+}
+
+.measure-panel input {
+  width: 12ch;
+}
+
 .readout {
   color: var(--ink-muted);
   font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

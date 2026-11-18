@@ -319,17 +319,17 @@ interface Painted {
 /** Each node's time branches as one CDF on the timeline drawn above them,
  * across the same pixels: down a run of them, the line stands at the time
  * each known one lands on, however thin, and crosses straight over the
- * unknown ones between; the time they move over, from where the path is,
- * is shaded, and behind it every other interval between the times the path
- * stood at before. Clipped to the node's children in those rows: a window
- * onto the timeline. */
+ * unknown ones between. The time they move over, from where the path is,
+ * and behind it each interval between the times the path stood at before,
+ * are shaded as the reading says. Clipped to the node's children in those
+ * rows: a window onto the timeline. */
 function timeCdfs(
   ctx: CanvasRenderingContext2D,
   spans: Map<NodeId, Painted[]>,
   timeline: Timeline,
   view: Viewport,
   known: (node: NodeId) => readonly Known[],
-  timeOf: (node: NodeId, branch: number) => { from: number; to: number; trail: Trail | null } | undefined,
+  timeOf: (node: NodeId, branch: number) => { from: number; to: number; shaded: boolean; trail: Trail | null } | undefined,
   ink: string,
 ): void {
   // Far-off coordinates lose precision and can stall rasterizing.
@@ -366,21 +366,20 @@ function timeCdfs(
       ctx.clip();
       ctx.fillStyle = ctx.strokeStyle = ink;
       ctx.beginPath();
-      // Back from ``from``, the interval just behind it clear, the one
-      // before that shaded, and so on. Time only moves on, so the rest of
-      // the trail lies left of the view once one time does.
+      // Back from ``from``, each interval the trail shades. Time only moves
+      // on, so the rest of the trail lies left of the view once one time does.
       let newer = from;
-      let shaded = false;
       for (let trail = start.trail; trail !== null && -OVERSCAN < newer; trail = trail.before) {
         const older = x(trail.at);
-        if (shaded) ctx.rect(older, top, newer - older, bottom - top);
-        shaded = !shaded;
+        if (trail.shaded) ctx.rect(older, top, newer - older, bottom - top);
         newer = older;
       }
-      ctx.moveTo(from, top);
-      for (const [px, py] of line) ctx.lineTo(px, py);
-      ctx.lineTo(from, bottom);
-      ctx.closePath();
+      if (start.shaded) {
+        ctx.moveTo(from, top);
+        for (const [px, py] of line) ctx.lineTo(px, py);
+        ctx.lineTo(from, bottom);
+        ctx.closePath();
+      }
       ctx.globalAlpha = TIME_ALPHA;
       ctx.fill();
       ctx.globalAlpha = 1;

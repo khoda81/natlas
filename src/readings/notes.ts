@@ -83,6 +83,11 @@ export interface Transcript {
   touched: Set<Note | Hit>;
 }
 
+/** Time is shaded while pitches start notes, the on/off switch on, as time moves on. */
+function starting(score: Score): boolean {
+  return score.velocity !== null && 0 < score.velocity;
+}
+
 /** What a transcript file says it is. */
 const PATH_KIND = "natlas.transcript";
 
@@ -132,7 +137,7 @@ export class NoteLabels implements Labels {
   /** The trail of time moved from ``score`` to ``to``: where it stood joins it. */
   private moved(score: Score, to: number): Trail | null {
     const at = score.window * this.span + score.tick;
-    return at === to ? score.trail : { at, before: score.trail };
+    return at === to ? score.trail : { at, shaded: starting(score), before: score.trail };
   }
 
   /** ``path`` as a transcript file: its events by name, which outlive the labels' numbering. */
@@ -178,7 +183,7 @@ export class NoteLabels implements Labels {
         const seconds = this.seconds(start + value);
         // Under a second, in milliseconds: shifts are steps of 10 ms.
         const text = seconds < 1 ? `${Math.round(seconds * 1000)} ms` : clock(seconds);
-        return { text, mark: "time", time: { from: start + score.tick, to: start + value, trail: score.trail } };
+        return { text, mark: "time", time: { from: start + score.tick, to: start + value, shaded: starting(score), trail: score.trail } };
       }
       case "tie":
         return { text: "tie", mark: "tie" };

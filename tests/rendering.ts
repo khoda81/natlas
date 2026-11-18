@@ -122,9 +122,9 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const camera = cam(0, 300);
     const frame = layout(tree, { p: 0, q: 0 }, camera, view, { rowPx: 1 / dpr });
     const timeline = { x: (time: number) => time, left: 0, right: view.width };
-    // Time stood at 12, then 24, before 30.
-    const trail = { at: 24, before: { at: 12, before: null } };
-    const glyph = (_: bigint, branch: number) => ({ text: "", mark: "time" as const, time: { from: 30, to: [60, 100, 140][branch]!, trail } });
+    // Time stood at 12, then 24, before 30: shaded from 12 on.
+    const trail = { at: 24, shaded: true, before: { at: 12, shaded: true, before: null } };
+    const glyph = (_: bigint, branch: number) => ({ text: "", mark: "time" as const, time: { from: 30, to: [60, 100, 140][branch]!, shaded: true, trail } });
     const known = () => frame.known(tree, { p: 0, q: 0 }, ROOT);
     const c = canvas(dpr), ctx = c.getContext("2d")!;
     draw(ctx, frame, camera, view, palette, { ...state, glyph, timeline, known });
@@ -134,8 +134,8 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const error = Math.max(differs(pixels, at(40, 70), shaded), differs(pixels, at(60, 70), ink),
       differs(pixels, at(100, 70), fill), differs(pixels, at(120, 250), shaded), differs(pixels, at(140, 250), ink),
       differs(pixels, at(148, 250), fill),
-      // Behind 30 the interval back to 24 is clear, the one back to 12 shaded, and before the trail nothing.
-      differs(pixels, at(27, 70), fill), differs(pixels, at(18, 250), shaded), differs(pixels, at(8, 70), fill));
+      // Behind 30 the intervals back to 24 and to 12 shaded as the trail says, and before it nothing.
+      differs(pixels, at(27, 70), shaded), differs(pixels, at(18, 250), shaded), differs(pixels, at(8, 70), fill));
     results.push({ name: "time branches are one CDF on the timeline", dpr, phase: 0, error });
     frame.dispose();
   }
@@ -149,7 +149,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const camera = cam(0, 300);
     const frame = layout(tree, { p: 0, q: 0 }, camera, view, { rowPx: 1 / dpr });
     const timeline = { x: (time: number) => time, left: 0, right: view.width };
-    const glyph = (node: bigint) => node === ROOT ? { text: "piano" } : { text: "9 s", mark: "time" as const, time: { from: 1000, to: 1000, trail: null } };
+    const glyph = (node: bigint) => node === ROOT ? { text: "piano" } : { text: "9 s", mark: "time" as const, time: { from: 1000, to: 1000, shaded: true, trail: null } };
     const c = canvas(dpr), ctx = c.getContext("2d")!;
     draw(ctx, frame, camera, view, palette, { ...state, glyph, timeline, child: (node, branch) => tree.child(node, branch) });
     // Carried labels are framed and faint: any pixel inside the children

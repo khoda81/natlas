@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { NoteLabels, type NotesFile } from "../src/readings/notes";
+import type { Trail } from "../src/readings/reading";
 
 // MuScriptor's vocabulary layout: special tokens, shifts, then the note events.
 const ranges: [string, number][] = [["PAD", 1], ["EOS", 1], ["UNK", 1], ["shift", 1001], ["pitch", 128], ["velocity", 2], ["tie", 1], ["program", 130], ["drum", 128]];
@@ -51,13 +52,19 @@ describe("NoteLabels", () => {
     expect(labels.glyph(at(path.slice(0, 7)), pitch(48))).toMatchObject({ text: "C3", mark: "onset" });
     expect(labels.glyph(at([]), program(24))).toMatchObject({ text: "acoustic guitar", mark: "instrument" });
     // A shift moves time from where the path is to where it says, in shift
-    // steps; the trail is where time stood before, newest first.
-    expect(labels.glyph(at([]), shift(123))).toEqual({ text: "31.23 s", mark: "time", time: { from: 0, to: 123, trail: null } });
-    expect(labels.glyph(at([eos]), shift(123))).toEqual({ text: "36.23 s", mark: "time", time: { from: 500, to: 623, trail: { at: 0, before: null } } });
-    expect(labels.glyph(at(path.slice(0, 4)), shift(28))).toMatchObject({ time: { from: 5, to: 28, trail: { at: 0, before: null } } });
+    // steps; the trail is where time stood before, newest first. Time is
+    // shaded while the on/off switch is on as it moves on.
+    const clear = (at: number, before: Trail | null = null): Trail => ({ at, shaded: false, before });
+    expect(labels.glyph(at([]), shift(123))).toEqual({ text: "31.23 s", mark: "time", time: { from: 0, to: 123, shaded: false, trail: null } });
+    expect(labels.glyph(at([eos]), shift(123))).toEqual({ text: "36.23 s", mark: "time", time: { from: 500, to: 623, shaded: false, trail: clear(0) } });
+    expect(labels.glyph(at(path.slice(0, 4)), shift(28))).toMatchObject({ time: { from: 5, to: 28, shaded: false, trail: clear(0) } });
+    // Notes started at 5: on to 28 is shaded, before and after it as the switch is.
+    expect(labels.glyph(at(path.slice(0, 8)), shift(28))).toMatchObject({ time: { from: 5, to: 28, shaded: true } });
+    expect(at(path).trail).toEqual({ at: 5, shaded: true, before: clear(0) });
+    expect(labels.glyph(at(path), shift(40))).toMatchObject({ time: { from: 28, to: 40, shaded: false } });
     // A shift to where time already is leaves no trail; an EOS from a window's end neither.
-    expect(at([...path.slice(0, 4), shift(5), shift(28)]).trail).toEqual({ at: 5, before: { at: 0, before: null } });
-    expect(at([...path.slice(0, 4), shift(500), eos]).trail).toEqual({ at: 5, before: { at: 0, before: null } });
+    expect(at([...path.slice(0, 4), shift(5), shift(28)]).trail).toEqual(clear(5, clear(0)));
+    expect(at([...path.slice(0, 4), shift(500), eos]).trail).toEqual(clear(5, clear(0)));
     expect(labels.glyph(at([]), eos)).toEqual({ text: "⇥ 35 s", mark: "end" });
     expect(labels.glyph(at([eos, eos]), eos)).toEqual({ text: "end", mark: "end" });
   });

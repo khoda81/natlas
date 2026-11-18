@@ -10,15 +10,17 @@ export interface Glyph {
   text: string;
   mark?: Mark;
   tint?: string;
-  /** Where the event moves time from and to, in the reading's time, and
-   * where it stood before ``from``: what a timeline shows in place of the text. */
-  time?: { from: number; to: number; trail: Trail | null };
+  /** Where the event moves time from and to, in the reading's time, whether
+   * that time is shaded, and where time stood before ``from``: what a
+   * timeline shows in place of the text. */
+  time?: { from: number; to: number; shaded: boolean; trail: Trail | null };
 }
 
-/** The times a path's time stood at, newest first. A path's is its
- * parent's with at most one more, which it shares. */
+/** The times a path's time stood at, newest first, each shaded on to the
+ * next or not. A path's is its parent's with at most one more, which it shares. */
 export interface Trail {
   at: number;
+  shaded: boolean;
   before: Trail | null;
 }
 

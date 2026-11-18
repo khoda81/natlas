@@ -13,11 +13,9 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "export"))
-from muscriptor.tokenizer.mt3 import MT3Tokenizer  # noqa: E402
-
 import scribe  # noqa: E402
 
-TOKENIZER = MT3Tokenizer()
+TOKENIZER = scribe.TOKENIZER
 EOS = TOKENIZER.eos_id
 
 
@@ -27,6 +25,17 @@ def token(kind: str, value: int = 0) -> int:
 
 def windows(at: float = 5.0, count: int | None = 3) -> scribe.Windows:
     return scribe.Windows(TOKENIZER, at, count, scribe.MAX_EVENTS)
+
+
+class LabelsTests(unittest.TestCase):
+    def test_programs_are_named_by_the_models_instrument_groups(self):
+        import json
+
+        instruments = json.loads(scribe.labels_file())["instruments"]
+        # Each group's first program: what the model writes for any in it.
+        self.assertEqual(instruments["32"], "acoustic bass")
+        self.assertEqual(instruments["52"], "voice")
+        self.assertEqual(instruments["64"], "soprano and alto sax")
 
 
 class TimeAreaTests(unittest.TestCase):

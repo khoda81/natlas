@@ -436,15 +436,21 @@ def time_area(rows: np.ndarray, time: np.ndarray) -> np.ndarray:
     return np.where(shifts, -width, ln_p).astype(np.float32)
 
 
-def labels_file(tokenizer: MT3Tokenizer) -> bytes:
-    name = _build_instrument_for_program(tokenizer)
+# The tokenizer every MuScriptor size reads with, as ``TranscriptionModel.load_model``
+# builds it. Its instrument groups name the programs: another vocabulary has the
+# same events but names the groups' first programs wrong.
+TOKENIZER = MT3Tokenizer(instrument_vocabulary="MT3_FULL_PLUS", max_shift_steps=1001)
+
+
+def labels_file() -> bytes:
+    name = _build_instrument_for_program(TOKENIZER)
     instruments = {program: name(program).replace("_", " ") for program in range(130)}
     return json.dumps(
         {
             "kind": "notes",
-            "frameRate": tokenizer.frame_rate,
+            "frameRate": TOKENIZER.frame_rate,
             "window": WINDOW_SECONDS,
-            "events": [[event.type, event.value] for event in tokenizer._vocab],  # noqa: SLF001
+            "events": [[event.type, event.value] for event in TOKENIZER._vocab],  # noqa: SLF001
             "instruments": instruments,
             "drums": DRUMS,
         }
@@ -578,8 +584,6 @@ def main() -> None:
     except (OSError, tomllib.TOMLDecodeError) as error:
         parser.error(f"{args.config}: {error}")
 
-    # Every size reads the same events, so the meaning needs no model.
-    tokenizer = MT3Tokenizer()
     recordings = Recordings()
     for audio in config.get("recordings", []):
         path = (args.config.parent / Path(audio).expanduser()).resolve()
@@ -587,7 +591,7 @@ def main() -> None:
             recordings.add(path.name, path.read_bytes())
         except (OSError, ValueError) as error:
             parser.error(f"{args.config}: {error}")
-    time = Windows(tokenizer, 0.0, None, args.max_events).kinds == "shift"
+    time = Windows(TOKENIZER, 0.0, None, args.max_events).kinds == "shift"
 
     def load(values: dict) -> Loaded:
         device = torch.device(values["device"])
@@ -602,7 +606,7 @@ def main() -> None:
             if instruments:
                 expect = instrument_group_from_names(resolve_instrument_names(instruments.split(",")))
             if audio is None:
-                windows = Windows(tokenizer, at, None, args.max_events)
+                windows = Windows(TOKENIZER, at, None, args.max_events)
                 silence = torch.zeros(1, WINDOW_SAMPLES, device=device)
 
                 def hear(_: int) -> torch.Tensor:
@@ -613,7 +617,7 @@ def main() -> None:
                 if not 0 <= start < samples.shape[-1]:
                     raise ValueError(f"at {at:g} s is outside the recording's {samples.shape[-1] / SAMPLE_RATE:.1f} s")
                 heard = samples[:, start:].to(device)
-                windows = Windows(tokenizer, at, math.ceil(heard.shape[-1] / WINDOW_SAMPLES), args.max_events)
+                windows = Windows(TOKENIZER, at, math.ceil(heard.shape[-1] / WINDOW_SAMPLES), args.max_events)
 
                 def hear(index: int) -> torch.Tensor:
                     chunk = heard[:, index * WINDOW_SAMPLES : (index + 1) * WINDOW_SAMPLES]
@@ -655,8 +659,8 @@ def main() -> None:
     manifest = [{"name": "scribe", "title": "MuScriptor · live", "labels": "labels.json", "catalog": catalog.describe()}]
     # MuScriptor's vocabulary is musical already: time shifts and pitches
     # ascending, so children keep its order.
-    model = Model(tokenizer.num_tokens, catalog, round(args.cache * 2**30), "branch")
-    files = {"labels.json": (labels_file(tokenizer), "application/json")}
+    model = Model(TOKENIZER.num_tokens, catalog, round(args.cache * 2**30), "branch")
+    files = {"labels.json": (labels_file(), "application/json")}
     uvicorn.run(app(model, manifest, files, routes=recordings.routes()), host=args.host, port=args.port, access_log=False)
 
 

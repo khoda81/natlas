@@ -47,6 +47,7 @@ const FLIGHT_MS = 140;
 const SEARCH_MS = 150;
 const SAVE_MS = 200;
 const UNITS_KEY = "natlas.units";
+const DEBUG_KEY = "natlas.debug";
 const LOCAL_SERVER = "http://localhost:8421/";
 
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -121,6 +122,8 @@ export class App {
   private frame: Frame | null = null;
   private geometry: { frame: Frame; key: string } | null = null;
   private units: Units = storedUnits();
+  /** Debug mode: the hover inspector shows each box's numbers. */
+  private debug = storedDebug();
   private palette = Palette.current();
   private hover: Selection | null = null;
   private lastPick: { frame: Frame; x: number; y: number; selection: Selection | null } | null = null;
@@ -819,6 +822,8 @@ export class App {
             return this.toggleUnits(), true;
           case "s":
             return this.setSpecs({ p: this.specs.q, q: this.specs.p }), true;
+          case "d":
+            return this.toggleDebug(), true;
           case "?":
             return this.toggleHelp(), true;
           case "Escape":
@@ -1122,7 +1127,7 @@ export class App {
   private updateInspect(): void {
     const selection = this.hover;
     const tree = this.tree;
-    if (selection === null || tree === null) {
+    if (!this.debug || selection === null || tree === null) {
       this.inspected = "";
       this.details.hidden = true;
       this.inspect.hidden = true;
@@ -1237,6 +1242,16 @@ export class App {
     this.invalidate();
   }
 
+  private toggleDebug(): void {
+    this.debug = !this.debug;
+    try {
+      localStorage.setItem(DEBUG_KEY, String(this.debug));
+    } catch {
+      // Remembering debug mode is only a convenience.
+    }
+    this.invalidate();
+  }
+
   private toggleHelp(): void {
     const help = element("help");
     help.hidden = !help.hidden;
@@ -1265,6 +1280,14 @@ function storedUnits(): Units {
     return localStorage.getItem(UNITS_KEY) === BITS.name ? BITS : NATS;
   } catch {
     return NATS;
+  }
+}
+
+function storedDebug(): boolean {
+  try {
+    return localStorage.getItem(DEBUG_KEY) === "true";
+  } catch {
+    return false;
   }
 }
 

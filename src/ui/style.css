@@ -435,6 +435,25 @@ input:hover {
   color: var(--ink-muted);
 }
 
+.score-legend button,
+.score-legend button:hover {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.score-legend button:hover {
+  color: var(--ink);
+}
+
+.score-legend button[aria-pressed="true"] {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+
 .score-legend i {
   display: inline-block;
   width: 10px;

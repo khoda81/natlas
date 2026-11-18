@@ -29,6 +29,8 @@ const TIME_LINES = { from: 24, to: 48 };
 /** Time labels show from this much room, which holds ten characters. They
  * never fade: translucent text reads as blurred. */
 const TIME_LABEL_SPACING = 64;
+/** Opacity of a muted instrument's notes. */
+const MUTED_ALPHA = 0.25;
 
 interface Geometry {
   width: number;
@@ -48,6 +50,10 @@ export class ScorePanel {
   private readonly canvas = document.createElement("canvas");
   private readonly tip = document.createElement("div");
   private readonly legend = document.createElement("span");
+  /** Each instrument's legend entry, which mutes and unmutes it, by program. */
+  private readonly entries = new Map<number, HTMLButtonElement>();
+  /** Programs left out of what plays, drums as ``DRUM_PROGRAM``. */
+  private readonly muted = new Set<number>();
   private readonly time = document.createElement("span");
   private readonly followButton = document.createElement("button");
   private readonly pitchButton = document.createElement("button");
@@ -70,7 +76,8 @@ export class ScorePanel {
   private drag: { id: number; x: number; y: number; moved: boolean } | null = null;
   private audio: AudioContext | null = null;
   private recording: Promise<AudioBuffer> | null = null;
-  private playing: { mode: Playing; started: number; from: number; stop: () => void } | null = null;
+  /** ``voices`` are the instruments playing, by program, each through its own gain. */
+  private playing: { mode: Playing; started: number; from: number; voices: Map<number, GainNode>; stop: () => void } | null = null;
   /** The time axis as last drawn, in client pixels: told to ``changed`` when it moves. */
   private axis = "";
 
@@ -179,18 +186,37 @@ export class ScorePanel {
     const transcript = this.transcript!;
     const programs = [...new Set(transcript.notes.map((note) => note.program))];
     if (transcript.hits.length > 0) programs.push(DRUM_PROGRAM);
-    this.legend.replaceChildren(
-      ...programs.map((program) => {
-        const item = document.createElement("span");
-        const swatch = document.createElement("i");
-        swatch.style.background = tint(program);
-        item.append(swatch, this.labels.instrument(program));
-        return item;
-      }),
-    );
+    // Entries are kept, not rebuilt, so one is not replaced while it is being clicked.
+    if (programs.length !== this.legend.childElementCount || programs.some((program, i) => this.legend.children[i] !== this.entries.get(program))) {
+      this.legend.replaceChildren(...programs.map((program) => this.entry(program)));
+    }
     const at = transcript.score.ended ? "ended" : `at ${clock(this.labels.seconds(transcript.now))}`;
     const hits = transcript.hits.length > 0 ? ` · ${transcript.hits.length} hits` : "";
     this.time.textContent = `${at} · ${transcript.notes.length} notes${hits}`;
+  }
+
+  private entry(program: number): HTMLButtonElement {
+    let entry = this.entries.get(program);
+    if (entry === undefined) {
+      const button = entry = document.createElement("button");
+      button.type = "button";
+      button.title = "mute or unmute in playback";
+      button.setAttribute("aria-pressed", "false");
+      const swatch = document.createElement("i");
+      swatch.style.background = tint(program);
+      button.append(swatch, this.labels.instrument(program));
+      button.addEventListener("click", () => {
+        const muted = !this.muted.has(program);
+        if (muted) this.muted.add(program);
+        else this.muted.delete(program);
+        button.setAttribute("aria-pressed", String(muted));
+        const voice = this.playing?.voices.get(program);
+        if (voice !== undefined) voice.gain.value = muted ? 0 : 1;
+        this.draw();
+      });
+      this.entries.set(program, entry);
+    }
+    return entry;
   }
 
   /** Pitches the roll can scroll through. */
@@ -480,6 +506,7 @@ export class ScorePanel {
       const y0 = y(note.pitch) + 0.5;
       const h = Math.max(2, row - 1);
       const color = tint(note.program);
+      ctx.globalAlpha = this.muted.has(note.program) ? MUTED_ALPHA : 1;
       if (note.end === null) {
         // Still sounding: fades toward the cursor, where it may yet end.
         const gradient = ctx.createLinearGradient(x0, 0, x1, 0);
@@ -513,9 +540,11 @@ export class ScorePanel {
       }
       this.boxes.push({ x0, x1, y0, y1: y0 + h, item: note });
     }
+    ctx.globalAlpha = 1;
     ctx.restore();
     if (lane > 0) {
       const middle = bottom + lane / 2;
+      ctx.globalAlpha = this.muted.has(DRUM_PROGRAM) ? MUTED_ALPHA : 1;
       for (const hit of transcript.hits) {
         if (hit.tick < view.start || hit.tick > view.start + view.span) continue;
         const at = x(hit.tick);
@@ -530,6 +559,7 @@ export class ScorePanel {
         ctx.fill();
         this.boxes.push({ x0: at - size, x1: at + size, y0: middle - size, y1: middle + size, item: hit });
       }
+      ctx.globalAlpha = 1;
     }
     // The cursor: where the next event happens.
     ctx.fillStyle = accent;
@@ -574,13 +604,24 @@ export class ScorePanel {
     const out = audio.createDynamicsCompressor();
     out.connect(audio.destination);
     const sources: AudioScheduledSourceNode[] = [];
+    const voices = new Map<number, GainNode>();
     const started = audio.currentTime + 0.05;
     let length = (until - from) / frameRate;
     if (mode !== "audio") {
       const notes = audio.createGain();
       notes.gain.value = mode === "both" ? 0.7 : 1;
       notes.connect(out);
-      const synthesized = synthesize(audio, notes, transcript, frameRate, from, started);
+      const voice = (program: number) => {
+        let gain = voices.get(program);
+        if (gain === undefined) {
+          gain = audio.createGain();
+          gain.gain.value = this.muted.has(program) ? 0 : 1;
+          gain.connect(notes);
+          voices.set(program, gain);
+        }
+        return gain;
+      };
+      const synthesized = synthesize(audio, voice, transcript, frameRate, from, started);
       length = Math.max(length, synthesized.length);
       sources.push(...synthesized.sources);
     }
@@ -608,7 +649,7 @@ export class ScorePanel {
       this.buttons.get(mode)?.classList.remove("on");
       this.draw();
     };
-    this.playing = { mode, started, from, stop };
+    this.playing = { mode, started, from, voices, stop };
     this.buttons.get(mode)?.classList.add("on");
     const tick = () => {
       if (this.playing?.stop !== stop) return;
@@ -651,14 +692,15 @@ function fade(spacing: number, { from, to }: { from: number; to: number }): numb
 let noise: AudioBuffer | null = null;
 
 /**
- * Schedule ``transcript`` from shift step ``from`` on ``out`` at time ``when``,
+ * Schedule ``transcript`` from shift step ``from`` at time ``when``, each
+ * instrument on its ``voice``,
  * a plucked triangle per note and a filtered noise burst or a falling sine per
  * drum hit, and return how long it lasts. A note still sounding at the cursor
  * rings a little past it, so a lone onset is heard.
  */
 function synthesize(
   audio: AudioContext,
-  out: AudioNode,
+  voice: (program: number) => AudioNode,
   transcript: Transcript,
   frameRate: number,
   from: number,
@@ -682,13 +724,13 @@ function synthesize(
     gain.gain.linearRampToValueAtTime(level, when + start + 0.006);
     gain.gain.setTargetAtTime(level * 0.35, when + start + 0.006, 0.25);
     gain.gain.setTargetAtTime(0, when + end, 0.05);
-    oscillator.connect(gain).connect(out);
+    oscillator.connect(gain).connect(voice(note.program));
     oscillator.start(when + start);
     oscillator.stop(when + end + 0.4);
     sources.push(oscillator);
   }
   for (const hit of transcript.hits) {
-    if (hit.tick >= from) sources.push(drum(audio, out, hit.pitch, when + (hit.tick - from) / frameRate));
+    if (hit.tick >= from) sources.push(drum(audio, voice(DRUM_PROGRAM), hit.pitch, when + (hit.tick - from) / frameRate));
   }
   return { length, sources };
 }

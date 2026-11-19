@@ -652,7 +652,7 @@ def main() -> None:
             load,
             open,
             config.get("presets", []),
-            released=torch.cuda.empty_cache,
+            released=lm.released,
         )
     except ValueError as error:
         parser.error(f"{args.config}: {error}")

@@ -71,10 +71,20 @@ def stepwise(ln_weights: Callable[[Sequence[int]], np.ndarray], walks: Sequence[
 
 
 def devices() -> tuple[str, ...]:
-    """Where a model can load: each GPU, then the CPU."""
+    """Where a model can load: each GPU, CUDA's or Apple's (MPS), then the CPU."""
     count = torch.cuda.device_count()
     gpus = ("cuda",) if count == 1 else tuple(f"cuda:{index}" for index in range(count))
+    if torch.backends.mps.is_available():
+        gpus += ("mps",)
     return (*gpus, "cpu")
+
+
+def released() -> None:
+    """Give the memory of models let go back to the GPU's other users."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 # Half precision saves memory on large models but can be slower: a GTX 1660 Ti
@@ -574,10 +584,6 @@ def catalog(
                 copies[control] = language.controlled(controls[control])
             language = copies[control]
         return measure(language, values["temperature"], values["context"])
-
-    def released() -> None:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     names = tuple(sources)
     models = [Choice("model", names, names[0]), Choice("device", devices(), devices()[0]), Choice("dtype", ("auto", *DTYPES), "auto")]

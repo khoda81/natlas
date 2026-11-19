@@ -71,7 +71,7 @@ the parent becomes the origin without moving the picture (with p = q).
 Absolute vertical coordinates would lose precision a few dozen nats deep, so
 the camera places one point instead: a path of branches below the origin, down
 to the deepest node that covers the view, and base-256 digits for the fraction
-of that node's p mass above the point (see `core/src/point.rs`). Zooming aims
+of that node's p mass above the point (see [point.rs](./core/src/point.rs)). Zooming aims
 the point at what is under the pointer and then changes depth alone, and going
 up a node keeps every digit, so zooming out and back in returns to the very
 same place. An edge is a point too: a run's top, as many digits as the view
@@ -92,7 +92,7 @@ halvings deep and beside children 2^−3000 of their parent, and compare every
 painted pixel with the rule computed from the children's edges.
 
 | input | motion |
-|---|---|
+| --- | --- |
 | wheel, ← → | deeper / shallower, zooming about the pointer |
 | drag | grab and move |
 | shift + wheel, ↑ ↓ | along the interval |

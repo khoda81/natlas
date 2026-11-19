@@ -20,7 +20,7 @@ use std::f64::consts::LN_2;
 use crate::distribution::{Distribution, Edge, Item, Rank};
 use crate::point::Point;
 use crate::session::View;
-use crate::tree::{bytes, child_hash, node_id, Branch, Lens, NodeId, Tree};
+use crate::tree::{bytes, child_hash, node_id, Branch, Lens, NodeId, Tree, ROOT};
 use crate::Result;
 
 /// View heights within which a node's edge is at the view's.
@@ -171,14 +171,21 @@ impl Placed {
         }
     }
 
-    /// The point at a view height, clamped to the node.
+    /// The point at a view height, clamped to the node. Between two edges
+    /// both farther than a float tells, the height is somewhere in the one
+    /// stretch between them, which holds the whole view: its top stands for
+    /// it.
     fn at(&self, y: f64) -> Point {
         let (edge, at) = if y <= self.top.1 || y - self.top.1 <= self.bottom.1 - y {
             &self.top
         } else {
             &self.bottom
         };
-        edge.moved(*at <= y, (y - at).abs(), -self.ln_scale)
+        let distance = (y - at).abs();
+        if distance == f64::INFINITY {
+            return self.top.0.clone();
+        }
+        edge.moved(*at <= y, distance, -self.ln_scale)
             .unwrap_or_else(|| {
                 if *at <= y {
                     Point::bottom()
@@ -298,6 +305,9 @@ pub struct Frame {
     pub spans: Vec<Span>,
     /// Every node laid out, for picking.
     pub placed: HashMap<NodeId, Placed>,
+    /// The shallowest node laid out: every pixel right of where its children
+    /// start is in them, so picking walks down from it.
+    pub top: NodeId,
     pub origin_top: f64,
     pub origin_bottom: f64,
 }
@@ -308,6 +318,7 @@ impl Frame {
         self.boxes.clear();
         self.spans.clear();
         self.placed.clear();
+        self.top = ROOT;
         self.origin_top = 0.0;
         self.origin_bottom = 0.0;
     }
@@ -830,9 +841,6 @@ pub(crate) fn layout_into(
         placed,
         spans,
     } = place_chain(tree, lens, cam)?;
-    for (&node, placed) in nodes.iter().zip(&placed) {
-        frame.placed.insert(node, placed.clone());
-    }
     (frame.origin_top, frame.origin_bottom) = spans[0];
     let mut context = Layout {
         tree,
@@ -843,6 +851,7 @@ pub(crate) fn layout_into(
         frame,
     };
     let depth = nodes.len() - 1;
+    context.frame.top = nodes[depth];
     context.lay(nodes[depth], placed[depth].clone(), None)?;
     for i in (0..depth).rev() {
         let (own, child, entry) = (&placed[i], &placed[i + 1], &entries[i]);
@@ -865,6 +874,7 @@ pub(crate) fn layout_into(
             y0,
             y1,
         });
+        context.frame.top = nodes[i];
         context.lay(nodes[i], own.clone(), Some(entry.rank))?;
         // Covering the view with its own box left of it, this node hides
         // every remaining ancestor's other children.
@@ -1151,7 +1161,7 @@ pub fn pick(
     if !(frame.origin_top..frame.origin_bottom).contains(&y) || x < 0.0 {
         return Ok(Some(origin));
     }
-    let mut node = cam.origin;
+    let mut node = frame.top;
     // The box of the node the pointer is in, below the origin.
     let mut within = None;
     loop {
@@ -1510,6 +1520,45 @@ mod tests {
         near(children[1].y1, 1.0);
         // The deepest node fills the view: no better name for the point.
         assert_eq!(settle(&tree, LENS, &camera).unwrap(), camera.anchor);
+    }
+
+    #[test]
+    fn a_pointer_deep_below_the_origin_picks_where_floats_of_the_origin_overflow() {
+        // 1100 halvings: the origin is e^762 view heights tall, past any float.
+        let path: Vec<Branch> = (0..1100).map(|i| i % 2).collect();
+        let (tree, deepest) = chain_tree(&[0.5, 0.5], &path);
+        let camera = cam(ROOT, 1100.0 * LN_2, at(&path, &[0x80]), 0.5);
+        let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
+        let hit = pick(&tree, LENS, &frame, &camera, VIEW, 500.0, 600.0, 1.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!((hit.r#box.node, hit.r#box.branch), (deepest, Some(1)));
+    }
+
+    #[test]
+    fn ancestors_past_any_float_of_the_view_are_laid_out_and_picked_through() {
+        // p halves 1100 times; q gives each step 2^-16, so the boxes of
+        // ancestors far taller than a float tells start right of the view.
+        let path: Vec<Branch> = (0..1100).map(|i| i % 2).collect();
+        let (mut tree, deepest) = chain_tree(&[0.5, 0.5], &path);
+        let q = [2f64.powi(-16), 2f64.powi(-16), 1.0 - 2f64.powi(-15)];
+        let mut node = ROOT;
+        tree.set(node, 1, weights(&q)).unwrap();
+        for &branch in &path {
+            node = tree.child(node, branch).unwrap();
+            tree.set(node, 1, weights(&q)).unwrap();
+        }
+        let lens = Lens { p: 0, q: 1 };
+        let camera = cam(ROOT, 1100.0 * LN_2, at(&path, &[0x80]), 0.5);
+        let frame = layout(&tree, lens, &camera, VIEW, 1.0).unwrap();
+        // 5 nats right of the view's left edge, 767.4 nats right of the
+        // root's, is the box of the 70th branch, e^714 view heights tall.
+        let hit = pick(&tree, lens, &frame, &camera, VIEW, 500.0, 600.0, 1.0)
+            .unwrap()
+            .unwrap();
+        let node = path[..69].iter().fold(ROOT, |node, &b| child_hash(node, b));
+        assert_eq!((hit.r#box.node, hit.r#box.branch), (node, Some(path[69])));
+        assert!(frame.boxes.iter().all(|b| b.node != deepest));
     }
 
     #[test]

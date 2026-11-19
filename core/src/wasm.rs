@@ -9,6 +9,20 @@ use crate::layout::{self, Camera, Frame, Viewport};
 use crate::session::{Demand, Path, Session as NativeSession, Update, View};
 use crate::tree::{Lens, Tree as NativeTree};
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console)]
+    fn error(message: &str);
+}
+
+/// A panic traps as "unreachable", saying nothing, and leaves whatever it
+/// borrowed borrowed for good: every later call reports aliasing instead.
+/// Its message and place, said first, name the actual fault.
+#[wasm_bindgen(start)]
+fn start() {
+    std::panic::set_hook(Box::new(|info| error(&info.to_string())));
+}
+
 fn js_error(error: impl std::fmt::Display) -> JsError {
     JsError::new(&error.to_string())
 }

@@ -54,11 +54,16 @@ model told to expect those instruments, ``temperature=T``, and
 ``shape=time-area`` for its time shifts drawn as one, keeping their area:
 ``large/cuda/float16/audio=3f2a9c/at=30``. Under silence a path goes on
 window after window; under a recording, its last window's EOS ends it. The
-config file (scribe.toml) lists models to offer as they are.
+config file (scribe.toml) lists models to offer as they are; every model
+loaded since is offered too.
 
 POST /recordings takes an audio file, any soundfile reads, and says its id;
 GET /recordings lists them, and GET /recordings/ID is one as the model
 hears it. GET /labels.json describes the events.
+
+The data directory (--data) keeps what outlives a restart: each recording
+uploaded, as recordings/ID/NAME, and the models loaded, one spec per line
+in models.txt.
 """
 
 from __future__ import annotations
@@ -69,6 +74,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import tempfile
 import tomllib
 import wave
@@ -469,27 +475,65 @@ class Recorded:
         return self.samples.shape[-1] / SAMPLE_RATE
 
 
+def _recording_id(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()[:12]
+
+
+def _decoded(name: str, path: Path) -> Recorded:
+    """The recording in ``path``; ValueError where it is no audio."""
+    try:
+        samples = load_audio(path, target_sr=SAMPLE_RATE)
+    except Exception as error:
+        raise ValueError(f"{name} is no audio soundfile reads: {error}") from error
+    if samples.shape[-1] == 0:
+        raise ValueError(f"{name} holds no sound")
+    return Recorded(name, samples)
+
+
 class Recordings:
-    """The recordings uploaded, by an id hashed from their bytes, so the
-    same file is the same recording however often it comes."""
+    """The recordings held, by an id hashed from their bytes, so the same
+    file is the same recording however often it comes. Those uploaded are
+    kept in ``kept``, as ID/NAME, and held again from there on start."""
 
-    def __init__(self):
+    def __init__(self, kept: Path):
+        self.kept = kept
         self.held: dict[str, Recorded] = {}
+        kept.mkdir(parents=True, exist_ok=True)
+        for folder in sorted(kept.iterdir()):
+            if folder.is_dir():
+                for path in folder.iterdir():
+                    self.add(path)
 
-    def add(self, name: str, content: bytes) -> str:
-        """Decode a file and keep it; ValueError where it is no audio."""
-        id = hashlib.sha256(content).hexdigest()[:12]
+    def add(self, path: Path) -> str:
+        """Hold the recording in ``path``; ValueError where it is no audio."""
+        id = _recording_id(path.read_bytes())
         if id not in self.held:
-            with tempfile.NamedTemporaryFile(suffix=Path(name).suffix) as file:
-                file.write(content)
-                file.flush()
-                try:
-                    samples = load_audio(file.name, target_sr=SAMPLE_RATE)
-                except Exception as error:
-                    raise ValueError(f"{name} is no audio soundfile reads: {error}") from error
-            if samples.shape[-1] == 0:
-                raise ValueError(f"{name} holds no sound")
-            self.held[id] = Recorded(name, samples)
+            self.held[id] = _decoded(path.name, path)
+        return id
+
+    def upload(self, name: str, content: bytes) -> str:
+        """Hold and keep an uploaded file; ValueError where it is no audio,
+        or ``name`` no file name."""
+        id = _recording_id(content)
+        if id in self.held:
+            return id
+        # The name a client gave becomes a path: only its last part.
+        name = Path(name).name
+        if name in ("", ".."):
+            raise ValueError(f"{name!r} is no file name")
+        # Decoded before it is moved into place, so only whole recordings
+        # are kept, and two uploads of one file never read each other's.
+        file, temporary = tempfile.mkstemp(dir=self.kept, prefix=".upload-")
+        try:
+            with os.fdopen(file, "wb") as out:
+                out.write(content)
+            recorded = _decoded(name, Path(temporary))
+            (self.kept / id).mkdir(exist_ok=True)
+            os.replace(temporary, self.kept / id / name)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+        self.held[id] = recorded
         return id
 
     def __getitem__(self, id: str) -> Recorded:
@@ -505,7 +549,7 @@ class Recordings:
         async def upload(request: Request) -> Response:
             name = request.query_params.get("name", "recording")
             try:
-                id = await anyio.to_thread.run_sync(self.add, name, await request.body())
+                id = await anyio.to_thread.run_sync(self.upload, name, await request.body())
             except ValueError as error:
                 return JSONResponse({"message": str(error)}, status_code=400)
             return JSONResponse(self.listed(id))
@@ -573,6 +617,12 @@ def main() -> None:
         default=Path(__file__).with_name("scribe.toml"),
         help="the models to offer as they are and recordings to offer from the start (default scribe.toml beside this script)",
     )
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "natlas/scribe",
+        help="where the recordings uploaded and the models loaded are kept (default $XDG_DATA_HOME/natlas/scribe)",
+    )
     parser.add_argument("--max-events", type=int, default=MAX_EVENTS, help="per window, counting its prologue and EOS")
     parser.add_argument("--slots", type=int, default=2, help="KV caches per transcriber, each holding one window")
     parser.add_argument("--cache", type=float, default=CACHE / 2**30, help=f"GiB of memory for the distributions it keeps, default {CACHE / 2**30:g}")
@@ -584,11 +634,13 @@ def main() -> None:
     except (OSError, tomllib.TOMLDecodeError) as error:
         parser.error(f"{args.config}: {error}")
 
-    recordings = Recordings()
+    try:
+        recordings = Recordings(args.data / "recordings")
+    except (OSError, ValueError) as error:
+        parser.error(f"{args.data}: {error}")
     for audio in config.get("recordings", []):
-        path = (args.config.parent / Path(audio).expanduser()).resolve()
         try:
-            recordings.add(path.name, path.read_bytes())
+            recordings.add((args.config.parent / Path(audio).expanduser()).resolve())
         except (OSError, ValueError) as error:
             parser.error(f"{args.config}: {error}")
     time = Windows(TOKENIZER, 0.0, None, args.max_events).kinds == "shift"
@@ -653,6 +705,7 @@ def main() -> None:
             open,
             config.get("presets", []),
             released=lm.released,
+            kept=args.data / "models.txt",
         )
     except ValueError as error:
         parser.error(f"{args.config}: {error}")

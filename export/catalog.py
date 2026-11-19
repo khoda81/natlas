@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import unquote
 
@@ -100,6 +101,7 @@ class Catalog:
         open: Callable[[Any, dict[str, Any]], Measure],
         presets: Sequence[str] = (),
         released: Callable[[], None] = lambda: None,
+        kept: Path | None = None,
     ):
         self.models = models
         # Told once a model let go is no longer held, to give back its memory.
@@ -111,6 +113,18 @@ class Catalog:
         self.presets = list(presets)
         for preset in self.presets:
             self.model(preset)
+        # Every model loaded before, one spec per line, offered after those
+        # given. A line naming no model here, as of a device this machine
+        # lacks now, stays in the file and is offered where it names one.
+        self.kept = kept
+        if kept is not None and kept.exists():
+            for spec in kept.read_text().splitlines():
+                try:
+                    self.model(spec)
+                except ValueError:
+                    continue
+                if spec not in self.presets:
+                    self.presets.append(spec)
 
     def model(self, spec: str) -> dict[str, str]:
         """Each of the model's parameters under its spec; ValueError where
@@ -137,8 +151,14 @@ class Catalog:
         return model, values
 
     def load(self, model: str) -> Any:
-        """The model ``model`` names, loaded: slow."""
-        return self._load(self.model(model))
+        """The model ``model`` names, loaded: slow. Once it has, it is kept
+        to offer from then on. Loads run one at a time."""
+        loaded = self._load(self.model(model))
+        if self.kept is not None and model not in self.presets:
+            self.presets.append(model)
+            with self.kept.open("a") as file:
+                file.write(model + "\n")
+        return loaded
 
     def open(self, model: Any, spec: str) -> Measure:
         """The measure ``spec`` names, of ``model``, loaded."""

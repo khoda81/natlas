@@ -285,7 +285,9 @@ uv run scribe.py            # the presets and recordings in export/scribe.toml
 `export/scribe.py` serves [MuScriptor](https://github.com/muscriptor/muscriptor)'s transcriptions of
 recordings the page uploads: choose one as a new measure's audio, or drop an
 audio file on the page for p to hear, a measure like p's of it. Its config
-offers recordings from the start too. MuScriptor writes music 5 seconds at a time,
+offers recordings from the start too. What a page uploads and every model it
+loads are kept in `$XDG_DATA_HOME/natlas/scribe` (`--data`), so a restart
+offers them again. MuScriptor writes music 5 seconds at a time,
 as MIDI-like events: a tie prologue naming the notes sustained into the
 window, then time shifts, instruments, note-ons and note-offs, pitches, drum
 hits and an EOS. A path is one transcription of the whole recording, scrolling

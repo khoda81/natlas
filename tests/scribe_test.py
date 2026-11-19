@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "export"))
 import scribe  # noqa: E402
+import torch  # noqa: E402
 
 TOKENIZER = scribe.TOKENIZER
 EOS = TOKENIZER.eos_id
@@ -124,6 +126,23 @@ class ValidTests(unittest.TestCase):
         body = self.allowed([*played, *window.prologue])
         self.assertNotIn(("program", 24), body)
         self.assertIn(("velocity", 1), body)
+
+
+class RecordingsTests(unittest.TestCase):
+    def test_an_upload_is_held_again_after_a_restart_and_what_is_no_audio_is_not_kept(self):
+        tone = scribe.wav_file(torch.sin(torch.arange(scribe.SAMPLE_RATE) / 10).unsqueeze(0))
+        with tempfile.TemporaryDirectory() as data:
+            kept = Path(data) / "recordings"
+            recordings = scribe.Recordings(kept)
+            id = recordings.upload("../tone.wav", tone)
+            self.assertEqual(recordings.upload("again.wav", tone), id)
+            for name, content in (("noise.wav", b"no audio"), ("..", tone + b"x")):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    recordings.upload(name, content)
+            restarted = scribe.Recordings(kept)
+            self.assertEqual(restarted.listed(id), {"id": id, "name": "tone.wav", "seconds": 1.0})
+            self.assertEqual(list(restarted.held), [id])
+            self.assertEqual([path.relative_to(kept) for path in kept.rglob("*")], [Path(id), Path(id) / "tone.wav"])
 
 
 if __name__ == "__main__":

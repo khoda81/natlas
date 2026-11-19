@@ -15,6 +15,7 @@ import importlib.util
 import math
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -267,6 +268,27 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(described["models"][0], {"name": "size", "kind": "choice", "options": ["small", "medium"], "default": "medium"})
         self.assertEqual(described["parameters"][0], {"name": "temperature", "kind": "number", "default": 1.0})
         self.assertEqual(described["presets"], ["small/cpu"])
+
+    def test_a_model_loaded_is_offered_after_a_restart_unless_it_failed_to_load_or_names_none_now(self):
+        models = [Choice("size", ("small", "medium"), "medium"), Choice("device", ("cuda", "cpu"), "cuda")]
+
+        def load(values: dict) -> dict:
+            if values["size"] == "medium" and values["device"] == "cpu":
+                raise RuntimeError("out of memory")
+            return values
+
+        with tempfile.TemporaryDirectory() as data:
+            kept = Path(data) / "models.txt"
+            kept.write_text("small/mps\n")
+            catalog = Catalog(models, [], load, dict, ["small/cpu"], kept=kept)
+            for spec in ("small/cpu", "medium/cuda", "medium/cuda"):
+                catalog.load(spec)
+            with self.assertRaises(RuntimeError):
+                catalog.load("medium/cpu")
+            self.assertEqual(Catalog(models, [], load, dict, ["small/cpu"], kept=kept).presets, ["small/cpu", "medium/cuda"])
+            # A device this machine lacks stays kept, offered where it has one.
+            wider = [models[0], Choice("device", ("cuda", "mps", "cpu"), "cuda")]
+            self.assertEqual(Catalog(wider, [], load, dict, [], kept=kept).presets, ["small/mps", "medium/cuda"])
 
 
 class ModelTests(unittest.TestCase):

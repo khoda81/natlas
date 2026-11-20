@@ -5,9 +5,9 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 use crate::distribution::Run;
-use crate::layout::{self, Camera, Frame, Viewport};
+use crate::layout::{self, Anchor, Camera, Frame, Viewport};
 use crate::session::{Demand, Path, Session as NativeSession, Update, View};
-use crate::tree::{Lens, Tree as NativeTree};
+use crate::tree::{child_hash, Lens, Tree as NativeTree};
 
 #[wasm_bindgen]
 extern "C" {
@@ -347,7 +347,47 @@ pub fn layout_frame(
         inner: layout::layout_into(&tree.inner, Lens { p, q }, &camera, view, row_px, frame)
             .map_err(js_error)?,
         pool: Rc::clone(&tree.frames),
+        projection: None,
     })
+}
+
+#[wasm_bindgen]
+pub fn project(
+    tree: &Tree,
+    p: usize,
+    q: usize,
+    camera: JsValue,
+    viewport: JsValue,
+    pixel_ratio: f64,
+) -> std::result::Result<LayoutFrame, JsError> {
+    let mut camera: Camera = from_js(camera)?;
+    let viewport: Viewport = from_js(viewport)?;
+    let frame = tree.frames.borrow_mut().pop().unwrap_or_default();
+    let (inner, demand) = layout::project(
+        &tree.inner,
+        Lens { p, q },
+        &mut camera,
+        viewport,
+        pixel_ratio,
+        frame,
+    )
+    .map_err(js_error)?;
+    Ok(LayoutFrame {
+        inner,
+        pool: Rc::clone(&tree.frames),
+        projection: Some(ProjectedView {
+            anchor: camera.anchor,
+            a: camera.a,
+            demand,
+        }),
+    })
+}
+
+#[derive(Serialize)]
+struct ProjectedView {
+    anchor: Anchor,
+    a: f64,
+    demand: View,
 }
 
 /// A frame stays in Wasm; only visible boxes cross.
@@ -355,6 +395,7 @@ pub fn layout_frame(
 pub struct LayoutFrame {
     inner: Frame,
     pool: Rc<RefCell<Vec<Frame>>>,
+    projection: Option<ProjectedView>,
 }
 
 impl Drop for LayoutFrame {
@@ -370,9 +411,30 @@ impl Drop for LayoutFrame {
 
 #[wasm_bindgen]
 impl LayoutFrame {
-    /// Each visible box's node, parallel to `boxes`.
-    pub fn nodes(&self) -> Vec<u64> {
-        self.inner.boxes.iter().map(|b| b.node).collect()
+    #[wasm_bindgen(js_name = takeProjection)]
+    pub fn take_projection(&mut self) -> std::result::Result<JsValue, JsError> {
+        to_js(
+            &self
+                .projection
+                .take()
+                .ok_or_else(|| js_error("frame has no projection"))?,
+        )
+    }
+
+    /// Each visible box's node and its child's hash, 0 for a gap's second id.
+    /// The branch column in `boxes` distinguishes a gap from a child.
+    #[wasm_bindgen(js_name = boxNodes)]
+    pub fn box_nodes(&self) -> Vec<u64> {
+        self.inner
+            .boxes
+            .iter()
+            .flat_map(|b| {
+                [
+                    b.node,
+                    b.branch.map_or(0, |branch| child_hash(b.node, branch)),
+                ]
+            })
+            .collect()
     }
 
     /// Eleven f64s per visible box; ranks and counts remain exact.
@@ -468,7 +530,14 @@ impl LayoutFrame {
             pixel_px,
         )
         .map_err(js_error)?;
-        to_js(&picked)
+        // Ancestor ids are u64s, as are the ids in boxNodes.
+        picked
+            .serialize(
+                &serde_wasm_bindgen::Serializer::new()
+                    .serialize_missing_as_null(true)
+                    .serialize_large_number_types_as_bigints(true),
+            )
+            .map_err(js_error)
     }
 }
 

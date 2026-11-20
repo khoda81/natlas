@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { aim, type Camera, clamp, extent, layout, pick, settle, top, view as viewOf } from "../src/core/layout";
+import { aim, type Camera, clamp, extent, layout, pick, project, settle, top, view as viewOf } from "../src/core/layout";
 import { glide, moveDepth, scale } from "../src/ui/camera";
 import { chainTree, answer, digits } from "./build";
 import { IntervalTree, ROOT } from "../src/core/tree";
@@ -152,6 +152,39 @@ describe("layout", () => {
     clamp(tree, lens, cam);
     expect(extent(tree, lens, cam, 0).top).toBeCloseTo(0, 15);
     expect(cam.a).toBeCloseTo(0, 15);
+  });
+
+  it("projects the frame and physical-row demand from the same clamped camera", () => {
+    const tree = chainTree([0.5, 0.5], [0, 0, 0, 0]);
+    const cam: Camera = { origin: ROOT, x: 2, k: 100, anchor: top([0, 0, 0]), a: 0.3 };
+    const expected = { ...cam };
+    settle(tree, lens, expected);
+    clamp(tree, lens, expected);
+    const dpr = 1.25;
+    const { frame, demand } = project(tree, lens, cam, view, dpr);
+    const reference = layout(tree, lens, expected, view, { rowPx: 1 / dpr });
+    expect(expected.a).toBe(0);
+    expect(cam).toEqual(expected);
+    expect(frame.boxes).toEqual(reference.boxes);
+    expect(frame.spans).toEqual(reference.spans);
+    expect(demand).toEqual(viewOf(tree, lens, expected, view, view.height * dpr));
+    frame.dispose();
+    reference.dispose();
+  });
+
+  it("identifies the boxes along the picked path without learning visible leaves", () => {
+    const tree = chainTree([0.5, 0.5], [0, 0]);
+    const child = tree.child(ROOT, 0);
+    const grandchild = tree.child(child, 0);
+    const cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
+    const { frame } = project(tree, lens, cam, view, 1);
+    const hit = pick(tree, lens, frame, cam, view, 160, 50, 1)!;
+    expect(hit.box.node).toBe(grandchild);
+    expect(hit.ancestors).toEqual([child, grandchild]);
+    expect(hit.ancestors.map((node) => frame.parentBoxes.get(node)?.node)).toEqual([ROOT, child]);
+    const [leaf] = [...frame.parentBoxes].find(([, box]) => box.node === ROOT && box.branch === 1)!;
+    expect(() => tree.path(leaf)).toThrow("unknown node");
+    frame.dispose();
   });
 
   it("ends the anchor's path at what p places", () => {

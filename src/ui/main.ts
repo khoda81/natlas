@@ -3,18 +3,17 @@ import {
   aim,
   type Box,
   type Camera,
-  clamp,
   extent,
   type Frame,
   type Lens,
-  layout,
   logView,
   pick,
+  project,
   reach,
   type Selection,
   settle,
   top,
-  view,
+  type View,
   type Viewport,
 } from "../core/layout";
 import { modelOf, parse } from "../data/catalog";
@@ -25,7 +24,7 @@ import { glide, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, serializeView, viewKey } from "./view-state";
 import { Palette } from "./color";
 import { describe, heard, Measures } from "./measures";
-import { BITS, draw, NATS, RULER_HEIGHT, childKey, pixelCorner, rulerCaption, type Units } from "./render";
+import { BITS, draw, NATS, RULER_HEIGHT, pixelCorner, rulerCaption, type Units } from "./render";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
 const KEY_DEPTH_SPEED = 300;
@@ -122,8 +121,8 @@ export class App {
   private cam: Camera = { origin: ROOT, x: 0, k: 100, anchor: top(), a: 0 };
   private view: Viewport = { width: 1, height: 1 };
   private pixelRatio = 1;
-  private frame: Frame | null = null;
-  private geometry: { frame: Frame; key: string } | null = null;
+  private geometry: { frame: Frame; demand: View; key: string } | null = null;
+  private get frame(): Frame | null { return this.geometry?.frame ?? null; }
   private units: Units = storedUnits();
   /** Debug mode: the hover inspector shows each box's numbers. */
   private debug = storedDebug();
@@ -213,9 +212,7 @@ export class App {
     this.flushView();
     this.loading++;
     this.link?.dispose();
-    if (this.geometry?.frame !== this.frame) this.geometry?.frame.dispose();
     this.frame?.dispose();
-    this.frame = null;
     this.lastPick = null;
     this.geometry = null;
     this.inspected = "";
@@ -573,23 +570,13 @@ export class App {
     if (this.flight) this.stepFlight(time);
     this.stepKeys(time);
     const previous = this.frame;
-    const frame = this.currentFrame();
-    this.frame = frame;
-    if (previous !== null && previous !== frame) previous.dispose();
-    // What the camera looks at, at the picture's finest: physical rows.
-    if (this.specs.p !== "" && this.specs.q !== "") this.link?.look(this.specs, view(tree, this.lens, this.cam, this.view, this.view.height * this.pixelRatio));
+    const { frame, demand } = this.currentFrame();
+    if (previous !== frame) {
+      previous?.dispose();
+      if (this.specs.p !== "" && this.specs.q !== "") this.link?.look(this.specs, demand);
+    }
     this.reachOut(frame);
     this.updateHover();
-    const ancestors = new Set<string>();
-    if (this.hover) {
-      const selected = this.hover.box;
-      ancestors.add(childKey(selected.node, selected.rank));
-      for (const node of tree.chain(this.cam.origin, selected.node).slice(1)) {
-        const parent = tree.parent(node)!;
-        const entry = tree.entry(parent, this.lens, tree.branch(node));
-        if (entry !== undefined) ancestors.add(childKey(parent, entry.rank));
-      }
-    }
     const origin = this.originNote(tree);
     // The reading's time, from the page's pixels to the canvas's.
     const timeline = this.reading?.timeline?.() ?? null;
@@ -602,10 +589,8 @@ export class App {
         right: timeline.right - canvasLeft,
       },
       hover: this.hover,
-      ancestors,
       units: this.units,
       glyph: (node, branch) => this.glyph(node, branch),
-      child: (node, branch) => tree.child(node, branch),
       note: origin && { text: origin.text, sweep: origin.loading && !this.reducedMotion.matches ? time : null },
     });
     this.fadeOut(time);
@@ -658,23 +643,18 @@ export class App {
     ctx.restore();
   }
 
-  private geometryKey(camera = this.cam): string {
-    const { origin, x, k, a, anchor } = camera;
+  private geometryKey(): string {
+    const { origin, x, k, a, anchor } = this.cam;
     return `${this.tree!.revision}:${this.lens.p}:${this.lens.q}:${origin}:${x}:${k}:${anchor.path}:${anchor.digits}:${a}:${this.view.width}:${this.view.height}:${this.pixelRatio}`;
   }
 
   /** The frame for a camera, kept while nothing it depends on changes. */
-  private currentFrame(camera = this.cam): Frame {
-    const key = this.geometryKey(camera);
-    if (this.geometry?.key === key) return this.geometry.frame;
-    settle(this.tree!, this.lens, camera);
-    clamp(this.tree!, this.lens, camera);
-    const settled = this.geometryKey(camera);
-    if (this.geometry?.key === settled) return this.geometry.frame;
-    const frame = layout(this.tree!, this.lens, camera, this.view, { rowPx: 1 / this.pixelRatio });
-    if (this.geometry?.frame !== this.frame) this.geometry?.frame.dispose();
-    this.geometry = { frame, key: settled };
-    return frame;
+  private currentFrame(): { frame: Frame; demand: View } {
+    const key = this.geometryKey();
+    if (this.geometry?.key === key) return this.geometry;
+    const projected = project(this.tree!, this.lens, this.cam, this.view, this.pixelRatio);
+    this.geometry = { ...projected, key: this.geometryKey() };
+    return this.geometry;
   }
 
   // Motions. The point follows them: a zoom's fixed point becomes the point

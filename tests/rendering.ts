@@ -7,8 +7,7 @@ import { answer, run } from "./build";
 
 const view = { width: 270, height: 340 };
 const palette = Palette.current();
-const state = { hover: null, ancestors: new Set<string>(), units: NATS, glyph: () => ({ text: "" }),
-  child: (node: bigint, branch: number) => (node << 20n) + BigInt(branch) + 1n, note: null, timeline: null, known: () => [] };
+const state = { hover: null, units: NATS, glyph: () => ({ text: "" }), note: null, timeline: null, known: () => [] };
 const cam = (phase = 0, k = 23) => ({ origin: ROOT, x: 0, k, anchor: top(), a: phase / view.height });
 const rgb = (color: string) => color.slice(1).match(/../g)!.map(c => Number.parseInt(c, 16));
 const canvas = (dpr: number) => {
@@ -153,7 +152,7 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const timeline = { x: (time: number) => time, left: 0, right: view.width };
     const glyph = (node: bigint) => node === ROOT ? { text: "piano" } : { text: "9 s", mark: "time" as const, time: { from: 1000, to: 1000, shaded: true, trail: null } };
     const c = canvas(dpr), ctx = c.getContext("2d")!;
-    draw(ctx, frame, camera, view, palette, { ...state, glyph, timeline, child: (node, branch) => tree.child(node, branch) });
+    draw(ctx, frame, camera, view, palette, { ...state, glyph, timeline });
     // Carried labels are framed and faint: any pixel inside the children
     // far from both the fill and the outline.
     const pixels = ctx.getImageData(Math.ceil(20 * dpr), Math.ceil(20 * dpr), Math.floor(200 * dpr), Math.floor(120 * dpr)).data;

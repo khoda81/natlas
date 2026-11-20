@@ -116,6 +116,8 @@ pub struct PickResult {
     pub r#box: LayoutBox,
     /// False in null space: the branch is known, its continuation is not.
     pub exact: bool,
+    /// Child ids along the picked path through the laid-out part of the frame.
+    pub ancestors: Vec<NodeId>,
 }
 
 /// Where a laid-out node sits: two of its edges placed exactly in view
@@ -439,6 +441,45 @@ struct Steps {
     xs: Vec<f64>,
 }
 
+impl Steps {
+    fn push(
+        &mut self,
+        tree: &Tree,
+        lens: Lens,
+        d: &Distribution,
+        (run, at): (usize, usize),
+        (top, bottom): (Point, Point),
+    ) -> Result<f64> {
+        let i = self.entries.len();
+        let node = self.nodes[i];
+        let child = d.run(run);
+        let branch = child.branch(at);
+        let ln_p = child.ln_p(at);
+        let nats_q = tree.nats_q(node, lens, branch, ln_p)?;
+        // Placed by its extent, sized by its weight.
+        let ln_extent = Point::ln_between(&top, &bottom);
+        self.nodes.push(child_hash(node, branch));
+        self.entries.push(ChainEntry {
+            branch,
+            rank: d.item_rank(Item::Child { run, at }),
+            ln_p,
+            nats_q,
+        });
+        self.edges.push((top, bottom));
+        self.ln_masses.push(self.ln_masses[i] + ln_extent);
+        self.xs.push(self.xs[i] + nats_q);
+        Ok(ln_extent)
+    }
+
+    fn truncate(&mut self, depth: usize) {
+        self.entries.truncate(depth);
+        self.edges.truncate(depth);
+        self.nodes.truncate(depth + 1);
+        self.ln_masses.truncate(depth + 1);
+        self.xs.truncate(depth + 1);
+    }
+}
+
 fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Steps> {
     let mut steps = Steps {
         nodes: vec![origin],
@@ -452,27 +493,16 @@ fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Ste
         let Some(p) = tree.distribution(node, lens.p)? else {
             break;
         };
-        let Some((rank, (run, at))) = p
-            .rank(branch)
-            .and_then(|rank| Some((rank, p.locate_rank(rank)?)))
-        else {
+        let Some((run, at)) = p.rank(branch).and_then(|rank| p.locate_rank(rank)) else {
             break;
         };
-        let (top, bottom) = p.item_edges(Item::Child { run, at });
-        // Placed by its extent, sized by its weight.
-        let ln_extent = Point::ln_between(&top, &bottom);
-        let ln_p = p.run(run).ln_p(at);
-        let nats_q = tree.nats_q(node, lens, branch, ln_p)?;
-        steps.nodes.push(child_hash(node, branch));
-        steps.entries.push(ChainEntry {
-            branch,
-            rank,
-            ln_p,
-            nats_q,
-        });
-        steps.edges.push((top, bottom));
-        steps.ln_masses.push(steps.ln_masses[i] + ln_extent);
-        steps.xs.push(steps.xs[i] + nats_q);
+        steps.push(
+            tree,
+            lens,
+            p,
+            (run, at),
+            p.item_edges(Item::Child { run, at }),
+        )?;
     }
     Ok(steps)
 }
@@ -485,19 +515,6 @@ fn around(d: Option<&Distribution>, point: &Point) -> (Point, Point) {
         .unwrap_or_else(|| (Point::top(), Point::bottom()))
 }
 
-/// The known child of a node holding a point, and its edges.
-fn held(d: Option<&Distribution>, point: &Point) -> Option<(Branch, Point, Point)> {
-    let d = d?;
-    let item = d.locate(point)?;
-    let Item::Child { run, at } = item else {
-        return None;
-    };
-    let (top, bottom) = d.item_edges(item);
-    point
-        .within(&top, &bottom)
-        .then(|| (d.run(run).branch(at), top, bottom))
-}
-
 /// Bits that tell a point of a node e^`ln_scale` view heights tall to
 /// 2^-64 of a view height.
 fn precision(ln_scale: f64) -> u64 {
@@ -507,21 +524,20 @@ fn precision(ln_scale: f64) -> u64 {
 /// The nodes from the origin down the anchor's path, each one's entry in its
 /// parent, where each is placed and its own extent in view heights: the
 /// anchor's node around its point, every ancestor at its chain child's edges.
-struct Chain {
-    nodes: Vec<NodeId>,
-    entries: Vec<ChainEntry>,
+struct Chain<'a> {
+    steps: &'a Steps,
     placed: Vec<Placed>,
     spans: Vec<(f64, f64)>,
 }
 
-fn place_chain(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Chain> {
+fn place_chain<'a>(tree: &Tree, lens: Lens, cam: &Camera, steps: &'a Steps) -> Result<Chain<'a>> {
     let Steps {
         nodes,
         entries,
         edges,
         ln_masses,
         xs,
-    } = steps(tree, lens, cam.origin, &cam.anchor.path)?;
+    } = steps;
     let depth = cam.anchor.path.len();
     if entries.len() < depth {
         return Err(format!(
@@ -551,22 +567,27 @@ fn place_chain(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Chain> {
         ln_scale,
         xs[depth],
     );
-    let mut placed = vec![anchor; nodes.len()];
-    let mut spans = vec![(y(&Point::top()), y(&Point::bottom())); nodes.len()];
-    for (i, (top, bottom)) in edges.into_iter().enumerate().rev() {
-        let (y0, y1) = spans[i + 1];
-        placed[i] = Placed::new(
-            (top, y0),
-            (bottom, y1),
+    let mut placed = Vec::with_capacity(nodes.len());
+    let mut spans = Vec::with_capacity(nodes.len());
+    placed.push(anchor);
+    let mut span = (y(&Point::top()), y(&Point::bottom()));
+    spans.push(span);
+    for (i, (top, bottom)) in edges.iter().enumerate().rev() {
+        let own = Placed::new(
+            (top.clone(), span.0),
+            (bottom.clone(), span.1),
             ln_masses[i],
             ln_masses[i] + cam.x,
             xs[i],
         );
-        spans[i] = placed[i].span();
+        span = own.span();
+        placed.push(own);
+        spans.push(span);
     }
+    placed.reverse();
+    spans.reverse();
     Ok(Chain {
-        nodes,
-        entries,
+        steps,
         placed,
         spans,
     })
@@ -827,15 +848,54 @@ pub(crate) fn layout_into(
     cam: &Camera,
     view: Viewport,
     row_px: f64,
+    frame: Frame,
+) -> Result<Frame> {
+    let steps = steps(tree, lens, cam.origin, &cam.anchor.path)?;
+    let chain = place_chain(tree, lens, cam, &steps)?;
+    layout_chain(tree, lens, cam, view, row_px, frame, chain)
+}
+
+/// Settle and clamp a camera, then draw and describe the same projection.
+#[cfg(feature = "wasm")]
+pub(crate) fn project(
+    tree: &Tree,
+    lens: Lens,
+    cam: &mut Camera,
+    viewport: Viewport,
+    pixel_ratio: f64,
+    frame: Frame,
+) -> Result<(Frame, View)> {
+    let (anchor, steps) = settled(tree, lens, cam)?;
+    cam.anchor = anchor;
+    let mut chain = place_chain(tree, lens, cam, &steps)?;
+    if cam.origin == ROOT {
+        let a = clamp_offset(cam.a, chain.spans[0]);
+        if a != cam.a {
+            cam.a = a;
+            // Place from the new offset to preserve rounding at pixel edges.
+            chain = place_chain(tree, lens, cam, &steps)?;
+        }
+    }
+    let demand = chain.view(cam, viewport, viewport.height * pixel_ratio);
+    let frame = layout_chain(tree, lens, cam, viewport, 1.0 / pixel_ratio, frame, chain)?;
+    Ok((frame, demand))
+}
+
+fn layout_chain(
+    tree: &Tree,
+    lens: Lens,
+    cam: &Camera,
+    view: Viewport,
+    row_px: f64,
     mut frame: Frame,
+    chain: Chain<'_>,
 ) -> Result<Frame> {
     frame.clear();
     let Chain {
-        nodes,
-        entries,
+        steps: Steps { nodes, entries, .. },
         placed,
         spans,
-    } = place_chain(tree, lens, cam)?;
+    } = chain;
     (frame.origin_top, frame.origin_bottom) = spans[0];
     let mut context = Layout {
         tree,
@@ -916,53 +976,59 @@ pub fn known(
 /// how far right the screen reaches past where its children start. Where the
 /// view reaches past the origin, what of it the origin holds.
 pub fn view(tree: &Tree, lens: Lens, cam: &Camera, viewport: Viewport, rows: f64) -> Result<View> {
-    let Chain {
-        nodes,
-        placed,
-        spans,
-        ..
-    } = place_chain(tree, lens, cam)?;
-    let right = cam.x + viewport.width / cam.k;
-    let covers = |&(top, bottom): &(f64, f64)| top <= 0.0 && 1.0 <= bottom;
-    // A node is placed only where q is known above it: the view is told
-    // from the deepest one the client can place, so the source tells what
-    // places the rest, though p's mass may all go one way.
-    let known = placed
-        .iter()
-        .position(|at| !at.x.is_finite())
-        .unwrap_or(placed.len());
-    let (depth, top, ln_height, rows) = match spans[..known].iter().rposition(covers) {
-        Some(depth) => {
-            let at = &placed[depth];
-            let point = (depth == nodes.len() - 1).then(|| Point::new(&cam.anchor.digits));
-            let top = view_top(at, point.as_ref(), cam.a).unwrap_or_else(|| Point::new(&[]));
-            (
-                depth,
-                top.floor(precision(at.ln_scale)),
-                0.0 - at.ln_scale,
-                rows,
-            )
+    let steps = steps(tree, lens, cam.origin, &cam.anchor.path)?;
+    Ok(place_chain(tree, lens, cam, &steps)?.view(cam, viewport, rows))
+}
+
+impl Chain<'_> {
+    fn view(&self, cam: &Camera, viewport: Viewport, rows: f64) -> View {
+        let Chain {
+            steps: Steps { nodes, .. },
+            placed,
+            spans,
+        } = self;
+        let right = cam.x + viewport.width / cam.k;
+        let covers = |&(top, bottom): &(f64, f64)| top <= 0.0 && 1.0 <= bottom;
+        // A node is placed only where q is known above it: the view is told
+        // from the deepest one the client can place, so the source tells what
+        // places the rest, though p's mass may all go one way.
+        let known = placed
+            .iter()
+            .position(|at| !at.x.is_finite())
+            .unwrap_or(placed.len());
+        let (depth, top, ln_height, rows) = match spans[..known].iter().rposition(covers) {
+            Some(depth) => {
+                let at = &placed[depth];
+                let point = (depth == nodes.len() - 1).then(|| Point::new(&cam.anchor.digits));
+                let top = view_top(at, point.as_ref(), cam.a).unwrap_or_else(|| Point::new(&[]));
+                (
+                    depth,
+                    top.floor(precision(at.ln_scale)),
+                    0.0 - at.ln_scale,
+                    rows,
+                )
+            }
+            None => {
+                // The view is at least as tall as the part of the origin it
+                // shows: floats of the origin's mass tell that part.
+                let (top, bottom) = spans[0];
+                let (from, to) = (top.max(0.0), bottom.min(1.0));
+                let at = &placed[0];
+                let start = Point::top()
+                    .moved(true, from - top, -at.ln_scale)
+                    .unwrap_or_else(Point::top);
+                let shown = (to - from).max(0.0);
+                (0, start, shown.ln() - at.ln_scale, rows * shown)
+            }
+        };
+        View {
+            node: nodes[depth],
+            top: top.digits(),
+            ln_height,
+            rows,
+            right: right - placed[depth].x,
         }
-        None => {
-            // The view is at least as tall as the part of the origin it
-            // shows: floats of the origin's mass tell that part.
-            let (top, bottom) = spans[0];
-            let (from, to) = (top.max(0.0), bottom.min(1.0));
-            let at = &placed[0];
-            let start = Point::top()
-                .moved(true, from - top, -at.ln_scale)
-                .unwrap_or_else(Point::top);
-            let shown = (to - from).max(0.0);
-            (0, start, shown.ln() - at.ln_scale, rows * shown)
-        }
-    };
-    Ok(View {
-        node: nodes[depth],
-        top: top.digits(),
-        ln_height,
-        rows,
-        right: right - placed[depth].x,
-    })
+    }
 }
 
 /// The top of the view as a point of a node holding it, told from whichever
@@ -1007,7 +1073,8 @@ pub fn reach(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result
 /// The edges in view heights of the node `depth` steps down the camera's
 /// path from its origin, as far as p places that path.
 pub fn extent(tree: &Tree, lens: Lens, cam: &Camera, depth: usize) -> Result<Extent> {
-    let spans = place_chain(tree, lens, cam)?.spans;
+    let steps = steps(tree, lens, cam.origin, &cam.anchor.path)?;
+    let spans = place_chain(tree, lens, cam, &steps)?.spans;
     let &(top, bottom) = spans.get(depth).ok_or_else(|| {
         format!(
             "the camera's path is placed {} deep, not {depth}",
@@ -1025,13 +1092,17 @@ pub fn clamp_position(tree: &Tree, lens: Lens, cam: &Camera) -> Result<f64> {
         return Ok(cam.a);
     }
     let Extent { top, bottom } = extent(tree, lens, cam, 0)?;
-    Ok(if top > 0.0 {
-        cam.a - top
+    Ok(clamp_offset(cam.a, (top, bottom)))
+}
+
+fn clamp_offset(a: f64, (top, bottom): (f64, f64)) -> f64 {
+    if 0.0 < top {
+        a - top
     } else if bottom < 1.0 {
-        cam.a + 1.0 - bottom
+        a + 1.0 - bottom
     } else {
-        cam.a
-    })
+        a
+    }
 }
 
 /// The camera's point under the name that keeps the view exact: its path
@@ -1044,9 +1115,13 @@ pub fn clamp_position(tree: &Tree, lens: Lens, cam: &Camera) -> Result<f64> {
 /// longer places a branch of the path, as after a lens or a replaced
 /// distribution, the path ends there, at that node's top.
 pub fn settle(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Anchor> {
-    let steps = steps(tree, lens, cam.origin, &cam.anchor.path)?;
-    let mut path = cam.anchor.path[..steps.entries.len()].to_vec();
-    let mut point = if path.len() == cam.anchor.path.len() {
+    settled(tree, lens, cam).map(|(anchor, _)| anchor)
+}
+
+fn settled(tree: &Tree, lens: Lens, cam: &Camera) -> Result<(Anchor, Steps)> {
+    let mut steps = steps(tree, lens, cam.origin, &cam.anchor.path)?;
+    let mut depth = steps.entries.len();
+    let mut point = if depth == cam.anchor.path.len() {
         Point::new(&cam.anchor.digits)
     } else {
         Point::new(&[])
@@ -1058,29 +1133,34 @@ pub fn settle(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Anchor> {
         let ((_, above), (_, under)) = (point.to(top), point.to(bottom));
         cam.a - (ln_scale + above).exp() <= FIT && 1.0 - FIT <= cam.a + (ln_scale + under).exp()
     };
-    while let Some((top, bottom)) = path.len().checked_sub(1).map(|i| &steps.edges[i]) {
-        let ln_scale = steps.ln_masses[path.len()] + cam.x;
+    while let Some((top, bottom)) = depth.checked_sub(1).map(|i| &steps.edges[i]) {
+        let ln_scale = steps.ln_masses[depth] + cam.x;
         if covers(&point, ln_scale, &Point::top(), &Point::bottom()) {
             break;
         }
         point = point.out_of_child(top, bottom);
-        path.pop();
+        depth -= 1;
     }
-    let mut node = steps.nodes[path.len()];
-    let mut ln_scale = steps.ln_masses[path.len()] + cam.x;
-    while let Some((branch, top, bottom)) = held(tree.distribution(node, lens.p)?, &point) {
-        if !covers(&point, ln_scale, &top, &bottom) {
+    steps.truncate(depth);
+    let mut ln_scale = steps.ln_masses[depth] + cam.x;
+    while let Some(d) = tree.distribution(steps.nodes[depth], lens.p)? {
+        let Some(item @ Item::Child { run, at }) = d.locate(&point) else {
+            break;
+        };
+        let (top, bottom) = d.item_edges(item);
+        if !point.within(&top, &bottom) || !covers(&point, ln_scale, &top, &bottom) {
             break;
         }
-        ln_scale += Point::ln_between(&top, &bottom);
-        point = point.into_child(&top, &bottom, precision(ln_scale));
-        path.push(branch);
-        node = child_hash(node, branch);
+        ln_scale += steps.push(tree, lens, d, (run, at), (top, bottom))?;
+        let (top, bottom) = &steps.edges[depth];
+        point = point.into_child(top, bottom, precision(ln_scale));
+        depth += 1;
     }
-    Ok(Anchor {
-        path,
+    let anchor = Anchor {
+        path: steps.entries.iter().map(|entry| entry.branch).collect(),
         digits: point.digits(),
-    })
+    };
+    Ok((anchor, steps))
 }
 
 /// The camera's point moved to what the view shows `fy` view heights down,
@@ -1096,8 +1176,7 @@ pub fn aim(tree: &Tree, lens: Lens, cam: &Camera, fy: f64) -> Result<Aim> {
     if by == 0.0 || !by.is_finite() {
         return Ok(same);
     }
-    let Anchor { path, digits } = settle(tree, lens, cam)?;
-    let steps = steps(tree, lens, cam.origin, &path)?;
+    let (Anchor { path, digits }, steps) = settled(tree, lens, cam)?;
     let ln_scale = steps.ln_masses[path.len()] + cam.x;
     if !ln_scale.is_finite() {
         return Ok(same);
@@ -1152,6 +1231,7 @@ pub fn pick(
             y1: frame.origin_bottom.max(1.0),
         },
         exact: false,
+        ancestors: Vec::new(),
     };
     if !(frame.origin_top..frame.origin_bottom).contains(&y) || x < 0.0 {
         return Ok(Some(origin));
@@ -1159,6 +1239,7 @@ pub fn pick(
     let mut node = frame.top;
     // The box of the node the pointer is in, below the origin.
     let mut within = None;
+    let mut ancestors = Vec::new();
     loop {
         let (Some(placed), Some(d)) = (frame.placed.get(&node), tree.distribution(node, lens.p)?)
         else {
@@ -1170,22 +1251,29 @@ pub fn pick(
             return Ok(Some(within.map_or(origin, |b| PickResult {
                 r#box: b,
                 exact: true,
+                ancestors,
             })));
         };
         let mut heights = Heights::new(placed, d);
         let item = pixel_child(&mut heights, item, y, y + pixel_px / view.height);
         let b = item_box(tree, lens, node, placed, d, item, heights.item(item))?;
-        let Some(branch) = b.branch.filter(|_| x >= b.x1) else {
+        let Some(branch) = b.branch.filter(|_| b.x1 <= x) else {
             let exact = b.branch.is_some();
-            return Ok(Some(PickResult { r#box: b, exact }));
+            return Ok(Some(PickResult {
+                r#box: b,
+                exact,
+                ancestors,
+            }));
         };
         let child = child_hash(node, branch);
         if !frame.placed.contains_key(&child) || tree.distribution(child, lens.p)?.is_none() {
             return Ok(Some(PickResult {
                 r#box: b,
                 exact: false,
+                ancestors,
             }));
         }
+        ancestors.push(child);
         within = Some(b);
         node = child;
     }

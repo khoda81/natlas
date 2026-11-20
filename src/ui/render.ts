@@ -17,13 +17,9 @@ export const BITS: Units = { name: "bits", nats: Math.LN2 };
 
 export interface DrawState {
   hover: Selection | null;
-  /** ``node:rank`` keys of the hovered box's ancestor children. */
-  ancestors: Set<string>;
   units: Units;
   /** How the child along ``branch`` of node ``node`` reads. */
   glyph: (node: NodeId, branch: number) => Glyph;
-  /** The node the child along ``branch`` of ``node`` is. */
-  child: (node: NodeId, branch: number) => NodeId;
   /** Why the origin shows no children, if it does not; ``sweep`` animates
    * a faint band behind the text while they load. */
   note: { text: string; sweep: number | null } | null;
@@ -86,10 +82,6 @@ function measure(ctx: CanvasRenderingContext2D, text: string): number {
     widths.set(text, width = ctx.measureText(text).width);
   }
   return width;
-}
-
-export function childKey(node: NodeId, rank: number): string {
-  return `${node}:${rank}`;
 }
 
 export interface ScreenRect {
@@ -207,17 +199,13 @@ export function draw(
   // A box whose label is too small to draw hands it, after the labels it
   // carries itself, to each of its children; they carry it until one draws
   // it before its own. A box's parent is the box of the branch its node is.
-  const parents = new Map<NodeId, Box>();
-  for (const box of frame.boxes) {
-    if (box.branch !== null) parents.set(state.child(box.node, box.branch), box);
-  }
   const carriedBy = new Map<NodeId, readonly Glyph[]>();
   /** The labels the children of ``node`` carry, outermost first. A time
    * window shows its time at any size and carries what it was handed on. */
   const carried = (node: NodeId): readonly Glyph[] => {
     let glyphs = carriedBy.get(node);
     if (glyphs === undefined) {
-      const parent = parents.get(node);
+      const parent = frame.parentBoxes.get(node);
       const glyph = parent && state.glyph(parent.node, parent.branch!);
       // A time window shows what it carries, never its own label.
       glyphs = parent === undefined || glyph === undefined || fitOf(parent) !== null
@@ -636,19 +624,21 @@ function outline(
   state: DrawState,
   ink: string,
 ): void {
-  if (state.hover === null) return;
+  const selected = state.hover;
+  if (selected === null) return;
   const scale = ctx.getTransform().a;
   const pixel = 1 / scale;
   ctx.strokeStyle = ctx.fillStyle = ink;
   // The path down to it, faint and thin.
+  const ancestors = new Set(selected.ancestors.map((node) => frame.parentBoxes.get(node)));
   ctx.globalAlpha = 0.5;
   for (const box of frame.boxes) {
-    if (!state.ancestors.has(childKey(box.node, box.rank))) continue;
+    if (!ancestors.has(box) && (box.node !== selected.box.node || box.rank !== selected.box.rank)) continue;
     frameRect(ctx, pixelRect(screenRect(box, cam, view), scale), pixel, false);
   }
   ctx.globalAlpha = 1;
   // A gap has no box to outline; the inspector still describes it.
-  const box = state.hover.box;
+  const box = selected.box;
   if (box.kind === "gap") return;
   // Its own pixels: a child thinner than a pixel, the row of pixels it is in.
   const exact = screenRect(box, cam, view);
@@ -656,7 +646,7 @@ function outline(
   const top = pixelCorner(exact.y0, scale);
   const rect = { ...own, y0: top, y1: Math.max(own.y1, top + pixel) };
   // Dashed where the branch is known but its continuation is not.
-  frameRect(ctx, rect, 2 * pixel, !state.hover.exact);
+  frameRect(ctx, rect, 2 * pixel, !selected.exact);
 }
 
 /** A frame ``width`` thick just inside a box's pixels, alike on every

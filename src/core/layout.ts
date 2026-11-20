@@ -7,6 +7,7 @@ import {
   clampPosition,
   extent as measureExtent,
   layout as layoutFrame,
+  project as projectFrame,
   reach as reachOf,
   settle as settleAnchor,
   type LayoutFrame,
@@ -117,19 +118,22 @@ export class Frame {
   readonly boxes: Box[];
   /** What is painted: every node's children as spans of rows. */
   readonly spans: Span[];
+  /** The visible box of each child, keyed by its node id. */
+  readonly parentBoxes = new Map<NodeId, Box>();
   private disposed = false;
 
   constructor(readonly raw: LayoutFrame) {
     const packed = raw.boxes();
-    const nodes = raw.nodes();
+    const nodes = raw.boxNodes();
     this.boxes = boxBuffers.pop() ?? [];
     for (let i = 0, box = 0; i < packed.length; i += 11, box++) {
       const b = this.boxes[box] ??= { node: 0n, rank: 0, count: 0, kind: "node", branch: null,
         p: 0, q: 0, lnMass: 0, x0: 0, x1: 0, y0: 0, y1: 0 };
-      b.node = nodes[box]!; b.rank = packed[i]!; b.count = packed[i + 1]!;
+      b.node = nodes[2 * box]!; b.rank = packed[i]!; b.count = packed[i + 1]!;
       b.kind = KINDS[packed[i + 2]!]!; b.branch = packed[i + 3] === -1 ? null : packed[i + 3]!;
       b.p = packed[i + 4]!; b.q = packed[i + 5]!; b.lnMass = packed[i + 6]!;
       b.x0 = packed[i + 7]!; b.x1 = packed[i + 8]!; b.y0 = packed[i + 9]!; b.y1 = packed[i + 10]!;
+      if (b.branch !== null) this.parentBoxes.set(nodes[2 * box + 1]!, b);
     }
     this.boxes.length = packed.length / 11;
     const spans = raw.spans();
@@ -165,6 +169,8 @@ export interface Selection {
   box: Box;
   /** False in null space: the branch is known, its exact continuation is not. */
   exact: boolean;
+  /** Child ids along the picked path through the laid-out part of the frame. */
+  ancestors: readonly NodeId[];
 }
 
 export interface LayoutOptions {
@@ -186,6 +192,21 @@ export function layout(
   options: Partial<LayoutOptions> = {},
 ): Frame {
   return new Frame(layoutFrame(tree.raw, lens.p, lens.q, cam, view, options.rowPx ?? 1));
+}
+
+/** Settle and clamp the camera, returning a frame and the demand it describes. */
+export function project(
+  tree: IntervalTree,
+  lens: Lens,
+  cam: Camera,
+  viewport: Viewport,
+  pixelRatio: number,
+): { frame: Frame; demand: View } {
+  const raw = projectFrame(tree.raw, lens.p, lens.q, cam, viewport, pixelRatio);
+  const { anchor, a, demand } = raw.takeProjection() as { anchor: Anchor; a: number; demand: View };
+  cam.anchor = anchor;
+  cam.a = a;
+  return { frame: new Frame(raw), demand };
 }
 
 /** Name the camera's point by the deepest node that holds it and covers the

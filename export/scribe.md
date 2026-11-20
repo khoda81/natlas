@@ -51,8 +51,9 @@ FP16 autocast for the initial pass of each window.
 
 ## Recordings
 
-`POST /recordings?name=FILE` accepts an audio file that soundfile can read
-and returns its ID, hashed from its bytes so identical files share an ID.
+`POST /recordings?name=FILE` accepts WAV, formats that SoundFile can read,
+and M4A when `ffmpeg` is on the server's `PATH`. It returns an ID hashed
+from the original file's bytes so identical files share an ID.
 `GET /recordings` lists recordings. `GET /recordings/ID` serves the 16 kHz
 audio that the model hears.
 

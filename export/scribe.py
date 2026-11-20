@@ -5,6 +5,7 @@
 #   "muscriptor==0.3.0",
 #   "numpy>=1.26",
 #   "protobuf>=7.36.1",
+#   "soundfile",
 #   "starlette>=0.40",
 #   "uvicorn>=0.30",
 #   "websockets>=13",
@@ -57,7 +58,7 @@ window after window; under a recording, its last window's EOS ends it. The
 config file (scribe.toml) lists models to offer as they are; every model
 loaded since is offered too.
 
-POST /recordings takes an audio file, any soundfile reads, and says its id;
+POST /recordings takes an audio file (including M4A via FFmpeg) and says its id;
 GET /recordings lists them, and GET /recordings/ID is one as the model
 hears it. GET /labels.json describes the events.
 
@@ -75,6 +76,7 @@ import io
 import json
 import math
 import os
+import subprocess
 import tempfile
 import tomllib
 import wave
@@ -103,6 +105,7 @@ from muscriptor.tokenizer.mt3 import (
 from muscriptor.transcription_model import _build_instrument_for_program
 from muscriptor.utils.audio import load_audio
 from service import CACHE, Model, app
+from soundfile import LibsndfileError
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
@@ -479,12 +482,34 @@ def _recording_id(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()[:12]
 
 
+def _decode_m4a(name: str, path: Path) -> torch.Tensor:
+    try:
+        decoded = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-v", "error", "-xerror",
+                # Decode the uploaded container without opening external tracks or URLs.
+                "-protocol_whitelist", "file", "-f", "mov", "-enable_drefs", "0", "-i", str(path.resolve()),
+                "-map", "0:a:0", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "pipe:1",
+            ],
+            capture_output=True,
+            check=True,
+        )
+    except FileNotFoundError as error:
+        raise ValueError(f"{name}: install FFmpeg on the scribe server to read M4A") from error
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.decode(errors="replace").strip()
+        raise ValueError(f"{name}: FFmpeg could not decode audio: {detail}") from error
+    return torch.from_numpy(np.frombuffer(decoded.stdout, dtype="<f4").astype(np.float32)).unsqueeze(0)
+
+
 def _decoded(name: str, path: Path) -> Recorded:
     """The recording in ``path``; ValueError where it is no audio."""
     try:
         samples = load_audio(path, target_sr=SAMPLE_RATE)
-    except Exception as error:
-        raise ValueError(f"{name} is no audio soundfile reads: {error}") from error
+    except (LibsndfileError, OSError, ValueError) as error:
+        if not isinstance(error, LibsndfileError) or not name.lower().endswith(".m4a"):
+            raise ValueError(f"{name}: could not read audio: {error}") from error
+        samples = _decode_m4a(name, path)
     if samples.shape[-1] == 0:
         raise ValueError(f"{name} holds no sound")
     return Recorded(name, samples)

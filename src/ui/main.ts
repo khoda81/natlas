@@ -833,10 +833,11 @@ export class App {
       const files = [...(event.dataTransfer?.files ?? [])];
       if (files.length === 0) return;
       // A recording dropped on a server whose measures hear one is what p hears.
-      const [audio] = files;
-      if (files.length === 1 && audio!.type.startsWith("audio/") && this.dataset?.recordings != null) {
-        this.setStatus(`Uploading ${audio!.name} …`);
-        this.measures!.hear(audio!).then(() => this.setStatus(""), (error: unknown) => this.setStatus(String(error)));
+      const audio = files[0]!;
+      if (files.length === 1 && this.dataset?.recordings != null &&
+          (audio.type.startsWith("audio/") || audio.name.toLowerCase().endsWith(".m4a"))) {
+        this.setStatus(`Uploading ${audio.name} …`);
+        this.measures!.hear(audio).then(() => this.setStatus(""), (error: unknown) => this.setStatus(String(error)));
         return;
       }
       const generation = ++this.loading;

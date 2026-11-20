@@ -284,7 +284,7 @@ export class Measures {
         this.hearing.push(select);
         const file = document.createElement("input");
         file.type = "file";
-        file.accept = "audio/*";
+        file.accept = "audio/*,.m4a";
         file.hidden = true;
         file.addEventListener("change", () => {
           const chosen = file.files?.[0];

@@ -3,6 +3,6 @@
 # own precision for the device.
 presets = ["medium/cuda/auto", "large/cuda/float16", "small/cpu/float32"]
 
-# Recordings offered from the start, any file soundfile reads, relative to
-# this file. The page uploads others.
+# Recordings offered from the start, relative to this file. The page uploads
+# others. M4A decoding requires ffmpeg on the server's PATH.
 recordings = []

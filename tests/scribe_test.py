@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["natlas-core", "muscriptor==0.3.0", "numpy>=1.26", "protobuf>=7.36.1", "starlette>=0.40", "uvicorn>=0.30", "websockets>=13"]
+# dependencies = ["natlas-core", "muscriptor==0.3.0", "numpy>=1.26", "protobuf>=7.36.1", "soundfile", "starlette>=0.40", "uvicorn>=0.30", "websockets>=13"]
 # [tool.uv.sources]
 # natlas-core = { path = "../core" }
 # ///
@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -129,6 +131,25 @@ class ValidTests(unittest.TestCase):
 
 
 class RecordingsTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for M4A")
+    def test_m4a_upload_is_decoded_and_reloaded(self):
+        tone = scribe.wav_file(torch.sin(torch.arange(scribe.SAMPLE_RATE) / 10).unsqueeze(0))
+        with tempfile.TemporaryDirectory() as data:
+            source = Path(data) / "tone.M4A"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-f", "wav", "-i", "pipe:0", "-c:a", "aac", "-ar", "44100", "-ac", "2", str(source)],
+                input=tone, check=True,
+            )
+            kept = Path(data) / "recordings"
+            recordings = scribe.Recordings(kept)
+            id = recordings.upload(source.name, source.read_bytes())
+            self.assertEqual(recordings.listed(id)["name"], source.name)
+            self.assertAlmostEqual(recordings[id].seconds, 1.0, delta=0.07)
+            self.assertEqual(recordings[id].samples.shape[0], 1)
+            self.assertEqual(recordings[id].samples.dtype, torch.float32)
+            self.assertEqual((kept / id / source.name).read_bytes(), source.read_bytes())
+            torch.testing.assert_close(scribe.Recordings(kept)[id].samples, recordings[id].samples)
+
     def test_an_upload_is_held_again_after_a_restart_and_what_is_no_audio_is_not_kept(self):
         tone = scribe.wav_file(torch.sin(torch.arange(scribe.SAMPLE_RATE) / 10).unsqueeze(0))
         with tempfile.TemporaryDirectory() as data:
@@ -136,7 +157,7 @@ class RecordingsTests(unittest.TestCase):
             recordings = scribe.Recordings(kept)
             id = recordings.upload("../tone.wav", tone)
             self.assertEqual(recordings.upload("again.wav", tone), id)
-            for name, content in (("noise.wav", b"no audio"), ("..", tone + b"x")):
+            for name, content in (("noise.wav", b"no audio"), ("noise.m4a", b"no audio"), ("..", tone + b"x")):
                 with self.subTest(name=name), self.assertRaises(ValueError):
                     recordings.upload(name, content)
             restarted = scribe.Recordings(kept)

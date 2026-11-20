@@ -93,6 +93,24 @@ class Pass:
     clients: frozenset[Client]
 
 
+@dataclass(frozen=True)
+class _Ready:
+    measure: Measure
+
+
+@dataclass(frozen=True)
+class _Failed:
+    message: str
+
+
+@dataclass
+class _MeasureRecord:
+    spec: str
+    model: str | None
+    # None waits for the model. A future means opening has been submitted.
+    state: Future[Measure] | _Ready | _Failed | None = None
+
+
 # Forward passes submitted and not yet finished: the one running and the one
 # queued behind it, so the model starts the next the moment one ends while
 # the scheduler packs the last one's result. A queued pass can still be
@@ -129,15 +147,10 @@ class Model:
         self.catalog = catalog
         # Each model asked for, by spec, as it loads and once it has.
         self.models: dict[str, Future[Any]] = {}
-        # Each measure's spec and its model's by id, the id of each spec
-        # named, the measures open, those waiting on their model, and why
-        # each closed one closed.
-        self.specs: list[str] = []
-        self.model_of: dict[int, str] = {}
-        self.ids: dict[str, int] = {}
-        self.measures: dict[int, Measure] = {}
-        self.pending: dict[str, list[int]] = {}
-        self.failures: dict[int, str] = {}
+        # Stable ids name records in sessions and stored distributions.
+        # Failed records retain their ids while clients may still name them.
+        self._measure_records: list[_MeasureRecord] = []
+        self._measure_ids: dict[str, int] = {}
         # The order each node's children rank in: "heaviest" first, or by
         # "branch", where branches already follow the reading's own order.
         self.order = order
@@ -181,19 +194,19 @@ class Model:
     def demand(self, client: Client, demand: pb.Demand) -> Future[None]:
         """What ``client`` looks at now. The future fails with ValueError for
         a demand the tree cannot take."""
+        return self.call(lambda: self._demand(client, demand))
+
+    def _demand(self, client: Client, demand: pb.Demand) -> None:
         view = None
         if demand.HasField("view"):
             v = demand.view
             view = (v.node, v.top, v.ln_height, v.rows, v.right)
         path = (demand.path.node, list(demand.path.branches)) if demand.HasField("path") else None
 
-        def demanded() -> None:
-            p, q = self._measure(demand.p), self._measure(demand.q)
-            client.session.demand(self.tree, p, q, view=view, path=path)
-            client.demand = demand
-            self._withdraw(client)
-
-        return self.call(demanded)
+        p, q = self._measure(demand.p), self._measure(demand.q)
+        client.session.demand(self.tree, p, q, view=view, path=path)
+        client.demand = demand
+        self._withdraw(client)
 
     def held(self) -> Future[dict[str, Any]]:
         """The models asked for, each loading, loaded or failed, and the
@@ -209,7 +222,10 @@ class Model:
 
             return {
                 "models": [state(model, loading) for model, loading in self.models.items()],
-                "measures": [self.specs[measure] for measure in sorted(self.measures)],
+                "measures": [
+                    spec for spec, measure in self._measure_ids.items()
+                    if isinstance(self._measure_records[measure].state, _Ready)
+                ],
             }
 
         return self.call(held)
@@ -239,10 +255,10 @@ class Model:
         def unload() -> None:
             if self.models.pop(model, None) is None:
                 return
-            for measure in self.pending.pop(model, []):
-                self._close(measure, f"{model} was unloaded")
-            for measure in [measure for measure in self.measures if self.model_of[measure] == model]:
-                self._close(measure, f"{model} was unloaded")
+            for measure in tuple(self._measure_ids.values()):
+                record = self._measure_records[measure]
+                if record.model == model:
+                    self._close(record, f"{model} was unloaded")
             # Once no pass holds it.
             self.inference.submit(self._release)
 
@@ -269,69 +285,82 @@ class Model:
             return
         if (error := future.exception()) is not None:
             traceback.print_exception(error)
-        for measure in self.pending.pop(model, []):
-            self._open(measure, future)
+        retry = set()
+        for record in self._measure_records:
+            if record.model != model:
+                continue
+            if record.state is None:
+                self._open(record, future)
+            elif isinstance(record.state, _Failed) and record.spec not in self._measure_ids:
+                retry.add(record.spec)
         if error is not None:
             return
         # Clients waiting on a measure of it, closed while it was not loaded.
         for client in self.clients:
             demand = client.demand
-            if demand is not None and any(spec not in self.ids for spec in (demand.p, demand.q)):
-                self.demand(client, demand)
+            if demand is not None and (demand.p in retry or demand.q in retry):
+                self._demand(client, demand)
 
     def _measure(self, spec: str) -> int:
         """The id of the measure ``spec`` names, opening it the first time.
         One that closed opens again when named again."""
-        known = self.ids.get(spec)
+        known = self._measure_ids.get(spec)
         if known is not None:
             return known
-        measure = self.ids[spec] = len(self.specs)
-        self.specs.append(spec)
+        measure = len(self._measure_records)
         try:
             model, _ = self.catalog.parse(spec)
         except ValueError as error:
-            self.model_of[measure] = ""
-            self._close(measure, str(error))
+            self._measure_records.append(_MeasureRecord(spec, None, _Failed(f"{spec}: {error}")))
             return measure
-        self.model_of[measure] = model
+        record = _MeasureRecord(spec, model)
+        self._measure_records.append(record)
+        self._measure_ids[spec] = measure
         loading = self.models.get(model)
         if loading is None:
-            self._close(measure, f"load {model} to read it")
-        elif not loading.done():
-            self.pending.setdefault(model, []).append(measure)
-        else:
-            self._open(measure, loading)
+            self._close(record, f"load {model} to read it")
+        elif loading.done():
+            self._open(record, loading)
         return measure
 
-    def _open(self, measure: int, loading: Future[Any]) -> None:
+    def _open(self, record: _MeasureRecord, loading: Future[Any]) -> None:
         """Open a measure of a model that has loaded, or could not."""
+        name = record.model
+        assert name is not None and record.state is None
         if (error := loading.exception()) is not None:
-            self._close(measure, f"{self.model_of[measure]} could not be loaded: {type(error).__name__}: {error}")
+            self._close(record, f"{name} could not be loaded: {type(error).__name__}: {error}")
             return
-        model, spec = loading.result(), self.specs[measure]
+        model, spec = loading.result(), record.spec
 
         def open() -> Measure:
             print(f"opening {spec} …", file=sys.stderr)
             return self.catalog.open(model, spec)
 
         future = self.inference.submit(open)
-        future.add_done_callback(lambda future: self.call(lambda: self._opened(measure, future)))
+        record.state = future
+        future.add_done_callback(lambda future: self.call(lambda: self._opened(record, name, loading, future)))
 
-    def _opened(self, measure: int, future: Future[Measure]) -> None:
-        if measure in self.failures:
+    def _opened(self, record: _MeasureRecord, model: str, loading: Future[Any], future: Future[Measure]) -> None:
+        if record.state is not future or self.models.get(model) is not loading:
             return
         if (error := future.exception()) is None:
-            self.measures[measure] = future.result()
+            record.state = _Ready(future.result())
             return
         traceback.print_exception(error)
-        self._close(measure, f"{type(error).__name__}: {error}")
+        self._close(record, f"{type(error).__name__}: {error}")
 
-    def _close(self, measure: int, why: str) -> None:
+    def _close(self, record: _MeasureRecord, why: str) -> None:
         """What waits on the measure fails, saying ``why``; named again, it opens anew."""
-        self.measures.pop(measure, None)
-        self.failures[measure] = f"{self.specs[measure]}: {why}"
-        if self.ids.get(self.specs[measure]) == measure:
-            del self.ids[self.specs[measure]]
+        state = record.state
+        record.state = _Failed(f"{record.spec}: {why}")
+        del self._measure_ids[record.spec]
+        if isinstance(state, Future):
+            state.cancel()
+
+    def _ready_measure(self, measure: int) -> Measure:
+        state = self._measure_records[measure].state
+        assert isinstance(state, _Ready), f"measure {measure} must be open"
+        return state.measure
 
     def learn(self, path: Sequence[int]) -> Future[list[int]]:
         """Learn the ids along ``path``, so demands can name them alone."""
@@ -360,7 +389,7 @@ class Model:
     def _step(self, client: Client) -> None:
         updates = client.session.step(self.tree)
         if updates:
-            client.send(_encode(updates, self.specs))
+            client.send(_encode(updates, lambda measure: self._measure_records[measure].spec))
 
     def _withdraw(self, client: Client) -> None:
         """Withdraw the client's queued pass; its result is taken, and the
@@ -396,15 +425,16 @@ class Model:
         # What waits on a measure that could not be opened fails; on one
         # still opening it waits.
         settled = False
+        waits = {client: [] for client in order}
         for client in order:
-            for measure, node, *_ in client.session.blocked():
-                if measure in self.failures:
-                    client.session.failed(measure, node, self.failures[measure])
+            for blocked in client.session.blocked():
+                measure, node, *_ = blocked
+                state = self._measure_records[measure].state
+                if isinstance(state, _Failed):
+                    client.session.failed(measure, node, state.message)
                     settled = True
-        waits = {
-            client: [blocked for blocked in client.session.blocked() if blocked[:2] not in reserved and blocked[0] in self.measures]
-            for client in order
-        }
+                elif isinstance(state, _Ready) and (measure, node) not in reserved:
+                    waits[client].append(blocked)
         first = next((index for index, client in enumerate(order) if waits[client]), None)
         if first is None:
             return None, settled
@@ -412,7 +442,8 @@ class Model:
         order = order[first:] + order[:first]
         measure = waits[order[0]][0][0]
         turns = zip_longest(*([(client, blocked) for blocked in waits[client] if blocked[0] == measure] for client in order))
-        width, paths = self.measures[measure].width, self.measures[measure].paths
+        source = self._ready_measure(measure)
+        width, paths = source.width, source.paths
         walks: list[tuple[int, ...]] = []
         clients: set[Client] = set()
         for client, (_, node, _, ahead) in (taken for turn in turns for taken in turn if taken is not None):
@@ -439,18 +470,18 @@ class Model:
         goes on below it, the next nodes along ``ahead`` that are neither
         held nor on their way. None where it needs no pass, as a node with no
         children or one deeper than the measure reads, settled at once."""
+        source = self._ready_measure(measure)
         tokens = tuple(self.tree.path(node))
-        if self._empty(measure, tokens):
+        if self._empty(source, tokens):
             self._keep(measure, [node], [np.empty(0, np.float32)])
             return None
-        longest = self.measures[measure].longest
-        if not self._reads(measure, tokens):
-            self._fail(measure, node, f"{len(self.measures[measure].start) + len(tokens)} tokens, but the context holds {longest}")
+        if not self._reads(source, tokens):
+            self._fail(measure, node, f"{len(source.start) + len(tokens)} tokens, but the context holds {source.longest}")
             return None
         nodes, along = [node], tokens
         for branch in ahead:
             along += (branch,)
-            if self._empty(measure, along) or not self._reads(measure, along):
+            if self._empty(source, along) or not self._reads(source, along):
                 break
             (_, child) = self.tree.walk(nodes[-1], [branch])
             if (measure, child) in reserved or self.tree.has(child, measure):
@@ -460,7 +491,9 @@ class Model:
 
     def _work(self, job: Pass) -> Callable[[], list[np.ndarray]]:
         """What the model runs for a pass."""
-        walk, start = self.measures[job.measure].walk, self.measures[job.measure].start
+        source = self._ready_measure(job.measure)
+        walk, start = source.walk, source.start
+        spec = self._measure_records[job.measure].spec
         reads = []
         for nodes in job.walks:
             path = start + tuple(self.tree.path(nodes[-1]))
@@ -472,7 +505,7 @@ class Model:
             elapsed = (time.perf_counter() - started) * 1000
             depths = sorted({first - len(start) for _, first in reads})
             print(
-                f"{self.specs[job.measure]} {len(reads)} paths, depth {depths[0]}–{depths[-1]}: "
+                f"{spec} {len(reads)} paths, depth {depths[0]}–{depths[-1]}: "
                 f"{sum(map(len, job.walks))} computed, {elapsed:.0f} ms",
                 file=sys.stderr,
             )
@@ -484,7 +517,7 @@ class Model:
         """Keep what a pass computed, or fail what waits on it."""
         job = self.passes.pop(future)
         # Withdrawn, or of a measure since closed.
-        if future.cancelled() or job.measure not in self.measures:
+        if future.cancelled() or not isinstance(self._measure_records[job.measure].state, _Ready):
             return
         error = future.exception()
         if error is None:
@@ -503,18 +536,18 @@ class Model:
             if any(blocked[:2] == (measure, node) for blocked in client.session.blocked()):
                 client.session.failed(measure, node, message)
 
-    def _reads(self, measure: int, tokens: tuple[int, ...]) -> bool:
+    def _reads(self, measure: Measure, tokens: tuple[int, ...]) -> bool:
         """Whether the measure reads a path this long."""
-        longest = self.measures[measure].longest
-        return longest is None or len(self.measures[measure].start) + len(tokens) <= longest
+        longest = measure.longest
+        return longest is None or len(measure.start) + len(tokens) <= longest
 
-    def _empty(self, measure: int, tokens: tuple[int, ...]) -> bool:
+    def _empty(self, measure: Measure, tokens: tuple[int, ...]) -> bool:
         """Whether a sequence has no children: finished, or past the vocabulary."""
-        return self.measures[measure].ends(tokens) or any(self.vocabulary <= branch for branch in tokens)
+        return measure.ends(tokens) or any(self.vocabulary <= branch for branch in tokens)
 
     def _keep(self, measure: int, nodes: list[int], rows: list[np.ndarray]) -> None:
         rows = [np.ascontiguousarray(row, dtype=np.float32) for row in rows]
-        sizes = self.tree.set(nodes, measure, rows, self.order, self.measures[measure].widths)
+        sizes = self.tree.set(nodes, measure, rows, self.order, self._ready_measure(measure).widths)
         for node, size in zip(nodes, sizes, strict=True):
             self.kept_bytes += size - self.kept.pop((node, measure), 0)
             self.kept[node, measure] = size
@@ -525,14 +558,14 @@ class Model:
             self.kept_bytes -= size
 
 
-def _encode(updates: list[tuple], specs: list[str]) -> bytes:
+def _encode(updates: list[tuple], spec: Callable[[int], str]) -> bytes:
     """A session's updates as one Updates frame, each measure by its spec."""
     frame = pb.Updates()
     for update in updates:
         match update:
             case ("answer", measure, node, parent, branch, runs, count):
                 answer = frame.updates.add().answer
-                answer.measure, answer.node = specs[measure], node
+                answer.measure, answer.node = spec(measure), node
                 if parent is not None:
                     answer.parent, answer.branch = parent, branch
                 answer.children.runs.extend(
@@ -546,9 +579,9 @@ def _encode(updates: list[tuple], specs: list[str]) -> bytes:
             case ("placed", node, branches):
                 frame.updates.add().placed.CopyFrom(pb.Path(node=node, branches=branches))
             case ("lacks", measure, node):
-                frame.updates.add().lacks.CopyFrom(pb.Missing(measure=specs[measure], node=node))
+                frame.updates.add().lacks.CopyFrom(pb.Missing(measure=spec(measure), node=node))
             case ("failed", measure, node, message):
-                frame.updates.add().failed.CopyFrom(pb.Failed(measure=specs[measure], node=node, message=message))
+                frame.updates.add().failed.CopyFrom(pb.Failed(measure=spec(measure), node=node, message=message))
     return frame.SerializeToString()
 
 

@@ -164,13 +164,13 @@ def demand(p="a", q="a", view=None, path=None):
     return message
 
 
-def settle(model):
-    """Wait until the scheduler has sent everything and has nothing to compute."""
+def settle(model, *, until=lambda: True):
+    """Wait until the expected result has been sent and the scheduler is idle."""
 
     def idle():
         for client in model.clients:
             model._step(client)  # noqa: SLF001
-        return not model.passes and not any(client.session.blocked() for client in model.clients)
+        return not model.passes and not any(client.session.blocked() for client in model.clients) and until()
 
     deadline = time.monotonic() + 5
     while not model.call(idle).result(5):
@@ -466,7 +466,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(client.kinds("placed")), 2)
 
     def test_a_measure_of_a_model_not_loaded_fails_and_is_answered_once_it_loads(self):
-        model, _, measures = fixture()
+        model, _, _ = fixture()
         client = Received(model)
         model.demand(client.client, demand(p="c/temperature=2", q="a", view=(0, 10.0, 1.0))).result(5)
         settle(model)
@@ -475,7 +475,7 @@ class ModelTests(unittest.TestCase):
         self.assertIn("load c", failed.message)
         # Loaded, it is opened for the client that named it, which says nothing more.
         model.load("c").result(5)
-        settle(model)
+        settle(model, until=lambda: bool(client.answered(0, "c/temperature=2")))
         self.assertEqual(client.answered(0, "c/temperature=2")[:2], [0, 1])
         self.assertIn("c/temperature=2", model.held().result(5)["measures"])
 
@@ -505,6 +505,44 @@ class ModelTests(unittest.TestCase):
         self.assertEqual({failed.measure for failed in client.kinds("failed")}, {"b"})
         self.assertIn("load b", client.kinds("failed")[0].message)
         self.assertEqual(model.held().result(5), {"models": [{"spec": "a", "state": "loaded"}, {"spec": "broken", "state": "failed", "message": "RuntimeError: no such weights"}], "measures": ["a"]})
+
+    def test_unloading_while_a_measure_opens_retires_it(self):
+        opening, release = threading.Event(), threading.Event()
+        first = Measure()
+        second = Measure((0.25, 0.6, 0.1, 0.049, 0.001))
+        loads = iter([first, second])
+
+        def open_measure(loaded, _):
+            if loaded is first:
+                opening.set()
+                if not release.wait(5):
+                    raise TimeoutError("the test did not release measure opening")
+            return loaded
+
+        catalog = Catalog([Choice("source", ("a",), "a")], [], lambda _: next(loads), open_measure)
+        model = service.Model(5, catalog)
+        model.load("a").result(5)
+        client = Received(model)
+        model.demand(client.client, demand(view=(0, 10.0, 1.0))).result(5)
+        try:
+            self.assertTrue(opening.wait(5))
+            model.unload("a").result(5)
+        finally:
+            release.set()
+
+        # The open callback is posted before the worker takes this marker.
+        model.inference.submit(lambda: None).result(5)
+        self.assertEqual(model.held().result(5), {"models": [], "measures": []})
+        settle(model)
+        (failed,) = client.kinds("failed")
+        self.assertIn("a was unloaded", failed.message)
+        self.assertEqual(client.answered(0), [])
+        self.assertEqual(first.calls, [])
+
+        model.load("a").result(5)
+        settle(model, until=lambda: bool(client.answered(0)))
+        self.assertEqual(client.answered(0)[:2], [1, 0])
+        self.assertEqual(model.held().result(5)["measures"], ["a"])
 
     def test_a_node_the_server_never_learned_is_said_unknown(self):
         model, _, measures = fixture()
@@ -548,7 +586,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.client.post("/models/c").json()["models"][-1]["spec"], "c")
         wait([self.model.models["c"]], 5)
         self.assertEqual(self.client.post("/measures/c/temperature=2").status_code, 200)
-        settle(self.model)
+        self.model.inference.submit(lambda: None).result(5)
         self.assertIn("c/temperature=2", self.client.get("/held").json()["measures"])
         self.assertEqual(self.client.post("/measures/c/depth=2").status_code, 400)
         self.assertEqual(self.client.post("/models/nothing").status_code, 400)

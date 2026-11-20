@@ -238,7 +238,7 @@ impl<'a> Heights<'a> {
             placed,
             d,
             scale: placed.ln_scale.exp(),
-            runs: vec![f64::NAN; d.runs().len()],
+            runs: vec![f64::NAN; d.run_count()],
             last: None,
         }
     }
@@ -256,7 +256,7 @@ impl<'a> Heights<'a> {
 
     fn measure(&mut self, edge: Edge) -> f64 {
         if let Edge::Of { run, at } = edge {
-            if let Some((point, offsets)) = self.d.runs()[run].offsets() {
+            if let Some((point, offsets)) = self.d.run(run).offsets() {
                 if self.runs[run].is_nan() {
                     self.runs[run] = self.placed.y(point);
                 }
@@ -337,7 +337,7 @@ fn item_box(
     let rank = d.item_rank(item);
     // A child is sized by its weight, a gap by what its neighbours leave it.
     let ln_p = match item {
-        Item::Child { run, at } => d.runs()[run].ln_p(at),
+        Item::Child { run, at } => d.run(run).ln_p(at),
         Item::Gap { .. } => {
             let (top, bottom) = d.item_edges(item);
             Point::ln_between(&top, &bottom)
@@ -345,7 +345,7 @@ fn item_box(
     };
     let (kind, branch, nats) = match item {
         Item::Child { run, at } => {
-            let branch = d.runs()[run].branch(at);
+            let branch = d.run(run).branch(at);
             let expanded = tree
                 .distribution(child_hash(node, branch), lens.p)?
                 .is_some();
@@ -404,14 +404,9 @@ fn gap_nats(
     }
     let above = before
         .checked_sub(1)
-        .map(|run| &d.runs()[run])
-        .filter(|run| !run.is_empty())
+        .map(|run| d.run(run))
         .map(|run| (run, run.len() - 1));
-    let below = d
-        .runs()
-        .get(before)
-        .filter(|run| !run.is_empty())
-        .map(|run| (run, 0));
+    let below = d.run_at(before).map(|run| (run, 0));
     let (mut sum, mut known) = (0.0, 0.0);
     for (run, at) in above.into_iter().chain(below) {
         let nats = tree.nats_q(node, lens, run.branch(at), run.ln_p(at))?;
@@ -466,7 +461,7 @@ fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Ste
         let (top, bottom) = p.item_edges(Item::Child { run, at });
         // Placed by its extent, sized by its weight.
         let ln_extent = Point::ln_between(&top, &bottom);
-        let ln_p = p.runs()[run].ln_p(at);
+        let ln_p = p.run(run).ln_p(at);
         let nats_q = tree.nats_q(node, lens, branch, ln_p)?;
         steps.nodes.push(child_hash(node, branch));
         steps.entries.push(ChainEntry {
@@ -500,7 +495,7 @@ fn held(d: Option<&Distribution>, point: &Point) -> Option<(Branch, Point, Point
     let (top, bottom) = d.item_edges(item);
     point
         .within(&top, &bottom)
-        .then(|| (d.runs()[run].branch(at), top, bottom))
+        .then(|| (d.run(run).branch(at), top, bottom))
 }
 
 /// Bits that tell a point of a node e^`ln_scale` view heights tall to
@@ -620,7 +615,7 @@ impl Layout<'_> {
             // is a hole in the node's children.
             let width = match found {
                 Item::Child { run, at } => {
-                    let r = &d.runs()[run];
+                    let r = d.run(run);
                     tree.nats_q(node, self.lens, r.branch(at), r.ln_p(at))?
                 }
                 Item::Gap { before } => {
@@ -908,7 +903,7 @@ pub fn known(
             break;
         }
         if let Item::Child { run, at } = found {
-            known.push((d.runs()[run].branch(at), y0, y1));
+            known.push((d.run(run).branch(at), y0, y1));
         }
         item = d.next(found);
     }
@@ -1395,7 +1390,7 @@ mod tests {
             runs.push(listed(1 + 2 * i, &[1 + 2 * i], &[w], 1.0 - below));
         }
         let mut tree = Tree::new();
-        tree.insert(ROOT, 0, runs).unwrap();
+        tree.insert(ROOT, 0, runs, None).unwrap();
         let camera = cam(ROOT, 0.0, top(&[]), 0.3 / VIEW.height);
         let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let rows = spans(&frame, ROOT);
@@ -1417,9 +1412,8 @@ mod tests {
         let runs = vec![
             listed(0, &[0], &[0.9975], 0.0),
             listed(5, &[5], &[0.0015], 0.9985),
-            Run::end_at(6),
         ];
-        tree.insert(ROOT, 0, runs).unwrap();
+        tree.insert(ROOT, 0, runs, Some(6)).unwrap();
         let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         // The gap's children at their mean weight, as a gap box draws them.
         let (heavy, gap, last) = (-0.9975f64.ln(), (4.0f64 / 0.001).ln(), -0.0015f64.ln());
@@ -1443,9 +1437,8 @@ mod tests {
         let runs = vec![
             listed(0, &[0], &[0.9], 0.0),
             listed(1, &[1, 2], &[1e-4, 0.0999], 0.9),
-            Run::end_at(3),
         ];
-        tree.insert(ROOT, 0, runs).unwrap();
+        tree.insert(ROOT, 0, runs, Some(3)).unwrap();
         let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let thick = frame
             .boxes
@@ -1465,7 +1458,7 @@ mod tests {
             runs.push(listed(1 + 2 * i, &[1 + 2 * i], &[w], 1.0 - below));
         }
         let mut tree = Tree::new();
-        tree.insert(ROOT, 0, runs).unwrap();
+        tree.insert(ROOT, 0, runs, None).unwrap();
         // Off the grid, so pixel corners fall inside gaps, not on edges:
         // a child and a gap repeat every 0.02 of a pixel.
         let camera = cam(ROOT, 0.0, top(&[]), 0.385 / VIEW.height);
@@ -1493,7 +1486,7 @@ mod tests {
             listed(5, &[5], &[0.1], 1.0 - below),
         ];
         let mut tree = Tree::new();
-        tree.insert(ROOT, 0, runs).unwrap();
+        tree.insert(ROOT, 0, runs, None).unwrap();
         let camera = cam(ROOT, 0.0, top(&[]), 0.0);
         let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let selected = |y_px: f64| {
@@ -1571,9 +1564,8 @@ mod tests {
         let runs = vec![
             listed(0, &[0], &[1.0], 0.0),
             Run::weighed(1, &[1, 2, 3], &[tiny.exp(); 3], &above, 140),
-            Run::end_at(4),
         ];
-        tree.insert(ROOT, 0, runs).unwrap();
+        tree.insert(ROOT, 0, runs, Some(4)).unwrap();
         // The view is the tail itself: x = 1000 bits is where children
         // 2^-1000 of the root fill it, from the top of the first of them.
         let camera = cam(ROOT, -tiny - 3f64.ln(), at(&[], &above.digits()), 0.0);
@@ -1597,7 +1589,7 @@ mod tests {
         // The two heaviest children of the root, and the node's end at rank
         // 1000: a quarter of its mass in 998 unknown children.
         let run = listed(0, &[4, 7], &[0.5, 0.25], 0.0);
-        tree.insert(ROOT, 0, vec![run, Run::end_at(1000)]).unwrap();
+        tree.insert(ROOT, 0, vec![run], Some(1000)).unwrap();
         let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let gap = frame
             .boxes
@@ -1611,7 +1603,7 @@ mod tests {
         // Not knowing how many, it is drawn as the child above it.
         let mut uncounted = Tree::new();
         let run = listed(0, &[4, 7], &[0.5, 0.25], 0.0);
-        uncounted.insert(ROOT, 0, vec![run]).unwrap();
+        uncounted.insert(ROOT, 0, vec![run], None).unwrap();
         let frame_ = layout(&uncounted, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         let gap_ = frame_
             .boxes
@@ -1627,7 +1619,7 @@ mod tests {
                 listed(2 + 100 * i, &[100 + i], &[1e-4], 1.0 - below)
             })
             .collect();
-        tree.insert(ROOT, 0, samples).unwrap();
+        tree.insert(ROOT, 0, samples, None).unwrap();
         let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
         // Each sample's row reaches its own width.
         let width = -(1e-4f64).ln();

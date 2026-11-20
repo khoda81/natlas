@@ -337,7 +337,7 @@ impl Session {
                 break;
             };
             // As precise as a view of the child as tall as the latest needs.
-            let ln_p = d.runs()[child.0].ln_p(child.1);
+            let ln_p = d.run(child.0).ln_p(child.1);
             let bits = precision(ln_p, self.rows.max(1.0));
             self.answer(tree, p, node, &[child], bits, updates)?;
             if q != p {
@@ -379,14 +379,14 @@ impl Session {
         let mut below: Vec<_> = onward
             .into_iter()
             .map(|(child, mut inner)| {
-                let r = &d.runs()[child.0];
+                let r = d.run(child.0);
                 inner.x = interval.x - r.ln_p(child.1);
                 (r.branch(child.1), inner)
             })
             .collect();
         let branches: Vec<_> = children
             .iter()
-            .map(|&(run, at)| d.runs()[run].branch(at))
+            .map(|&(run, at)| d.run(run).branch(at))
             .collect();
         self.answer(tree, p, node, &children, bits, updates)?;
         if q != p {
@@ -435,7 +435,7 @@ impl Session {
         let fresh: Vec<Child> = children
             .iter()
             .copied()
-            .filter(|&(run, at)| sent.take(d.runs()[run].rank() + at as Rank, bits))
+            .filter(|&(run, at)| sent.take(d.run(run).rank() + at as Rank, bits))
             .collect();
         let fresh = d.answer(&fresh, bits);
         let count = d.count().filter(|_| !mem::replace(&mut sent.count, true));
@@ -876,7 +876,7 @@ mod tests {
         .unwrap();
         let d = tree.distribution(ROOT, 0).unwrap().unwrap();
         let (top, bottom) = d.item_edges(Item::Child { run: 0, at: 1 });
-        let ln_light = d.runs()[0].ln_p(1);
+        let ln_light = d.run(0).ln_p(1);
         let mut session = Session::new();
         // Zoomed out, the light child is a sample at most.
         session
@@ -891,10 +891,10 @@ mod tests {
         };
         session.demand(&tree, looking(P, Some(view), None)).unwrap();
         let updates = session.step(&mut tree).unwrap();
-        let mut client = Distribution::new(Run::end_at(3));
+        let mut client = Distribution::from_answer(Vec::new(), Some(3)).unwrap();
         for update in updates {
             if let Update::Answer { runs, .. } = update {
-                client.insert(runs).unwrap();
+                client.insert(runs, None).unwrap();
             }
         }
         let rank = client.rank(1).expect("the light child is sent");

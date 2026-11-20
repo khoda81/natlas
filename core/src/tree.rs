@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::distribution::{Distribution, Run};
+use crate::distribution::{Distribution, Rank, Run};
 use crate::point::Point;
 use crate::Result;
 
@@ -223,19 +223,24 @@ impl Tree {
             .and_then(|node| node.distributions.get(measure)?.as_ref()))
     }
 
-    /// Add a run a source sent, and whether anything changed.
-    /// Add one answer's runs for the node, and whether anything changed.
-    pub fn insert(&mut self, id: NodeId, measure: usize, runs: Vec<Run>) -> Result<bool> {
-        let slot = self.node_mut(id)?.slot(measure);
-        let changed = match slot {
-            Some(distribution) => distribution.insert(runs)?,
-            None if runs.is_empty() => false,
-            None => {
-                *slot = Some(Distribution::from_answer(runs)?);
-                true
-            }
-        };
-        Ok(changed)
+    /// Add one answer for the node, and report whether anything changed.
+    pub fn insert(
+        &mut self,
+        id: NodeId,
+        measure: usize,
+        runs: Vec<Run>,
+        count: Option<Rank>,
+    ) -> Result<bool> {
+        let node = self.node_mut(id)?;
+        if runs.is_empty() && count.is_none() {
+            return Ok(false);
+        }
+        if let Some(Some(distribution)) = node.distributions.get_mut(measure) {
+            return distribution.insert(runs, count);
+        }
+        let distribution = Distribution::from_answer(runs, count)?;
+        *node.slot(measure) = Some(distribution);
+        Ok(true)
     }
 
     /// Replace everything known of the node's children under `measure`.
@@ -292,7 +297,7 @@ impl Tree {
         let mut entropy = 0.0;
         let mut cross = 0.0;
         let mut bounded = !p.complete();
-        for run in p.runs() {
+        for run in (0..p.run_count()).map(|index| p.run(index)) {
             for at in 0..run.len() {
                 let ln_p = run.ln_p(at);
                 // p (−ln p) is zero both at p = 0 and at p = 1.

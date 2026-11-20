@@ -70,8 +70,8 @@ enum UpdateMessage<'a> {
 #[serde(rename_all = "camelCase")]
 struct RunMessage<'a> {
     rank: u32,
-    branches: std::borrow::Cow<'a, [u32]>,
-    ln_weights: std::borrow::Cow<'a, [f64]>,
+    branches: &'a [u32],
+    ln_weights: &'a [f64],
     #[serde(with = "serde_bytes_slice")]
     top: Vec<u8>,
 }
@@ -206,7 +206,7 @@ impl Tree {
         children: Option<u32>,
     ) -> std::result::Result<bool, JsError> {
         let (mut child, mut digit) = (0, 0);
-        let mut runs = Vec::with_capacity(ranks.len() + 1);
+        let mut runs = Vec::with_capacity(ranks.len());
         for ((&rank, &length), &count) in ranks.iter().zip(&lengths).zip(&digits) {
             let (length, count) = (length as usize, count as usize);
             let (Some(run_branches), Some(run_weights), Some(top)) = (
@@ -224,8 +224,9 @@ impl Tree {
             );
             (child, digit) = (child + length, digit + count);
         }
-        runs.extend(children.map(Run::end_at));
-        self.inner.insert(id, measure, runs).map_err(js_error)
+        self.inner
+            .insert(id, measure, runs, children)
+            .map_err(js_error)
     }
 
     /// Whether `measure` has said anything of the node's children.

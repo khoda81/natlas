@@ -150,10 +150,6 @@ impl Packed {
             .get(at as u64 * u64::from(self.width), self.width) as Branch
     }
 
-    pub(crate) fn branches(&self, from: usize, to: usize) -> Vec<Branch> {
-        (from..to).map(|at| self.branch(at)).collect()
-    }
-
     /// The rank of each of `wanted` this node has, in one pass.
     pub(crate) fn positions(&self, wanted: &[Branch]) -> Vec<Option<usize>> {
         let mut sorted: Vec<(Branch, usize)> = wanted.iter().copied().zip(0..).collect();

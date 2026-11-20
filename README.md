@@ -68,7 +68,3 @@ The [server tests](tests/server_test.py) use deterministic distributions.
 To try the same fixture in the browser, run
 `PORT=8427 uv run tests/server_test.py --serve` and open
 `http://localhost:5173/?server=http://127.0.0.1:8427/`.
-
-## License
-
-[MIT](LICENSE)

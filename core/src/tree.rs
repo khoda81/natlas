@@ -32,6 +32,8 @@ pub mod node_id {
 /// lists has weight zero. What a branch denotes is up to the reader.
 pub type Branch = u32;
 
+const BRANCH_STEP: u64 = 0x9e37_79b9_7f4a_7c15;
+
 /// The measure whose order and weights split heights, and the one whose
 /// surprisal sets widths.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -44,17 +46,31 @@ pub struct Lens {
 /// naming a node never needs the path itself. SplitMix64's finalizer is a
 /// bijection, so siblings never collide; other collisions are left to chance
 /// at 64 bits and refused when they happen.
-pub fn child_hash(parent: u64, branch: Branch) -> u64 {
-    let mut z = parent.wrapping_add(0x9e37_79b9_7f4a_7c15u64.wrapping_mul(u64::from(branch) + 1));
+pub fn child_hash(parent: NodeId, branch: Branch) -> NodeId {
+    let mut z = parent.wrapping_add(BRANCH_STEP.wrapping_mul(u64::from(branch) + 1));
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
 }
 
+/// Recover the branch of a stored edge from its two node ids.
+fn branch_from_hash(parent: NodeId, child: NodeId) -> Branch {
+    // Undo each right-shift XOR with two shifts, and each odd multiplication
+    // with its inverse modulo 2^64, in reverse order.
+    let z = (child ^ (child >> 31) ^ (child >> 62)).wrapping_mul(0x3196_42b2_d24d_8ec3);
+    let z = (z ^ (z >> 27) ^ (z >> 54)).wrapping_mul(0x96de_1b17_3f11_9089);
+    let z = z ^ (z >> 30) ^ (z >> 60);
+    let branch = z
+        .wrapping_sub(parent)
+        .wrapping_mul(0xf1de_83e1_9937_733d)
+        .wrapping_sub(1);
+    Branch::try_from(branch).expect("stored parent and child must name a valid branch")
+}
+
 #[derive(Debug)]
 struct Node {
-    /// Parent and the branch to this node; `None` only for the root.
-    edge: Option<(NodeId, Branch)>,
+    /// Parent id. The node keyed by `ROOT` stores `ROOT` here.
+    parent: NodeId,
     /// By measure: as many as the last measure that said something of it.
     distributions: Vec<Option<Distribution>>,
 }
@@ -107,15 +123,15 @@ impl Tree {
         let mut tree = Self {
             nodes: HashMap::new(),
         };
-        tree.insert_node(ROOT, None);
+        tree.insert_node(ROOT, ROOT);
         tree
     }
 
-    fn insert_node(&mut self, id: NodeId, edge: Option<(NodeId, Branch)>) {
+    fn insert_node(&mut self, id: NodeId, parent: NodeId) {
         self.nodes.insert(
             id,
             Node {
-                edge,
+                parent,
                 distributions: Vec::new(),
             },
         );
@@ -138,12 +154,10 @@ impl Tree {
         self.node(parent)?;
         let id = child_hash(parent, branch);
         match self.nodes.get(&id) {
-            Some(node) if node.edge != Some((parent, branch)) => {
-                Err(format!("node id {id:#018x} collides"))
-            }
-            Some(_) => Ok(id),
+            Some(node) if id != ROOT && node.parent == parent => Ok(id),
+            Some(_) => Err(format!("node id {id:#018x} collides")),
             None => {
-                self.insert_node(id, Some((parent, branch)));
+                self.insert_node(id, parent);
                 Ok(id)
             }
         }
@@ -164,11 +178,14 @@ impl Tree {
     }
 
     pub fn parent(&self, id: NodeId) -> Result<Option<NodeId>> {
-        Ok(self.node(id)?.edge.map(|(parent, _)| parent))
+        let node = self.node(id)?;
+        Ok((id != ROOT).then_some(node.parent))
     }
 
-    pub fn branch(&self, id: NodeId) -> Result<Option<Branch>> {
-        Ok(self.node(id)?.edge.map(|(_, branch)| branch))
+    pub fn branch(&self, child: NodeId) -> Result<Option<Branch>> {
+        Ok(self
+            .parent(child)?
+            .map(|parent| branch_from_hash(parent, child)))
     }
 
     /// Nodes from `origin` down to `id`, inclusive.
@@ -188,10 +205,10 @@ impl Tree {
     /// Branches from the root down to `id`.
     pub fn path(&self, id: NodeId) -> Result<Vec<Branch>> {
         let mut path = Vec::new();
-        let mut current = self.node(id)?;
-        while let Some((parent, branch)) = current.edge {
-            path.push(branch);
-            current = self.node(parent)?;
+        let mut current = id;
+        while let Some(parent) = self.parent(current)? {
+            path.push(branch_from_hash(parent, current));
+            current = parent;
         }
         path.reverse();
         Ok(path)
@@ -327,25 +344,38 @@ mod tests {
     #[test]
     fn nodes_are_named_by_their_shared_hashes() {
         let mut tree = Tree::new();
-        let child = tree.child(ROOT, 5).unwrap();
-        let grandchild = tree.child(child, 2).unwrap();
-        assert_eq!(grandchild, child_hash(child_hash(ROOT, 5), 2));
-        assert_eq!(tree.child(ROOT, 5).unwrap(), child);
+        let child = tree.child(ROOT, 0).unwrap();
+        let grandchild = tree.child(child, Branch::MAX).unwrap();
+        assert_eq!(grandchild, child_hash(child_hash(ROOT, 0), Branch::MAX));
+        assert_eq!(tree.child(ROOT, 0).unwrap(), child);
         assert_eq!(tree.parent(ROOT).unwrap(), None);
+        assert_eq!(tree.branch(ROOT).unwrap(), None);
+        assert!(tree.path(ROOT).unwrap().is_empty());
         assert_eq!(tree.parent(grandchild).unwrap(), Some(child));
-        assert_eq!(tree.branch(grandchild).unwrap(), Some(2));
-        assert_eq!(tree.path(grandchild).unwrap(), [5, 2]);
+        assert_eq!(tree.branch(grandchild).unwrap(), Some(Branch::MAX));
+        assert_eq!(tree.path(grandchild).unwrap(), [0, Branch::MAX]);
         assert_eq!(
             tree.chain(ROOT, grandchild).unwrap(),
             [ROOT, child, grandchild]
         );
         assert!(tree.chain(grandchild, child).is_err());
         let mut other = Tree::new();
-        assert_eq!(other.descend(ROOT, &[5, 2]).unwrap(), grandchild);
+        assert_eq!(other.descend(ROOT, &[0, Branch::MAX]).unwrap(), grandchild);
         assert!(!tree.contains(child_hash(ROOT, 9)));
-        // Another parent claiming the same id is a collision, refused.
-        tree.insert_node(child_hash(ROOT, 3), Some((ROOT, 4)));
-        assert!(tree.child(ROOT, 3).is_err());
+        assert!(tree.path(child_hash(ROOT, 9)).is_err());
+    }
+
+    #[test]
+    fn a_colliding_child_keeps_the_existing_parent() {
+        let mut tree = Tree::new();
+        let parent = tree.child(ROOT, 5).unwrap();
+        let child = tree.child(parent, 1).unwrap();
+        // Adding one step to the parent cancels subtracting one branch.
+        let other_parent = parent.wrapping_add(BRANCH_STEP);
+        tree.insert_node(other_parent, ROOT);
+        assert_eq!(child_hash(other_parent, 0), child);
+        assert!(tree.child(other_parent, 0).is_err());
+        assert_eq!(tree.path(child).unwrap(), [5, 1]);
     }
 
     #[test]

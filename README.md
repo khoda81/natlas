@@ -55,6 +55,21 @@ bun run bench      # browser frame timings and canvas/inspector snapshots
 bun run proto      # regenerate TypeScript and Python bindings; needs protoc
 ```
 
+The PStore Criterion suite measures construction and batches of 256 queries
+on the same 150,000-branch fixtures. For browser Wasm, put a
+`wasm-bindgen-test-runner` matching `wasm-bindgen` in `core/Cargo.lock` and a
+compatible WebDriver on your PATH. The Wasm suite runs in a dedicated
+browser worker so the driver can read progress during sampling. The full
+suite spends about five minutes warming up and sampling per target.
+
+```bash
+cargo bench --manifest-path core/Cargo.toml --no-default-features --bench pstore
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+WASM_BINDGEN_TEST_TIMEOUT=600 \
+cargo bench --manifest-path core/Cargo.toml --no-default-features --bench pstore \
+    --target wasm32-unknown-unknown
+```
+
 For targeted checks after building the core:
 
 ```bash

@@ -37,6 +37,10 @@ impl CdfRange {
         self.start + (self.end - self.start) / 2
     }
 
+    pub(crate) fn bounds(self) -> (u64, u64) {
+        (self.start, self.end)
+    }
+
     /// A pixel starting at this range's top, clipped to the range.
     pub fn first_pixel(self, mass: u64) -> Self {
         Self {
@@ -133,21 +137,12 @@ pub trait PStore: Sized {
 /// `ends[n - 1] == u64::MAX`, and `starts[i + 1] == ends[i] + 1`.
 /// Cumulative cuts are computed in f64 and rounded to the integer grid.
 /// A branch whose rounded cuts coincide has no interval.
-fn normalize_logits(logits: &[f32]) -> (Vec<u64>, Vec<u64>, Vec<Branch>, Vec<f32>) {
+pub(crate) fn normalize_logits(logits: &[f32]) -> (Vec<u64>, Vec<u64>, Vec<Branch>, Vec<f32>) {
     assert!(
         logits.len() <= LEAF_BIT as usize,
         "too many branches for a PStore"
     );
-    let max_l = logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, |max, logit| {
-            assert!(
-                !logit.is_nan() && logit != f32::INFINITY,
-                "invalid PStore logit"
-            );
-            max.max(logit)
-        });
+    let max_l = max_logit(logits);
     if max_l == f32::NEG_INFINITY {
         return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
@@ -199,6 +194,16 @@ fn normalize_logits(logits: &[f32]) -> (Vec<u64>, Vec<u64>, Vec<Branch>, Vec<f32
         cur_start = next_start;
     }
     (starts, ends, branches, ln_p)
+}
+
+pub(crate) fn max_logit(logits: &[f32]) -> f32 {
+    logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |max, logit| {
+            assert!(!logit.is_nan() && logit != f32::INFINITY, "invalid logit");
+            max.max(logit)
+        })
 }
 
 #[inline]

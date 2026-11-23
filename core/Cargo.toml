@@ -31,3 +31,7 @@ wasm-bindgen-test = "0.3.80"
 [[bench]]
 name = "pstore"
 harness = false
+
+[[bench]]
+name = "qlayout"
+harness = false

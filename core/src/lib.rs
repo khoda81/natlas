@@ -7,6 +7,7 @@ pub mod session;
 pub mod tree;
 
 pub mod pstore;
+pub mod qlayout;
 
 pub type Result<T> = std::result::Result<T, String>;
 

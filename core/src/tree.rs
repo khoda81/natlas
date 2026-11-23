@@ -53,18 +53,30 @@ pub fn child_hash(parent: NodeId, branch: Branch) -> NodeId {
     z ^ (z >> 31)
 }
 
-/// Recover the branch of a stored edge from its two node ids.
-fn branch_from_hash(parent: NodeId, child: NodeId) -> Branch {
+fn unmix_id(child: NodeId) -> u64 {
     // Undo each right-shift XOR with two shifts, and each odd multiplication
     // with its inverse modulo 2^64, in reverse order.
     let z = (child ^ (child >> 31) ^ (child >> 62)).wrapping_mul(0x3196_42b2_d24d_8ec3);
     let z = (z ^ (z >> 27) ^ (z >> 54)).wrapping_mul(0x96de_1b17_3f11_9089);
-    let z = z ^ (z >> 30) ^ (z >> 60);
-    let branch = z
+    z ^ (z >> 30) ^ (z >> 60)
+}
+
+/// Recover the branch when `child` is a child of the given `parent` hash.
+pub fn derive_branch(parent: NodeId, child: NodeId) -> Option<Branch> {
+    let branch = unmix_id(child)
         .wrapping_sub(parent)
         .wrapping_mul(0xf1de_83e1_9937_733d)
         .wrapping_sub(1);
-    Branch::try_from(branch).expect("stored parent and child must name a valid branch")
+    Branch::try_from(branch).ok()
+}
+
+/// Recover the parent hash for an edge with a known child and branch.
+pub fn derive_parent(child: NodeId, branch: Branch) -> NodeId {
+    unmix_id(child).wrapping_sub(BRANCH_STEP.wrapping_mul(u64::from(branch) + 1))
+}
+
+fn branch_from_hash(parent: NodeId, child: NodeId) -> Branch {
+    derive_branch(parent, child).expect("stored parent and child must name a valid branch")
 }
 
 #[derive(Debug)]

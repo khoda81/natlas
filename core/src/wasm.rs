@@ -6,6 +6,10 @@ use wasm_bindgen::prelude::*;
 
 use crate::distribution::Run;
 use crate::layout::{self, Anchor, Camera, Frame, Viewport};
+use crate::pstore::{
+    bench_logits, bench_queries, BTreeMax, BranchHit, CdfRange, EytzingerMax, PStore, QueryScratch,
+    TieredPStore,
+};
 use crate::session::{Demand, Path, Session as NativeSession, Update, View};
 use crate::tree::{child_hash, Lens, Tree as NativeTree};
 
@@ -616,4 +620,122 @@ pub fn clamp_position(
 ) -> std::result::Result<f64, JsError> {
     let camera: Camera = from_js(camera)?;
     layout::clamp_position(&tree.inner, Lens { p, q }, &camera).map_err(js_error)
+}
+
+/// WASM benchmark handle for comparing `PStore` implementations head-to-head.
+/// `impl_id`: 0 = BTreeMax, 1 = EytzingerMax, 2 = TieredPStore.
+/// `dist_kind`: 0 = Zipf Heaviest, 1 = Zipf Shuffled, 2 = Uniform.
+#[wasm_bindgen]
+pub struct PStoreBench {
+    store: PStoreKind,
+    queries: Vec<(CdfRange, u64)>,
+    scratch: QueryScratch,
+    out: Vec<BranchHit>,
+}
+
+enum PStoreKind {
+    BTree(BTreeMax),
+    Eytzinger(EytzingerMax),
+    Tiered(TieredPStore),
+}
+
+#[wasm_bindgen]
+impl PStoreBench {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        impl_id: u32,
+        dist_kind: u32,
+        vocab: usize,
+        query_count: usize,
+    ) -> std::result::Result<PStoreBench, JsError> {
+        if 2 < dist_kind {
+            return Err(js_error(format!(
+                "unknown PStore benchmark distribution {dist_kind}"
+            )));
+        }
+        let build = match impl_id {
+            0 => |logits: &[f32]| PStoreKind::BTree(BTreeMax::from_logits(logits)),
+            1 => |logits: &[f32]| PStoreKind::Eytzinger(EytzingerMax::from_logits(logits)),
+            2 => |logits: &[f32]| PStoreKind::Tiered(TieredPStore::from_logits(logits)),
+            _ => return Err(js_error(format!("unknown PStore implementation {impl_id}"))),
+        };
+        let logits = bench_logits(dist_kind, vocab);
+        Ok(Self {
+            store: build(&logits),
+            queries: bench_queries(query_count),
+            scratch: Default::default(),
+            out: Vec::with_capacity(1024),
+        })
+    }
+
+    pub fn name(&self) -> String {
+        match &self.store {
+            PStoreKind::BTree(_) => BTreeMax::name().to_string(),
+            PStoreKind::Eytzinger(_) => EytzingerMax::name().to_string(),
+            PStoreKind::Tiered(_) => TieredPStore::name().to_string(),
+        }
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        match &self.store {
+            PStoreKind::BTree(s) => s.memory_bytes(),
+            PStoreKind::Eytzinger(s) => s.memory_bytes(),
+            PStoreKind::Tiered(s) => s.memory_bytes(),
+        }
+    }
+
+    pub fn run_query_tall(&mut self, reps: usize) -> usize {
+        let mut hits = 0usize;
+        for _ in 0..reps {
+            for &(range, min_mass) in &self.queries {
+                match &self.store {
+                    PStoreKind::BTree(s) => {
+                        s.query_tall(range, min_mass, &mut self.scratch, &mut self.out)
+                    }
+                    PStoreKind::Eytzinger(s) => {
+                        s.query_tall(range, min_mass, &mut self.scratch, &mut self.out)
+                    }
+                    PStoreKind::Tiered(s) => {
+                        s.query_tall(range, min_mass, &mut self.scratch, &mut self.out)
+                    }
+                }
+                hits += self.out.len();
+            }
+        }
+        hits
+    }
+
+    pub fn run_locate(&self, reps: usize) -> u32 {
+        let mut acc = 0u32;
+        for _ in 0..reps {
+            for &(range, _) in &self.queries {
+                let mid = range.midpoint();
+                let hit = match &self.store {
+                    PStoreKind::BTree(s) => s.locate(mid),
+                    PStoreKind::Eytzinger(s) => s.locate(mid),
+                    PStoreKind::Tiered(s) => s.locate(mid),
+                };
+                if let Some(h) = hit {
+                    acc = acc.wrapping_add(h.branch);
+                }
+            }
+        }
+        acc
+    }
+
+    pub fn run_contains_boundary(&self, reps: usize) -> u32 {
+        let mut acc = 0u32;
+        for _ in 0..reps {
+            for &(range, min_mass) in &self.queries {
+                let px = range.first_pixel(min_mass);
+                let hit = match &self.store {
+                    PStoreKind::BTree(s) => s.contains_boundary(px),
+                    PStoreKind::Eytzinger(s) => s.contains_boundary(px),
+                    PStoreKind::Tiered(s) => s.contains_boundary(px),
+                };
+                acc += u32::from(hit);
+            }
+        }
+        acc
+    }
 }

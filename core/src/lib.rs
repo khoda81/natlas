@@ -6,6 +6,8 @@ pub mod point;
 pub mod session;
 pub mod tree;
 
+pub mod pstore;
+
 pub type Result<T> = std::result::Result<T, String>;
 
 #[cfg(feature = "python")]

@@ -15,7 +15,7 @@ import {
   view as wasmView,
 } from "../src/core/wasm";
 import { Frame, type Camera, type Viewport } from "../src/core/layout";
-import { IntervalTree, ROOT, type Lens } from "../src/core/tree";
+import { IntervalTree, RecordedTree, ROOT, type Lens } from "../src/core/tree";
 import type { Update } from "../src/data/source";
 import { digits, run } from "./build";
 
@@ -57,8 +57,7 @@ function zipfWeights(count: number, alpha = 1.15): number[] {
   return raw.map((w) => w / total);
 }
 
-function buildSourceTree(count: number, withQ: boolean) {
-  const tree = new IntervalTree();
+function buildSourceTree<T extends IntervalTree | RecordedTree>(tree: T, count: number, withQ: boolean) {
   const p = tree.measure("p");
   const q = withQ ? tree.measure("q") : p;
   const lens: Lens = { p, q };
@@ -167,12 +166,14 @@ type SessionUpdate =
   | { kind: Exclude<Update["kind"], "answer"> };
 
 async function runScenario(scenario: Scenario) {
-  const { tree: source, lens, ingestMs: bulkIngestMs, wireBytes: bulkWireBytes } = buildSourceTree(
+  const recording = scenario.streaming ? new RecordedTree() : null;
+  const client = new IntervalTree();
+  const { lens, ingestMs: bulkIngestMs, wireBytes: bulkWireBytes } = buildSourceTree(
+    recording ?? client,
     scenario.count,
     scenario.withQ,
   );
-  const client = scenario.streaming ? new IntervalTree() : source;
-  const session = scenario.streaming ? new WasmSession() : null;
+  const session = recording === null ? null : new WasmSession();
 
   const cam: Camera = {
     origin: ROOT,
@@ -198,11 +199,11 @@ async function runScenario(scenario: Scenario) {
 
     // Stage 1: Streaming demand + transfer + client ingest (when streaming)
     let ingestThisFrame = 0;
-    if (session) {
+    if (session && recording) {
       const t0 = performance.now();
       const v = wasmView(client.raw, lens.p, lens.q, cam, VIEW, VIEW.height / ROW_PX);
-      session.demand(source.raw, lens.p, lens.q, v, null);
-      const updates = session.answer(source.raw) as SessionUpdate[];
+      session.demand(recording.raw, lens.p, lens.q, v, null);
+      const updates = session.answer(recording.raw) as SessionUpdate[];
       for (const u of updates) {
         if (u.kind !== "answer") continue;
         if (u.parent !== null && u.branch !== null) {

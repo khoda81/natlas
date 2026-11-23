@@ -1,14 +1,7 @@
-//! A measure's children as a server keeps them, a whole vocabulary per node
-//! in the measure's order: each one's branch at the vocabulary's width, and
-//! its ln weight as an f32, the precision a model computes its logits in,
-//! told by how far it is from the one before.
-//!
-//! Neighbouring f32s lie close together: on Qwen3-4B's 152k children the
-//! steps between the bit patterns of sorted weights take about 5 bits.
-//! Children are kept in blocks of `BLOCK`; a block holds its first weight
-//! and where its steps start, and packs its other steps, signed so any order
-//! packs, at the width of its largest.
-//!
+//! A whole vocabulary in its supplied rank order. The compact store keeps
+//! branch ids and final f64 log weights losslessly. Nearby weights commonly
+//! share low bits, so each block drops the zeros common to its deltas.
+
 //! Each child's weight is fixed once as a float, `e^(ln w − max)`, and the
 //! sums of those floats are exact: fixed-point over the node's range, kept
 //! before every `SUMMED`th child. An edge's fraction above, Σ_{i<r} w_i / W,
@@ -17,18 +10,14 @@
 
 use num_bigint::BigUint;
 
-use crate::distribution::Scale;
-use crate::point::{self, Point};
+use crate::point::Point;
 use crate::tree::Branch;
 
-/// Children per block. Measured on Qwen3-4B, a read of 1600 points takes
-/// about 2.4 ms with blocks of 8, 3.5 ms with 16 and 5.9 ms with 32; their
-/// weights take about 1.9, 1.4 and 1.2 bytes per child.
-const BLOCK: usize = 16;
-/// Children per kept exact sum. Measured on Qwen3-4B, an edge from a sum
-/// kept every 256 children takes 0.6–0.7 µs and 0.13 bytes per child, every
-/// 16 0.3–0.5 µs and 2 bytes, and summing on demand 110–130 µs.
-const SUMMED: usize = 16 * BLOCK;
+/// The block header holds an f64 key. A 32-child block amortizes it while
+/// a scalar width read decodes only up to the requested position.
+const BLOCK: usize = 32;
+/// A kept sum every 256 children balances cached bytes against edge time.
+const SUMMED: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Packed {
@@ -37,7 +26,8 @@ pub(crate) struct Packed {
     branches: Bits,
     width: u32,
     /// Each block's first weight, as its key.
-    keys: Vec<u32>,
+    keys: Vec<u64>,
+    shifts: Vec<u8>,
     /// Where each block's steps start in `steps`, in bits, and where the
     /// last one's end.
     starts: Vec<u32>,
@@ -45,7 +35,7 @@ pub(crate) struct Packed {
     /// one before, zigzagged.
     steps: Bits,
     /// The heaviest ln weight: weights are fixed relative to it.
-    max: f32,
+    max: f64,
     /// The exact sum of the weights above every `SUMMED`th child, in units
     /// of 2^`lo`, `limbs` words each, least significant first.
     sums: Vec<u64>,
@@ -53,42 +43,51 @@ pub(crate) struct Packed {
     lo: i64,
     /// The sum of every weight, W, in the same units.
     total: BigUint,
-    /// What a child's ln weight less is its conditional weight: the
-    /// heaviest's and the sum's, or none where the weights are absolute.
-    ln_norm: f64,
 }
 
 impl Packed {
     /// Children in the measure's order: at least one, each weight finite.
-    pub(crate) fn new(children: &[(f32, Branch)], scale: Scale) -> Self {
-        assert!(!children.is_empty() && children.iter().all(|(weight, _)| weight.is_finite()));
+    pub(crate) fn new(children: &[(Branch, f64)]) -> Self {
+        assert!(!children.is_empty() && children.iter().all(|(_, weight)| weight.is_finite()));
         let len = children.len();
         let max_branch = children
             .iter()
-            .map(|&(_, branch)| branch)
+            .map(|&(branch, _)| branch)
             .max()
             .expect("children");
         let width = u32::BITS - max_branch.leading_zeros();
         let mut branches = Bits::default();
-        for &(_, branch) in children {
+        for &(branch, _) in children {
             branches.push(u64::from(branch), width);
         }
-        let (mut keys, mut starts, mut steps) = (Vec::new(), Vec::new(), Bits::default());
+        let blocks = len.div_ceil(BLOCK);
+        let mut keys = Vec::with_capacity(blocks);
+        let mut shifts = Vec::with_capacity(blocks);
+        let mut starts = Vec::with_capacity(blocks + 1);
+        let mut steps = Bits::default();
         for block in children.chunks(BLOCK) {
-            let block: Vec<u32> = block.iter().map(|&(weight, _)| key(weight)).collect();
-            let zigzagged: Vec<u32> = block
+            let mut words = [0; BLOCK];
+            for (slot, &(_, weight)) in words.iter_mut().zip(block) {
+                *slot = key(weight);
+            }
+            let words = &words[..block.len()];
+            let zeroes = words
                 .windows(2)
-                .map(|pair| step(pair[0], pair[1]))
-                .collect();
-            let width = zigzagged
-                .iter()
-                .map(|step| u32::BITS - step.leading_zeros())
+                .map(|pair| pair[1].wrapping_sub(pair[0]))
+                .fold(0, |bits, delta| bits | delta)
+                .trailing_zeros()
+                .min(u64::BITS - 1);
+            let encoded = |pair: &[u64]| step(pair[0], pair[1], zeroes);
+            let width = words
+                .windows(2)
+                .map(encoded)
                 .max()
-                .unwrap_or(0);
-            keys.push(block[0]);
+                .map_or(0, |n| u64::BITS - n.leading_zeros());
+            keys.push(words[0]);
+            shifts.push(zeroes as u8);
             starts.push(u32::try_from(steps.len).expect("steps fit in u32 bits"));
-            for step in zigzagged {
-                steps.push(u64::from(step), width);
+            for pair in words.windows(2) {
+                steps.push(encoded(pair), width);
             }
         }
         starts.push(u32::try_from(steps.len).expect("steps fit in u32 bits"));
@@ -100,13 +99,13 @@ impl Packed {
         starts.shrink_to_fit();
         let max = children
             .iter()
-            .map(|&(weight, _)| weight)
-            .fold(f32::NEG_INFINITY, f32::max);
+            .map(|&(_, weight)| weight)
+            .fold(f64::NEG_INFINITY, f64::max);
         // Units below the lightest weight's last bit, and words enough for
         // the sum of every weight, each at most 1.
         let lo = children
             .iter()
-            .map(|&(weight, _)| ulp_exponent(fixed(weight, max)))
+            .map(|&(_, weight)| ulp_exponent(fixed(weight, max)))
             .min()
             .expect("children");
         let limbs = ((1 - lo) as u64 + u64::from(usize::BITS - len.leading_zeros())).div_ceil(64)
@@ -114,22 +113,19 @@ impl Packed {
             + 1;
         let mut sums = Vec::with_capacity(len.div_ceil(SUMMED) * limbs);
         let mut sum = vec![0; limbs];
-        for (at, &(weight, _)) in children.iter().enumerate() {
+        for (at, &(_, weight)) in children.iter().enumerate() {
             if at % SUMMED == 0 {
                 sums.extend_from_slice(&sum);
             }
             add(&mut sum, fixed(weight, max), lo);
         }
         let total = whole(&sum);
-        let ln_norm = match scale {
-            Scale::Relative => f64::from(max) + point::ln(&total, lo),
-            Scale::Absolute => 0.0,
-        };
         Self {
             len,
             branches,
             width,
             keys,
+            shifts,
             starts,
             steps,
             max,
@@ -137,7 +133,6 @@ impl Packed {
             limbs,
             lo,
             total,
-            ln_norm,
         }
     }
 
@@ -173,35 +168,28 @@ impl Packed {
         found
     }
 
-    /// The ln weights of a block, its first first, and how many it has.
-    fn block(&self, block: usize) -> ([f32; BLOCK], usize) {
+    /// Decode only the part of the block the caller consumes.
+    fn block(&self, block: usize) -> impl Iterator<Item = f64> + '_ {
         let count = BLOCK.min(self.len - block * BLOCK);
-        let (start, end) = (self.starts[block], self.starts[block + 1]);
+        let start = u64::from(self.starts[block]);
         let width = if count == 1 {
             0
         } else {
-            (end - start) / (count as u32 - 1)
+            (self.starts[block + 1] - self.starts[block]) / (count as u32 - 1)
         };
         let mut key = self.keys[block];
-        let mut weights = [0.0; BLOCK];
-        weights[0] = weight(key);
-        for (step, slot) in (0..).zip(&mut weights[1..count]) {
-            let zigzagged =
-                self.steps
-                    .get(u64::from(start) + step * u64::from(width), width) as u32;
-            key = key.wrapping_add(unzigzag(zigzagged));
-            *slot = weight(key);
-        }
-        (weights, count)
+        let shift = self.shifts[block];
+        std::iter::once(weight(key)).chain((0..count - 1).map(move |at| {
+            let encoded = self.steps.get(start + at as u64 * u64::from(width), width);
+            key = key.wrapping_add(unzigzag(encoded) << shift);
+            weight(key)
+        }))
     }
 
-    pub(crate) fn ln_weight(&self, at: usize) -> f32 {
-        self.block(at / BLOCK).0[at % BLOCK]
-    }
-
-    /// ln of the child's weight, conditional on the node.
     pub(crate) fn ln_p(&self, at: usize) -> f64 {
-        f64::from(self.ln_weight(at)) - self.ln_norm
+        self.block(at / BLOCK)
+            .nth(at % BLOCK)
+            .expect("a known rank")
     }
 
     /// The exact sum of the weights above rank `at`, from the kept sum
@@ -211,8 +199,7 @@ impl Packed {
         let mut sum = self.sums[kept * self.limbs..(kept + 1) * self.limbs].to_vec();
         let mut rank = kept * SUMMED;
         while rank < at {
-            let (weights, count) = self.block(rank / BLOCK);
-            for &weight in &weights[..count.min(at - rank)] {
+            for weight in self.block(rank / BLOCK).take(at - rank) {
                 add(&mut sum, fixed(weight, self.max), self.lo);
             }
             rank += BLOCK;
@@ -268,8 +255,7 @@ impl Packed {
         let mut sum = at(low).to_vec();
         let mut rank = low * SUMMED;
         while rank < self.len {
-            let (weights, count) = self.block(rank / BLOCK);
-            for &weight in &weights[..count] {
+            for weight in self.block(rank / BLOCK) {
                 add(&mut sum, fixed(weight, self.max), self.lo);
                 if !under(&sum) {
                     return rank;
@@ -286,14 +272,16 @@ impl Packed {
             + self.branches.bytes()
             + self.steps.bytes()
             + self.sums.capacity() * size_of::<u64>()
-            + (self.keys.capacity() + self.starts.capacity()) * size_of::<u32>()
+            + self.keys.capacity() * size_of::<u64>()
+            + self.starts.capacity() * size_of::<u32>()
+            + self.shifts.capacity()
             + self.total.to_u64_digits().len() * size_of::<u64>()
     }
 }
 
 /// A child's weight as the node fixes it: e^(ln w − max), at most 1.
-fn fixed(ln_weight: f32, max: f32) -> f64 {
-    (f64::from(ln_weight) - f64::from(max)).exp()
+fn fixed(ln_weight: f64, max: f64) -> f64 {
+    (ln_weight - max).exp()
 }
 
 /// The exponent of a float's last bit: of 2^-1074 for zero and subnormals.
@@ -359,35 +347,35 @@ fn less(a: &[u64], b: &[u64]) -> bool {
     a.iter().rev().cmp(b.iter().rev()).is_lt()
 }
 
-/// An f32's bits as a key ordered like the f32: larger for a larger value.
-fn key(weight: f32) -> u32 {
+/// An f64's bits ordered like its value, including signed zeros.
+fn key(weight: f64) -> u64 {
     let bits = weight.to_bits();
-    if bits >> 31 == 1 {
+    if bits >> 63 == 1 {
         !bits
     } else {
-        bits | 1 << 31
+        bits | 1 << 63
     }
 }
 
-fn weight(key: u32) -> f32 {
-    f32::from_bits(if key >> 31 == 1 {
-        key & !(1 << 31)
+fn weight(key: u64) -> f64 {
+    f64::from_bits(if key >> 63 == 1 {
+        key & !(1 << 63)
     } else {
         !key
     })
 }
 
-/// How far `to` is from `from`, wrapping, as a zigzag: small either way.
-fn step(from: u32, to: u32) -> u32 {
-    let step = to.wrapping_sub(from) as i32;
-    ((step << 1) ^ (step >> 31)) as u32
+/// A wrapping delta without its known low zeros, zigzagged to be small either way.
+fn step(from: u64, to: u64, shift: u32) -> u64 {
+    let delta = (to.wrapping_sub(from) as i64) >> shift;
+    ((delta << 1) ^ (delta >> 63)) as u64
 }
 
-fn unzigzag(zigzagged: u32) -> u32 {
+fn unzigzag(zigzagged: u64) -> u64 {
     (zigzagged >> 1) ^ (zigzagged & 1).wrapping_neg()
 }
 
-/// Values of up to 32 bits each, packed end to end.
+/// Values of up to 64 bits each, packed end to end.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Bits {
     words: Vec<u64>,
@@ -396,7 +384,7 @@ struct Bits {
 
 impl Bits {
     fn push(&mut self, value: u64, width: u32) {
-        debug_assert!(width <= 32 && value >> width == 0);
+        debug_assert!(width == 64 || (width < 64 && value >> width == 0));
         if width == 0 {
             return;
         }
@@ -420,7 +408,7 @@ impl Bits {
         if 64 < offset + width {
             value |= self.words[word + 1] << (64 - offset);
         }
-        value & ((1 << width) - 1)
+        value & (u64::MAX >> (64 - width))
     }
 
     fn bytes(&self) -> usize {
@@ -434,37 +422,37 @@ mod tests {
 
     #[test]
     fn keys_order_like_their_weights_and_steps_go_either_way() {
-        let weights = [3.5f32, 0.0, -0.0, -1e-30, -1.0, -700.25, f32::MIN];
+        let weights = [3.5f64, 0.0, -0.0, -1e-30, -1.0, -700.25, f64::MIN];
         for pair in weights.windows(2) {
             assert!(key(pair[1]) <= key(pair[0]), "{pair:?}");
             let (a, b) = (key(pair[0]), key(pair[1]));
-            assert_eq!(a.wrapping_add(unzigzag(step(a, b))), b);
-            assert_eq!(b.wrapping_add(unzigzag(step(b, a))), a);
+            assert_eq!(a.wrapping_add(unzigzag(step(a, b, 0))), b);
+            assert_eq!(b.wrapping_add(unzigzag(step(b, a, 0))), a);
         }
         for weight_ in weights {
             assert_eq!(weight(key(weight_)).to_bits(), weight_.to_bits());
         }
-        assert_eq!(step(5, 5), 0);
-        assert!(step(5, 4) < 4 && step(5, 6) < 4);
+        assert_eq!(step(5, 5, 0), 0);
+        assert!(step(5, 4, 0) < 4 && step(5, 6, 0) < 4);
     }
 
     #[test]
     fn packs_branches_and_weights_in_any_order_and_reads_them_back() {
         // Ties, single-child last block, and wide and zero-width steps, in
         // an order that is not by weight.
-        let children: Vec<(f32, Branch)> = (0..37)
+        let children: Vec<(Branch, f64)> = (0..37)
             .map(|i: u32| {
                 (
-                    ((i * 7) % 11) as f32 * -0.37 - if i == 20 { 1e3 } else { 0.0 },
                     151_935 - i * 4000,
+                    f64::from((i * 7) % 11) * -0.37 - if i == 20 { 1e3 } else { 0.0 },
                 )
             })
             .collect();
-        let packed = Packed::new(&children, Scale::Relative);
-        for (at, &(weight_, branch)) in children.iter().enumerate() {
-            assert_eq!((packed.branch(at), packed.ln_weight(at)), (branch, weight_));
+        let packed = Packed::new(&children);
+        for (at, &(branch, weight_)) in children.iter().enumerate() {
+            assert_eq!((packed.branch(at), packed.ln_p(at)), (branch, weight_));
         }
-        let wanted = [children[36].1, 7, children[0].1];
+        let wanted = [children[36].0, 7, children[0].0];
         assert_eq!(packed.positions(&wanted), [Some(36), None, Some(0)]);
     }
 
@@ -472,22 +460,21 @@ mod tests {
     fn edges_are_exact_sums_and_points_find_the_child_between_them() {
         // A light child between heavy ones, in branch order, across many
         // kept sums: its extent is far below any float of the edges.
-        let mut children: Vec<(f32, Branch)> = (0..1000)
-            .map(|i| (-(f64::from(i % 97) * 0.37) as f32, i))
+        let mut children: Vec<(Branch, f64)> = (0..1000)
+            .map(|i| (i, f64::from(-(f64::from(i % 97) * 0.37) as f32)))
             .collect();
-        children[600].0 = -60.0;
-        let packed = Packed::new(&children, Scale::Relative);
-        let total: f64 = children
-            .iter()
-            .map(|&(weight, _)| f64::from(weight).exp())
-            .sum();
+        children[600].1 = -60.0;
+        let total: f64 = children.iter().map(|&(_, weight)| weight.exp()).sum();
+        let mut normalized = children.clone();
+        crate::distribution::log_softmax(&mut normalized);
+        let packed = Packed::new(&normalized);
         assert_eq!(packed.edge(0), Point::top());
         assert_eq!(packed.top(1000, 64), Point::bottom());
         let mut above = 0.0;
-        for (at, &(weight, _)) in children.iter().enumerate() {
+        for (at, &(_, weight)) in children.iter().enumerate() {
             let edge = packed.edge(at);
             assert!((edge.ln_below().exp() - (1.0 - above / total)).abs() < 1e-12);
-            assert!((packed.ln_p(at) - (f64::from(weight) - total.ln())).abs() < 1e-12);
+            assert!((packed.ln_p(at) - (weight - total.ln())).abs() < 1e-12);
             // The edge itself, and the points just either side of it.
             assert_eq!(packed.holding(&edge), at);
             let next = packed.edge(at + 1);
@@ -497,7 +484,7 @@ mod tests {
                 let before = edge.moved(false, 1.0, -200.0).unwrap();
                 assert_eq!(packed.holding(&before), at - 1);
             }
-            above += f64::from(weight).exp();
+            above += weight.exp();
         }
         let light = Point::ln_between(&packed.edge(600), &packed.edge(601));
         assert!((light - packed.ln_p(600)).abs() < 1e-9);

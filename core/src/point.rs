@@ -183,6 +183,15 @@ impl Point {
         self.floor(bits).0.raised(bits)
     }
 
+    /// The node's cut in units of 2^-64, including the bottom cut at 2^64.
+    pub(crate) fn q64(&self) -> u128 {
+        if self.0.bits <= 64 && self.0.n.bits() <= 64 {
+            let n = self.0.n.iter_u64_digits().next().unwrap_or(0);
+            return u128::from(n) << (64 - self.0.bits);
+        }
+        u128::try_from(self.numerator(64)).expect("a point of a node fits in Q0.64")
+    }
+
     /// Its first `count` digits, rounded down.
     pub fn digits_at(&self, count: usize) -> Vec<u8> {
         let n = self.numerator(8 * count as u64);

@@ -27,7 +27,7 @@ use std::mem;
 
 use serde::{Deserialize, Serialize};
 
-use crate::distribution::{Distribution, Item, Rank, Run};
+use crate::distribution::{Distribution, Item, Rank, RankView, Run};
 use crate::point::Point;
 use crate::tree::{bytes, node_id, Branch, Lens, NodeId, Tree};
 use crate::Result;
@@ -555,7 +555,7 @@ impl Sent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::{Order, Scale};
+    use crate::distribution::log_softmax;
     use crate::tree::{child_hash, ROOT};
 
     const P: Lens = Lens { p: 0, q: 0 };
@@ -868,12 +868,10 @@ mod tests {
         // By branch: heavy, a child e^-60 of them, heavy.
         let weights = [0.0f32, -60.0, 0.0];
         let mut tree = Tree::new();
-        tree.set(
-            ROOT,
-            0,
-            Distribution::from_weights(&weights, Order::Branch, Scale::Relative).unwrap(),
-        )
-        .unwrap();
+        let mut children: Vec<_> = (0..).zip(weights.iter().copied().map(f64::from)).collect();
+        log_softmax(&mut children);
+        tree.set(ROOT, 0, Distribution::from_ordered(children).unwrap())
+            .unwrap();
         let d = tree.distribution(ROOT, 0).unwrap().unwrap();
         let (top, bottom) = d.item_edges(Item::Child { run: 0, at: 1 });
         let ln_light = d.run(0).ln_p(1);

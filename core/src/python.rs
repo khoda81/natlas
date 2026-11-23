@@ -5,7 +5,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::distribution::{Distribution, Order, Run, Scale};
+use crate::distribution::{Distribution, Run};
 use crate::session::{Demand, Path, Session, Update, View};
 use crate::tree::{Lens, Tree};
 
@@ -60,46 +60,36 @@ impl PythonTree {
             .is_some())
     }
 
-    /// Set the children of each of `nodes` under `measure` from its row of
-    /// `ln_weights`: every branch's ln weight up to a constant, a float32
-    /// buffer indexed by branch, as a measure computes them, ranked in
-    /// `order`: "heaviest" first or by "branch". `widths` where they are each
-    /// child's own ln weight, −ln of the width it is drawn at, rather than up
-    /// to a constant. Says about how many bytes each holds. The rows are
-    /// packed on every core, without the GIL and before the tree is
-    /// borrowed.
-    #[pyo3(signature = (nodes, measure, ln_weights, order, widths=false))]
+    /// Set each node's ordered branch and final log-weight pairs, packed
+    /// into parallel u32 and f64 buffers. Packing runs without the GIL.
     fn set(
         slf: &Bound<'_, Self>,
         nodes: Vec<u64>,
         measure: usize,
-        ln_weights: Vec<PyBuffer<f32>>,
-        order: &str,
-        widths: bool,
+        children: Vec<(PyBuffer<u32>, PyBuffer<f64>)>,
     ) -> PyResult<Vec<usize>> {
-        let scale = if widths {
-            Scale::Absolute
-        } else {
-            Scale::Relative
-        };
-        let order = match order {
-            "heaviest" => Order::Heaviest,
-            "branch" => Order::Branch,
-            _ => return Err(error(format!("no order {order:?}: heaviest or branch"))),
-        };
-        if nodes.len() != ln_weights.len() {
+        if nodes.len() != children.len() {
             return Err(error(format!(
-                "{} nodes but {} rows of weights",
+                "{} nodes but {} rows of children",
                 nodes.len(),
-                ln_weights.len()
+                children.len()
             )));
         }
         let py = slf.py();
-        let rows = ln_weights
-            .iter()
-            .map(|row| row.to_vec(py))
+        let rows = children
+            .into_iter()
+            .map(|(branches, weights)| {
+                if branches.item_count() != weights.item_count() {
+                    return Err(error("each branch needs one log weight".into()));
+                }
+                Ok(branches
+                    .to_vec(py)?
+                    .into_iter()
+                    .zip(weights.to_vec(py)?)
+                    .collect())
+            })
             .collect::<PyResult<Vec<_>>>()?;
-        let distributions = py.detach(|| packed(&rows, order, scale)).map_err(error)?;
+        let distributions = py.detach(|| packed(rows)).map_err(error)?;
         let mut tree = slf.borrow_mut();
         nodes
             .into_iter()
@@ -118,24 +108,25 @@ impl PythonTree {
 }
 
 /// Each row's distribution, rows shared out among the cores in order.
-fn packed(rows: &[Vec<f32>], order: Order, scale: Scale) -> Result<Vec<Distribution>, String> {
+fn packed(mut rows: Vec<Vec<(u32, f64)>>) -> Result<Vec<Distribution>, String> {
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     let share = rows.len().div_ceil(cores).max(1);
+    let count = rows.len();
     std::thread::scope(|scope| {
         let workers: Vec<_> = rows
-            .chunks(share)
+            .chunks_mut(share)
             .map(|chunk| {
                 scope.spawn(move || {
                     chunk
-                        .iter()
-                        .map(|row| Distribution::from_weights(row, order, scale))
+                        .iter_mut()
+                        .map(|row| Distribution::from_ordered(std::mem::take(row)))
                         .collect::<Result<Vec<_>, String>>()
                 })
             })
             .collect();
-        let mut distributions = Vec::with_capacity(rows.len());
+        let mut distributions = Vec::with_capacity(count);
         for worker in workers {
-            distributions.extend(worker.join().expect("sorting does not panic")?);
+            distributions.extend(worker.join().expect("packing does not panic")?);
         }
         Ok(distributions)
     })

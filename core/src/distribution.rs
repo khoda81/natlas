@@ -9,9 +9,9 @@
 //! Each child's own weight is kept beside its edges, at relative precision
 //! however light it is: its extent places it, its weight sizes it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::ops::Range;
+use std::sync::OnceLock;
 
 use crate::packed::Packed;
 use crate::point::Point;
@@ -40,36 +40,92 @@ pub fn ln_between(top: f64, bottom: f64) -> f64 {
     }
 }
 
-/// What a measure's ln weights are.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scale {
-    /// Up to a constant, as a model's logits: each node's are normalized.
-    Relative,
-    /// Each child's ln weight conditional on the node, as given: a measure
-    /// that sets widths, its −ln q whatever it sums to.
-    Absolute,
-}
-
-/// The order a measure ranks a node's children in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Order {
-    /// Heaviest first, ties by increasing branch.
-    Heaviest,
-    /// By increasing branch.
-    Branch,
+/// Normalize logits before ingestion, preserving the supplied branch order.
+pub fn log_softmax(children: &mut [(Branch, f64)]) {
+    let max = children
+        .iter()
+        .map(|&(_, w)| w)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if max == f64::NEG_INFINITY {
+        return;
+    }
+    let log_sum = children
+        .iter()
+        .map(|&(_, w)| (w - max).exp())
+        .sum::<f64>()
+        .ln();
+    for (_, weight) in children {
+        *weight = (*weight - max) - log_sum;
+    }
 }
 
 /// Consecutive ranks from `rank`: their branches, weights and edges.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Run {
     rank: Rank,
-    branches: Vec<Branch>,
-    ln_p: Vec<f64>,
-    top: Point,
+    top: RunTop,
     /// The bits the top was sent to.
     precision: u64,
-    /// A slice keeps offsets from the original top, so its edges stay put.
-    offsets: Vec<f64>,
+    contents: RunContents,
+}
+
+#[derive(Clone, Debug)]
+enum RunTop {
+    // Most wire anchors fit in one word. Materialize the exact point only
+    // when a camera, recorder, or deep layout asks for it.
+    Wire(u64, OnceLock<Point>),
+    Point(Point),
+}
+
+impl RunTop {
+    fn from_digits(digits: &[u8]) -> Self {
+        if digits.len() <= 8 {
+            let mut word = [0; 8];
+            word[..digits.len()].copy_from_slice(digits);
+            Self::Wire(u64::from_be_bytes(word), OnceLock::new())
+        } else {
+            Self::Point(Point::new(digits))
+        }
+    }
+
+    fn point(&self) -> &Point {
+        match self {
+            Self::Wire(word, point) => point.get_or_init(|| {
+                let bytes = word.to_be_bytes();
+                let used = bytes.len() - (word.trailing_zeros() / u8::BITS) as usize;
+                Point::new(&bytes[..used])
+            }),
+            Self::Point(point) => point,
+        }
+    }
+
+    fn q64(&self) -> u128 {
+        match self {
+            Self::Wire(word, _) => u128::from(*word),
+            Self::Point(point) => point.q64(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum RunContents {
+    Single {
+        branch: Branch,
+        ln_p: f64,
+        offsets: [f64; 2],
+    },
+    Many {
+        branches: Vec<Branch>,
+        ln_p: Vec<f64>,
+        // A slice keeps offsets from the original top, so its edges stay put.
+        offsets: Vec<f64>,
+    },
+}
+
+impl PartialEq for Run {
+    fn eq(&self, other: &Self) -> bool {
+        self.whole() == other.whole()
+    }
 }
 
 /// The f64 sums of `ln_p`'s weights from a top: the sums every edge of a
@@ -96,17 +152,45 @@ impl Run {
         ln_weights: Vec<f64>,
         top: &[u8],
     ) -> Result<Self> {
-        if ln_weights.len() != branches.len() {
+        Self::validate(rank, branches.len(), &ln_weights, top)?;
+        Ok(Self::with_top(
+            rank,
+            branches,
+            ln_weights,
+            RunTop::from_digits(top),
+            8 * top.len() as u64,
+        ))
+    }
+
+    #[cfg(feature = "wasm")]
+    pub(crate) fn from_slices(
+        rank: Rank,
+        branches: &[Branch],
+        ln_p: &[f64],
+        top: &[u8],
+    ) -> Result<Self> {
+        Self::validate(rank, branches.len(), ln_p, top)?;
+        let point = RunTop::from_digits(top);
+        let precision = 8 * top.len() as u64;
+        Ok(if let [branch] = branches {
+            Self::single(rank, *branch, ln_p[0], point, precision)
+        } else {
+            Self::with_top(rank, branches.to_vec(), ln_p.to_vec(), point, precision)
+        })
+    }
+
+    fn validate(rank: Rank, len: usize, ln_weights: &[f64], top: &[u8]) -> Result<()> {
+        if ln_weights.len() != len {
             return Err(format!(
                 "a run of {} branches has {} weights",
-                branches.len(),
+                len,
                 ln_weights.len()
             ));
         }
-        if branches.is_empty() {
+        if len == 0 {
             return Err("a run places no children".into());
         }
-        if u64::from(Rank::MAX) < u64::from(rank) + branches.len() as u64 {
+        if u64::from(Rank::MAX) < u64::from(rank) + len as u64 {
             return Err("a run reaches past the last rank".into());
         }
         if ln_weights
@@ -118,13 +202,7 @@ impl Run {
         if rank == 0 && top.iter().any(|&digit| digit != 0) {
             return Err("the first child's top is the node's".into());
         }
-        Ok(Self::listed(
-            rank,
-            branches,
-            ln_weights,
-            Point::new(top),
-            8 * top.len() as u64,
-        ))
+        Ok(())
     }
 
     /// Children of these weights from `rank`, `above` of the node above
@@ -148,22 +226,61 @@ impl Run {
         top: Point,
         precision: u64,
     ) -> Self {
+        Self::with_top(rank, branches, ln_p, RunTop::Point(top), precision)
+    }
+
+    fn with_top(
+        rank: Rank,
+        branches: Vec<Branch>,
+        ln_p: Vec<f64>,
+        top: RunTop,
+        precision: u64,
+    ) -> Self {
+        if let [branch] = *branches {
+            return Self::single(rank, branch, ln_p[0], top, precision);
+        }
         let offsets = offsets(&ln_p);
-        Self {
-            rank,
+        let contents = RunContents::Many {
             branches,
             ln_p,
+            offsets,
+        };
+        Self {
+            rank,
             top,
             precision,
-            offsets,
+            contents,
         }
     }
 
-    fn bytes(&self) -> usize {
+    fn single(rank: Rank, branch: Branch, ln_p: f64, top: RunTop, precision: u64) -> Self {
+        let contents = RunContents::Single {
+            branch,
+            ln_p,
+            offsets: [0.0, ln_p.exp()],
+        };
+        Self {
+            rank,
+            top,
+            precision,
+            contents,
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
         use std::mem::size_of;
         size_of::<Self>()
-            + self.branches.capacity() * size_of::<Branch>()
-            + (self.ln_p.capacity() + self.offsets.capacity()) * size_of::<f64>()
+            + match &self.contents {
+                RunContents::Single { .. } => 0,
+                RunContents::Many {
+                    branches,
+                    ln_p,
+                    offsets,
+                } => {
+                    branches.capacity() * size_of::<Branch>()
+                        + (ln_p.capacity() + offsets.capacity()) * size_of::<f64>()
+                }
+            }
     }
 
     pub fn rank(&self) -> Rank {
@@ -176,31 +293,215 @@ impl Run {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.branches.len()
+        self.branches().len()
     }
 
     pub fn branches(&self) -> &[Branch] {
-        &self.branches
+        match &self.contents {
+            RunContents::Single { branch, .. } => std::slice::from_ref(branch),
+            RunContents::Many { branches, .. } => branches,
+        }
     }
 
     /// Each child's ln weight, conditional on the node.
     pub fn ln_weights(&self) -> &[f64] {
-        &self.ln_p
+        match &self.contents {
+            RunContents::Single { ln_p, .. } => std::slice::from_ref(ln_p),
+            RunContents::Many { ln_p, .. } => ln_p,
+        }
     }
 
     /// The top as a source sends it: digits to the run's precision.
     pub fn top_digits(&self) -> Vec<u8> {
-        self.edge(0).digits_at((self.precision / 8) as usize)
+        self.edge(0).digits_at((self.precision() / 8) as usize)
+    }
+
+    pub(crate) fn base(&self) -> &Point {
+        self.top.point()
+    }
+
+    pub(crate) fn q64_base(&self) -> u128 {
+        self.top.q64()
+    }
+
+    pub(crate) fn offsets(&self) -> &[f64] {
+        match &self.contents {
+            RunContents::Single { offsets, .. } => offsets,
+            RunContents::Many { offsets, .. } => offsets,
+        }
+    }
+
+    pub(crate) fn precision(&self) -> u64 {
+        self.precision
     }
 
     /// The top edge of the child at `at`; `at == len` is the run's bottom.
     fn edge(&self, at: usize) -> Point {
-        self.top.plus(self.offsets[at])
+        self.base().plus(self.offsets()[at])
     }
 
-    /// The child holding a point the run holds: the last whose top it is at
-    /// or below.
-    fn holding(&self, point: &Point) -> usize {
+    fn whole(&self) -> RunSlice<'_> {
+        self.window(self.rank(), self.end())
+    }
+
+    pub(crate) fn window(&self, from: Rank, to: Rank) -> RunSlice<'_> {
+        RunSlice {
+            run: self,
+            from: (from - self.rank) as usize,
+            to: (to - self.rank) as usize,
+        }
+    }
+
+    fn slice_ranks(&self, from: Rank, to: Rank) -> Self {
+        let part = self.window(from, to);
+        let contents = if let [branch] = part.branches() {
+            RunContents::Single {
+                branch: *branch,
+                ln_p: part.ln_weights()[0],
+                offsets: part.offsets().try_into().expect("two edges of one child"),
+            }
+        } else {
+            RunContents::Many {
+                branches: part.branches().to_vec(),
+                ln_p: part.ln_weights().to_vec(),
+                offsets: part.offsets().to_vec(),
+            }
+        };
+        Self {
+            rank: from,
+            top: self.top.clone(),
+            precision: self.precision,
+            contents,
+        }
+    }
+}
+
+/// A view of consecutive ranks within one owned Run. Browser segments share
+/// the owned run, so splitting an overlap only narrows this range.
+#[derive(Clone, Copy)]
+pub(crate) struct RunSlice<'a> {
+    run: &'a Run,
+    from: usize,
+    to: usize,
+}
+
+impl<'a> RunSlice<'a> {
+    pub(crate) fn rank(self) -> Rank {
+        self.run.rank() + self.from as Rank
+    }
+    pub(crate) fn end(self) -> Rank {
+        self.run.rank() + self.to as Rank
+    }
+    pub(crate) fn len(self) -> usize {
+        self.to - self.from
+    }
+    pub(crate) fn branches(self) -> &'a [Branch] {
+        &self.run.branches()[self.from..self.to]
+    }
+    pub(crate) fn ln_weights(self) -> &'a [f64] {
+        &self.run.ln_weights()[self.from..self.to]
+    }
+    pub(crate) fn offsets(self) -> &'a [f64] {
+        &self.run.offsets()[self.from..=self.to]
+    }
+    pub(crate) fn base(self) -> &'a Point {
+        self.run.base()
+    }
+    pub(crate) fn q64_base(self) -> u128 {
+        self.run.q64_base()
+    }
+    pub(crate) fn precision(self) -> u64 {
+        self.run.precision()
+    }
+    pub(crate) fn edge(self, at: usize) -> Point {
+        self.run.edge(self.from + at)
+    }
+}
+
+impl PartialEq for RunSlice<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank() == other.rank()
+            && self.len() == other.len()
+            && (std::ptr::eq(self.run, other.run)
+                || self.precision() == other.precision()
+                    && self.run.base() == other.run.base()
+                    && self.branches() == other.branches()
+                    && self.ln_weights() == other.ln_weights()
+                    && self.offsets() == other.offsets())
+    }
+}
+
+/// A contiguous range of known ranks. A packed distribution holds one range
+/// starting at rank zero, which can be read without unpacking it into a run.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct RunRef<'a>(RunStorage<'a>);
+
+#[derive(Clone, Copy)]
+enum RunStorage<'a> {
+    Listed(RunSlice<'a>),
+    Packed(&'a Packed),
+}
+
+impl<'a> RunRef<'a> {
+    pub(crate) fn listed(run: &'a Run) -> Self {
+        Self::slice(run.whole())
+    }
+
+    pub(crate) fn slice(run: RunSlice<'a>) -> Self {
+        Self(RunStorage::Listed(run))
+    }
+
+    pub(crate) fn rank(self) -> Rank {
+        match self.0 {
+            RunStorage::Listed(run) => run.rank(),
+            RunStorage::Packed(_) => 0,
+        }
+    }
+
+    fn end(self) -> Rank {
+        self.rank() + self.len() as Rank
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self.0 {
+            RunStorage::Listed(run) => run.len(),
+            RunStorage::Packed(packed) => packed.len(),
+        }
+    }
+
+    pub(crate) fn branch(self, at: usize) -> Branch {
+        match self.0 {
+            RunStorage::Listed(run) => run.branches()[at],
+            RunStorage::Packed(packed) => packed.branch(at),
+        }
+    }
+
+    pub(crate) fn ln_p(self, at: usize) -> f64 {
+        match self.0 {
+            RunStorage::Listed(run) => run.ln_weights()[at],
+            RunStorage::Packed(packed) => packed.ln_p(at),
+        }
+    }
+
+    fn edge(self, at: usize) -> Point {
+        match self.0 {
+            RunStorage::Listed(run) => run.edge(at),
+            RunStorage::Packed(packed) => packed.edge(at),
+        }
+    }
+
+    pub(crate) fn listed_slice(self) -> Option<RunSlice<'a>> {
+        match self.0 {
+            RunStorage::Listed(run) => Some(run),
+            RunStorage::Packed(_) => None,
+        }
+    }
+
+    fn holding(self, point: &Point) -> usize {
+        if let RunStorage::Packed(packed) = self.0 {
+            return packed.holding(point).min(packed.len() - 1);
+        }
         let (mut low, mut high) = (1, self.len() + 1);
         while low < high {
             let middle = (low + high) / 2;
@@ -213,92 +514,17 @@ impl Run {
         (low - 1).min(self.len() - 1)
     }
 
-    /// Children [from, to) as a run of their own, its edges unmoved.
-    fn slice(&self, from: usize, to: usize) -> Run {
-        Self {
-            rank: self.rank + from as Rank,
-            branches: self.branches[from..to].to_vec(),
-            ln_p: self.ln_p[from..to].to_vec(),
-            top: self.top.clone(),
-            precision: self.precision,
-            offsets: self.offsets[from..=to].to_vec(),
-        }
-    }
-}
-
-/// A contiguous range of known ranks. A packed distribution holds one range
-/// starting at rank zero, which can be read without unpacking it into a run.
-#[derive(Clone, Copy)]
-pub(crate) enum RunRef<'a> {
-    Listed(&'a Run),
-    Packed(&'a Packed),
-}
-
-impl<'a> RunRef<'a> {
-    pub(crate) fn rank(self) -> Rank {
-        match self {
-            Self::Listed(run) => run.rank,
-            Self::Packed(_) => 0,
-        }
-    }
-
-    fn end(self) -> Rank {
-        self.rank() + self.len() as Rank
-    }
-
-    pub(crate) fn len(self) -> usize {
-        match self {
-            Self::Listed(run) => run.len(),
-            Self::Packed(packed) => packed.len(),
-        }
-    }
-
-    pub(crate) fn branch(self, at: usize) -> Branch {
-        match self {
-            Self::Listed(run) => run.branches[at],
-            Self::Packed(packed) => packed.branch(at),
-        }
-    }
-
-    pub(crate) fn ln_p(self, at: usize) -> f64 {
-        match self {
-            Self::Listed(run) => run.ln_p[at],
-            Self::Packed(packed) => packed.ln_p(at),
-        }
-    }
-
-    fn edge(self, at: usize) -> Point {
-        match self {
-            Self::Listed(run) => run.edge(at),
-            Self::Packed(packed) => packed.edge(at),
-        }
-    }
-
-    pub(crate) fn offsets(self) -> Option<(&'a Point, &'a [f64])> {
-        match self {
-            Self::Listed(run) => Some((&run.top, &run.offsets)),
-            Self::Packed(_) => None,
-        }
-    }
-
-    fn holding(self, point: &Point) -> usize {
-        match self {
-            Self::Listed(run) => run.holding(point),
-            Self::Packed(packed) => packed.holding(point).min(packed.len() - 1),
-        }
-    }
-
     fn precision(self) -> u64 {
-        match self {
-            Self::Listed(run) => run.precision,
-            Self::Packed(_) => u64::MAX,
+        match self.0 {
+            RunStorage::Listed(run) => run.precision(),
+            RunStorage::Packed(_) => u64::MAX,
         }
     }
 
     fn top_at(self, at: usize, bits: u64) -> Point {
-        match self {
-            Self::Listed(run) => run.edge(at).floor(bits),
-            Self::Packed(packed) => packed.top(at, bits),
+        match self.0 {
+            RunStorage::Listed(run) => run.edge(at).floor(bits),
+            RunStorage::Packed(packed) => packed.top(at, bits),
         }
     }
 }
@@ -342,18 +568,7 @@ struct Listed {
 
 impl Listed {
     fn new(mut runs: Vec<Run>, count: Option<Rank>) -> Result<Self> {
-        if runs.is_empty() && count.is_none() {
-            return Err("an answer gives neither runs nor a child count".into());
-        }
-        runs.sort_by_key(Run::rank);
-        if runs.windows(2).any(|pair| pair[1].rank < pair[0].end()) {
-            return Err("an answer places a rank twice".into());
-        }
-        if let (Some(count), Some(last)) = (count, runs.last()) {
-            if count < last.end() {
-                return Err("an answer places children past its count".into());
-            }
-        }
+        sort_runs(&mut runs, count)?;
         let mut rank =
             HashMap::with_capacity_and_hasher(runs.iter().map(Run::len).sum(), Default::default());
         for run in &runs {
@@ -371,11 +586,27 @@ impl Listed {
     }
 }
 
+pub(crate) fn sort_runs(runs: &mut [Run], count: Option<Rank>) -> Result<()> {
+    if runs.is_empty() && count.is_none() {
+        return Err("an answer gives neither runs nor a child count".into());
+    }
+    runs.sort_unstable_by_key(Run::rank);
+    if runs.windows(2).any(|pair| pair[1].rank() < pair[0].end()) {
+        return Err("an answer places a rank twice".into());
+    }
+    if let (Some(count), Some(last)) = (count, runs.last()) {
+        if count < last.end() {
+            return Err("an answer places children past its count".into());
+        }
+    }
+    Ok(())
+}
+
 /// Branches come from the node's own source, mostly small and dense: one
 /// multiply spreads them across the table's bits at a fraction of SipHash's
 /// cost.
 #[derive(Default)]
-struct BranchHasher(u64);
+pub(crate) struct BranchHasher(u64);
 
 impl Hasher for BranchHasher {
     fn write(&mut self, _: &[u8]) {
@@ -392,32 +623,33 @@ impl Hasher for BranchHasher {
 }
 
 impl Distribution {
-    /// Every branch's ln weight, indexed by branch, as a measure computes it:
-    /// complete, as an f32 like a model's logits, on its `scale`, ranked in
-    /// `order`. Weightless branches have no rank.
-    pub fn from_weights(ln_weights: &[f32], order: Order, scale: Scale) -> Result<Self> {
-        if ln_weights.iter().any(|weight| weight.is_nan()) {
-            return Err("a weight is not a number".into());
+    /// Complete, ordered children with their final log weights. A
+    /// weightless branch has no rank.
+    pub fn from_ordered(mut children: Vec<(Branch, f64)>) -> Result<Self> {
+        if u64::from(Rank::MAX) < children.len() as u64 {
+            return Err("too many children to rank".into());
         }
-        // Each weight beside its branch: sorting them together reads memory
-        // in order rather than looking every weight up.
-        let mut children: Vec<(f32, Branch)> = ln_weights
+        if children
             .iter()
-            .zip(0..)
-            .map(|(&weight, branch)| (weight, branch))
-            .filter(|&(weight, _)| f32::NEG_INFINITY < weight)
-            .collect();
-        if children.iter().any(|(weight, _)| weight.is_infinite()) {
-            return Err("a weight is infinite".into());
+            .any(|&(_, weight)| weight.is_nan() || weight == f64::INFINITY)
+        {
+            return Err("a weight must be a log mass".into());
         }
-        if order == Order::Heaviest {
-            children.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        }
+        children.retain(|&(_, weight)| f64::NEG_INFINITY < weight);
         if children.is_empty() {
             return Self::from_answer(Vec::new(), Some(0));
         }
+        let mut seen = HashSet::with_capacity_and_hasher(
+            children.len(),
+            BuildHasherDefault::<BranchHasher>::default(),
+        );
+        for &(branch, _) in &children {
+            if !seen.insert(branch) {
+                return Err(format!("branch {branch} is placed twice"));
+            }
+        }
         Ok(Self {
-            storage: Storage::Packed(Box::new(Packed::new(&children, scale))),
+            storage: Storage::Packed(Box::new(Packed::new(&children))),
         })
     }
 
@@ -456,13 +688,9 @@ impl Distribution {
 
     pub(crate) fn run_at(&self, index: usize) -> Option<RunRef<'_>> {
         match &self.storage {
-            Storage::Listed(listed) => listed.runs.get(index).map(RunRef::Listed),
-            Storage::Packed(packed) => (index == 0).then_some(RunRef::Packed(packed)),
+            Storage::Listed(listed) => listed.runs.get(index).map(RunRef::listed),
+            Storage::Packed(packed) => (index == 0).then_some(RunRef(RunStorage::Packed(packed))),
         }
-    }
-
-    pub(crate) fn run(&self, index: usize) -> RunRef<'_> {
-        self.run_at(index).expect("a known run index")
     }
 
     /// Add what a source said of the node in one answer, and whether
@@ -520,6 +748,10 @@ impl Distribution {
             Storage::Listed(listed) => listed.rank.get(&branch).copied(),
             Storage::Packed(_) => self.ranks(&[branch])[0],
         }
+    }
+
+    pub(crate) fn is_packed(&self) -> bool {
+        matches!(self.storage, Storage::Packed(_))
     }
 
     /// The rank of each of `branches` the node has, in one pass where the
@@ -628,129 +860,6 @@ impl Distribution {
         self.count() == Some(0)
     }
 
-    pub fn gap_exists(&self, before: usize) -> bool {
-        let gap = Item::Gap { before };
-        self.item_end(gap)
-            .is_none_or(|end| self.item_rank(gap) < end)
-    }
-
-    pub fn point(&self, edge: Edge) -> Point {
-        match edge {
-            Edge::Top => Point::top(),
-            Edge::Bottom => Point::bottom(),
-            Edge::Of { run, at } => self.run(run).edge(at),
-        }
-    }
-
-    /// The next run's top or the node's bottom when it bounds this run.
-    fn run_bottom(&self, run: usize) -> Edge {
-        let current = self.run(run);
-        match self.run_at(run + 1) {
-            Some(next) if next.rank() == current.end() => Edge::Of {
-                run: run + 1,
-                at: 0,
-            },
-            None if self.count() == Some(current.end()) => Edge::Bottom,
-            _ => Edge::Of {
-                run,
-                at: current.len(),
-            },
-        }
-    }
-
-    /// Where an item's edges come from.
-    pub fn item_bounds(&self, item: Item) -> (Edge, Edge) {
-        let top = match item {
-            Item::Child { run, at } => Edge::Of { run, at },
-            Item::Gap { before: 0 } => Edge::Top,
-            Item::Gap { before } => self.run_bottom(before - 1),
-        };
-        let bottom = match item {
-            Item::Child { run, at } if at + 1 < self.run(run).len() => Edge::Of { run, at: at + 1 },
-            Item::Child { run, .. } => self.run_bottom(run),
-            Item::Gap { before } if before < self.run_count() => Edge::Of { run: before, at: 0 },
-            Item::Gap { .. } => Edge::Bottom,
-        };
-        (top, bottom)
-    }
-
-    /// Both of an item's edges.
-    pub fn item_edges(&self, item: Item) -> (Point, Point) {
-        let (top, bottom) = self.item_bounds(item);
-        (self.point(top), self.point(bottom))
-    }
-
-    /// The rank an item starts at: a gap's is its first unknown one.
-    pub fn item_rank(&self, item: Item) -> Rank {
-        match item {
-            Item::Child { run, at } => self.run(run).rank() + at as Rank,
-            Item::Gap { before: 0 } => 0,
-            Item::Gap { before } => self.run(before - 1).end(),
-        }
-    }
-
-    /// The bottom edge's rank, where one is known.
-    pub fn item_end(&self, item: Item) -> Option<Rank> {
-        match item {
-            Item::Child { run, at } => Some(self.run(run).rank() + at as Rank + 1),
-            Item::Gap { before } => self
-                .run_at(before)
-                .map(RunRef::rank)
-                .or_else(|| self.count()),
-        }
-    }
-
-    /// The item after `item`, if any.
-    pub fn next(&self, item: Item) -> Option<Item> {
-        let before = match item {
-            Item::Child { run, at } if at + 1 < self.run(run).len() => {
-                return Some(Item::Child { run, at: at + 1 });
-            }
-            Item::Child { run, .. } => run + 1,
-            Item::Gap { before } => {
-                return (before < self.run_count()).then_some(Item::Child { run: before, at: 0 });
-            }
-        };
-        if self.gap_exists(before) {
-            Some(Item::Gap { before })
-        } else {
-            (before < self.run_count()).then_some(Item::Child { run: before, at: 0 })
-        }
-    }
-
-    /// The node's first item, if it has any.
-    pub fn first(&self) -> Option<Item> {
-        if self.gap_exists(0) {
-            Some(Item::Gap { before: 0 })
-        } else {
-            (0 < self.run_count()).then_some(Item::Child { run: 0, at: 0 })
-        }
-    }
-
-    /// The item holding a point: the first whose bottom edge is under it.
-    /// At or below the node's bottom, there is none.
-    pub fn locate(&self, point: &Point) -> Option<Item> {
-        if Point::bottom() <= *point {
-            return None;
-        }
-        let (mut run, mut high) = (0, self.run_count());
-        while run < high {
-            let middle = (run + high) / 2;
-            if point.below(&self.point(self.run_bottom(middle))) {
-                run = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        if let Some(found) = self.run_at(run).filter(|found| point.below(&found.edge(0))) {
-            return Some(Item::Child {
-                run,
-                at: found.holding(point),
-            });
-        }
-        self.gap_exists(run).then_some(Item::Gap { before: run })
-    }
-
     /// Known children, in order, as runs to send a client: each run's top
     /// rounded down to `bits` bits, or the source's own where that is
     /// coarser, and a new run started wherever an f64 sum from the top would
@@ -790,9 +899,172 @@ impl Distribution {
     }
 }
 
+/// Ordered ranks and exact edges shared by recorded and client geometry.
+#[doc(hidden)]
+pub trait RankView {
+    fn run_count(&self) -> usize;
+    fn run_at(&self, index: usize) -> Option<RunRef<'_>>;
+    fn rank(&self, branch: Branch) -> Option<Rank>;
+    fn locate_rank(&self, rank: Rank) -> Option<(usize, usize)>;
+    fn count(&self) -> Option<Rank>;
+
+    fn run(&self, index: usize) -> RunRef<'_> {
+        self.run_at(index).expect("a known run index")
+    }
+
+    fn gap_exists(&self, before: usize) -> bool {
+        let gap = Item::Gap { before };
+        self.item_end(gap)
+            .is_none_or(|end| self.item_rank(gap) < end)
+    }
+
+    fn point(&self, edge: Edge) -> Point {
+        match edge {
+            Edge::Top => Point::top(),
+            Edge::Bottom => Point::bottom(),
+            Edge::Of { run, at } => self.run(run).edge(at),
+        }
+    }
+
+    /// The next run's top or the node's bottom when it bounds this run.
+    fn run_bottom(&self, run: usize) -> Edge {
+        let current = self.run(run);
+        match self.run_at(run + 1) {
+            Some(next) if next.rank() == current.end() => Edge::Of {
+                run: run + 1,
+                at: 0,
+            },
+            None if self.count() == Some(current.end()) => Edge::Bottom,
+            _ => Edge::Of {
+                run,
+                at: current.len(),
+            },
+        }
+    }
+
+    /// Where an item's edges come from.
+    fn item_bounds(&self, item: Item) -> (Edge, Edge) {
+        let top = match item {
+            Item::Child { run, at } => Edge::Of { run, at },
+            Item::Gap { before: 0 } => Edge::Top,
+            Item::Gap { before } => self.run_bottom(before - 1),
+        };
+        let bottom = match item {
+            Item::Child { run, at } if at + 1 < self.run(run).len() => Edge::Of { run, at: at + 1 },
+            Item::Child { run, .. } => self.run_bottom(run),
+            Item::Gap { before } if before < self.run_count() => Edge::Of { run: before, at: 0 },
+            Item::Gap { .. } => Edge::Bottom,
+        };
+        (top, bottom)
+    }
+
+    /// Both of an item's edges.
+    fn item_edges(&self, item: Item) -> (Point, Point) {
+        let (top, bottom) = self.item_bounds(item);
+        (self.point(top), self.point(bottom))
+    }
+
+    /// The rank an item starts at: a gap's is its first unknown one.
+    fn item_rank(&self, item: Item) -> Rank {
+        match item {
+            Item::Child { run, at } => self.run(run).rank() + at as Rank,
+            Item::Gap { before: 0 } => 0,
+            Item::Gap { before } => self.run(before - 1).end(),
+        }
+    }
+
+    /// The bottom edge's rank, where one is known.
+    fn item_end(&self, item: Item) -> Option<Rank> {
+        match item {
+            Item::Child { run, at } => Some(self.run(run).rank() + at as Rank + 1),
+            Item::Gap { before } => self
+                .run_at(before)
+                .map(RunRef::rank)
+                .or_else(|| self.count()),
+        }
+    }
+
+    /// The item after `item`, if any.
+    fn next(&self, item: Item) -> Option<Item> {
+        let before = match item {
+            Item::Child { run, at } if at + 1 < self.run(run).len() => {
+                return Some(Item::Child { run, at: at + 1 });
+            }
+            Item::Child { run, .. } => run + 1,
+            Item::Gap { before } => {
+                return (before < self.run_count()).then_some(Item::Child { run: before, at: 0 });
+            }
+        };
+        if self.gap_exists(before) {
+            Some(Item::Gap { before })
+        } else {
+            (before < self.run_count()).then_some(Item::Child { run: before, at: 0 })
+        }
+    }
+
+    /// The node's first item, if it has any.
+    fn first(&self) -> Option<Item> {
+        if self.gap_exists(0) {
+            Some(Item::Gap { before: 0 })
+        } else {
+            (0 < self.run_count()).then_some(Item::Child { run: 0, at: 0 })
+        }
+    }
+
+    /// The item holding a point: the first whose bottom edge is under it.
+    /// At or below the node's bottom, there is none.
+    fn locate(&self, point: &Point) -> Option<Item> {
+        self.locate_exact(point)
+    }
+
+    fn locate_exact(&self, point: &Point) -> Option<Item> {
+        if Point::bottom() <= *point {
+            return None;
+        }
+        let (mut run, mut high) = (0, self.run_count());
+        while run < high {
+            let middle = (run + high) / 2;
+            if point.below(&self.point(self.run_bottom(middle))) {
+                run = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        if let Some(found) = self.run_at(run).filter(|found| point.below(&found.edge(0))) {
+            return Some(Item::Child {
+                run,
+                at: found.holding(point),
+            });
+        }
+        self.gap_exists(run).then_some(Item::Gap { before: run })
+    }
+}
+
+impl RankView for Distribution {
+    fn run_count(&self) -> usize {
+        self.run_count()
+    }
+
+    fn run_at(&self, index: usize) -> Option<RunRef<'_>> {
+        self.run_at(index)
+    }
+
+    fn rank(&self, branch: Branch) -> Option<Rank> {
+        self.rank(branch)
+    }
+
+    fn locate_rank(&self, rank: Rank) -> Option<(usize, usize)> {
+        self.locate_rank(rank)
+    }
+
+    fn count(&self) -> Option<Rank> {
+        self.count()
+    }
+}
+
 /// `fresh` runs over `old` ones: each rank from the run with the more
-/// precise top, the fresh one where they are alike; `None` where they
-/// contradict, naming one rank by two branches or one branch at two ranks.
+/// precise top, the fresh one where they are alike. A contradiction replaces
+/// the old answer, including a branch named by two ranks.
 fn merge(old: &Listed, fresh: &Listed) -> Option<Listed> {
     let mut runs = Vec::new();
     for (side, over, fresh_side) in [
@@ -800,47 +1072,40 @@ fn merge(old: &Listed, fresh: &Listed) -> Option<Listed> {
         (&fresh.runs, &old.runs, true),
     ] {
         for run in side {
-            #[allow(clippy::single_range_in_vec_init)]
-            let mut left = vec![run.rank..run.end()];
-            for other in over {
-                let shared = run.rank.max(other.rank)..run.end().min(other.end());
-                for rank in shared.clone() {
-                    let (a, b) = (rank - run.rank, rank - other.rank);
-                    if run.branches[a as usize] != other.branches[b as usize] {
-                        return None;
-                    }
+            let first = over.partition_point(|other| other.end() <= run.rank());
+            let mut from = run.rank();
+            for other in &over[first..] {
+                if run.end() <= other.rank() {
+                    break;
                 }
-                // Each rank from the more precise top, the fresh where alike.
-                let wins = if fresh_side {
-                    run.precision < other.precision
+                let start = run.rank().max(other.rank());
+                let end = run.end().min(other.end());
+                if !fresh_side && !same_branches(run.whole(), other.whole(), start, end) {
+                    return None;
+                }
+                let other_wins = if fresh_side {
+                    run.precision() < other.precision()
                 } else {
-                    run.precision <= other.precision
+                    run.precision() <= other.precision()
                 };
-                if shared.start < shared.end && wins {
-                    left = left
-                        .into_iter()
-                        .flat_map(|range| minus(range, &shared))
-                        .collect();
+                if other_wins {
+                    if from < start {
+                        runs.push(run.slice_ranks(from, start));
+                    }
+                    from = end;
                 }
             }
-            for range in left {
-                let (from, to) = (range.start - run.rank, range.end - run.rank);
-                runs.push(run.slice(from as usize, to as usize));
+            if from < run.end() {
+                runs.push(run.slice_ranks(from, run.end()));
             }
         }
     }
     Listed::new(runs, fresh.count.or(old.count)).ok()
 }
 
-/// The ranks of `range` outside `cut`.
-fn minus(range: Range<Rank>, cut: &Range<Rank>) -> Vec<Range<Rank>> {
-    [
-        range.start..cut.start.min(range.end),
-        cut.end.max(range.start)..range.end,
-    ]
-    .into_iter()
-    .filter(|part| part.start < part.end)
-    .collect()
+pub(crate) fn same_branches(a: RunSlice<'_>, b: RunSlice<'_>, start: Rank, end: Rank) -> bool {
+    a.branches()[(start - a.rank()) as usize..(end - a.rank()) as usize]
+        == b.branches()[(start - b.rank()) as usize..(end - b.rank()) as usize]
 }
 
 #[cfg(test)]
@@ -891,8 +1156,17 @@ mod tests {
         close(r.ln_weights()[1], -80.0 * std::f64::consts::LN_2);
         assert_eq!(r.edge(3), Point::new(&[0xe0]));
         assert_eq!(r.top_digits(), [0x80]);
-        assert_eq!(r.holding(&Point::new(&[0xc8])), 2);
-        assert_eq!(r.holding(&Point::new(&[0x80])), 0);
+        assert_eq!(RunRef::listed(&r).holding(&Point::new(&[0xc8])), 2);
+        assert_eq!(RunRef::listed(&r).holding(&Point::new(&[0x80])), 0);
+    }
+
+    fn ordered(weights: &[f32], heaviest: bool) -> Distribution {
+        let mut children: Vec<_> = (0..).zip(weights.iter().copied().map(f64::from)).collect();
+        if heaviest {
+            children.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        }
+        log_softmax(&mut children);
+        Distribution::from_ordered(children).unwrap()
     }
 
     #[test]
@@ -907,7 +1181,7 @@ mod tests {
             0.2f64.ln(),
         ]
         .map(|weight| weight as f32);
-        let d = Distribution::from_weights(&weights, Order::Heaviest, Scale::Relative).unwrap();
+        let d = ordered(&weights, true);
         let run = d.run(0);
         assert_eq!(
             (0..run.len()).map(|at| run.branch(at)).collect::<Vec<_>>(),
@@ -930,7 +1204,7 @@ mod tests {
         assert!(d.complete());
         // By branch, the tiny child sits between heavy ones, with an extent
         // of its own.
-        let d = Distribution::from_weights(&weights, Order::Branch, Scale::Relative).unwrap();
+        let d = ordered(&weights, false);
         let run = d.run(0);
         assert_eq!(
             (0..run.len()).map(|at| run.branch(at)).collect::<Vec<_>>(),
@@ -939,24 +1213,16 @@ mod tests {
         let (top, bottom) = d.item_edges(Item::Child { run: 0, at: 3 });
         assert!(top < bottom);
         assert_eq!(d.locate(&top), Some(Item::Child { run: 0, at: 3 }));
-        assert!(
-            Distribution::from_weights(&[], Order::Branch, Scale::Relative)
-                .unwrap()
-                .ended()
-        );
-        assert!(Distribution::from_weights(&[f32::NAN], Order::Branch, Scale::Relative).is_err());
+        assert!(Distribution::from_ordered(Vec::new()).unwrap().ended());
+        assert!(Distribution::from_ordered(vec![(0, f64::NAN)]).is_err());
         // Absolute weights are each child's own, whatever they sum to: a
         // measure of widths.
-        let widths =
-            Distribution::from_weights(&[-1.0, -1.0, -3.0], Order::Branch, Scale::Absolute)
-                .unwrap();
+        let widths = Distribution::from_ordered(vec![(0, -1.0), (1, -1.0), (2, -3.0)]).unwrap();
         assert_eq!(
             (0..3).map(|at| widths.run(0).ln_p(at)).collect::<Vec<_>>(),
             [-1.0, -1.0, -3.0]
         );
-        assert!(
-            Distribution::from_weights(&[f32::INFINITY], Order::Branch, Scale::Relative).is_err()
-        );
+        assert!(Distribution::from_ordered(vec![(0, f64::INFINITY)]).is_err());
     }
 
     #[test]
@@ -965,7 +1231,7 @@ mod tests {
         // them tells apart, in branch order.
         let mut weights = vec![-1.0f32; 10];
         weights[5] = -90.0;
-        let d = Distribution::from_weights(&weights, Order::Branch, Scale::Relative).unwrap();
+        let d = ordered(&weights, false);
         let all: Vec<_> = (0..10).map(|at| (0, at)).collect();
         // Coarse: one run, its top the node's.
         let coarse = d.answer(&all, 16);
@@ -1111,7 +1377,7 @@ mod tests {
 
     #[test]
     fn a_listed_answer_replaces_packed_data_only_when_it_disagrees() {
-        let mut d = Distribution::from_weights(&[-1.0; 2], Order::Branch, Scale::Relative).unwrap();
+        let mut d = ordered(&[-1.0; 2], false);
         assert!(!d
             .insert(vec![run(1, &[1], &[0.5], 0.5, 1)], Some(2))
             .unwrap());

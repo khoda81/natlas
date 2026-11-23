@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::distribution::{Distribution, Rank, Run};
+use crate::distribution::{Distribution, Rank, RankView, Run};
 use crate::point::Point;
 use crate::Result;
 

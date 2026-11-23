@@ -11,17 +11,76 @@
 //! heavy one.
 
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
 use std::f64::consts::LN_2;
 
-use crate::distribution::{Distribution, Edge, Item, Rank};
+use crate::client::{ClientMeasure, ClientTree, FixedIndex, IdHasher};
+use crate::distribution::{Distribution, Edge, Item, Rank, RankView};
 use crate::point::Point;
+use crate::pstore::CDF_SIZE;
+use crate::qlayout::{QLayout, WidthIndex};
 use crate::session::View;
 use crate::tree::{bytes, child_hash, node_id, Branch, Lens, NodeId, Tree, ROOT};
 use crate::Result;
+
+/// Read boundary shared by the compact tree and the render tree.
+#[doc(hidden)]
+pub trait LayoutTree {
+    type Store: RankView;
+
+    fn distribution(&self, node: NodeId, measure: usize) -> Result<Option<&Self::Store>>;
+    fn nats_q(&self, node: NodeId, lens: Lens, branch: Branch, ln_p: f64) -> Result<f64>;
+
+    fn packed_q(&self, _node: NodeId, _lens: Lens) -> Option<&Distribution> {
+        None
+    }
+
+    fn client_measure(&self, _node: NodeId, _measure: usize) -> Option<&ClientMeasure> {
+        None
+    }
+}
+
+impl LayoutTree for Tree {
+    type Store = Distribution;
+
+    fn distribution(&self, node: NodeId, measure: usize) -> Result<Option<&Distribution>> {
+        self.distribution(node, measure)
+    }
+
+    fn packed_q(&self, node: NodeId, lens: Lens) -> Option<&Distribution> {
+        if lens.p == lens.q {
+            return None;
+        }
+        self.distribution(node, lens.q)
+            .ok()
+            .flatten()
+            .filter(|q| q.is_packed())
+    }
+
+    fn nats_q(&self, node: NodeId, lens: Lens, branch: Branch, ln_p: f64) -> Result<f64> {
+        self.nats_q(node, lens, branch, ln_p)
+    }
+}
+
+impl LayoutTree for ClientTree {
+    type Store = ClientMeasure;
+
+    fn distribution(&self, node: NodeId, measure: usize) -> Result<Option<&ClientMeasure>> {
+        Ok(self.distribution(node, measure))
+    }
+
+    fn nats_q(&self, node: NodeId, lens: Lens, branch: Branch, ln_p: f64) -> Result<f64> {
+        Ok(self.nats_q(node, lens, branch, ln_p))
+    }
+
+    fn client_measure(&self, node: NodeId, measure: usize) -> Option<&ClientMeasure> {
+        self.distribution(node, measure)
+    }
+}
 
 /// View heights within which a node's edge is at the view's.
 const FIT: f64 = 1e-12;
@@ -197,6 +256,14 @@ impl Placed {
             })
     }
 
+    fn quantile(&self) -> Option<QLayout> {
+        QLayout::new(
+            self.ln_scale,
+            (&self.top.0, self.top.1),
+            (&self.bottom.0, self.bottom.1),
+        )
+    }
+
     /// The node's own extent in view heights.
     fn span(&self) -> (f64, f64) {
         (self.y(&Point::top()), self.y(&Point::bottom()))
@@ -222,25 +289,27 @@ const NEAR: f64 = 65536.0;
 
 /// The view heights of a placed node's edges: each run's own point placed
 /// exactly once, and its edges near the view by their f64 offsets from it.
-struct Heights<'a> {
+struct Heights<'a, D> {
     placed: &'a Placed,
-    d: &'a Distribution,
+    d: &'a D,
+    quantile: Option<&'a QLayout>,
     /// View heights per unit of the node's mass, where a float holds it.
     scale: f64,
-    /// Each run's point's height, NaN until asked.
-    runs: Vec<f64>,
+    /// The most recent run's projected base. Edges are read in run order.
+    base: Option<(usize, f64)>,
     /// The last edge asked, and its height: the next item's top is the
     /// bottom of the one before.
     last: Option<(Edge, f64)>,
 }
 
-impl<'a> Heights<'a> {
-    fn new(placed: &'a Placed, d: &'a Distribution) -> Self {
+impl<'a, D: RankView> Heights<'a, D> {
+    fn new(placed: &'a Placed, d: &'a D, quantile: Option<&'a QLayout>) -> Self {
         Self {
             placed,
             d,
+            quantile,
             scale: placed.ln_scale.exp(),
-            runs: vec![f64::NAN; d.run_count()],
+            base: None,
             last: None,
         }
     }
@@ -258,17 +327,26 @@ impl<'a> Heights<'a> {
 
     fn measure(&mut self, edge: Edge) -> f64 {
         if let Edge::Of { run, at } = edge {
-            if let Some((point, offsets)) = self.d.run(run).offsets() {
-                if self.runs[run].is_nan() {
-                    self.runs[run] = self.placed.y(point);
-                }
-                if self.runs[run].abs() <= NEAR {
+            if let Some(slice) = self.d.run(run).listed_slice() {
+                let base = match self.base {
+                    Some((index, at)) if index == run => at,
+                    _ => {
+                        let at = self.quantile.map_or_else(
+                            || self.placed.y(slice.base()),
+                            |geometry| geometry.y(slice.q64_base()),
+                        );
+                        self.base = Some((run, at));
+                        at
+                    }
+                };
+                if base.abs() <= NEAR {
+                    let offset = slice.offsets()[at];
                     let offset = if self.scale.is_finite() {
-                        offsets[at] * self.scale
+                        offset * self.scale
                     } else {
-                        (offsets[at].ln() + self.placed.ln_scale).exp()
+                        (offset.ln() + self.placed.ln_scale).exp()
                     };
-                    return self.runs[run] + offset;
+                    return base + offset;
                 }
             }
         }
@@ -306,7 +384,7 @@ pub struct Frame {
     /// What is painted: every node's children as spans of rows.
     pub spans: Vec<Span>,
     /// Every node laid out, for picking.
-    pub placed: HashMap<NodeId, Placed>,
+    placed: HashMap<NodeId, Placed, BuildHasherDefault<IdHasher>>,
     /// The shallowest node laid out: every pixel right of where its children
     /// start is in them, so picking walks down from it.
     pub top: NodeId,
@@ -327,27 +405,23 @@ impl Frame {
 }
 
 /// A child's or a gap's box, as laid out and as picked.
+#[allow(clippy::too_many_arguments)]
 fn item_box(
-    tree: &Tree,
+    tree: &impl LayoutTree,
     lens: Lens,
     node: NodeId,
     placed: &Placed,
-    d: &Distribution,
+    d: &impl RankView,
     item: Item,
     (y0, y1): (f64, f64),
+    known: Option<f64>,
 ) -> Result<LayoutBox> {
-    let rank = d.item_rank(item);
-    // A child is sized by its weight, a gap by what its neighbours leave it.
-    let ln_p = match item {
-        Item::Child { run, at } => d.run(run).ln_p(at),
-        Item::Gap { .. } => {
-            let (top, bottom) = d.item_edges(item);
-            Point::ln_between(&top, &bottom)
-        }
-    };
-    let (kind, branch, nats) = match item {
+    let (rank, count, kind, branch, ln_p, nats) = match item {
         Item::Child { run, at } => {
-            let branch = d.run(run).branch(at);
+            let run = d.run(run);
+            let branch = run.branch(at);
+            let ln_p = run.ln_p(at);
+            let rank = run.rank() + at as Rank;
             let expanded = tree
                 .distribution(child_hash(node, branch), lens.p)?
                 .is_some();
@@ -356,25 +430,45 @@ fn item_box(
             } else {
                 BoxKind::Leaf
             };
-            (kind, Some(branch), tree.nats_q(node, lens, branch, ln_p)?)
+            let nats = known.map_or_else(|| tree.nats_q(node, lens, branch, ln_p), Ok)?;
+            (rank, 1, kind, Some(branch), ln_p, nats)
         }
         Item::Gap { before } => {
-            let nats = gap_nats(tree, lens, node, d, before, ln_p, rank, d.item_end(item))?;
-            (BoxKind::Gap, None, nats)
+            let rank = d.item_rank(item);
+            let end = d.item_end(item);
+            let ln_p = known.unwrap_or_else(|| {
+                let (top, bottom) = d.item_edges(item);
+                Point::ln_between(&top, &bottom)
+            });
+            let nats = gap_nats(tree, lens, node, d, before, ln_p, rank, end)?;
+            (
+                rank,
+                end.map_or(0, |end| end - rank),
+                BoxKind::Gap,
+                None,
+                ln_p,
+                nats,
+            )
         }
+    };
+    let p = ln_p.exp();
+    let q = if nats.is_finite() {
+        if lens.p == lens.q && branch.is_some() {
+            p
+        } else {
+            (-nats).exp()
+        }
+    } else {
+        f64::NAN
     };
     Ok(LayoutBox {
         node,
         rank,
-        count: d.item_end(item).map_or(0, |end| end - rank),
+        count,
         kind,
         branch,
-        p: ln_p.exp(),
-        q: if nats.is_finite() {
-            (-nats).exp()
-        } else {
-            f64::NAN
-        },
+        p,
+        q,
         ln_mass: placed.ln_mass + ln_p,
         x0: placed.x,
         x1: placed.x + nats,
@@ -390,10 +484,10 @@ fn item_box(
 /// Infinite with neither.
 #[allow(clippy::too_many_arguments)]
 fn gap_nats(
-    tree: &Tree,
+    tree: &impl LayoutTree,
     lens: Lens,
     node: NodeId,
-    d: &Distribution,
+    d: &impl RankView,
     before: usize,
     ln_mass: f64,
     rank: Rank,
@@ -444,9 +538,9 @@ struct Steps {
 impl Steps {
     fn push(
         &mut self,
-        tree: &Tree,
+        tree: &impl LayoutTree,
         lens: Lens,
-        d: &Distribution,
+        d: &impl RankView,
         (run, at): (usize, usize),
         (top, bottom): (Point, Point),
     ) -> Result<f64> {
@@ -480,7 +574,7 @@ impl Steps {
     }
 }
 
-fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Steps> {
+fn steps(tree: &impl LayoutTree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Steps> {
     let mut steps = Steps {
         nodes: vec![origin],
         entries: Vec::with_capacity(path.len()),
@@ -509,7 +603,7 @@ fn steps(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Ste
 
 /// The known edges nearest a point of a node, above and below it: those of
 /// the item holding it, or the node's own.
-fn around(d: Option<&Distribution>, point: &Point) -> (Point, Point) {
+fn around(d: Option<&impl RankView>, point: &Point) -> (Point, Point) {
     d.and_then(|d| Some(d.item_edges(d.locate(point)?)))
         .filter(|(top, bottom)| point.within(top, bottom))
         .unwrap_or_else(|| (Point::top(), Point::bottom()))
@@ -530,7 +624,12 @@ struct Chain<'a> {
     spans: Vec<(f64, f64)>,
 }
 
-fn place_chain<'a>(tree: &Tree, lens: Lens, cam: &Camera, steps: &'a Steps) -> Result<Chain<'a>> {
+fn place_chain<'a>(
+    tree: &impl LayoutTree,
+    lens: Lens,
+    cam: &Camera,
+    steps: &'a Steps,
+) -> Result<Chain<'a>> {
     let Steps {
         nodes,
         entries,
@@ -558,19 +657,34 @@ fn place_chain<'a>(tree: &Tree, lens: Lens, cam: &Camera, steps: &'a Steps) -> R
             cam.a - far
         }
     };
-    let (top, bottom) = around(tree.distribution(nodes[depth], lens.p)?, &point);
-    let (y_top, y_bottom) = (y(&top), y(&bottom));
-    let anchor = Placed::new(
-        (top, y_top),
-        (bottom, y_bottom),
-        ln_masses[depth],
-        ln_scale,
-        xs[depth],
-    );
+    let fixed = QLayout::supports(ln_scale) && tree.client_measure(nodes[depth], lens.p).is_some();
+    let (anchor, mut span) = if fixed {
+        // The camera already places an exact point. In the fixed range
+        // it can anchor the whole node without locating a child first.
+        let anchor = Placed::new(
+            (point.clone(), cam.a),
+            (point, cam.a),
+            ln_masses[depth],
+            ln_scale,
+            xs[depth],
+        );
+        let geometry = anchor.quantile().expect("the camera is in the fixed range");
+        (anchor, (geometry.y(0), geometry.y(CDF_SIZE)))
+    } else {
+        let (top, bottom) = around(tree.distribution(nodes[depth], lens.p)?, &point);
+        let (y_top, y_bottom) = (y(&top), y(&bottom));
+        let anchor = Placed::new(
+            (top, y_top),
+            (bottom, y_bottom),
+            ln_masses[depth],
+            ln_scale,
+            xs[depth],
+        );
+        (anchor, (y(&Point::top()), y(&Point::bottom())))
+    };
     let mut placed = Vec::with_capacity(nodes.len());
     let mut spans = Vec::with_capacity(nodes.len());
     placed.push(anchor);
-    let mut span = (y(&Point::top()), y(&Point::bottom()));
     spans.push(span);
     for (i, (top, bottom)) in edges.iter().enumerate().rev() {
         let own = Placed::new(
@@ -593,8 +707,8 @@ fn place_chain<'a>(tree: &Tree, lens: Lens, cam: &Camera, steps: &'a Steps) -> R
     })
 }
 
-struct Layout<'a> {
-    tree: &'a Tree,
+struct Layout<'a, T> {
+    tree: &'a T,
     lens: Lens,
     cam: &'a Camera,
     right: f64,
@@ -604,7 +718,7 @@ struct Layout<'a> {
     frame: Frame,
 }
 
-impl Layout<'_> {
+impl<T: LayoutTree> Layout<'_, T> {
     fn push(&mut self, b: LayoutBox) {
         if b.x1 > self.cam.x && b.x0 < self.right && b.y1 > 0.0 && b.y0 < 1.0 {
             self.frame.boxes.push(b);
@@ -621,63 +735,207 @@ impl Layout<'_> {
         let Some(d) = tree.distribution(node, self.lens.p)? else {
             return Ok(());
         };
-        let mut heights = Heights::new(&placed, d);
-        let mut raster = Raster::new(self.row);
-        // From the first item that ends in the row above the view, so the
-        // step above the first in it is known, to the last that starts in it.
-        let mut item = d.locate(&placed.at(-self.row));
-        while let Some(found) = item {
-            item = d.next(found);
-            let (y0, y1) = heights.item(found);
-            if 1.0 <= y0 {
-                break;
-            }
-            // How wide it is drawn; a gap of children no width is known for
-            // is a hole in the node's children.
-            let width = match found {
-                Item::Child { run, at } => {
-                    let r = d.run(run);
-                    tree.nats_q(node, self.lens, r.branch(at), r.ln_p(at))?
-                }
-                Item::Gap { before } => {
-                    let ln_mass = (y1 - y0).ln() - placed.ln_scale;
-                    let (rank, end) = (d.item_rank(found), d.item_end(found));
-                    gap_nats(tree, self.lens, node, d, before, ln_mass, rank, end)?
-                }
+        if let Some((d, geometry)) = tree
+            .client_measure(node, self.lens.p)
+            .and_then(|d| Some((d, placed.quantile()?)))
+        {
+            return match d.fixed() {
+                Some(fixed) => self.lay_quantile(node, &placed, skip, d, fixed, &geometry),
+                None => self.lay_exact(node, &placed, skip, &d.scan(), Some(&geometry)),
             };
-            raster.add(y0, y1, width);
-            let chain = matches!(found, Item::Child { .. }) && skip == Some(d.item_rank(found));
-            if chain || y1 - y0 < self.row {
+        }
+        self.lay_exact(node, &placed, skip, d, None)
+    }
+
+    fn lay_exact(
+        &mut self,
+        node: NodeId,
+        placed: &Placed,
+        skip: Option<Rank>,
+        d: &impl RankView,
+        quantile: Option<&QLayout>,
+    ) -> Result<()> {
+        let mut heights = Heights::new(placed, d, quantile);
+        let mut raster = Raster::new(self.row);
+        // Start a row above the view so the first visible step has a width.
+        let mut item = d.locate(&placed.at(-self.row));
+        let mut visible = std::iter::from_fn(move || {
+            let found = item?;
+            item = d.next(found);
+            let ys = heights.item(found);
+            (ys.0 < 1.0).then_some((found, ys))
+        });
+        if let Some(q) = self.tree.packed_q(node, self.lens) {
+            // Packed q does not have a persistent branch index. Batch the
+            // visible lookups into one pass through q's packed positions.
+            let items: Vec<_> = visible.collect();
+            let branches: Vec<_> = items
+                .iter()
+                .filter_map(|(item, _)| match *item {
+                    Item::Child { run, at } => Some(d.run(run).branch(at)),
+                    Item::Gap { .. } => None,
+                })
+                .collect();
+            let mut widths = q.ranks(&branches).into_iter().map(|rank| {
+                rank.and_then(|rank| q.locate_rank(rank))
+                    .map_or(f64::INFINITY, |(run, at)| -q.run(run).ln_p(at))
+            });
+            for (item, ys) in items {
+                let width = matches!(item, Item::Child { .. }).then(|| widths.next().unwrap());
+                self.lay_item(node, placed, skip, d, item, ys, width, &mut raster)?;
+            }
+        } else {
+            for (item, ys) in &mut visible {
+                self.lay_item(node, placed, skip, d, item, ys, None, &mut raster)?;
+            }
+        }
+        let last = (1.0 / self.row).ceil() as i64;
+        for mut span in raster.finish() {
+            span.rows.start = span.rows.start.max(0);
+            span.rows.end = span.rows.end.min(last);
+            if span.rows.start < span.rows.end {
+                self.span(node, placed, span);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lay_item(
+        &mut self,
+        node: NodeId,
+        placed: &Placed,
+        skip: Option<Rank>,
+        d: &impl RankView,
+        item: Item,
+        (y0, y1): (f64, f64),
+        known_width: Option<f64>,
+        raster: &mut Raster,
+    ) -> Result<()> {
+        let width = match item {
+            Item::Child { run, at } => {
+                let r = d.run(run);
+                known_width.map_or_else(
+                    || self.tree.nats_q(node, self.lens, r.branch(at), r.ln_p(at)),
+                    Ok,
+                )?
+            }
+            Item::Gap { before } => {
+                let ln_mass = (y1 - y0).ln() - placed.ln_scale;
+                let (rank, end) = (d.item_rank(item), d.item_end(item));
+                gap_nats(self.tree, self.lens, node, d, before, ln_mass, rank, end)?
+            }
+        };
+        raster.add(y0, y1, width);
+        let chain = matches!(item, Item::Child { .. }) && skip == Some(d.item_rank(item));
+        if chain || y1 - y0 < self.row {
+            return Ok(());
+        }
+        let b = item_box(
+            self.tree,
+            self.lens,
+            node,
+            placed,
+            d,
+            item,
+            (y0, y1),
+            matches!(item, Item::Child { .. }).then_some(width),
+        )?;
+        match item {
+            Item::Child { .. } => self.child(node, placed, b, || {
+                let (top, bottom) = d.item_edges(item);
+                Point::ln_between(&top, &bottom)
+            })?,
+            Item::Gap { .. } => self.push(b),
+        }
+        Ok(())
+    }
+
+    fn lay_quantile(
+        &mut self,
+        node: NodeId,
+        placed: &Placed,
+        skip: Option<Rank>,
+        d: &ClientMeasure,
+        fixed: &FixedIndex,
+        geometry: &QLayout,
+    ) -> Result<()> {
+        let rows = 1.0 / self.row;
+        let row_geometry = geometry.in_rows(self.row);
+        let visible =
+            row_geometry.position(&fixed.p, -1.0)..row_geometry.tops_before(&fixed.p, rows, 0);
+        if visible.is_empty() {
+            return Ok(());
+        }
+        let q = self.tree.client_measure(node, self.lens.q);
+        let key = (self.lens.q, q.map_or(0, ClientMeasure::revision));
+        let mut cached = fixed.widths.borrow_mut();
+        if cached
+            .as_ref()
+            .is_none_or(|(prior, widths)| *prior != key || !widths.covers(&visible))
+        {
+            *cached = Some((
+                key,
+                d.fixed_widths(fixed, visible.clone(), q, self.lens.p == self.lens.q),
+            ));
+        }
+        let (_, widths) = cached.as_ref().expect("a width index for this lens");
+        let mut hits = Vec::new();
+        geometry.tall(&fixed.p, [-self.row, 1.0], self.row, &mut hits);
+        // Keep boxes and child traversal in rank order, as in the exact path.
+        hits.sort_unstable_by_key(|hit| hit.start);
+        for hit in hits {
+            let item = fixed.items[hit.branch as usize];
+            if skip
+                .is_some_and(|rank| matches!(item, Item::Child { .. }) && rank == d.item_rank(item))
+            {
                 continue;
             }
-            let b = item_box(tree, self.lens, node, &placed, d, found, (y0, y1))?;
-            match found {
-                Item::Child { .. } => self.child(node, &placed, d, found, b)?,
+            let end = u128::from(hit.end) + 1;
+            let (y0, y1) = (geometry.y(u128::from(hit.start)), geometry.y(end));
+            if y1 - y0 < self.row || y1 <= -self.row || 1.0 <= y0 {
+                continue;
+            }
+            let ln_extent = || cdf_ln(u128::from(hit.start), end);
+            let ln_gap = matches!(item, Item::Gap { .. }).then(ln_extent);
+            let b = item_box(
+                self.tree,
+                self.lens,
+                node,
+                placed,
+                d,
+                item,
+                (y0, y1),
+                ln_gap,
+            )?;
+            match item {
+                Item::Child { .. } => self.child(node, placed, b, ln_extent)?,
                 Item::Gap { .. } => self.push(b),
             }
         }
-        for span in raster.finish() {
-            self.span(node, &placed, span);
-        }
+
+        quantile_rows(&row_geometry, fixed, widths, rows, visible, |span| {
+            self.span(node, placed, span)
+        });
         Ok(())
     }
 
     /// A span of a node's rows, where it shows.
     fn span(&mut self, node: NodeId, placed: &Placed, span: RowSpan) {
+        let reach = placed.x + span.reach;
+        if reach <= self.cam.x || self.right <= placed.x {
+            return;
+        }
         let (y0, y1) = (
             span.rows.start as f64 * self.row,
             span.rows.end as f64 * self.row,
         );
-        let reach = placed.x + span.reach;
-        if y1 <= 0.0 || 1.0 <= y0 || reach <= self.cam.x || self.right <= placed.x {
-            return;
-        }
         self.frame.spans.push(Span {
             node,
             y0,
             y1,
             x0: placed.x,
-            fill: placed.x + span.fill.unwrap_or(0.0),
+            fill: if span.boundary { placed.x } else { reach },
             reach,
         });
     }
@@ -687,57 +945,51 @@ impl Layout<'_> {
         &mut self,
         node: NodeId,
         placed: &Placed,
-        d: &Distribution,
-        item: Item,
         b: LayoutBox,
+        ln_extent: impl FnOnce() -> f64,
     ) -> Result<()> {
-        let id = child_hash(node, b.branch.expect("a child has a branch"));
-        let (x1, kind, ys) = (b.x1, b.kind, (b.y0, b.y1));
+        let (x1, kind, ys, branch) = (b.x1, b.kind, (b.y0, b.y1), b.branch);
         self.push(b);
         if self.right <= x1 || kind != BoxKind::Node {
             return Ok(());
         }
-        let (top, bottom) = d.item_edges(item);
-        let ln_extent = Point::ln_between(&top, &bottom);
-        self.lay(id, placed.child(ys, ln_extent, x1), None)
+        let id = child_hash(node, branch.expect("an expanded node has a branch"));
+        self.lay(id, placed.child(ys, ln_extent(), x1), None)
     }
 }
 
-/// A run of physical rows of a node's children drawn alike, in the rows' own
-/// units: down from `rows.start`, filled as far as `fill`, before which no
-/// edge of them falls in any of the rows, and outlined to `reach`, where the
-/// last edge in them falls. Without `fill`, an edge reaching back to where
-/// the children start falls in the rows: they are outline throughout.
+/// Consecutive physical rows with the same right edge and boundary coverage.
 #[derive(Clone, Debug, PartialEq)]
 struct RowSpan {
     rows: Range<i64>,
-    fill: Option<f64>,
     reach: f64,
+    boundary: bool,
 }
 
-/// A node's children as physical rows, each pixel the half-open square
-/// from its corner: one an edge of them falls in is outline, one wholly
-/// inside them is filled. An edge on a grid line falls in the pixel below
-/// it or to its right. In a row, the edges are each child's end, and each
-/// step from one child to the next, which runs from the one's width to the
-/// other's, or from where the children start at the node's top, its
-/// bottom, and the sides of a hole: every pixel from the first edge to the
-/// last holds one, since the steps chain from one width to the next.
+impl RowSpan {
+    fn join(&mut self, next: &Self) -> bool {
+        if self.rows.end != next.rows.start
+            || self.reach != next.reach
+            || self.boundary != next.boundary
+        {
+            return false;
+        }
+        self.rows.end = next.rows.end;
+        true
+    }
+}
+
+/// A node's children as physical rows. The pixel at an edge of any child
+/// is outline, including shared horizontal edges. An edge on a grid line
+/// belongs to the pixel below it or to its right.
 struct Raster {
     /// A physical row, in view heights.
     height: f64,
     /// The width of the item before, none for a hole, and where it ends,
     /// in rows; none before the first.
     before: Option<(Option<f64>, f64)>,
-    open: Option<RowEdges>,
+    open: Option<RowSpan>,
     spans: Vec<RowSpan>,
-}
-
-/// The nearest and furthest edges in one row.
-struct RowEdges {
-    index: i64,
-    near: f64,
-    far: f64,
 }
 
 impl Raster {
@@ -768,82 +1020,169 @@ impl Raster {
             return;
         }
         let width = width.is_finite().then_some(width);
-        // The step at its top, from the item before, or from where the
-        // children start at the node's top or below a hole.
+        // Both children's horizontal edges start at the node's left edge.
         let before = self.before.and_then(|(width, _)| width).unwrap_or(0.0);
-        self.edge(first, before);
-        self.edge(first, width.unwrap_or(0.0));
+        self.edge(first, before.max(width.unwrap_or(0.0)), true);
         if let Some(width) = width {
             // The rows between, wholly its own: no edge but its end.
             if first + 1 < last {
                 self.flush();
                 self.emit(RowSpan {
                     rows: first + 1..last,
-                    fill: Some(width),
+                    boundary: false,
                     reach: width,
                 });
             }
-            self.edge(last, width);
+            self.edge(last, width, false);
         }
         self.before = Some((width, bottom));
     }
 
-    /// An edge in row `index` reaching `width` from where the children start.
-    fn edge(&mut self, index: i64, width: f64) {
-        if self.open.as_ref().is_some_and(|row| row.index != index) {
+    /// A side or horizontal boundary of a child in this row.
+    fn edge(&mut self, index: i64, width: f64, boundary: bool) {
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|row| row.rows.start != index)
+        {
             self.flush();
         }
-        let row = self.open.get_or_insert(RowEdges {
-            index,
-            near: width,
-            far: width,
+        let row = self.open.get_or_insert(RowSpan {
+            rows: index..index + 1,
+            reach: width,
+            boundary,
         });
-        row.near = row.near.min(width);
-        row.far = row.far.max(width);
+        row.reach = row.reach.max(width);
+        row.boundary |= boundary;
     }
 
     fn flush(&mut self) {
         if let Some(row) = self.open.take() {
-            self.emit(RowSpan {
-                rows: row.index..row.index + 1,
-                fill: (0.0 < row.near).then_some(row.near),
-                reach: row.far,
-            });
+            self.emit(row);
         }
     }
 
     /// A span, joined to the one before where it continues it alike.
     fn emit(&mut self, span: RowSpan) {
-        if let Some(last) = self.spans.last_mut() {
-            if last.rows.end == span.rows.start
-                && last.fill == span.fill
-                && last.reach == span.reach
-            {
-                last.rows.end = span.rows.end;
-                return;
-            }
+        if !self.spans.last_mut().is_some_and(|last| last.join(&span)) {
+            self.spans.push(span);
         }
-        self.spans.push(span);
     }
 
     /// The step at the bottom of the last item, to where the children start.
     fn finish(mut self) -> Vec<RowSpan> {
         if let Some((width, bottom)) = self.before {
             let row = Self::row(bottom);
-            self.edge(row, width.unwrap_or(0.0));
-            self.edge(row, 0.0);
+            self.edge(row, width.unwrap_or(0.0), true);
         }
         self.flush();
         self.spans
     }
 }
 
-pub fn layout(tree: &Tree, lens: Lens, cam: &Camera, view: Viewport, row_px: f64) -> Result<Frame> {
+fn cdf_ln(start: u128, bottom: u128) -> f64 {
+    ((bottom - start) as f64 / CDF_SIZE as f64).ln()
+}
+
+/// Every horizontal boundary in a row joins its adjacent children's widths.
+/// At a grid line the preceding child still contributes its bottom edge.
+fn quantile_rows(
+    geometry: &QLayout,
+    fixed: &FixedIndex,
+    widths: &WidthIndex,
+    rows: f64,
+    visible: Range<usize>,
+    mut out: impl FnMut(RowSpan),
+) {
+    let p = &fixed.p;
+    let limit = visible.end;
+    let mut cursor = visible.start;
+    let mut before = None;
+    let mut open: Option<RowSpan> = None;
+    let mut emit = |next: RowSpan| {
+        if open.as_mut().is_some_and(|prior| prior.join(&next)) {
+            return;
+        }
+        if let Some(prior) = open.replace(next) {
+            out(prior);
+        }
+    };
+    let mut index = Raster::row(geometry.y(0)).max(-1);
+    let end_row = Raster::row(geometry.y(CDF_SIZE))
+        .saturating_add(1)
+        .min(rows.ceil() as i64);
+    let mut last_end = f64::NEG_INFINITY;
+    while index < end_row {
+        let lower = index as f64 + ON_GRID;
+        let first = if lower <= last_end {
+            cursor
+        } else {
+            geometry.bottom_at(p, lower, cursor)
+        };
+        let end = geometry
+            .tops_before(p, index as f64 + 1.0 - ON_GRID, first)
+            .min(limit);
+        let mut reach = 0.0;
+        let mut boundary = false;
+        if first < end {
+            reach = widths.maximum(first, end);
+            boundary = first + 1 < end;
+            if before != Some(first) {
+                let top = geometry.y(QLayout::start(p, first));
+                if index as f64 <= top + ON_GRID {
+                    boundary = true;
+                    reach = reach.max(before.map_or(0.0, |at| widths.at(at)));
+                }
+            }
+            before = Some(end - 1);
+            cursor = end - 1;
+            last_end = geometry.end_y(p.ends()[cursor]);
+        }
+        if before.is_some_and(|at| at + 1 == limit) && index == Raster::row(last_end) {
+            boundary = true;
+            reach = reach.max(widths.at(cursor));
+        }
+        if 0 <= index && 0.0 < reach {
+            emit(RowSpan {
+                rows: index..index + 1,
+                boundary,
+                reach,
+            });
+        }
+        index += 1;
+        // Skip the whole interior of a tall child, leaving its final row
+        // for the next boundary. Most rows never need this rounding.
+        if first < end && (index + 1) as f64 <= last_end - ON_GRID {
+            let last = Raster::row(last_end - 2.0 * ON_GRID).min(end_row);
+            let width = widths.at(cursor);
+            if index < last && 0.0 < width {
+                emit(RowSpan {
+                    rows: index.max(0)..last,
+                    boundary: false,
+                    reach: width,
+                });
+            }
+            index = last;
+        }
+    }
+    if let Some(prior) = open {
+        out(prior);
+    }
+}
+
+pub fn layout(
+    tree: &impl LayoutTree,
+    lens: Lens,
+    cam: &Camera,
+    view: Viewport,
+    row_px: f64,
+) -> Result<Frame> {
     layout_into(tree, lens, cam, view, row_px, Frame::default())
 }
 
-pub(crate) fn layout_into(
-    tree: &Tree,
+/// Lay out into a previous frame's storage.
+pub fn layout_into(
+    tree: &impl LayoutTree,
     lens: Lens,
     cam: &Camera,
     view: Viewport,
@@ -856,9 +1195,8 @@ pub(crate) fn layout_into(
 }
 
 /// Settle and clamp a camera, then draw and describe the same projection.
-#[cfg(feature = "wasm")]
-pub(crate) fn project(
-    tree: &Tree,
+pub fn project(
+    tree: &impl LayoutTree,
     lens: Lens,
     cam: &mut Camera,
     viewport: Viewport,
@@ -882,7 +1220,7 @@ pub(crate) fn project(
 }
 
 fn layout_chain(
-    tree: &Tree,
+    tree: &impl LayoutTree,
     lens: Lens,
     cam: &Camera,
     view: Viewport,
@@ -945,7 +1283,7 @@ fn layout_chain(
 /// the view, top to bottom: each one's branch and its edges in view heights,
 /// however thin, even where the frame draws it in a row with others.
 pub fn known(
-    tree: &Tree,
+    tree: &impl LayoutTree,
     lens: Lens,
     frame: &Frame,
     node: NodeId,
@@ -954,7 +1292,27 @@ pub fn known(
     else {
         return Ok(Vec::new());
     };
-    let mut heights = Heights::new(placed, d);
+    let quantile = tree
+        .client_measure(node, lens.p)
+        .and_then(|d| Some((d, placed.quantile()?)));
+    if let Some((d, geometry, fixed)) = quantile
+        .as_ref()
+        .and_then(|(d, geometry)| Some((*d, geometry, d.fixed()?)))
+    {
+        let first = geometry.position(&fixed.p, 0.0);
+        let end = geometry.tops_before(&fixed.p, 1.0, first);
+        let known = (first..end)
+            .filter_map(|position| {
+                let Item::Child { run, at } = fixed.items[position] else {
+                    return None;
+                };
+                let (y0, y1) = geometry.span(&fixed.p, position);
+                Some((d.run(run).branch(at), y0, y1))
+            })
+            .collect();
+        return Ok(known);
+    }
+    let mut heights = Heights::new(placed, d, quantile.as_ref().map(|(_, geometry)| geometry));
     let mut known = Vec::new();
     let mut item = d.locate(&placed.at(0.0));
     while let Some(found) = item {
@@ -975,7 +1333,13 @@ pub fn known(
 /// top in it, exact as a frame places it, ln of the view's height in it, and
 /// how far right the screen reaches past where its children start. Where the
 /// view reaches past the origin, what of it the origin holds.
-pub fn view(tree: &Tree, lens: Lens, cam: &Camera, viewport: Viewport, rows: f64) -> Result<View> {
+pub fn view(
+    tree: &impl LayoutTree,
+    lens: Lens,
+    cam: &Camera,
+    viewport: Viewport,
+    rows: f64,
+) -> Result<View> {
     let steps = steps(tree, lens, cam.origin, &cam.anchor.path)?;
     Ok(place_chain(tree, lens, cam, &steps)?.view(cam, viewport, rows))
 }
@@ -1060,7 +1424,7 @@ pub struct Reach {
     pub placed: usize,
 }
 
-pub fn reach(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Reach> {
+pub fn reach(tree: &impl LayoutTree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result<Reach> {
     let steps = steps(tree, lens, origin, path)?;
     let placed = steps.entries.len();
     Ok(Reach {
@@ -1072,7 +1436,7 @@ pub fn reach(tree: &Tree, lens: Lens, origin: NodeId, path: &[Branch]) -> Result
 
 /// The edges in view heights of the node `depth` steps down the camera's
 /// path from its origin, as far as p places that path.
-pub fn extent(tree: &Tree, lens: Lens, cam: &Camera, depth: usize) -> Result<Extent> {
+pub fn extent(tree: &impl LayoutTree, lens: Lens, cam: &Camera, depth: usize) -> Result<Extent> {
     let steps = steps(tree, lens, cam.origin, &cam.anchor.path)?;
     let spans = place_chain(tree, lens, cam, &steps)?.spans;
     let &(top, bottom) = spans.get(depth).ok_or_else(|| {
@@ -1085,7 +1449,7 @@ pub fn extent(tree: &Tree, lens: Lens, cam: &Camera, depth: usize) -> Result<Ext
 }
 
 /// Keep the view inside the root's interval, returning only the new anchor offset.
-pub fn clamp_position(tree: &Tree, lens: Lens, cam: &Camera) -> Result<f64> {
+pub fn clamp_position(tree: &impl LayoutTree, lens: Lens, cam: &Camera) -> Result<f64> {
     // Only the root's interval is all there is; beyond any other origin lies
     // its parent, unknown until fetched.
     if cam.origin != crate::tree::ROOT {
@@ -1114,11 +1478,11 @@ fn clamp_offset(a: f64, (top, bottom): (f64, f64)) -> f64 {
 /// point it has not re-aimed returns to the very same anchor. Where p no
 /// longer places a branch of the path, as after a lens or a replaced
 /// distribution, the path ends there, at that node's top.
-pub fn settle(tree: &Tree, lens: Lens, cam: &Camera) -> Result<Anchor> {
+pub fn settle(tree: &impl LayoutTree, lens: Lens, cam: &Camera) -> Result<Anchor> {
     settled(tree, lens, cam).map(|(anchor, _)| anchor)
 }
 
-fn settled(tree: &Tree, lens: Lens, cam: &Camera) -> Result<(Anchor, Steps)> {
+fn settled(tree: &impl LayoutTree, lens: Lens, cam: &Camera) -> Result<(Anchor, Steps)> {
     let mut steps = steps(tree, lens, cam.origin, &cam.anchor.path)?;
     let mut depth = steps.entries.len();
     let mut point = if depth == cam.anchor.path.len() {
@@ -1167,7 +1531,7 @@ fn settled(tree: &Tree, lens: Lens, cam: &Camera) -> Result<(Anchor, Steps)> {
 /// to 2^-64 of a view height, under its settled name: the point a zoom about
 /// `fy` then leaves where it is, so only depth changes. Unchanged where the
 /// point is there already, or where the origin does not reach that far.
-pub fn aim(tree: &Tree, lens: Lens, cam: &Camera, fy: f64) -> Result<Aim> {
+pub fn aim(tree: &impl LayoutTree, lens: Lens, cam: &Camera, fy: f64) -> Result<Aim> {
     let same = Aim {
         anchor: cam.anchor.clone(),
         a: cam.a,
@@ -1196,7 +1560,7 @@ pub fn aim(tree: &Tree, lens: Lens, cam: &Camera, fy: f64) -> Result<Aim> {
 /// from the origin through the nodes the frame laid out.
 #[allow(clippy::too_many_arguments)]
 pub fn pick(
-    tree: &Tree,
+    tree: &impl LayoutTree,
     lens: Lens,
     frame: &Frame,
     cam: &Camera,
@@ -1247,16 +1611,54 @@ pub fn pick(
         };
         // Nothing at any height: a node known to have no children, whose
         // box is all there is.
-        let Some(item) = d.locate(&placed.at(y)) else {
-            return Ok(Some(within.map_or(origin, |b| PickResult {
-                r#box: b,
-                exact: true,
-                ancestors,
-            })));
+        let none = || {
+            Some(within.map_or_else(
+                || origin.clone(),
+                |b| PickResult {
+                    r#box: b,
+                    exact: true,
+                    ancestors: ancestors.clone(),
+                },
+            ))
         };
-        let mut heights = Heights::new(placed, d);
-        let item = pixel_child(&mut heights, item, y, y + pixel_px / view.height);
-        let b = item_box(tree, lens, node, placed, d, item, heights.item(item))?;
+        let pixel_bottom = y + pixel_px / view.height;
+        let quantile = tree
+            .client_measure(node, lens.p)
+            .and_then(|d| Some((d, placed.quantile()?)));
+        let b = if let Some((d, geometry, fixed)) = quantile
+            .as_ref()
+            .and_then(|(d, geometry)| Some((*d, geometry, d.fixed()?)))
+        {
+            let mut position = geometry.position(&fixed.p, y);
+            let Some(&item) = fixed.items.get(position) else {
+                return Ok(none());
+            };
+            let mut edges = geometry.span(&fixed.p, position);
+            if matches!(item, Item::Gap { .. })
+                && edges.1 - edges.0 < pixel_bottom - y
+                && edges.1 < pixel_bottom
+                && matches!(fixed.items.get(position + 1), Some(Item::Child { .. }))
+            {
+                position += 1;
+                edges = geometry.span(&fixed.p, position);
+            }
+            let item = fixed.items[position];
+            let ln_gap = matches!(item, Item::Gap { .. }).then(|| {
+                cdf_ln(
+                    QLayout::start(&fixed.p, position),
+                    u128::from(fixed.p.ends()[position]) + 1,
+                )
+            });
+            item_box(tree, lens, node, placed, d, item, edges, ln_gap)?
+        } else {
+            let Some(item) = d.locate(&placed.at(y)) else {
+                return Ok(none());
+            };
+            let mut heights =
+                Heights::new(placed, d, quantile.as_ref().map(|(_, geometry)| geometry));
+            let item = pixel_child(&mut heights, item, y, pixel_bottom);
+            item_box(tree, lens, node, placed, d, item, heights.item(item), None)?
+        };
         let Some(branch) = b.branch.filter(|_| b.x1 <= x) else {
             let exact = b.branch.is_some();
             return Ok(Some(PickResult {
@@ -1284,7 +1686,7 @@ pub fn pick(
 /// with the children there, so the known child after it in the pixel is
 /// selected instead. A gap a pixel or more tall is drawn as its own box and
 /// keeps its pixels.
-fn pixel_child(heights: &mut Heights, item: Item, y: f64, bottom: f64) -> Item {
+fn pixel_child(heights: &mut Heights<'_, impl RankView>, item: Item, y: f64, bottom: f64) -> Item {
     if !matches!(item, Item::Gap { .. }) {
         return item;
     }
@@ -1301,9 +1703,197 @@ fn pixel_child(heights: &mut Heights, item: Item, y: f64, bottom: f64) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::{Distribution, Order, Run, Scale};
+    use crate::distribution::Run;
     use crate::tree::ROOT;
     use std::f64::consts::LN_2;
+
+    #[test]
+    fn clipped_windows_reach_children_to_the_right_of_hidden_parents() {
+        let mut tree = ClientTree::new();
+        let equal = || Run::new(0, vec![0, 1], vec![-LN_2; 2], &[]).unwrap();
+        tree.insert(ROOT, 0, vec![equal()], Some(2)).unwrap();
+        let child = tree.child(ROOT, 0).unwrap();
+        tree.insert(child, 0, vec![equal()], Some(2)).unwrap();
+        let cam = Camera {
+            origin: ROOT,
+            x: 1.0,
+            k: 1.0,
+            anchor: Anchor::default(),
+            a: 0.0,
+        };
+        let placed = Placed::new(
+            (Point::new(&[0x40]), 0.0),
+            (Point::new(&[0xc0]), 1.0),
+            0.0,
+            LN_2,
+            0.0,
+        );
+        let mut layout = Layout {
+            tree: &tree,
+            lens: LENS,
+            cam: &cam,
+            right: 4.0,
+            row: 0.25,
+            frame: Frame::default(),
+        };
+        layout.lay(ROOT, placed, None).unwrap();
+        assert_eq!(layout.frame.boxes.len(), 1);
+        let b = &layout.frame.boxes[0];
+        assert_eq!((b.node, b.branch, b.y0, b.y1), (child, Some(1), 0.0, 0.5));
+        // The visible child has one filled row between its boundary rows.
+        let spans = &layout.frame.spans;
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            (spans[0].y0, spans[0].y1, spans[0].fill, spans[0].reach),
+            (0.0, 0.25, b.x0, b.x1)
+        );
+        assert_eq!((spans[1].y0, spans[1].y1, spans[1].fill), (0.25, 0.5, b.x1));
+        assert_eq!(
+            (spans[2].y0, spans[2].y1, spans[2].fill, spans[2].reach),
+            (0.5, 0.75, b.x0, b.x1)
+        );
+    }
+
+    #[test]
+    fn a_missing_q_stays_unknown_and_sparse_q_uses_branch_ids() {
+        let mut tree = ClientTree::new();
+        let equal = Run::new(0, vec![0, 1], vec![-LN_2; 2], &[]).unwrap();
+        tree.insert(ROOT, 0, vec![equal], Some(2)).unwrap();
+        let cam = Camera {
+            origin: ROOT,
+            x: 0.0,
+            k: 1.0,
+            anchor: Anchor::default(),
+            a: 0.0,
+        };
+        let view = Viewport {
+            width: 4.0,
+            height: 2.0,
+        };
+        let lens = Lens { p: 0, q: 1 };
+        let frame = layout(&tree, lens, &cam, view, 1.0).unwrap();
+        assert_eq!(frame.boxes.len(), 2);
+        assert!(frame.boxes.iter().all(|b| b.x1 == f64::INFINITY));
+        let q = Run::new(0, vec![1, 0], vec![-3.0, -2.0], &[]).unwrap();
+        tree.insert(ROOT, 1, vec![q], None).unwrap();
+        let frame = layout(&tree, lens, &cam, view, 1.0).unwrap();
+        assert_eq!((frame.boxes[0].x1, frame.boxes[1].x1), (2.0, 3.0));
+
+        let (_, _, branches, weights) = crate::pstore::normalize_logits(&[f32::MAX; 2]);
+        let normalized = Run::new(
+            0,
+            branches,
+            weights.into_iter().map(f64::from).collect(),
+            &[],
+        )
+        .unwrap();
+        tree.insert(ROOT, 2, vec![normalized], Some(2)).unwrap();
+        assert_eq!(
+            tree.nats_q(ROOT, Lens { p: 0, q: 2 }, 0, 0.0) as f32,
+            std::f32::consts::LN_2,
+        );
+    }
+
+    #[test]
+    fn fixed_layout_draws_the_same_sibling_steps_as_exact_layout() {
+        let p = Run::new(
+            0,
+            vec![3, 5, 8, 9],
+            [0.5f64, 0.3, 0.15, 0.05].into_iter().map(f64::ln).collect(),
+            &[],
+        )
+        .unwrap();
+        let q = Run::new(0, vec![9, 3, 8, 5], vec![-1.0, -2.5, -2.5, -3.0], &[]).unwrap();
+        let mut exact = Tree::new();
+        let mut quantile = ClientTree::new();
+        for (measure, run) in [p, q].into_iter().enumerate() {
+            exact
+                .insert(ROOT, measure, vec![run.clone()], Some(4))
+                .unwrap();
+            quantile.insert(ROOT, measure, vec![run], Some(4)).unwrap();
+        }
+        for lens in [LENS, Lens { p: 0, q: 1 }] {
+            for dpr in [1.0, 1.25, 1.5, 2.0] {
+                for phase in [0.0, 0.2, 0.61, 0.99] {
+                    let camera = cam(ROOT, 0.0, top(&[]), phase / VIEW.height);
+                    let expected = layout(&exact, lens, &camera, VIEW, 1.0 / dpr).unwrap();
+                    let actual = layout(&quantile, lens, &camera, VIEW, 1.0 / dpr).unwrap();
+                    let visible = |frame: Frame| {
+                        let height = VIEW.height * dpr;
+                        let mut rows = vec![None; height.floor() as usize];
+                        for span in frame.spans {
+                            let first = (span.y0 * height).round() as usize;
+                            let last = ((span.y1 * height).round() as usize).min(rows.len());
+                            if first < last {
+                                rows[first..last].fill(Some((span.fill, span.reach)));
+                            }
+                        }
+                        rows
+                    };
+                    assert_eq!(
+                        visible(actual),
+                        visible(expected),
+                        "lens {lens:?}, DPR {dpr}, phase {phase}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coincident_siblings_keep_the_widest_boundary() {
+        let mut tree = ClientTree::new();
+        let run = |rank, ln_p, top: &[u8]| Run::new(rank, vec![rank], vec![ln_p], top).unwrap();
+        tree.insert(
+            ROOT,
+            0,
+            vec![
+                run(0, -LN_2, &[]),
+                run(1, 0.1f64.ln(), &[0x80]),
+                run(2, -LN_2, &[0x80]),
+            ],
+            Some(3),
+        )
+        .unwrap();
+        let q = Run::new(0, vec![0, 1, 2], vec![-2.0, -7.0, -3.0], &[]).unwrap();
+        tree.insert(ROOT, 1, vec![q], Some(3)).unwrap();
+        let lens = Lens { p: 0, q: 1 };
+        let camera = cam(ROOT, 0.0, top(&[]), 0.375 / VIEW.height);
+        let frame = layout(&tree, lens, &camera, VIEW, 1.0).unwrap();
+        let fixed = tree.distribution(ROOT, 0).unwrap().fixed().unwrap();
+        assert_eq!(fixed.p.locate(1 << 63).unwrap().branch, 2);
+        let row = spans(&frame, ROOT)
+            .into_iter()
+            .find(|span| span.0 <= 400.0 && 400.0 < span.1)
+            .unwrap();
+        assert_eq!(row, (400.0, 401.0, 0.0, 7.0));
+        let known = known(&tree, lens, &frame, ROOT).unwrap();
+        assert_eq!(
+            known
+                .iter()
+                .map(|&(branch, _, _)| branch)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(known[1].1, known[1].2);
+    }
+
+    #[test]
+    fn overlapping_wire_tops_keep_their_boundaries_in_the_fixed_range() {
+        let runs = vec![
+            listed(0, &[0], &[0.625], 0.0),
+            listed(2, &[2], &[0.390625], 0.609375),
+        ];
+        let mut client = ClientTree::new();
+        let mut exact = Tree::new();
+        client.insert(ROOT, 0, runs.clone(), Some(3)).unwrap();
+        exact.insert(ROOT, 0, runs, Some(3)).unwrap();
+        let camera = cam(ROOT, 0.0, top(&[]), 0.375 / VIEW.height);
+        let actual = layout(&client, LENS, &camera, VIEW, 1.0).unwrap();
+        let expected = layout(&exact, LENS, &camera, VIEW, 1.0).unwrap();
+        assert!(client.distribution(ROOT, 0).unwrap().fixed().is_none());
+        near_all(&spans(&actual, ROOT), &spans(&expected, ROOT));
+    }
 
     const VIEW: Viewport = Viewport {
         width: 1000.0,
@@ -1427,8 +2017,8 @@ mod tests {
     #[test]
     fn thin_children_are_filled_and_outlined_where_they_fall_and_pick_apart() {
         // Two thick children, the second ending at 798.8, then three
-        // thinner than a pixel: a row is filled as far as its narrowest
-        // child reaches, and outlined to its widest.
+        // thinner than a pixel: a row holding their horizontal edges
+        // is outlined from the left to the widest child.
         let weights_ = [0.5, 0.4985, 0.0006, 0.0005, 0.0004];
         let (tree, _) = chain_tree(&weights_, &[]);
         let camera = cam(ROOT, 0.0, top(&[]), 0.0);
@@ -1441,10 +2031,10 @@ mod tests {
             &[
                 (0.0, 1.0, 0.0, w[0]),
                 (1.0, 400.0, w[0], w[0]),
-                (400.0, 401.0, w[0], w[1]),
+                (400.0, 401.0, 0.0, w[1]),
                 (401.0, 798.0, w[1], w[1]),
-                (798.0, 799.0, w[1], w[2]),
-                (799.0, 800.0, w[2], w[4]),
+                (798.0, 799.0, 0.0, w[2]),
+                (799.0, 800.0, 0.0, w[4]),
             ],
         );
         // Only the thick ones are boxes; a pixel of the thin selects the
@@ -1513,7 +2103,7 @@ mod tests {
         );
         // The row from 798 holds the step from the heavy child to the gap,
         // and from the gap to the last child.
-        near_all(&rows[2..3], &[(798.0, 799.0, heavy, gap)]);
+        near_all(&rows[2..3], &[(798.0, 799.0, 0.0, gap)]);
         assert!((rows[3].2 - last).abs() < 1e-6 && (rows[3].3 - last).abs() < 1e-6);
     }
 
@@ -1929,12 +2519,8 @@ mod tests {
         // Branch 0 ends the sequence: nothing lies past its box.
         let (mut tree, _) = chain_tree(&[0.5, 0.5], &[]);
         let ended = tree.child(ROOT, 0).unwrap();
-        tree.set(
-            ended,
-            0,
-            Distribution::from_weights(&[], Order::Heaviest, Scale::Relative).unwrap(),
-        )
-        .unwrap();
+        tree.set(ended, 0, Distribution::from_ordered(Vec::new()).unwrap())
+            .unwrap();
         let camera = cam(ROOT, 0.0, top(&[]), 0.0);
         let frame = layout(&tree, LENS, &camera, VIEW, 1.0).unwrap();
         let hit = pick(&tree, LENS, &frame, &camera, VIEW, 300.0, 200.0, 1.0)

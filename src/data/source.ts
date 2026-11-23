@@ -11,7 +11,7 @@ import { type NotesFile, NoteLabels } from "../readings/notes";
 import type { Labels } from "../readings/reading";
 import type { Path, View } from "../core/layout";
 import { Session } from "../core/wasm";
-import { type Branch, IntervalTree, type NodeId, ROOT, type Run } from "../core/tree";
+import { type Branch, type NodeId, RecordedTree, ROOT, type Run } from "../core/tree";
 import { type Catalog, named } from "./catalog";
 
 /** The measures in view, by spec: p places children, q sizes them. */
@@ -231,7 +231,7 @@ function decode(frame: Uint8Array): Update[] {
  * tree of its own, read through a session in the page as a server would,
  * lacking whatever it did not record. Its specs are its measures' names. */
 export class RecordedServer implements Server {
-  private readonly recorded = new IntervalTree();
+  private readonly recorded = new RecordedTree();
   /** The paths recorded under any measure, for text search. */
   private readonly paths: Branch[][];
 

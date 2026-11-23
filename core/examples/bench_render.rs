@@ -1,7 +1,7 @@
 //! Headless render & data-transfer benchmark for `natlas-core`.
 //!
 //! Measures:
-//! 1. Distribution construction (`from_weights`) & memory footprint
+//! 1. Distribution construction (`from_ordered`) & memory footprint
 //! 2. Streaming from `Session` into `Tree::insert`, with an estimated payload size
 //! 3. Frame layout (`layout::layout`) and picking (`layout::pick`) across zoom dives,
 //!    tail pans, `p != q`, and branch-order distributions.
@@ -15,7 +15,8 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use natlas_core::distribution::{Distribution, Order, Run, Scale};
+use natlas_core::client::ClientTree;
+use natlas_core::distribution::{log_softmax, Distribution, Run};
 use natlas_core::layout::{self, Anchor, Camera, Viewport};
 use natlas_core::point::Point;
 use natlas_core::session::{Demand, Session, Update};
@@ -102,6 +103,15 @@ fn tree_bytes(tree: &Tree, nodes: &[NodeId], measures: &[usize]) -> usize {
     total
 }
 
+fn ordered(logits: &[f32], heaviest: bool) -> Vec<(Branch, f64)> {
+    let mut children: Vec<_> = (0..).zip(logits.iter().copied().map(f64::from)).collect();
+    if heaviest {
+        children.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    }
+    log_softmax(&mut children);
+    children
+}
+
 /// Build a multi-level Zipf tree resembling an expanded LLM exploration tree:
 /// - Depth 0 (root): `root_vocab` branches
 /// - Depth 1..=2 (top children): `mid_vocab` branches
@@ -111,7 +121,7 @@ fn build_multilevel_tree(
     mid_vocab: usize,
     leaf_vocab: usize,
     depth: usize,
-    order: Order,
+    heaviest: bool,
     with_q: bool,
 ) -> (Tree, Vec<NodeId>, Duration) {
     let t0 = Instant::now();
@@ -123,7 +133,7 @@ fn build_multilevel_tree(
     tree.set(
         ROOT,
         0,
-        Distribution::from_weights(&root_p, order, Scale::Relative).unwrap(),
+        Distribution::from_ordered(ordered(&root_p, heaviest)).unwrap(),
     )
     .unwrap();
     if with_q {
@@ -132,7 +142,7 @@ fn build_multilevel_tree(
         tree.set(
             ROOT,
             1,
-            Distribution::from_weights(&root_q, order, Scale::Relative).unwrap(),
+            Distribution::from_ordered(ordered(&root_q, heaviest)).unwrap(),
         )
         .unwrap();
     }
@@ -147,14 +157,14 @@ fn build_multilevel_tree(
         tree.set(
             n1,
             0,
-            Distribution::from_weights(&mid_p, order, Scale::Relative).unwrap(),
+            Distribution::from_ordered(ordered(&mid_p, heaviest)).unwrap(),
         )
         .unwrap();
         if with_q {
             tree.set(
                 n1,
                 1,
-                Distribution::from_weights(&mid_q, order, Scale::Relative).unwrap(),
+                Distribution::from_ordered(ordered(&mid_q, heaviest)).unwrap(),
             )
             .unwrap();
         }
@@ -164,14 +174,14 @@ fn build_multilevel_tree(
             tree.set(
                 n2,
                 0,
-                Distribution::from_weights(&mid_p, order, Scale::Relative).unwrap(),
+                Distribution::from_ordered(ordered(&mid_p, heaviest)).unwrap(),
             )
             .unwrap();
             if with_q {
                 tree.set(
                     n2,
                     1,
-                    Distribution::from_weights(&mid_q, order, Scale::Relative).unwrap(),
+                    Distribution::from_ordered(ordered(&mid_q, heaviest)).unwrap(),
                 )
                 .unwrap();
             }
@@ -190,14 +200,14 @@ fn build_multilevel_tree(
         tree.set(
             cur,
             0,
-            Distribution::from_weights(&leaf_p, order, Scale::Relative).unwrap(),
+            Distribution::from_ordered(ordered(&leaf_p, heaviest)).unwrap(),
         )
         .unwrap();
         if with_q {
             tree.set(
                 cur,
                 1,
-                Distribution::from_weights(&leaf_q, order, Scale::Relative).unwrap(),
+                Distribution::from_ordered(ordered(&leaf_q, heaviest)).unwrap(),
             )
             .unwrap();
         }
@@ -253,8 +263,7 @@ fn run_streaming_bench(
     mut cam: Camera,
     mut step_camera: impl FnMut(usize, usize, &mut Camera),
 ) {
-    let mut client = Tree::new();
-    let mut client_nodes = vec![ROOT];
+    let mut client = ClientTree::new();
     let mut session = Session::new();
 
     let mut server_times = Vec::with_capacity(frames);
@@ -302,7 +311,6 @@ fn run_streaming_bench(
                     if !client.contains(node) {
                         let created = client.child(parent, branch).unwrap();
                         assert_eq!(created, node);
-                        client_nodes.push(node);
                     }
                 }
                 client.insert(node, measure, runs, count).unwrap();
@@ -320,12 +328,7 @@ fn run_streaming_bench(
     let ss = Stats::from_durations(&mut server_times);
     let is = Stats::from_durations(&mut ingest_times);
     let ls = Stats::from_durations(&mut layout_times);
-    let measures: Vec<usize> = if lens.p == lens.q {
-        vec![lens.p]
-    } else {
-        vec![lens.p, lens.q]
-    };
-    let client_kb = tree_bytes(&client, &client_nodes, &measures) as f64 / 1024.0;
+    let client_kb = client.bytes() as f64 / 1024.0;
 
     println!(
         "{name:<28} | srv p50 {:>7.1}us | ing p50 {:>7.1}us | lay p50 {:>7.1}us (p95 {:>7.1}us) | wire {:>7.1} KB ({total_answers:>4} msgs) | RAM {:>7.1} KB",
@@ -355,25 +358,13 @@ fn main() {
     // 1. Construction & Memory Footprint (150k vocab)
     // -------------------------------------------------------------------------
     println!("--- 1. Distribution Construction & Footprint (150,000 branches) ---");
-    for (label, logits, order) in [
-        (
-            "zipf-150k Heaviest",
-            zipf_logits(150_000, 1.15),
-            Order::Heaviest,
-        ),
-        (
-            "zipf-150k Branch",
-            zipf_logits(150_000, 1.15),
-            Order::Branch,
-        ),
-        (
-            "uniform-150k Heaviest",
-            uniform_logits(150_000),
-            Order::Heaviest,
-        ),
+    for (label, logits, heaviest) in [
+        ("zipf-150k Heaviest", zipf_logits(150_000, 1.15), true),
+        ("zipf-150k Branch", zipf_logits(150_000, 1.15), false),
+        ("uniform-150k Heaviest", uniform_logits(150_000), true),
     ] {
         let t0 = Instant::now();
-        let d = Distribution::from_weights(&logits, order, Scale::Relative).unwrap();
+        let d = Distribution::from_ordered(ordered(&logits, heaviest)).unwrap();
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
         println!(
             "{label:<24} | build {:>7.2} ms | RAM {:>8.1} KB ({:.2} B/branch)",
@@ -388,9 +379,9 @@ fn main() {
     // 2. Build Multi-Level Trees
     // -------------------------------------------------------------------------
     let (mut tree_heaviest, nodes_h, build_h) =
-        build_multilevel_tree(150_000, 4_096, 256, 20, Order::Heaviest, true);
+        build_multilevel_tree(150_000, 4_096, 256, 20, true, true);
     let (tree_branch, nodes_b, build_b) =
-        build_multilevel_tree(150_000, 4_096, 256, 20, Order::Branch, true);
+        build_multilevel_tree(150_000, 4_096, 256, 20, false, true);
     println!(
         "Multi-level trees ({} nodes): Heaviest built in {:.1} ms ({:.1} MB) | Branch built in {:.1} ms ({:.1} MB)\n",
         nodes_h.len(),

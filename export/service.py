@@ -40,9 +40,22 @@ from natlas import natlas_pb2 as pb
 
 _PROTO_CONTENT_TYPE = "application/proto"
 # Memory for distributions a server keeps by default, across its measures.
-# The core keeps each sorted and packed, about 4 bytes per vocabulary entry:
+# The core keeps each packed, about 4 bytes per vocabulary entry:
 # some 1700 nodes of a 150k vocabulary, 5000 of a 50k one.
 CACHE = 1 << 30
+
+
+def ordered_children(row: np.ndarray, order: str, widths: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Prepare ordered branch/log-weight pairs in two contiguous buffers."""
+    branches = np.flatnonzero(row != -np.inf)
+    weights = row[branches].astype(np.float64, copy=False)
+    if order == "heaviest":
+        ranked = np.argsort(-weights, kind="stable")
+        branches, weights = branches[ranked], weights[ranked]
+    if not widths and len(weights) and np.isfinite(weights).all():
+        weights -= weights.max()
+        weights -= np.log(np.exp(weights).sum())
+    return branches.astype(np.uint32), weights
 
 
 @dataclass(eq=False)
@@ -546,8 +559,8 @@ class Model:
         return measure.ends(tokens) or any(self.vocabulary <= branch for branch in tokens)
 
     def _keep(self, measure: int, nodes: list[int], rows: list[np.ndarray]) -> None:
-        rows = [np.ascontiguousarray(row, dtype=np.float32) for row in rows]
-        sizes = self.tree.set(nodes, measure, rows, self.order, self._ready_measure(measure).widths)
+        widths = self._ready_measure(measure).widths
+        sizes = self.tree.set(nodes, measure, [ordered_children(row, self.order, widths) for row in rows])
         for node, size in zip(nodes, sizes, strict=True):
             self.kept_bytes += size - self.kept.pop((node, measure), 0)
             self.kept[node, measure] = size

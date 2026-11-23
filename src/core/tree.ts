@@ -2,7 +2,7 @@
 // distributions, and all geometry; this wrapper adds change notifications
 // for the fetch/render loop and caches immutable paths.
 
-import { Tree } from "./wasm";
+import { RecordedTree as WasmRecordedTree, Tree } from "./wasm";
 
 /** A node's id: hashed from its branches, shared by the client and every server. */
 export type NodeId = bigint;
@@ -45,6 +45,52 @@ export interface Entry {
   natsQ: number;
 }
 
+function insertRuns(raw: Tree | WasmRecordedTree, id: NodeId, measure: number, { runs, count }: Children): boolean {
+  for (const run of runs) {
+    if (run.lnWeights.length !== run.branches.length) throw new Error("a run needs a weight for every branch");
+  }
+  const ranks = Uint32Array.from(runs, (run) => run.rank);
+  const lengths = Uint32Array.from(runs, (run) => run.branches.length);
+  const digits = Uint32Array.from(runs, (run) => run.top.length);
+  const branches = new Uint32Array(lengths.reduce((sum, length) => sum + length, 0));
+  const lnWeights = new Float64Array(branches.length);
+  const tops = new Uint8Array(digits.reduce((sum, length) => sum + length, 0));
+  for (let i = 0, at = 0, digit = 0; i < runs.length; at += lengths[i]!, digit += digits[i]!, i++) {
+    branches.set(runs[i]!.branches, at);
+    lnWeights.set(runs[i]!.lnWeights, at);
+    tops.set(runs[i]!.top, digit);
+  }
+  return raw.insert(id, measure, ranks, lengths, branches, lnWeights, digits, tops, count);
+}
+
+function measureId(measures: Map<string, number>, spec: string): number {
+  let measure = measures.get(spec);
+  if (measure === undefined) measures.set(spec, measure = measures.size);
+  return measure;
+}
+
+/** A lossless source fed to the local snapshot session. */
+export class RecordedTree {
+  readonly raw = new WasmRecordedTree();
+  private readonly measures = new Map<string, number>();
+
+  measure(spec: string): number {
+    return measureId(this.measures, spec);
+  }
+
+  child(node: NodeId, branch: Branch): NodeId {
+    return this.raw.child(node, branch);
+  }
+
+  descend(node: NodeId, path: readonly Branch[]): NodeId {
+    return this.raw.descend(node, Uint32Array.from(path));
+  }
+
+  insert(node: NodeId, measure: number, children: Children): void {
+    insertRuns(this.raw, node, measure, children);
+  }
+}
+
 export class IntervalTree {
   readonly raw: Tree;
   readonly root: NodeId;
@@ -65,9 +111,7 @@ export class IntervalTree {
 
   /** The number this tree gives the measure ``spec`` names. */
   measure(spec: string): number {
-    let measure = this.measures.get(spec);
-    if (measure === undefined) this.measures.set(spec, measure = this.measures.size);
-    return measure;
+    return measureId(this.measures, spec);
   }
 
   child(parent: NodeId, branch: Branch): NodeId {
@@ -135,21 +179,7 @@ export class IntervalTree {
 
   /** Add one answer for a node. Listeners hear only of answers that changed something. */
   insert(id: NodeId, measure: number, { runs, count }: Children): void {
-    for (const run of runs) {
-      if (run.lnWeights.length !== run.branches.length) throw new Error("a run needs a weight for every branch");
-    }
-    const ranks = Uint32Array.from(runs, (run) => run.rank);
-    const lengths = Uint32Array.from(runs, (run) => run.branches.length);
-    const digits = Uint32Array.from(runs, (run) => run.top.length);
-    const branches = new Uint32Array(lengths.reduce((sum, length) => sum + length, 0));
-    const lnWeights = new Float64Array(branches.length);
-    const tops = new Uint8Array(digits.reduce((sum, length) => sum + length, 0));
-    for (let i = 0, at = 0, digit = 0; i < runs.length; at += lengths[i]!, digit += digits[i]!, i++) {
-      branches.set(runs[i]!.branches, at);
-      lnWeights.set(runs[i]!.lnWeights, at);
-      tops.set(runs[i]!.top, digit);
-    }
-    if (!this.raw.insert(id, measure, ranks, lengths, branches, lnWeights, digits, tops, count)) return;
+    if (!insertRuns(this.raw, id, measure, { runs, count })) return;
     this.revision++;
     this.revisions.set(id, this.revision);
     for (const listener of this.listeners) listener();

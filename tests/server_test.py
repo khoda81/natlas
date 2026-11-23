@@ -224,7 +224,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(session.step(tree), [])
         self.assertEqual(session.blocked(), [(0, 0, 10.0, [])])
         with np.errstate(divide="ignore"):
-            tree.set([0], 0, [np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32))], "heaviest")
+            tree.set([0], 0, [service.ordered_children(np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32)), "heaviest")])
         ((kind, measure, node, parent, branch, runs, count),) = session.step(tree)
         self.assertEqual((kind, measure, node, parent, branch, count), ("answer", 0, 0, None, None, 3))
         self.assertEqual([branch for _, branches, _, _ in runs for branch in branches], [1, 3, 0])
@@ -235,13 +235,13 @@ class CoreTests(unittest.TestCase):
             above += sum(math.exp(ln) for ln in ln_weights)
         self.assertAlmostEqual(above, 1.0)
         # Widths are each child's own ln weight, whatever they sum to.
-        tree.set([0], 0, [np.array([-1.0, -1.0, -3.0], np.float32)], "branch", widths=True)
+        tree.set([0], 0, [service.ordered_children(np.array([-1.0, -1.0, -3.0], np.float32), "branch", widths=True)])
         session = Session()
         session.demand(tree, 0, 0, view=(0, b"", 0.0, 10.0, 0.1))
         ((*_, runs, _),) = session.step(tree)
         self.assertEqual([round(ln, 6) for _, _, ln_weights, _ in runs for ln in ln_weights], [-1.0, -1.0, -3.0])
         # By branch, the same weights in branch order.
-        tree.set([0], 0, [np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32))], "branch")
+        tree.set([0], 0, [service.ordered_children(np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32)), "branch")])
         session = Session()
         session.demand(tree, 0, 0, view=(0, b"", 0.0, 10.0, 0.1))
         ((*_, runs, _),) = session.step(tree)

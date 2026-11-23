@@ -10,7 +10,8 @@
 //!   exactly when `min_mass - 1 <= end - start`.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
+use std::mem::size_of;
 
 use crate::tree::Branch;
 
@@ -204,26 +205,6 @@ pub(crate) fn max_logit(logits: &[f32]) -> f32 {
             assert!(!logit.is_nan() && logit != f32::INFINITY, "invalid logit");
             max.max(logit)
         })
-}
-
-#[inline]
-fn locate_in_slice(
-    starts: &[u64],
-    ends: &[u64],
-    branches: &[Branch],
-    ln_p: &[f32],
-    cdf: u64,
-) -> Option<BranchHit> {
-    if branches.is_empty() {
-        return None;
-    }
-    let idx = ends.partition_point(|&e| e < cdf);
-    Some(BranchHit {
-        branch: branches[idx],
-        start: starts[idx],
-        end: ends[idx],
-        ln_p: ln_p[idx],
-    })
 }
 
 #[inline]
@@ -726,112 +707,171 @@ impl PStore for EytzingerMax {
 // Design 3: TieredPStore — Scale-stratified base-2 tiers (heavy branches in L1)
 // =============================================================================
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct TierEntry {
-    start: u64,
-    end: u64,
-    branch: Branch,
-    ln_p: f32,
-}
+pub(crate) const CDF_SIZE: u128 = 1 << 64;
+const TIERS: usize = u64::BITS as usize + 1;
+const GAP: u32 = u32::MAX;
 
-/// Branches stratified by `span_m1.leading_zeros()` (65 power-of-two tiers `0..=64`),
-/// sorted by `start` within each tier. Zero heap pops during `query_tall`.
+/// Branches are stored once, in descending mass tiers and in CDF order within
+/// each tier. Compact sorted ends and entry indices serve point queries.
 pub struct TieredPStore {
-    starts: Vec<u64>,
+    entries: Vec<BranchHit>,
+    tier_starts: [u32; TIERS + 1],
     ends: Vec<u64>,
-    branches: Vec<Branch>,
-    ln_p: Vec<f32>,
-    /// All branches packed contiguously by tier `0..=64`, sorted by `start` inside each tier.
-    entries: Vec<TierEntry>,
-    tier_starts: [u32; 66],
+    pos_to_entry: Vec<u32>,
 }
 
-impl PStore for TieredPStore {
-    fn name() -> &'static str {
-        "TieredPStore(base2)"
+impl TieredPStore {
+    pub fn from_logits(logits: &[f32]) -> Self {
+        let (starts, ends, branches, weights) = normalize_logits(logits);
+        let mut entries = Vec::with_capacity(starts.len());
+        for (((start, end), branch), ln_p) in
+            starts.into_iter().zip(ends).zip(branches).zip(weights)
+        {
+            entries.push(BranchHit {
+                start,
+                end,
+                branch,
+                ln_p,
+            });
+        }
+        Self::from_entries(&entries)
     }
 
-    fn from_logits(logits: &[f32]) -> Self {
-        let (starts, ends, branches, ln_p) = normalize_logits(logits);
-        let n = branches.len();
-        let mut counts = [0u32; 65];
-        for i in 0..n {
-            let t = (ends[i] - starts[i]).leading_zeros() as usize;
-            counts[t] += 1;
+    /// Disjoint known intervals in ascending CDF order, one per branch.
+    /// The uncovered coordinates remain unknown.
+    pub fn from_sorted_entries(entries: &[BranchHit]) -> Self {
+        let mut branches = HashSet::with_capacity(entries.len());
+        for entry in entries {
+            assert!(
+                branches.insert(entry.branch),
+                "a branch may have only one CDF interval"
+            );
         }
-        let mut tier_starts = [0u32; 66];
-        for t in 0..65 {
-            tier_starts[t + 1] = tier_starts[t] + counts[t];
+        Self::from_entries(entries)
+    }
+
+    fn from_entries(raw: &[BranchHit]) -> Self {
+        u32::try_from(raw.len()).expect("the tier index must fit in u32");
+        let mut next = 0;
+        let mut positions = raw.len();
+        for entry in raw {
+            let start = u128::from(entry.start);
+            assert!(
+                next <= start && entry.start <= entry.end,
+                "invalid CDF interval order"
+            );
+            assert!(entry.ln_p <= 0.0, "invalid log probability");
+            positions += usize::from(next < start);
+            next = u128::from(entry.end) + 1;
         }
-        let mut entries = vec![
-            TierEntry {
-                start: 0,
-                end: 0,
-                branch: 0,
-                ln_p: 0.0,
-            };
-            n
-        ];
-        let mut cursors = [0u32; 65];
-        cursors.copy_from_slice(&tier_starts[..65]);
-        // Input is already ordered by increasing `start`, so each tier stays sorted by `start`!
-        for i in 0..n {
-            let st = starts[i];
-            let en = ends[i];
-            let t = (en - st).leading_zeros() as usize;
-            let pos = cursors[t] as usize;
-            cursors[t] += 1;
-            entries[pos] = TierEntry {
-                start: st,
-                end: en,
-                branch: branches[i],
-                ln_p: ln_p[i],
-            };
+        positions += usize::from(!raw.is_empty() && next < CDF_SIZE);
+
+        let mut ends = Vec::with_capacity(positions);
+        let mut pos_to_entry = Vec::with_capacity(positions);
+        next = 0;
+        let (entries, tier_starts) = Self::pack_tiers(raw.iter().copied(), |entry, index| {
+            if next < u128::from(entry.start) {
+                ends.push(entry.start - 1);
+                pos_to_entry.push(GAP);
+            }
+            ends.push(entry.end);
+            pos_to_entry.push(index);
+            next = u128::from(entry.end) + 1;
+        });
+        if !raw.is_empty() && next < CDF_SIZE {
+            ends.push(u64::MAX);
+            pos_to_entry.push(GAP);
         }
         Self {
-            starts,
-            ends,
-            branches,
-            ln_p,
             entries,
             tier_starts,
+            ends,
+            pos_to_entry,
         }
     }
 
-    fn query_tall(
-        &self,
-        range: CdfRange,
-        min_mass: u64,
-        _scratch: &mut QueryScratch,
-        out: &mut Vec<BranchHit>,
-    ) {
-        out.clear();
-        if self.entries.is_empty() {
-            return;
+    /// A contiguous partition, with the position as payload. A repeated
+    /// end is a coincident boundary and has no positive interval to index.
+    pub(crate) fn from_partition(ends: Vec<u64>) -> Self {
+        u32::try_from(ends.len()).expect("the tier index must fit in u32");
+        let raw = ends.iter().copied().enumerate().filter_map(|(pos, end)| {
+            let start = match pos.checked_sub(1) {
+                Some(prior) => ends[prior].checked_add(1)?,
+                None => 0,
+            };
+            (start <= end).then_some(BranchHit {
+                branch: pos as u32,
+                start,
+                end,
+                ln_p: 0.0,
+            })
+        });
+        let mut pos_to_entry = vec![GAP; ends.len()];
+        let (entries, tier_starts) = Self::pack_tiers(raw, |entry, index| {
+            pos_to_entry[entry.branch as usize] = index;
+        });
+        Self {
+            entries,
+            tier_starts,
+            ends,
+            pos_to_entry,
         }
-        let min_span_m1 = min_mass.saturating_sub(1);
-        let max_tier = min_span_m1.leading_zeros() as usize;
-        for t in 0..=max_tier {
-            let s = self.tier_starts[t] as usize;
-            let e = self.tier_starts[t + 1] as usize;
-            if s == e {
+    }
+
+    fn pack_tiers(
+        raw: impl Iterator<Item = BranchHit> + Clone,
+        mut position: impl FnMut(BranchHit, u32),
+    ) -> (Vec<BranchHit>, [u32; TIERS + 1]) {
+        let tier = |entry: BranchHit| entry.span_m1().leading_zeros() as usize;
+        let mut starts = [0u32; TIERS + 1];
+        for entry in raw.clone() {
+            starts[tier(entry) + 1] += 1;
+        }
+        for tier in 0..TIERS {
+            starts[tier + 1] += starts[tier];
+        }
+        let mut entries = vec![
+            BranchHit {
+                branch: 0,
+                start: 0,
+                end: 0,
+                ln_p: 0.0
+            };
+            starts[TIERS] as usize
+        ];
+        let mut cursors = starts;
+        for entry in raw {
+            let at = &mut cursors[tier(entry)];
+            entries[*at as usize] = entry;
+            position(entry, *at);
+            *at += 1;
+        }
+        (entries, starts)
+    }
+
+    /// Replace `out` with known overlapping branches at least `min_mass`
+    /// CDF units tall, heaviest first, with ties in CDF order.
+    pub(crate) fn tall(&self, range: CdfRange, min_mass: u64, out: &mut Vec<BranchHit>) {
+        self.query_spans(range, min_mass.saturating_sub(1), out);
+    }
+
+    pub(crate) fn query_spans(&self, range: CdfRange, min_span_m1: u64, out: &mut Vec<BranchHit>) {
+        out.clear();
+        let (start, end) = range.bounds();
+        let last_tier = min_span_m1.leading_zeros() as usize;
+        for t in 0..=last_tier {
+            let tier =
+                &self.entries[self.tier_starts[t] as usize..self.tier_starts[t + 1] as usize];
+            if tier.is_empty() {
                 continue;
             }
-            let slice = &self.entries[s..e];
-            // First entry whose end meets or passes the range's start.
-            let first = slice.partition_point(|x| x.end < range.start);
-            for entry in &slice[first..] {
-                if range.end < entry.start {
+            let first = tier.partition_point(|entry| entry.end < start);
+            for &entry in &tier[first..] {
+                if end < entry.start {
                     break;
                 }
-                if min_span_m1 <= entry.end - entry.start {
-                    out.push(BranchHit {
-                        branch: entry.branch,
-                        start: entry.start,
-                        end: entry.end,
-                        ln_p: entry.ln_p,
-                    });
+                if min_span_m1 <= entry.span_m1() {
+                    out.push(entry);
                 }
             }
         }
@@ -842,21 +882,84 @@ impl PStore for TieredPStore {
         });
     }
 
+    /// Find the branch containing a coordinate, if its interval is known.
+    pub fn locate(&self, at: u64) -> Option<BranchHit> {
+        let pos = self.ends.partition_point(|&end| end < at);
+        let &index = self.pos_to_entry.get(pos)?;
+        (index != GAP).then(|| self.entries[index as usize])
+    }
+
+    pub(crate) fn ends(&self) -> &[u64] {
+        &self.ends
+    }
+
+    pub(crate) fn position(&self, at: u64) -> usize {
+        self.ends.partition_point(|&end| end < at)
+    }
+
+    /// The first interval at or past a cursor, with a galloping search
+    /// so a sequence of nearby row boundaries does not revisit the root.
+    #[inline]
+    pub(crate) fn seek(&self, at: u64, from: usize) -> usize {
+        if self.ends.get(from).is_none_or(|&end| at <= end) {
+            return from;
+        }
+        let mut skip = 1;
+        let rest = &self.ends[from..];
+        while rest.get(skip).is_some_and(|&end| end < at) {
+            skip *= 2;
+        }
+        let first = skip / 2 + 1;
+        from + first + rest[first..(skip + 1).min(rest.len())].partition_point(|&end| end < at)
+    }
+
+    /// Whether the range straddles a branch or gap boundary.
+    pub fn contains_boundary(&self, range: CdfRange) -> bool {
+        let (start, end) = range.bounds();
+        let pos = self.ends.partition_point(|&end| end < start);
+        self.ends.get(pos).is_some_and(|&cut| cut < end)
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        size_of::<Self>() + self.heap_bytes()
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.entries.capacity() * size_of::<BranchHit>()
+            + self.ends.capacity() * size_of::<u64>()
+            + self.pos_to_entry.capacity() * size_of::<u32>()
+    }
+}
+
+impl PStore for TieredPStore {
+    fn name() -> &'static str {
+        "TieredPStore(base2)"
+    }
+
+    fn from_logits(logits: &[f32]) -> Self {
+        Self::from_logits(logits)
+    }
+
+    fn query_tall(
+        &self,
+        range: CdfRange,
+        min_mass: u64,
+        _scratch: &mut QueryScratch,
+        out: &mut Vec<BranchHit>,
+    ) {
+        self.tall(range, min_mass, out);
+    }
+
     fn locate(&self, cdf: u64) -> Option<BranchHit> {
-        locate_in_slice(&self.starts, &self.ends, &self.branches, &self.ln_p, cdf)
+        self.locate(cdf)
     }
 
     fn contains_boundary(&self, range: CdfRange) -> bool {
-        contains_boundary_in_slice(&self.ends, range)
+        self.contains_boundary(range)
     }
 
     fn memory_bytes(&self) -> usize {
-        use std::mem::size_of;
-        size_of::<Self>()
-            + (self.starts.capacity() + self.ends.capacity()) * size_of::<u64>()
-            + self.branches.capacity() * size_of::<Branch>()
-            + self.ln_p.capacity() * size_of::<f32>()
-            + self.entries.capacity() * size_of::<TierEntry>()
+        self.memory_bytes()
     }
 }
 

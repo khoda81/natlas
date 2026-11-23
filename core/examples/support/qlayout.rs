@@ -1,12 +1,15 @@
-use natlas_core::pstore::CdfRange;
-use natlas_core::qlayout::{FastTree, QViewport, ROOT_IDX};
-use natlas_core::tree::Lens;
+use natlas_core::client::ClientTree;
+use natlas_core::distribution::{log_softmax, Distribution};
+use natlas_core::layout::{Anchor, Camera, Viewport};
+use natlas_core::point::Point;
+use natlas_core::tree::{Lens, NodeId, ROOT};
 
 pub const FRAMES: usize = 180;
 pub const VOCAB: usize = 150_000;
-const ROWS: u32 = 900;
-const WIDTH: f64 = 1200.0;
-const CDF_SIZE: u128 = 1 << 64;
+pub const VIEW: Viewport = Viewport {
+    width: 1200.0,
+    height: 900.0,
+};
 
 struct Rng(u64);
 
@@ -30,9 +33,19 @@ fn logits(count: usize, alpha: f64) -> Vec<f32> {
         .collect()
 }
 
+fn insert_logits(tree: &mut ClientTree, node: NodeId, measure: usize, logits: &[f32]) {
+    let mut children: Vec<_> = (0..).zip(logits.iter().copied().map(f64::from)).collect();
+    log_softmax(&mut children);
+    let d = Distribution::from_ordered(children).unwrap();
+    let count = d.count().unwrap();
+    let children: Vec<_> = (0..count as usize).map(|at| (0, at)).collect();
+    tree.insert(node, measure, d.answer(&children, 0), Some(count))
+        .unwrap();
+}
+
 /// The same topology, logits and q permutation as the packed benchmark for
 /// Heaviest. Shuffled gives the root and intermediate p measures arbitrary order.
-pub fn build_tree(shuffled: bool) -> FastTree {
+pub fn build_tree(shuffled: bool) -> ClientTree {
     let mut rng = Rng(0xdead_beef_cafe_babe);
     let mut pair = |count, alpha, shuffle_p| {
         let mut p = logits(count, alpha);
@@ -47,25 +60,25 @@ pub fn build_tree(shuffled: bool) -> FastTree {
     let (mid_p, mid_q) = pair(4096, 1.2, shuffled);
     let (leaf_p, leaf_q) = pair(256, 1.35, false);
 
-    let mut tree = FastTree::new();
-    tree.set_measure_logits(ROOT_IDX, 0, &root_p);
-    tree.set_measure_logits(ROOT_IDX, 1, &root_q);
+    let mut tree = ClientTree::new();
+    insert_logits(&mut tree, ROOT, 0, &root_p);
+    insert_logits(&mut tree, ROOT, 1, &root_q);
     for b1 in 0..6 {
-        let n1 = tree.child(ROOT_IDX, b1).unwrap();
-        tree.set_measure_logits(n1, 0, &mid_p);
-        tree.set_measure_logits(n1, 1, &mid_q);
+        let n1 = tree.child(ROOT, b1).unwrap();
+        insert_logits(&mut tree, n1, 0, &mid_p);
+        insert_logits(&mut tree, n1, 1, &mid_q);
         for b2 in 0..3 {
             let n2 = tree.child(n1, b2).unwrap();
-            tree.set_measure_logits(n2, 0, &mid_p);
-            tree.set_measure_logits(n2, 1, &mid_q);
+            insert_logits(&mut tree, n2, 0, &mid_p);
+            insert_logits(&mut tree, n2, 1, &mid_q);
         }
     }
-    let mut spine = tree.child(ROOT_IDX, 0).unwrap();
+    let mut spine = tree.child(ROOT, 0).unwrap();
     spine = tree.child(spine, 0).unwrap();
     for _ in 2..20 {
         spine = tree.child(spine, 0).unwrap();
-        tree.set_measure_logits(spine, 0, &leaf_p);
-        tree.set_measure_logits(spine, 1, &leaf_q);
+        insert_logits(&mut tree, spine, 0, &leaf_p);
+        insert_logits(&mut tree, spine, 1, &leaf_q);
     }
     tree
 }
@@ -86,7 +99,7 @@ impl Motion {
         }
     }
 
-    pub fn viewports(self, frames: usize) -> Vec<QViewport> {
+    pub fn cameras(self, frames: usize) -> Vec<Camera> {
         (0..frames)
             .map(|i| {
                 let t = i as f64 / (frames - 1).max(1) as f64;
@@ -106,26 +119,15 @@ impl Motion {
                     ),
                     Self::ZoomDive => (t * 18.0, 120.0, 0.12, 0.35),
                 };
-                let height = (-x).exp();
-                let top = anchor - a * height;
-                let bottom = top + height;
-                let start = (top.max(0.0) * CDF_SIZE as f64).floor() as u64;
-                let end = (bottom.min(1.0) * CDF_SIZE as f64).ceil() as u128;
-                let rows = f64::from(ROWS);
-                // Keep blank rows above the root and beyond its bottom.
-                let visible_top = if top < 0.0 { -top / height * rows } else { 0.0 };
-                let visible_bottom = if 1.0 < bottom {
-                    (1.0 - top) / height * rows
-                } else {
-                    rows
-                };
-                QViewport {
-                    root: ROOT_IDX,
-                    range: CdfRange::new(start, (end - 1) as u64),
-                    visible_rows: [visible_top, visible_bottom],
-                    x_left: x as f32,
-                    x_right: (x + WIDTH / k) as f32,
-                    rows: ROWS,
+                Camera {
+                    origin: ROOT,
+                    x,
+                    k,
+                    anchor: Anchor {
+                        path: Vec::new(),
+                        digits: Point::top().plus(anchor).digits(),
+                    },
+                    a,
                 }
             })
             .collect()

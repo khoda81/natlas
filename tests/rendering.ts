@@ -3,7 +3,7 @@ import { layout, pick, top, type Frame } from "../src/core/layout";
 import { IntervalTree, type Lens, ROOT } from "../src/core/tree";
 import { Palette } from "../src/ui/color";
 import { draw, NATS, RULER_HEIGHT } from "../src/ui/render";
-import { answer, run } from "./build";
+import { answer, digits, run } from "./build";
 
 const view = { width: 270, height: 340 };
 const palette = Palette.current();
@@ -50,7 +50,7 @@ gapped.insert(ROOT, 0, { runs: Array.from({ length: count / 2 }, (_, i) =>
  * itself: one any edge of them falls in, each pixel the half-open square
  * from its corner, is outline; one whose middle is inside them is filled;
  * any other is background. Their edges: where they start, the node's top
- * and bottom, each child's end, and each step between two children.
+ * and bottom, each child's end, and the shared horizontal edges of two children.
  */
 function oracle(tree: IntervalTree, lens: Lens, frame: Frame, camera: ReturnType<typeof cam>, dpr: number): Uint8Array {
   const [columns, rows] = [Math.round(view.width * dpr), Math.floor(view.height * dpr)];
@@ -81,7 +81,7 @@ function oracle(tree: IntervalTree, lens: Lens, frame: Frame, camera: ReturnType
   children.forEach((child, i) => {
     mark(cell(child.y0), cell(child.y1 - 2e-6), cell(child.x1), cell(child.x1));
     const next = children[i + 1];
-    if (next !== undefined) mark(cell(child.y1), cell(child.y1), cell(Math.min(child.x1, next.x1)), cell(Math.max(child.x1, next.x1)));
+    if (next !== undefined) mark(cell(child.y1), cell(child.y1), cell(x0), cell(Math.max(child.x1, next.x1)));
   });
   return shown;
 }
@@ -108,6 +108,37 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       results.push({ name: `pixels by containment: ${name}`, dpr, phase, error });
       frame.dispose();
     }
+  }
+
+  // Three boundaries of equal-width siblings occupy one row when small.
+  // After zoom they are separate lines, including after the camera pans.
+  {
+    const tree = new IntervalTree();
+    const cuts = [0.5, 0.5004, 0.5008];
+    tree.insert(ROOT, 0, complete([cuts[0]!, cuts[1]! - cuts[0]!, cuts[2]! - cuts[1]!, 1 - cuts[2]!]));
+    tree.insert(ROOT, 1, answer(Array(4).fill(Math.exp(-7))));
+    const lens = { p: 0, q: 1 };
+    const anchor = { path: [], digits: digits(0.5) };
+    let error = 0;
+    for (const [x, pan] of [[0, 0.1], [4, 0.1], [4, 0.77]] as const) {
+      const a = (Math.floor(0.4 * view.height * dpr) + pan) / (view.height * dpr);
+      const camera = { ...cam(0, 40), x, anchor, a };
+      const frame = layout(tree, lens, camera, view, { rowPx: 1 / dpr });
+      const ctx = canvas(dpr).getContext("2d")!;
+      draw(ctx, frame, camera, view, palette, state);
+      const rows = cuts.map(cut => Math.floor((a + (cut - 0.5) * Math.exp(x)) * view.height * dpr + 1e-6));
+      const column = Math.floor(30 * dpr);
+      const color = (row: number, rgb: number[]) => differs(ctx.getImageData(column, row, 1, 1).data, 0, rgb);
+      for (const row of rows) error = Math.max(error, color(row, stroke));
+      if (x === 0) {
+        if (new Set(rows).size !== 1) error = 255;
+      } else {
+        if (new Set(rows).size !== cuts.length) error = 255;
+        for (const row of rows.slice(0, -1)) error = Math.max(error, color(row + 1, fill));
+      }
+      frame.dispose();
+    }
+    results.push({ name: "sibling boundaries stay visible and split on zoom", dpr, phase: 0, error });
   }
 
   // A node's time branches are one CDF on the timeline drawn across the same

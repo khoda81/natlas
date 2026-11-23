@@ -8,7 +8,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::{wasm_bindgen_bench, wasm_bindgen_test_configure, Criterion};
 
-use natlas_core::qlayout::{layout_frame, QFrame};
+use natlas_core::layout::{layout_into, Frame};
 
 #[path = "../examples/support/qlayout.rs"]
 mod workload;
@@ -28,16 +28,24 @@ fn layout_trajectory(criterion: &mut Criterion) {
             "distinct_q"
         };
         let name = format!(
-            "qlayout/{fixture}/{}/{relation}/FastTree/{}",
+            "qlayout/{fixture}/{}/{relation}/ClientTree/{}",
             motion.name(),
             workload::VOCAB,
         );
-        let viewports = motion.viewports(workload::FRAMES);
-        let mut frame = QFrame::default();
+        let viewports = motion.cameras(workload::FRAMES);
+        let mut frame = Frame::default();
         criterion.bench_function(&name, |bencher| {
             bencher.iter(|| {
-                for &view in black_box(&viewports) {
-                    layout_frame(tree, lens, view, &mut frame);
+                for camera in black_box(&viewports) {
+                    frame = layout_into(
+                        tree,
+                        lens,
+                        camera,
+                        workload::VIEW,
+                        1.0,
+                        std::mem::take(&mut frame),
+                    )
+                    .unwrap();
                     black_box(&frame);
                 }
             });

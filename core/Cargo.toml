@@ -35,3 +35,10 @@ harness = false
 [[bench]]
 name = "qlayout"
 harness = false
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O3"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

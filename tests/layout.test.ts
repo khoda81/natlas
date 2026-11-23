@@ -15,11 +15,11 @@ describe("layout", () => {
     const high = layout(tree, lens, cam, view, { rowPx: 1 / 2 });
     // At 800 CSS pixels high, the last two children are 0.72 and 0.48 CSS
     // pixels tall: no box of their own, and the last physical row holds
-    // both, filled as far as the narrower reaches. On a 2× display the
+    // both, with a horizontal boundary reaching the wider child. On a 2× display the
     // first of them is a box of its own.
     expect(low.boxes.map(box => box.rank)).toEqual([0, 1]);
     const last = low.spans.find(span => Math.round(span.y0 * view.height) === 799)!;
-    expect(last.fill - last.x0).toBeCloseTo(-Math.log(0.0009), 12);
+    expect(last.fill).toBe(last.x0);
     expect(last.reach - last.x0).toBeCloseTo(-Math.log(0.0006), 12);
     expect(high.boxes.find(box => box.rank === 2)).toMatchObject({ kind: "leaf", branch: 2 });
     for (const frame of [low, high]) {
@@ -37,12 +37,12 @@ describe("layout", () => {
     const widths = frame.spans.map(span => [Math.round(span.y0 * view.height), Math.round(span.y1 * view.height),
       span.fill - span.x0, span.reach - span.x0]);
     // Each half as wide as −ln q, its outline at its end; outline rows at
-    // the node's top and at the step between them.
+    // the node's top and at the boundary between them.
     const [wide, narrow] = [-Math.log(0.25), -Math.log(0.75)];
     expect(widths).toEqual([
       [0, 1, 0, expect.closeTo(wide, 12)],
       [1, 400, expect.closeTo(wide, 12), expect.closeTo(wide, 12)],
-      [400, 401, expect.closeTo(narrow, 12), expect.closeTo(wide, 12)],
+      [400, 401, 0, expect.closeTo(wide, 12)],
       [401, 800, expect.closeTo(narrow, 12), expect.closeTo(narrow, 12)],
     ]);
     frame.dispose();

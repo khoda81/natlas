@@ -18,7 +18,7 @@ import {
 } from "../core/layout";
 import { modelOf, parse } from "../data/catalog";
 import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, type Held, manifest, type Specs } from "../data/source";
-import { type Branch, IntervalTree, type NodeId, ROOT } from "../core/tree";
+import { IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
 import { glide, moveDepth, panVertical, scale } from "./camera";
 import { parseView, type SavedView, serializeView, viewKey } from "./view-state";
@@ -51,13 +51,9 @@ const LOCAL_SERVER = "http://localhost:8421/";
 
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
-/** A glide to depth ``to.x`` with the camera's point ``to.a`` view heights
- * down, begun at ``start``, ``eased`` of the way there so far. */
-/** A focus animation, toward a fixed camera, or toward a node standing
- * like the root wherever layout places it on each frame: a group's width
- * may change as its children arrive. */
+/** A glide to a position in the view, begun at ``start`` and ``eased`` of the way there. */
 interface Focus {
-  to: { x: number; a: number } | { node: NodeId };
+  to: { x: number; a: number };
   start: number;
   eased: number;
 }
@@ -318,7 +314,11 @@ export class App {
     const tree = this.tree!;
     const chain = tree.chain(origin, target);
     let first = 0;
-    while (first < chain.length - 1 && tree.entry(chain[first]!, this.lens, tree.branch(chain[first + 1]!)) !== undefined) first++;
+    while (first < chain.length - 1) {
+      const edge = tree.entry(chain[first]!, this.lens, tree.branch(chain[first + 1]!));
+      if (edge === undefined || !Number.isFinite(edge.natsQ)) break;
+      first++;
+    }
     if (first === chain.length - 1) return true;
     return this.link!.place(chain[first]!, chain.slice(first + 1).map((node) => tree.branch(node)));
   }
@@ -716,7 +716,7 @@ export class App {
         const x = pixelCorner(event.offsetX, this.pixelRatio);
         const y = pixelCorner(event.offsetY, this.pixelRatio);
         const selection = this.frame ? pick(this.tree!, this.lens, this.frame, this.cam, this.view, x, y, 1 / this.pixelRatio) : null;
-        if (selection) this.startFocus(selection.box);
+        if (selection) this.selectBox(selection.box);
       }
       this.invalidate();
     };
@@ -835,7 +835,7 @@ export class App {
       // A recording dropped on a server whose measures hear one is what p hears.
       const audio = files[0]!;
       if (files.length === 1 && this.dataset?.recordings != null &&
-          (audio.type.startsWith("audio/") || audio.name.toLowerCase().endsWith(".m4a"))) {
+        (audio.type.startsWith("audio/") || audio.name.toLowerCase().endsWith(".m4a"))) {
         this.setStatus(`Uploading ${audio.name} …`);
         this.measures!.hear(audio).then(() => this.setStatus(""), (error: unknown) => this.setStatus(String(error)));
         return;
@@ -969,51 +969,27 @@ export class App {
 
   // Focus animation.
 
-  private startFocus(box: Box): void {
+  private selectBox(box: Box): void {
     const tree = this.tree;
     if (tree === null) return;
-    // The point becomes the box's top: a child's by name, a gap's or a
-    // row's, which have none, by where it is drawn.
-    if (box.branch === null) {
-      aim(tree, this.lens, this.cam, box.y0);
-      if (this.cam.a !== box.y0) return;
-    } else {
-      const path = tree.chain(this.cam.origin, box.node).slice(1).map((node) => tree.branch(node));
-      this.cam.anchor = top([...path, box.branch]);
-      this.cam.a = box.y0;
+    if (box.branch !== null) {
+      this.fly(tree.child(box.node, box.branch));
+      return;
     }
-    // Standing like the root: as tall as the view where its width allows,
-    // centred; a child wherever layout places it on each frame.
-    const to = box.branch === null ? standing(box.lnMass, box.x1) : { node: tree.child(box.node, box.branch) };
+    // An unresolved interval is selected by its position in the view.
+    aim(tree, this.lens, this.cam, box.y0);
+    if (this.cam.a !== box.y0) return;
+    const to = standing(box.lnMass, box.x1);
     this.focus = { to, start: performance.now(), eased: 0 };
     this.invalidate();
-  }
-
-  /** Where ``node`` stands like the root, as layout places it now: none
-   * once the origin no longer reaches it. */
-  private standingAt(node: NodeId): { x: number; a: number } | null {
-    const tree = this.tree!;
-    let path: Branch[];
-    try {
-      path = tree.chain(this.cam.origin, node).slice(1).map((child) => tree.branch(child));
-    } catch {
-      return null;
-    }
-    const at = reach(tree, this.lens, this.cam.origin, path);
-    return at.placed === path.length ? standing(at.lnMass, at.x) : null;
   }
 
   private stepFocus(time: number): void {
     const focus = this.focus!;
     const t = Math.min(1, Math.max(0, (time - focus.start) / FOCUS_MS));
     const eased = t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
-    const to = "node" in focus.to ? this.standingAt(focus.to.node) : focus.to;
-    if (to === null) {
-      this.focus = null;
-      return;
-    }
     // This frame's share of what was left.
-    glide(this.cam, to, focus.eased < 1 ? (eased - focus.eased) / (1 - focus.eased) : 1);
+    glide(this.cam, focus.to, focus.eased < 1 ? (eased - focus.eased) / (1 - focus.eased) : 1);
     focus.eased = eased;
     if (t === 1) this.focus = null;
   }

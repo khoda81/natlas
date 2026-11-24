@@ -180,6 +180,22 @@ describe("Link", () => {
     link.dispose();
   });
 
+  it("requires a width as well as a position for a completed path", async () => {
+    const tree = new IntervalTree();
+    const server = scripted();
+    const link = new Link(tree, server);
+    link.look({ p: "p", q: "q" }, null);
+    const listing = { node: ROOT, parent: null, branch: null, ...answer([0.5, 0.5]), count: 2 };
+    const done: Update = { kind: "placed", node: ROOT, branches: [1] };
+    const partial = link.place(ROOT, [1]);
+    server.say([{ ...listing, kind: "answer", measure: "p" }, done]);
+    expect(await partial).toBe(false);
+    const complete = link.place(ROOT, [1]);
+    server.say([{ ...listing, kind: "answer", measure: "q" }, done]);
+    expect(await complete).toBe(true);
+    link.dispose();
+  });
+
   it("reports a server's failure", () => {
     const server = scripted();
     const link = new Link(new IntervalTree(), server);

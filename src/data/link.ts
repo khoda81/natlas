@@ -121,11 +121,12 @@ export class Link {
     if (changed) this.tell();
   }
 
-  /** Whether p places every branch of the path. */
+  /** Whether p and q give every branch of the path a position and finite width. */
   private placed({ node, branches }: Path): boolean {
     const lens = { p: this.tree.measure(this.specs!.p), q: this.tree.measure(this.specs!.q) };
     for (const branch of branches) {
-      if (this.tree.entry(node, lens, branch) === undefined) return false;
+      const edge = this.tree.entry(node, lens, branch);
+      if (edge === undefined || !Number.isFinite(edge.natsQ)) return false;
       node = this.tree.child(node, branch);
     }
     return true;

@@ -617,10 +617,8 @@ export class App {
     if (specs.some((spec) => this.link!.lacks(origin, tree.measure(spec)))) {
       return { text: "This recording does not continue here · press 0 for the root", loading: false };
     }
-    const waiting = specs.filter((spec) => !tree.has(origin, tree.measure(spec)));
-    if (waiting.length === 0) return null;
-    const { catalog, recordings } = this.dataset!;
-    return { text: `Loading ${waiting.map((spec) => describe(catalog, spec, recordings)).join(" and ")} …`, loading: true };
+    if (specs.every((spec) => tree.has(origin, tree.measure(spec)))) return null;
+    return { text: "Waiting for branches…", loading: true };
   }
 
   /** Draw the previous view over this one, fading and growing as if passed through. */

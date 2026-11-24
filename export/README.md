@@ -26,6 +26,28 @@ four tokens. Other settings include `temperature=T` and, for GGUF models,
 `control=NAME`. Precision `auto` uses the checkpoint's saved precision.
 See [lm.py](lm.py) for the model and measure implementations.
 
+### Qwen chat markers
+
+The live server tokenizes the text you enter in the path inspector directly.
+In Qwen3 chat, `<|im_start|>user` and `<|im_start|>assistant` open turns,
+and `<|im_end|>` closes a turn. Paste a prefix like this to explore the
+assistant's next token.
+
+```text
+<|im_start|>user
+What is 2 + 2?<|im_end|>
+<|im_start|>assistant
+```
+
+Keep a newline after `assistant`. Use Shift+Enter to insert a newline in
+the inspector and Enter to jump to the path.
+
+`<think>` opens the assistant's reasoning block and `</think>` closes it
+before the answer. To start inside the block, append `<think>` followed by
+a newline. The Qwen3 non-thinking template appends an empty block,
+`<think>\n\n</think>\n\n`, with real newlines.
+[Qwen3-4B chat template](https://huggingface.co/Qwen/Qwen3-4B/blob/main/tokenizer_config.json)
+
 ## Live endpoints
 
 The [shared service](service.py) implements the browser's WebSocket session

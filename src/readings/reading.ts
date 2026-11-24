@@ -5,6 +5,7 @@ import type { IntervalTree, Branch, NodeId } from "../core/tree";
 import type { Values } from "../data/catalog";
 
 export type Mark = "onset" | "offset" | "tie" | "hit" | "time" | "instrument" | "end";
+export type ChatSection = "user" | "assistant" | "thinking";
 
 export interface Glyph {
   text: string;
@@ -60,6 +61,8 @@ export interface Reading {
   show(panel: HTMLElement, node: NodeId, branch: Branch | null, more?: string): void;
   /** Plain text for editing/searching, for readers whose labels represent text. */
   text?(node: NodeId, branch: Branch | null): string;
+  /** The chat section at this path, including ``branch`` when given. */
+  conversation?(node: NodeId, branch?: Branch): ChatSection | null;
   key?(event: KeyboardEvent): boolean;
   /** Where its time is on the page now, while it shows it. */
   timeline?(): Timeline | null;

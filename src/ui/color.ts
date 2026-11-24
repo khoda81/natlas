@@ -1,8 +1,10 @@
 // The canvas's colors, each thing its own: the background for empty space,
-// one quiet fill for the inside of every node's children, a gray outline
+// quiet fills for the inside of every node's children, a gray outline
 // around them, ink for labels and time, a quieter fill under time windows,
 // and one saturated color, the hover's, which nothing else uses. Color says nothing about the measures:
 // height is p, width is −ln q, and their product the area.
+
+import type { ChatSection } from "../readings/reading";
 
 type Rgb = readonly [number, number, number];
 
@@ -12,8 +14,9 @@ export interface Scheme {
   inkMuted: string;
   inkOnDark: string;
   inkOnLight: string;
-  /** The inside of every node's children. */
+  /** The default fill for a branch. */
   tile: string;
+  conversation: Record<ChatSection, string>;
   /** The outline around each node's children, apart from fill and background. */
   stroke: string;
   /** Under a time window: further from the ink than the fill, so labels on
@@ -30,6 +33,7 @@ const LIGHT: Scheme = {
   inkOnDark: "#f0efec",
   inkOnLight: "#0b0b0b",
   tile: "#e4e8ed",
+  conversation: { user: "#cee6f8", assistant: "#d7ebd8", thinking: "#e6dcf8" },
   stroke: "#a3abb6",
   window: "#f4f6f8",
   hover: "#c26a00",
@@ -42,6 +46,7 @@ const DARK: Scheme = {
   inkOnDark: "#f0efec",
   inkOnLight: "#0b0b0b",
   tile: "#30343b",
+  conversation: { user: "#25445b", assistant: "#254839", thinking: "#49355c" },
   stroke: "#5f6773",
   window: "#202328",
   hover: "#f0a040",

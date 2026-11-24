@@ -30,8 +30,9 @@ See [lm.py](lm.py) for the model and measure implementations.
 
 The live server tokenizes the text you enter in the path inspector directly.
 In Qwen3 chat, `<|im_start|>user` and `<|im_start|>assistant` open turns,
-and `<|im_end|>` closes a turn. Paste a prefix like this to explore the
-assistant's next token.
+and `<|im_end|>` closes a turn. The live server gives next-token
+distributions after the separator, so you can explore paths across turns.
+Paste a prefix like this to explore the assistant's next token.
 
 ```text
 <|im_start|>user

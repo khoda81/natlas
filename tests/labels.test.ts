@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { IntervalTree, ROOT } from "../src/core/tree";
 import { TextLabels } from "../src/readings/labels";
 
 const utf8 = (text: string) => new TextEncoder().encode(text);
@@ -21,5 +22,26 @@ describe("TextLabels", () => {
 
   it("parses base64 labels", () => {
     expect(TextLabels.parse(JSON.stringify([btoa("a b"), btoa("\xda")])).along([0, 1])).toEqual(["a b", ""]);
+  });
+
+  it("follows ChatML roles and thinking markers along each branch", () => {
+    const pieces = ["<|im_start|>", "us", "er", "\n", "assistant\n", "system\n",
+      "<|im_end|>", "<think>", "</thi", "nk>", " text"];
+    const tree = new IntervalTree();
+    const conversation = new TextLabels(pieces.map(utf8)).read(tree).conversation!;
+    const branch = (piece: string) => pieces.indexOf(piece);
+    const node = (...path: string[]) => tree.descend(ROOT, path.map(branch));
+    const user = ["<|im_start|>", "us", "er", "\n"];
+    const assistant = [...user, " text", "<|im_end|>", "\n", "<|im_start|>", "assistant\n"];
+
+    expect(labels.read(tree).conversation).toBeUndefined();
+    expect(conversation(node("<|im_start|>", "system\n", " text"))).toBeNull();
+    expect(conversation(node(...user), branch("<think>"))).toBe("user");
+    expect(conversation(node(...user, "<|im_end|>"))).toBeNull();
+    expect(conversation(node(...assistant))).toBe("assistant");
+    expect(conversation(node(...assistant), branch("<think>"))).toBe("thinking");
+    expect(conversation(node(...assistant), branch(" text"))).toBe("assistant");
+    expect(conversation(node(...assistant, "<think>", " text", "</thi"))).toBe("thinking");
+    expect(conversation(node(...assistant, "<think>", " text", "</thi", "nk>", " text"))).toBe("assistant");
   });
 });

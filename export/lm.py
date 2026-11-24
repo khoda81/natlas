@@ -49,8 +49,8 @@ class Measure:
     paths: int
     # The most tokens a path it reads may hold, or None where nothing says.
     longest: int | None
-    # Whether a path is finished, with no children.
-    ends: Callable[[tuple[int, ...]], bool]
+    # Whether the source has a finite path with no continuation.
+    ends: Callable[[tuple[int, ...]], bool] = lambda _: False
     # Whether its rows are each child's own ln weight, -ln of the width it
     # is drawn at, rather than ln weights up to a constant.
     widths: bool = False
@@ -526,7 +526,8 @@ def tempered(walk: Walk, temperature: float) -> Walk:
 
 def measure(language: Language, temperature: float = 1.0, context: float | None = None) -> Measure:
     """The model at ``temperature``, seeing only the last ``context`` tokens
-    where that is given."""
+    where that is given. Every readable prefix has a next-token distribution,
+    including prefixes ending in a generation stop token."""
     walk, width, longest = language.walk, language.width, language.longest
     if context is not None:
         n = int(context)
@@ -542,8 +543,7 @@ def measure(language: Language, temperature: float = 1.0, context: float | None 
         width = language.paths
         # A window longer than the model reads fails on paths that long.
         longest = None if language.longest is None or n <= language.longest else language.longest
-    eos = language.eos
-    return Measure(language.start, tempered(walk, temperature), width, language.paths, longest, lambda tokens: bool(tokens) and tokens[-1] in eos)
+    return Measure(language.start, tempered(walk, temperature), width, language.paths, longest)
 
 
 def catalog(

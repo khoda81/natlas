@@ -31,9 +31,11 @@ Each child of a node is a box.
 At a node with $p$-mass $m$, the area of the child boxes represents
 $m \sum_i p_i(-\ln q_i)$. This is mass times conditional entropy when
 $p = q$, or mass times conditional cross-entropy when the measures differ.
-The excess over the $p = q$ area is $m D_{\mathrm{KL}}(p\|q)$. Color
-shows the branch's conditional $p$ when $p = q$. With two measures it shows
-$\ln(p/q)$, red where $q$ gives the branch less weight.
+The excess over the $p = q$ area is $m D_{\mathrm{KL}}(p\|q)$.
+
+For ChatML token paths, blue fills show the user turn, green the assistant
+turn, and purple the assistant's thinking. A turn separator brings the fill
+back to neutral until the next role header.
 
 ## Canvas navigation
 

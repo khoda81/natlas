@@ -1,6 +1,7 @@
 // Real Canvas pixel checks, served by scripts/check-rendering.ts.
 import { layout, pick, top, type Frame } from "../src/core/layout";
 import { IntervalTree, type Lens, ROOT } from "../src/core/tree";
+import { TextLabels } from "../src/readings/labels";
 import { Palette } from "../src/ui/color";
 import { draw, NATS, RULER_HEIGHT } from "../src/ui/render";
 import { answer, digits, run } from "./build";
@@ -108,6 +109,38 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
       results.push({ name: `pixels by containment: ${name}`, dpr, phase, error });
       frame.dispose();
     }
+  }
+
+  // Branch fills follow the resulting role, including on its control token.
+  // The same sibling boundary pixels are still drawn over every fill.
+  {
+    const tree = new IntervalTree();
+    const tokens = ["<|im_start|>", "user\n", "assistant\n", "<think>", "</think>", "<|im_end|>", " text"];
+    const utf8 = new TextEncoder();
+    const { conversation } = new TextLabels(tokens.map(token => utf8.encode(token))).read(tree);
+    const { user, assistant, thinking } = palette.scheme.conversation;
+    let error = 0;
+    for (const [path, branches, colors] of [
+      [[0], [1, 2], [user, assistant]],
+      [[0, 2], [6, 3, 5, 0], [assistant, thinking, palette.scheme.tile, palette.scheme.tile]],
+      [[0, 2, 3], [6, 4], [thinking, assistant]],
+    ] as const) {
+      const origin = tree.descend(ROOT, path);
+      tree.insert(origin, 0, complete(branches.map(() => 1 / branches.length), [...branches]));
+      const camera = { ...cam(0, 100), origin };
+      const frame = layout(tree, { p: 0, q: 0 }, camera, view, { rowPx: 1 / dpr });
+      const c = canvas(dpr), ctx = c.getContext("2d")!;
+      draw(ctx, frame, camera, view, palette, { ...state, conversation });
+      for (const [i, color] of colors.entries()) {
+        const height = view.height * dpr / branches.length;
+        const column = Math.floor(12 * dpr);
+        const interior = ctx.getImageData(column, Math.floor((i + 0.5) * height), 1, 1).data;
+        const boundary = ctx.getImageData(column, Math.floor(i * height + 1e-6), 1, 1).data;
+        error = Math.max(error, differs(interior, 0, rgb(color)), differs(boundary, 0, stroke));
+      }
+      frame.dispose();
+    }
+    results.push({ name: "ChatML branches tint the fill and retain their outlines", dpr, phase: 0, error });
   }
 
   // Three boundaries of equal-width siblings occupy one row when small.

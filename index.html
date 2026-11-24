@@ -39,9 +39,10 @@
       <p>
         Each node's interval is split among its children. Height is the child's probability under
         <b>p</b>; width is its surprisal under <b>q</b>, −log q. With p = q the boxes of a node add up
-        to its entropy in area; otherwise to its cross-entropy, and color shows ln(p/q).
+        to its entropy in area. With different measures, they add up to its cross-entropy.
       </p>
-      <p>Gray tails are children not yet listed, drawn at the least width they can have. Sub-pixel children merge into borderless runs without changing the tree.</p>
+      <p>For ChatML text, blue shows the user turn, green the assistant turn, and purple the assistant's thinking.</p>
+      <p>Gaps stand for children waiting to be listed, drawn at the least width they can have. A pixel can show several sibling boundaries until you zoom in.</p>
       <h2>Moving</h2>
       <dl>
         <dt>wheel · → ←</dt>

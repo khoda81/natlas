@@ -591,6 +591,7 @@ export class App {
       hover: this.hover,
       units: this.units,
       glyph: (node, branch) => this.glyph(node, branch),
+      conversation: this.reading?.conversation,
       note: origin && { text: origin.text, sweep: origin.loading && !this.reducedMotion.matches ? time : null },
     });
     this.fadeOut(time);

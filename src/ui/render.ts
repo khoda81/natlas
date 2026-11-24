@@ -4,7 +4,7 @@ import { decimalTicks, layoutTicks } from "@qbar/qbar";
 import type { Palette } from "./color";
 import type { Box, Camera, Frame, Known, Selection, Viewport } from "../core/layout";
 import type { NodeId } from "../core/tree";
-import type { Glyph, Mark, Timeline, Trail } from "../readings/reading";
+import type { ChatSection, Glyph, Mark, Reading, Timeline, Trail } from "../readings/reading";
 
 export interface Units {
   name: string;
@@ -20,6 +20,7 @@ export interface DrawState {
   units: Units;
   /** How the child along ``branch`` of node ``node`` reads. */
   glyph: (node: NodeId, branch: number) => Glyph;
+  conversation?: Reading["conversation"];
   /** Why the origin shows no children, if it does not; ``sweep`` animates
    * a faint band behind the text while they load. */
   note: { text: string; sweep: number | null } | null;
@@ -161,16 +162,50 @@ export function draw(
     if (node === undefined) spans.set(span.node, [painted]);
     else node.push(painted);
   }
-  // Each layer one path, filled once: a call a span would cost more than
-  // the pixels.
+  // Batch spans by fill. A span without a named branch reads as its node's
+  // prefix, so thin tails require no extra child traversal.
+  const conversation = state.conversation;
+  const fills = new Map<ChatSection, Path2D>();
   ctx.beginPath();
-  for (const node of spans.values()) {
-    for (const { y0, y1, left, fill } of node) {
-      if (fill !== null && left + pixel < fill) ctx.rect(left + pixel, y0, fill - left - pixel, y1 - y0);
+  for (const [node, rows] of spans) {
+    const section = conversation?.(node) ?? null;
+    let path: Path2D | CanvasRenderingContext2D = ctx;
+    if (section !== null) {
+      let tint = fills.get(section);
+      if (tint === undefined) fills.set(section, tint = new Path2D());
+      path = tint;
+    }
+    for (const { y0, y1, left, fill } of rows) {
+      if (fill !== null && left + pixel < fill) path.rect(left + pixel, y0, fill - left - pixel, y1 - y0);
     }
   }
   ctx.fillStyle = scheme.tile;
   ctx.fill();
+  for (const [section, path] of fills) {
+    ctx.fillStyle = scheme.conversation[section];
+    ctx.fill(path);
+  }
+  // Some branches change section. Recolor the part of their box already
+  // filled by the spans, leaving all outline pixels and holes alone.
+  if (conversation !== undefined) {
+    for (const box of frame.boxes) {
+      const rows = spans.get(box.node);
+      if (rows === undefined || box.branch === null || !Number.isFinite(box.x1)) continue;
+      const section = conversation(box.node, box.branch);
+      if (section === conversation(box.node)) continue;
+      const top = gridEdge(box.y0 * view.height, scale);
+      const bottom = gridEdge(box.y1 * view.height, scale);
+      const right = column(box.x1);
+      ctx.fillStyle = section === null ? scheme.tile : scheme.conversation[section];
+      // A node's spans are laid out from top to bottom.
+      for (const { y0, y1, left, fill } of rows) {
+        if (bottom <= y0) break;
+        const start = Math.max(y0, top), end = Math.min(y1, bottom);
+        const x1 = Math.min(fill ?? left, right);
+        if (start < end && left + pixel < x1) ctx.fillRect(left + pixel, start, x1 - left - pixel, end - start);
+      }
+    }
+  }
   if (state.timeline !== null) {
     timeCdfs(ctx, spans, state.timeline, view, state.known, (node, branch) => state.glyph(node, branch).time, scheme.window, palette.ink);
   }

@@ -4,8 +4,45 @@
 // it shows the characters its own bytes complete. A labels file is a JSON
 // array of base64 strings, indexed by label, as proto3 JSON writes bytes.
 
-import { type Glyph, type Labels, type Reading, States } from "./reading";
+import { type ChatSection, type Glyph, type Labels, type Reading, States } from "./reading";
 import type { IntervalTree, Branch, NodeId } from "../core/tree";
+
+const TURN_START = "<|im_start|>";
+const USER_START = `${TURN_START}user\n`;
+const ASSISTANT_START = `${TURN_START}assistant\n`;
+const TURN_END = "<|im_end|>";
+const THINK_START = "<think>";
+const THINK_END = "</think>";
+const CHAT_MARKERS = [USER_START, ASSISTANT_START, TURN_START, TURN_END, THINK_START, THINK_END];
+const TURN_START_BYTES = new TextEncoder().encode(TURN_START);
+
+interface ChatState {
+  section: ChatSection | null;
+  /** A suffix that can complete a delimiter or role header on the next branch. */
+  pending: string;
+}
+
+function chatAfter(before: ChatState, text: string): ChatState {
+  text = before.pending + text;
+  let section = before.section;
+  for (let at = text.indexOf("<"); at !== -1;) {
+    const tail = text.slice(at);
+    if (CHAT_MARKERS.some(marker => tail.length < marker.length && marker.startsWith(tail))) {
+      return { section: tail.startsWith(TURN_START) ? null : section, pending: tail };
+    }
+    const marker = CHAT_MARKERS.find(marker => tail.startsWith(marker));
+    switch (marker) {
+      case USER_START: section = "user"; break;
+      case ASSISTANT_START: section = "assistant"; break;
+      case TURN_START:
+      case TURN_END: section = null; break;
+      case THINK_START: if (section === "assistant") section = "thinking"; break;
+      case THINK_END: if (section === "thinking") section = "assistant"; break;
+    }
+    at = text.indexOf("<", at + (marker?.length ?? 1));
+  }
+  return section === before.section && before.pending === "" ? before : { section, pending: "" };
+}
 
 /** The bytes a decoder holds back after ``bytes``: an unfinished UTF-8 character, at most 3 bytes. */
 function unfinished(bytes: Uint8Array): Uint8Array {
@@ -32,8 +69,11 @@ function hex(bytes: Uint8Array): string {
 
 export class TextLabels implements Labels {
   private readonly decoder = new TextDecoder();
+  private readonly chat: boolean;
 
-  constructor(private readonly bytes: readonly Uint8Array[]) {}
+  constructor(private readonly bytes: readonly Uint8Array[]) {
+    this.chat = bytes.some(label => equal(label, TURN_START_BYTES));
+  }
 
   get searchable(): boolean {
     return this.bytes.length > 0;
@@ -55,6 +95,12 @@ export class TextLabels implements Labels {
   read(tree: IntervalTree): Reading {
     // Per node, the unfinished character its path's bytes end in.
     const unfinished = new States<Uint8Array>(tree, new Uint8Array(), (before, branch) => this.after(before, branch).unfinished);
+    const readChat = (before: ChatState, branch: Branch) => {
+      const own = this.bytes[branch];
+      if (before.pending === "" && !own?.includes(0x3c)) return before; // '<' starts every delimiter.
+      return chatAfter(before, own === undefined ? `#${branch}` : this.decoder.decode(own));
+    };
+    const chat = this.chat ? new States<ChatState>(tree, { section: null, pending: "" }, readChat) : null;
     const paths = new Map<NodeId, { tokens: string[]; text: string }>();
     const along = (node: NodeId) => {
       let texts = paths.get(node);
@@ -66,6 +112,10 @@ export class TextLabels implements Labels {
     };
     return {
       glyph: (node: NodeId, branch: Branch): Glyph => ({ text: visible(this.shown(unfinished.at(node), branch)) }),
+      conversation: chat === null ? undefined : (node, branch) => {
+        const before = chat.at(node);
+        return (branch === undefined ? before : readChat(before, branch)).section;
+      },
       show: (panel: HTMLElement, node: NodeId, branch: Branch | null, more?: string) => {
         const tokens = along(node).tokens;
         const current = branch === null ? null : this.shown(unfinished.at(node), branch);

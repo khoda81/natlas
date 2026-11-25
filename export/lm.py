@@ -31,7 +31,7 @@ from typing import Protocol
 
 import numpy as np
 import torch
-from catalog import Catalog, Choice, Number
+from catalog import Catalog, Choice, Number, Text
 
 # For each walk (tokens, start), the ln weights after tokens[:k] for every k
 # from start through len(tokens), a float32 row each, in order.
@@ -524,50 +524,33 @@ def tempered(walk: Walk, temperature: float) -> Walk:
     return lambda walks: [rows / np.float32(temperature) for rows in walk(walks)]
 
 
-def measure(language: Language, temperature: float = 1.0, context: float | None = None) -> Measure:
-    """The model at ``temperature``, seeing only the last ``context`` tokens
-    where that is given. Every readable prefix has a next-token distribution,
-    including prefixes ending in a generation stop token."""
-    walk, width, longest = language.walk, language.width, language.longest
-    if context is not None:
-        n = int(context)
-        if n != context or n < 1:
-            raise ValueError(f"a context is a count of tokens, not {context:g}")
-
-        def walk(walks: Sequence[tuple[Sequence[int], int]]) -> list[np.ndarray]:
-            # Each position reads its own window, a path of its own.
-            windows = [tokens[:end][-n:] for tokens, start in walks for end in range(start, len(tokens) + 1)]
-            rows = iter([rows[0] for rows in language.walk([(tokens, len(tokens)) for tokens in windows])])
-            return [np.stack([next(rows) for _ in range(start, len(tokens) + 1)]) for tokens, start in walks]
-
-        width = language.paths
-        # A window longer than the model reads fails on paths that long.
-        longest = None if language.longest is None or n <= language.longest else language.longest
-    return Measure(language.start, tempered(walk, temperature), width, language.paths, longest)
+def measure(language: Language, temperature: float = 1.0) -> Measure:
+    """The model at ``temperature``. Every readable prefix has a next-token
+    distribution, including prefixes ending in a generation stop token."""
+    return Measure(language.start, tempered(language.walk, temperature), language.width, language.paths, language.longest)
 
 
 def catalog(
-    sources: dict[str, str],
     vocabulary: Vocabulary,
-    controls: dict[str, Path],
-    presets: Sequence[str] = (),
+    suggestions: Sequence[str] = (),
     tokenizer: str | None = None,
-    context: int = 8192,
-    gpu_layers: int = -1,
 ) -> Catalog:
-    """Every source offered, loaded on any device at any precision, read at
-    any temperature and context, and steered by any control vector offered
-    where it is a .gguf file. A .gguf model reads ``context`` tokens at most,
-    with ``gpu_layers`` of its layers on a GPU (-1 for all)."""
-    # Each loaded .gguf model's steered copies, by control: let go with it.
+    """Load any HF repo id or local .gguf matching ``vocabulary``, on any
+    device/precision with configurable GGUF ``n_ctx`` and ``gpu_layers``,
+    and read measures at any temperature or optional control vector path."""
     steered: weakref.WeakKeyDictionary[LlamaCpp, dict[str, LlamaCpp]] = weakref.WeakKeyDictionary()
 
     def load(values: dict) -> Language:
-        source, device, dtype = sources[values["model"]], values["device"], values["dtype"]
+        source = values["source"].strip()
+        if not source:
+            raise ValueError("source must be a Hugging Face model id or path to a .gguf file")
+        device, dtype = values["device"], values["dtype"]
         if source.endswith(".gguf"):
             if dtype != "auto":
                 raise ValueError("a .gguf file's weights are as it stores them: its dtype is auto")
-            language: Language = LlamaCpp(Path(source).expanduser(), context, 0 if device == "cpu" else gpu_layers)
+            n_ctx = int(values["n_ctx"])
+            gpu_layers = 0 if device == "cpu" else int(values["gpu_layers"])
+            language: Language = LlamaCpp(Path(source).expanduser().resolve(), n_ctx, gpu_layers)
         else:
             language = Transformers(source, device, dtype, tokenizer)
         if language.vocabulary != vocabulary.size:
@@ -575,22 +558,29 @@ def catalog(
         return language
 
     def open(language: Language, values: dict) -> Measure:
-        control = values.get("control", "none")
-        if control != "none":
+        control = values.get("control", "").strip()
+        if control:
             if not isinstance(language, LlamaCpp):
                 raise ValueError("control vectors need a .gguf model")
             copies = steered.setdefault(language, {})
             if control not in copies:
-                copies[control] = language.controlled(controls[control])
+                copies[control] = language.controlled(Path(control).expanduser().resolve())
             language = copies[control]
-        return measure(language, values["temperature"], values["context"])
+        return measure(language, values["temperature"])
 
-    names = tuple(sources)
-    models = [Choice("model", names, names[0]), Choice("device", devices(), devices()[0]), Choice("dtype", ("auto", *DTYPES), "auto")]
-    parameters = [Number("temperature", 1.0), Number("context", None)]
-    if controls:
-        parameters.append(Choice("control", ("none", *controls), "none"))
-    return Catalog(models, parameters, load, open, presets, released)
+    suggested = tuple(suggestions)
+    models = [
+        Text("source", default=suggested[0] if suggested else "", placeholder="HF repo id or path to .gguf", suggestions=suggested),
+        Choice("device", devices(), devices()[0]),
+        Choice("dtype", ("auto", *DTYPES), "auto"),
+        Number("n_ctx", 8192, min=1, integer=True),
+        Number("gpu_layers", -1, min=-1, integer=True),
+    ]
+    parameters = [
+        Number("temperature", 1.0, min=0.0, step=0.1),
+        Text("control", placeholder="optional .gguf control vector"),
+    ]
+    return Catalog(models, parameters, load, open, released)
 
 
 def start_of_text(tokenizer) -> tuple[int, ...]:

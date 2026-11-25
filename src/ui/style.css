@@ -251,8 +251,24 @@ body {
   color: var(--ink-muted);
 }
 
-.measure-form input {
+.measure-form input[type="number"] {
   width: 12ch;
+}
+
+.measure-form input[type="text"] {
+  width: 28ch;
+  max-width: 100%;
+}
+
+.measure-model-actions {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.preset-chip {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 2px;
 }
 
 

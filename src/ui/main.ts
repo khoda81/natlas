@@ -252,12 +252,13 @@ export class App {
     const failed = (error: unknown) => {
       if (dataset === this.dataset) this.toasts.error(error, "measures");
     };
-    const measures = this.measures = new Measures(dataset.catalog, dataset.holdings, dataset.recordings,
+    const measures = this.measures = new Measures(dataset.id, dataset.catalog, dataset.holdings, dataset.recordings,
       (which, spec) => this.setSpecs({ ...this.specs, [which]: spec }), failed);
     element("p").replaceChildren(measures.p);
     element("q").replaceChildren(measures.q);
     element("models").replaceChildren(measures.toggle, measures.element);
-    element("lens").hidden = measures.toggle.hidden && dataset.catalog.models[0]!.options.length <= 1;
+    const firstModel = dataset.catalog.models[0];
+    element("lens").hidden = measures.toggle.hidden && (firstModel?.kind !== "choice" || firstModel.options.length <= 1);
     // Until one is chosen, the first measure the server holds is p and q.
     measures.onHeld = (held) => {
       const [first] = held.measures;

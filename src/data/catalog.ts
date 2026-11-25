@@ -1,28 +1,24 @@
-// Specs: the names a server gives its models and measures. A model is
-// weights loaded on a device at a precision, and its spec is each of its
-// parameters in turn, as path segments: large/cuda/float16. A measure is a
-// model read one way, and its spec is its model's, then name=value for each
-// of its own parameters not at its default, the value percent-encoded:
-// large/cuda/float16/temperature=3. The server's catalog says what
-// parameters there are, and the page builds specs from them.
+// Specs: the names a server gives its models and measures. A model spec is
+// canonical k=v pairs joined by '&' (omitting defaults, keeping the first
+// parameter when all are at default). A measure spec is '<model_spec>' when
+// all measure parameters are at default, or '<model_spec>|<k=v&...>'.
 
 export type Parameter =
   | { name: string; kind: "choice"; options: string[]; default: string }
   /** A finite number, or none where the default is null. */
-  | { name: string; kind: "number"; default: number | null }
-  | { name: string; kind: "text" }
+  | { name: string; kind: "number"; default: number | null; min?: number; max?: number; step?: number; integer?: boolean }
+  | { name: string; kind: "text"; default?: string; placeholder?: string; suggestions?: string[] }
+  | { name: string; kind: "boolean"; default: boolean }
   /** A recording uploaded to the server, by id, or none. */
   | { name: string; kind: "recording" };
 
 export type Choice = Extract<Parameter, { kind: "choice" }>;
 
 export interface Catalog {
-  /** A model's parameters, in order. */
-  models: Choice[];
-  /** A measure's own parameters. */
+  /** A model's load-time parameters, in order. */
+  models: Parameter[];
+  /** A measure's read-time parameters, in order. */
   parameters: Parameter[];
-  /** Models offered as they are, by spec. */
-  presets: string[];
 }
 
 /** Each parameter's value as a spec writes it, the default where it is left out. */
@@ -36,6 +32,9 @@ export function defaultValue(parameter: Parameter): string {
     case "number":
       return parameter.default === null ? "" : String(parameter.default);
     case "text":
+      return parameter.default ?? "";
+    case "boolean":
+      return parameter.default ? "true" : "false";
     case "recording":
       return "";
   }
@@ -43,43 +42,67 @@ export function defaultValue(parameter: Parameter): string {
 
 /** Whether a spec leaves ``value`` out, as the parameter's default. */
 export function atDefault(parameter: Parameter, value: string): boolean {
-  if (parameter.kind !== "number") return value === defaultValue(parameter);
-  return value.trim() === "" || Number(value) === parameter.default;
+  if (parameter.kind === "number") {
+    return value.trim() === "" || (parameter.default !== null && Number(value) === parameter.default);
+  }
+  return value === defaultValue(parameter);
 }
 
 /** The spec of the model a measure's spec names. */
-export function modelOf(catalog: Catalog, spec: string): string {
-  return spec.split("/").slice(0, catalog.models.length).join("/");
+export function modelOf(_catalog: Catalog, spec: string): string {
+  const sep = spec.indexOf("|");
+  return sep < 0 ? spec : spec.slice(0, sep);
 }
 
-/** What ``spec`` says of each parameter, the model's and the measure's. A
- * part no parameter takes is left for the server to refuse. */
+/** What ``spec`` says of each parameter, the model's and the measure's. */
 export function parse(catalog: Catalog, spec: string): Values {
-  const segments = spec.split("/");
-  const values = new Map(catalog.parameters.map((parameter) => [parameter.name, defaultValue(parameter)]));
-  catalog.models.forEach((parameter, index) => values.set(parameter.name, decodeURIComponent(segments[index] ?? "")));
-  for (const segment of segments.slice(catalog.models.length)) {
-    const equals = segment.indexOf("=");
-    if (equals < 0) continue;
-    values.set(segment.slice(0, equals), decodeURIComponent(segment.slice(equals + 1)));
+  const values = new Map<string, string>();
+  for (const parameter of catalog.models) values.set(parameter.name, defaultValue(parameter));
+  for (const parameter of catalog.parameters) values.set(parameter.name, defaultValue(parameter));
+  const sep = spec.indexOf("|");
+  const modelPart = sep < 0 ? spec : spec.slice(0, sep);
+  const measurePart = sep < 0 ? "" : spec.slice(sep + 1);
+  if (modelPart !== "") {
+    for (const [name, value] of new URLSearchParams(modelPart)) values.set(name, value);
+  }
+  if (measurePart !== "") {
+    for (const [name, value] of new URLSearchParams(measurePart)) values.set(name, value);
   }
   return values;
 }
 
-/** The spec of a measure ``values`` names, leaving out each of its own
- * parameters at its default. */
-export function format(catalog: Catalog, values: Values): string {
-  const segments = catalog.models.map((parameter) => encodeURIComponent(values.get(parameter.name) ?? parameter.default));
-  for (const parameter of catalog.parameters) {
-    const value = values.get(parameter.name) ?? "";
+/** Format a canonical model spec from ``values``, omitting defaults unless all are at default. */
+export function formatModel(catalog: Catalog, values: Values): string {
+  const params = new URLSearchParams();
+  for (const parameter of catalog.models) {
+    const value = values.get(parameter.name) ?? defaultValue(parameter);
     if (atDefault(parameter, value)) continue;
-    segments.push(`${parameter.name}=${encodeURIComponent(value)}`);
+    params.set(parameter.name, value);
   }
-  return segments.join("/");
+  if ([...params.keys()].length === 0 && catalog.models.length > 0) {
+    const first = catalog.models[0]!;
+    params.set(first.name, values.get(first.name) ?? defaultValue(first));
+  }
+  return params.toString();
 }
 
-/** A catalog of nothing but models, each its only measure: a recording's
- * measures, by name. */
+/** The spec of a measure ``values`` names, leaving out each parameter at its default. */
+export function format(catalog: Catalog, values: Values): string {
+  const modelSpec = formatModel(catalog, values);
+  const measureParams = new URLSearchParams();
+  for (const parameter of catalog.parameters) {
+    const value = values.get(parameter.name) ?? defaultValue(parameter);
+    if (atDefault(parameter, value)) continue;
+    measureParams.set(parameter.name, value);
+  }
+  const suffix = measureParams.toString();
+  return suffix === "" ? modelSpec : `${modelSpec}|${suffix}`;
+}
+
+/** A catalog of nothing but models, each its only measure: a recording's measures, by name. */
 export function named(names: string[]): Catalog {
-  return { models: [{ name: "measure", kind: "choice", options: names, default: names[0] ?? "" }], parameters: [], presets: [] };
+  return {
+    models: [{ name: "measure", kind: "choice", options: names, default: names[0] ?? "" }],
+    parameters: [],
+  };
 }

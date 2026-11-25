@@ -602,6 +602,7 @@ fn place_chain<'a>(
         edges,
         ln_masses,
         xs,
+        ..
     } = steps;
     let depth = cam.anchor.path.len();
     if entries.len() < depth {

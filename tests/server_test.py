@@ -108,11 +108,11 @@ def fixture(**measure):
             raise RuntimeError("no such weights")
         return values["source"]
 
-    catalog = Catalog([Choice("source", ("a", "b", "c", "broken"), "a")], [Number("temperature", 1.0)], load, lambda model, _: measures[model], ["a"])
+    catalog = Catalog([Choice("source", ("a", "b", "c", "broken"), "a")], [Number("temperature", 1.0)], load, lambda model, _: measures[model])
     model = service.Model(5, catalog)
-    for name in ("a", "b", "broken"):
+    for name in ("source=a", "source=b", "source=broken"):
         model.load(name).result(5)
-    wait([model.models[name] for name in ("a", "b", "broken")], 5)
+    wait([model.models[name] for name in ("source=a", "source=b", "source=broken")], 5)
     manifest = [{"name": "fixture", "title": "Integer sequence fixture", "labels": "labels.json", "catalog": catalog.describe()}]
     labels = [b"a", b"b", b"c", b"r", b"\n"]
 
@@ -140,7 +140,7 @@ class Received:
     def kinds(self, kind):
         return [getattr(update, kind) for update in self.updates if update.WhichOneof("kind") == kind]
 
-    def answered(self, node, measure="a"):
+    def answered(self, node, measure="source=a"):
         """The branches answered for a node, in order."""
         return [
             branch
@@ -151,7 +151,7 @@ class Received:
         ]
 
 
-def demand(p="a", q="a", view=None, path=None):
+def demand(p="source=a", q="source=a", view=None, path=None):
     """A demand: the view as (node, rows, right) of the node's whole mass, the
     path as (node, branches)."""
     message = pb.Demand(p=p, q=q)
@@ -288,45 +288,21 @@ class CoreTests(unittest.TestCase):
 
 
 class CatalogTests(unittest.TestCase):
-    def test_a_spec_is_a_model_each_of_its_parameters_then_the_measures_by_name_each_else_its_default(self):
+    def test_a_spec_is_a_model_and_optional_measure_parameters_with_defaults_omitted(self):
         models = [Choice("size", ("small", "medium"), "medium"), Choice("device", ("cuda", "cpu"), "cuda")]
-        catalog = Catalog(models, [Number("temperature", 1.0), Number("context", None), Text("instruments")], dict, dict, ["small/cpu"])
-        self.assertEqual(catalog.model("medium/cuda"), {"size": "medium", "device": "cuda"})
-        self.assertEqual(catalog.parse("small/cpu"), ("small/cpu", {"temperature": 1.0, "context": None, "instruments": ""}))
+        catalog = Catalog(models, [Number("temperature", 1.0), Text("instruments")], dict, dict)
+        self.assertEqual(catalog.model("size=small&device=cpu"), {"size": "small", "device": "cpu"})
+        self.assertEqual(catalog.parse("size=small&device=cpu"), ("size=small&device=cpu", {"temperature": 1.0, "instruments": ""}))
         self.assertEqual(
-            catalog.parse("medium/cuda/instruments=piano%2Cdrums/temperature=1.6"),
-            ("medium/cuda", {"temperature": 1.6, "context": None, "instruments": "piano,drums"}),
+            catalog.parse("size=medium|instruments=piano%2Cdrums&temperature=1.6"),
+            ("size=medium", {"temperature": 1.6, "instruments": "piano,drums"}),
         )
-        for spec in ("small", "large/cpu", "small/cpu/temperature", "small/cpu/temperature=inf", "small/cpu/temperature=1/temperature=2", "small/cpu/depth=3"):
+        for spec in ("", "size=large", "size=small|temperature", "size=small|temperature=inf", "size=small|temperature=1&temperature=2", "size=small|depth=3"):
             with self.subTest(spec=spec), self.assertRaises(ValueError):
                 catalog.parse(spec)
-        with self.assertRaises(ValueError):
-            Catalog(models, [], dict, dict, ["small"])
         described = catalog.describe()
         self.assertEqual(described["models"][0], {"name": "size", "kind": "choice", "options": ["small", "medium"], "default": "medium"})
         self.assertEqual(described["parameters"][0], {"name": "temperature", "kind": "number", "default": 1.0})
-        self.assertEqual(described["presets"], ["small/cpu"])
-
-    def test_a_model_loaded_is_offered_after_a_restart_unless_it_failed_to_load_or_names_none_now(self):
-        models = [Choice("size", ("small", "medium"), "medium"), Choice("device", ("cuda", "cpu"), "cuda")]
-
-        def load(values: dict) -> dict:
-            if values["size"] == "medium" and values["device"] == "cpu":
-                raise RuntimeError("out of memory")
-            return values
-
-        with tempfile.TemporaryDirectory() as data:
-            kept = Path(data) / "models.txt"
-            kept.write_text("small/mps\n")
-            catalog = Catalog(models, [], load, dict, ["small/cpu"], kept=kept)
-            for spec in ("small/cpu", "medium/cuda", "medium/cuda"):
-                catalog.load(spec)
-            with self.assertRaises(RuntimeError):
-                catalog.load("medium/cpu")
-            self.assertEqual(Catalog(models, [], load, dict, ["small/cpu"], kept=kept).presets, ["small/cpu", "medium/cuda"])
-            # A device this machine lacks stays kept, offered where it has one.
-            wider = [models[0], Choice("device", ("cuda", "mps", "cpu"), "cuda")]
-            self.assertEqual(Catalog(wider, [], load, dict, [], kept=kept).presets, ["small/mps", "medium/cuda"])
 
 
 class ModelTests(unittest.TestCase):
@@ -335,7 +311,7 @@ class ModelTests(unittest.TestCase):
         client = Received(model)
         model.demand(client.client, demand(view=(0, 10.0, 2.0))).result(5)
         settle(model)
-        calls = measures["a"].calls
+        calls = measures["source=a"].calls
         # Ten rows: 6 on branch 0, then 3.6 on its own branch 0, 2.5 on
         # branch 1, 2.16 below 0, 0, and 1.5 each on two more; what starts
         # past two nats, or is worth less than a row, is not computed. Each
@@ -358,7 +334,7 @@ class ModelTests(unittest.TestCase):
         one.result(5)
         two.result(5)
         settle(model)
-        self.assertEqual(measures["a"].calls, [(99,), (99, 2), (99, 1), (99, 2, 2), (99, 1, 1)])
+        self.assertEqual(measures["source=a"].calls, [(99,), (99, 2), (99, 1), (99, 2, 2), (99, 1, 1)])
         self.assertEqual([list(path.branches) for path in first.kinds("placed")], [[1, 1, 1]])
         self.assertEqual([list(path.branches) for path in second.kinds("placed")], [[2, 2, 2]])
 
@@ -367,7 +343,7 @@ class ModelTests(unittest.TestCase):
         client = Received(model)
         model.demand(client.client, demand(path=(0, [0, 1, 2, 3]))).result(5)
         settle(model)
-        measure = measures["a"]
+        measure = measures["source=a"]
         self.assertEqual(measure.walks, [((99, 0, 1), 1), ((99, 0, 1, 2, 3), 4)])
         self.assertEqual(client.answered(node_id([0, 1, 2])), [3])
         self.assertEqual(len(client.kinds("placed")), 1)
@@ -390,7 +366,7 @@ class ModelTests(unittest.TestCase):
                 for demanded in demands:
                     demanded.result(5)
                 settle(model)
-                self.assertEqual(measures["a"].passes, passes)
+                self.assertEqual(measures["source=a"].passes, passes)
                 for client in (first, second):
                     self.assertEqual([list(path.branches) for path in client.kinds("placed")], [[0]])
 
@@ -399,7 +375,7 @@ class ModelTests(unittest.TestCase):
         client = Received(model)
         model.demand(client.client, demand(view=(0, 10.0, 2.0))).result(5)
         settle(model)
-        measure = measures["a"]
+        measure = measures["source=a"]
         # What the view computes one at a time, each once.
         self.assertEqual(
             set(measure.calls),
@@ -411,7 +387,7 @@ class ModelTests(unittest.TestCase):
 
     def test_a_new_demand_drops_what_the_old_one_waited_on(self):
         model, _, measures = fixture()
-        measure = measures["a"]
+        measure = measures["source=a"]
         gate = measure.gates[(99, 1)] = threading.Event()
         client = Received(model)
         model.demand(client.client, demand(path=(0, [1, 1, 1])))
@@ -430,18 +406,18 @@ class ModelTests(unittest.TestCase):
         gate = held(model)
         # Views under the other measure, each superseded before it is read.
         for rows in range(1, 100):
-            model.demand(client.client, demand(p="b", q="b", view=(0, float(rows), 1.0)))
+            model.demand(client.client, demand(p="source=b", q="source=b", view=(0, float(rows), 1.0)))
         latest = model.demand(client.client, demand(path=(0, [2])))
         gate.set()
         latest.result(5)
         settle(model)
         self.assertEqual(measures["b"].calls, [])
-        self.assertEqual(measures["a"].calls, [(99,)])
+        self.assertEqual(measures["source=a"].calls, [(99,)])
         self.assertEqual([list(path.branches) for path in client.kinds("placed")], [[2]])
 
     def test_the_next_pass_is_queued_while_one_runs_and_withdrawn_on_close(self):
         model, _, measures = fixture()
-        measure = measures["a"]
+        measure = measures["source=a"]
         gate = measure.gates[(99,)] = threading.Event()
         first, second = Received(model), Received(model)
         model.learn([2]).result(5)
@@ -457,7 +433,7 @@ class ModelTests(unittest.TestCase):
 
     def test_a_distribution_on_its_way_is_not_computed_again(self):
         model, _, measures = fixture()
-        measure = measures["a"]
+        measure = measures["source=a"]
         gate = measure.gates[(99,)] = threading.Event()
         first, second = Received(model), Received(model)
         model.demand(first.client, demand(path=(0, [1])))
@@ -480,8 +456,8 @@ class ModelTests(unittest.TestCase):
             settle(model)
             (answer,) = [answer for answer in client.kinds("answer") if answer.node == node]
             self.assertEqual((list(answer.children.runs), answer.children.count), ([], 0))
-        self.assertTrue(all(len(call) <= 5 for call in measures["a"].calls))
-        self.assertNotIn((99, 7), measures["a"].calls)
+        self.assertTrue(all(len(call) <= 5 for call in measures["source=a"].calls))
+        self.assertNotIn((99, 7), measures["source=a"].calls)
 
     def test_a_distribution_that_cannot_be_computed_fails_what_waits_on_it(self):
         model, _, measures = fixture(longest=3)
@@ -489,7 +465,7 @@ class ModelTests(unittest.TestCase):
         model.demand(client.client, demand(path=(0, [0, 0, 0, 0]))).result(5)
         settle(model)
         (failed,) = client.kinds("failed")
-        self.assertEqual((failed.measure, failed.node), ("a", node_id([0, 0, 0])))
+        self.assertEqual((failed.measure, failed.node), ("source=a", node_id([0, 0, 0])))
         self.assertIn("context", failed.message)
 
     def test_eviction_forgets_the_oldest_and_recomputes_it_alike(self):
@@ -500,19 +476,19 @@ class ModelTests(unittest.TestCase):
         settle(model)
         model.demand(client.client, demand(path=(0, [0, 1, 2]))).result(5)
         settle(model)
-        self.assertEqual(measures["a"].calls.count((99,)), 2)
+        self.assertEqual(measures["source=a"].calls.count((99,)), 2)
         self.assertEqual(len(client.kinds("placed")), 2)
 
     def test_a_measure_of_a_model_not_loaded_fails_and_is_answered_once_it_loads(self):
         model, _, _ = fixture()
         client = Received(model)
-        model.demand(client.client, demand(p="c/temperature=2", q="a", view=(0, 10.0, 1.0))).result(5)
+        model.demand(client.client, demand(p="source=c|temperature=2", q="source=a", view=(0, 10.0, 1.0))).result(5)
         settle(model)
         (failed,) = client.kinds("failed")
         self.assertEqual((failed.measure, failed.node), ("c/temperature=2", 0))
         self.assertIn("load c", failed.message)
         # Loaded, it is opened for the client that named it, which says nothing more.
-        model.load("c").result(5)
+        model.load("source=c").result(5)
         settle(model, until=lambda: bool(client.answered(0, "c/temperature=2")))
         self.assertEqual(client.answered(0, "c/temperature=2")[:2], [0, 1])
         self.assertIn("c/temperature=2", model.held().result(5)["measures"])
@@ -520,10 +496,10 @@ class ModelTests(unittest.TestCase):
     def test_a_model_that_cannot_load_fails_what_waits_on_its_measures(self):
         model, _, _ = fixture()
         client = Received(model)
-        model.demand(client.client, demand(p="broken", q="a", view=(0, 10.0, 1.0))).result(5)
+        model.demand(client.client, demand(p="source=broken", q="source=a", view=(0, 10.0, 1.0))).result(5)
         settle(model)
         (failed,) = client.kinds("failed")
-        self.assertEqual((failed.measure, failed.node), ("broken", 0))
+        self.assertEqual((failed.measure, failed.node), ("source=broken", 0))
         self.assertIn("no such weights", failed.message)
         held = model.held().result(5)
         self.assertEqual([loaded["state"] for loaded in held["models"]], ["loaded", "loaded", "failed"])
@@ -532,17 +508,17 @@ class ModelTests(unittest.TestCase):
     def test_unloading_closes_its_measures_and_what_waits_on_them_fails(self):
         model, _, measures = fixture()
         client = Received(model)
-        model.demand(client.client, demand(p="b", q="a", view=(0, 10.0, 1.0))).result(5)
+        model.demand(client.client, demand(p="source=b", q="source=a", view=(0, 10.0, 1.0))).result(5)
         settle(model)
-        self.assertEqual(client.answered(0, "b")[:2], [1, 0])
-        self.assertEqual(model.held().result(5)["measures"], ["b", "a"])
-        model.unload("b").result(5)
+        self.assertEqual(client.answered(0, "source=b")[:2], [1, 0])
+        self.assertEqual(model.held().result(5)["measures"], ["source=b", "source=a"])
+        model.unload("source=b").result(5)
         model.learn([1]).result(5)
-        model.demand(client.client, demand(p="b", q="a", view=(node_id([1]), 10.0, 1.0))).result(5)
+        model.demand(client.client, demand(p="source=b", q="source=a", view=(node_id([1]), 10.0, 1.0))).result(5)
         settle(model)
-        self.assertEqual({failed.measure for failed in client.kinds("failed")}, {"b"})
+        self.assertEqual({failed.measure for failed in client.kinds("failed")}, {"source=b"})
         self.assertIn("load b", client.kinds("failed")[0].message)
-        self.assertEqual(model.held().result(5), {"models": [{"spec": "a", "state": "loaded"}, {"spec": "broken", "state": "failed", "message": "RuntimeError: no such weights"}], "measures": ["a"]})
+        self.assertEqual(model.held().result(5), {"models": [{"spec": "source=a", "state": "loaded"}, {"spec": "source=broken", "state": "failed", "message": "RuntimeError: no such weights"}], "measures": ["source=a"]})
 
     def test_unloading_while_a_measure_opens_retires_it(self):
         opening, release = threading.Event(), threading.Event()
@@ -559,12 +535,12 @@ class ModelTests(unittest.TestCase):
 
         catalog = Catalog([Choice("source", ("a",), "a")], [], lambda _: next(loads), open_measure)
         model = service.Model(5, catalog)
-        model.load("a").result(5)
+        model.load("source=a").result(5)
         client = Received(model)
         model.demand(client.client, demand(view=(0, 10.0, 1.0))).result(5)
         try:
             self.assertTrue(opening.wait(5))
-            model.unload("a").result(5)
+            model.unload("source=a").result(5)
         finally:
             release.set()
 
@@ -577,10 +553,10 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(client.answered(0), [])
         self.assertEqual(first.calls, [])
 
-        model.load("a").result(5)
+        model.load("source=a").result(5)
         settle(model, until=lambda: bool(client.answered(0)))
         self.assertEqual(client.answered(0)[:2], [1, 0])
-        self.assertEqual(model.held().result(5)["measures"], ["a"])
+        self.assertEqual(model.held().result(5)["measures"], ["source=a"])
 
     def test_a_node_the_server_never_learned_is_said_unknown(self):
         model, _, measures = fixture()
@@ -588,7 +564,7 @@ class ModelTests(unittest.TestCase):
         model.demand(client.client, demand(view=(node_id([3, 3]), 10.0, 1.0))).result(5)
         settle(model)
         self.assertEqual(client.kinds("unknown"), [node_id([3, 3])])
-        self.assertEqual(measures["a"].calls, [])
+        self.assertEqual(measures["source=a"].calls, [])
 
 
 class TransportTests(unittest.TestCase):
@@ -620,17 +596,17 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(closed.exception.code, 1007)
 
     def test_models_load_and_unload_and_measures_open_by_spec(self):
-        self.assertIn("load c", self.client.post("/measures/c").json()["message"])
-        self.assertEqual(self.client.post("/models/c").json()["models"][-1]["spec"], "c")
-        wait([self.model.models["c"]], 5)
-        self.assertEqual(self.client.post("/measures/c/temperature=2").status_code, 200)
+        self.assertIn("load source=c", self.client.post("/measures", json={"spec": "source=c"}).json()["message"])
+        self.assertEqual(self.client.post("/models", json={"spec": "source=c"}).json()["models"][-1]["spec"], "source=c")
+        wait([self.model.models["source=c"]], 5)
+        self.assertEqual(self.client.post("/measures", json={"spec": "source=c|temperature=2"}).status_code, 200)
         self.model.inference.submit(lambda: None).result(5)
-        self.assertIn("c/temperature=2", self.client.get("/held").json()["measures"])
-        self.assertEqual(self.client.post("/measures/c/depth=2").status_code, 400)
-        self.assertEqual(self.client.post("/models/nothing").status_code, 400)
-        held = self.client.delete("/models/c").json()
-        self.assertNotIn("c", [loaded["spec"] for loaded in held["models"]])
-        self.assertNotIn("c/temperature=2", held["measures"])
+        self.assertIn("source=c|temperature=2", self.client.get("/held").json()["measures"])
+        self.assertEqual(self.client.post("/measures", json={"spec": "source=c|depth=2"}).status_code, 400)
+        self.assertEqual(self.client.post("/models", json={"spec": "source=nothing"}).status_code, 400)
+        held = self.client.request("DELETE", "/models", json={"spec": "source=c"}).json()
+        self.assertNotIn("source=c", [loaded["spec"] for loaded in held["models"]])
+        self.assertNotIn("source=c|temperature=2", held["measures"])
 
     def test_search_teaches_the_server_the_ids_along_the_text(self):
         response = self.client.post(
@@ -640,11 +616,11 @@ class TransportTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(list(pb.SearchResponse.FromString(response.content).path), [0, 1, 2])
-        self.assertEqual(self.measures["a"].calls, [])
+        self.assertEqual(self.measures["source=a"].calls, [])
         with self.client.websocket_connect("/session") as socket:
             socket.send_bytes(demand(path=(node_id([0, 1]), [2])).SerializeToString())
             self.updates_until_placed(socket)
-        self.assertEqual(self.measures["a"].calls, [(99, 0, 1)])
+        self.assertEqual(self.measures["source=a"].calls, [(99, 0, 1)])
         response = self.client.post(
             "/natlas.Natlas/Search",
             content=b"\x80",

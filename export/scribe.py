@@ -716,24 +716,19 @@ def main() -> None:
         # The start token carries the audio: paths are read whole.
         return lm.Measure(scribe.start, walk, scribe.width, scribe.paths, None, windows.ends, widths)
 
-    try:
-        catalog = Catalog(
-            [Choice("size", SIZES, "medium"), Choice("device", lm.devices(), lm.devices()[0]), Choice("dtype", ("auto", *lm.DTYPES), "auto")],
-            [
-                Recording("audio"),
-                Number("at", 0.0),
-                Text("instruments"),
-                Number("temperature", 1.0),
-                Choice("shape", ("none", "time-area"), "none"),
-            ],
-            load,
-            open,
-            config.get("presets", []),
-            released=lm.released,
-            kept=args.data / "models.txt",
-        )
-    except ValueError as error:
-        parser.error(f"{args.config}: {error}")
+    catalog = Catalog(
+        [Choice("size", SIZES, "medium"), Choice("device", lm.devices(), lm.devices()[0]), Choice("dtype", ("auto", *lm.DTYPES), "auto")],
+        [
+            Recording("audio"),
+            Number("at", 0.0, min=0.0, step=0.1),
+            Text("instruments", placeholder="e.g. piano,drums"),
+            Number("temperature", 1.0, min=0.0, step=0.1),
+            Choice("shape", ("none", "time-area"), "none"),
+        ],
+        load,
+        open,
+        released=lm.released,
+    )
     manifest = [{"name": "scribe", "title": "MuScriptor · live", "labels": "labels.json", "catalog": catalog.describe()}]
     # MuScriptor's vocabulary is musical already: time shifts and pitches
     # ascending, so children keep its order.

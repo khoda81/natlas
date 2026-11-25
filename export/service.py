@@ -692,11 +692,15 @@ def app(
         return JSONResponse(await asyncio.wrap_future(model.held()))
 
     def changing(change: Callable[[str], Future[None]]):
-        """A request changing what the model holds, by the spec in its path."""
+        """A request changing what the model holds, by JSON {"spec": ...}."""
 
         async def changed(request: Request) -> Response:
             try:
-                await asyncio.wrap_future(change(request.path_params["spec"]))
+                body = await request.json()
+                spec = body.get("spec") if isinstance(body, dict) else None
+                if not isinstance(spec, str):
+                    raise ValueError("request body must be JSON with a string 'spec'")
+                await asyncio.wrap_future(change(spec))
             except ValueError as error:
                 return JSONResponse({"message": str(error)}, status_code=400)
             return JSONResponse(await asyncio.wrap_future(model.held()))
@@ -708,9 +712,9 @@ def app(
         WebSocketRoute("/session", session),
         # What the model holds, and loading, unloading and opening by spec.
         Route("/held", held),
-        Route("/models/{spec:path}", changing(model.load), methods=["POST"]),
-        Route("/models/{spec:path}", changing(model.unload), methods=["DELETE"]),
-        Route("/measures/{spec:path}", changing(model.open_measure), methods=["POST"]),
+        Route("/models", changing(model.load), methods=["POST"]),
+        Route("/models", changing(model.unload), methods=["DELETE"]),
+        Route("/measures", changing(model.open_measure), methods=["POST"]),
     ]
     served += [Route(f"/{path}", file(*content)) for path, content in files.items()]
     served += [Route("/natlas.Natlas/Search", search_rpc, methods=["POST"]), *routes]

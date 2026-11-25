@@ -230,13 +230,17 @@ export class LiveHoldings implements Holdings {
   }
 
   readonly change = {
-    load: (model: string) => this.send("POST", `models/${model}`),
-    unload: (model: string) => this.send("DELETE", `models/${model}`),
-    open: (spec: string) => this.send("POST", `measures/${spec}`),
+    load: (model: string) => this.send("POST", "models", model),
+    unload: (model: string) => this.send("DELETE", "models", model),
+    open: (spec: string) => this.send("POST", "measures", spec),
   };
 
-  private async send(method: string, path: string): Promise<Held> {
-    const response = await fetch(new URL(path, this.base), { method });
+  private async send(method: string, path: string, spec: string): Promise<Held> {
+    const response = await fetch(new URL(path, this.base), {
+      method,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spec }),
+    });
     const body = (await response.json().catch(() => ({ message: `${response.status}` }))) as Held & { message?: string };
     if (!response.ok) throw new Error(body.message);
     return body;
@@ -319,7 +323,7 @@ export class RecordedServer implements Server {
       demand: ({ specs, view, path }) => {
         try {
           const [p, q] = [specs.p, specs.q].map((spec) => {
-            const measure = this.recorded.measure(decodeURIComponent(spec.split("/")[0]!));
+            const measure = this.recorded.measure(new URLSearchParams(spec.split("|")[0]!).get("measure") ?? spec);
             spoken.set(measure, spec);
             return measure;
           }) as [number, number];

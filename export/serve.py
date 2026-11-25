@@ -23,21 +23,15 @@
 
 """Serve language models' integer-sequence distributions to natlas, live.
 
-The root is the empty sequence; a model reads its start-of-text token
-internally before that path. Every other node is a complete token path from
-the root, and its children are the next tokens. The config file (serve.toml)
-names the sources offered, which all share one tokenizer, the control
-vectors, and models to offer as they are. Nothing loads until a page asks:
-it loads a model, a source on a device at a precision, and reads measures of
-it by spec (see lm.py). The browser sends demands and receives updates over
-the /session WebSocket. Search uses Connect unary. GET /labels.json holds
-the token bytes.
+Each server instance serves one fixed vocabulary (known at startup from
+``tokenizer``, either a Hugging Face repo id or a local .gguf file) and one
+fixed branch ordering. Models and measures are loaded and configured live from
+the browser through the catalog schema — no TOML config file required.
 """
 
 from __future__ import annotations
 
 import argparse
-import tomllib
 from pathlib import Path
 
 import lm
@@ -46,13 +40,42 @@ from natlas_codec import labels_json
 from service import CACHE, Model, app
 
 
+def _discover_ggufs(tokenizer: str, dirs: list[Path]) -> list[str]:
+    suggestions: list[str] = []
+    seen: set[str] = set()
+
+    def add(item: str) -> None:
+        if item not in seen:
+            seen.add(item)
+            suggestions.append(item)
+
+    if tokenizer.endswith(".gguf"):
+        resolved = Path(tokenizer).expanduser().resolve()
+        add(str(resolved))
+        dirs = [resolved.parent, *dirs]
+    else:
+        add(tokenizer)
+    for directory in dirs:
+        root = directory.expanduser().resolve()
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.gguf")):
+            add(str(path))
+    return suggestions
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--config",
+        "tokenizer",
+        help="HF model/tokenizer id or path to a .gguf file defining this server's fixed vocabulary",
+    )
+    parser.add_argument(
+        "--models-dir",
         type=Path,
-        default=Path(__file__).with_name("serve.toml"),
-        help="the sources, control vectors and models to offer (default serve.toml beside this script)",
+        action="append",
+        default=[],
+        help="optional directory to scan for .gguf autocomplete suggestions (repeatable)",
     )
     parser.add_argument("--cache", type=float, default=CACHE / 2**30, help=f"GiB of memory for the distributions it keeps, default {CACHE / 2**30:g}")
     parser.add_argument(
@@ -64,34 +87,18 @@ def main() -> None:
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8421)
     args = parser.parse_args()
-    try:
-        config = tomllib.loads(args.config.read_text())
-        sources: dict[str, str] = config["sources"]
-        if not sources:
-            raise ValueError("no sources")
-    except (OSError, KeyError, ValueError, tomllib.TOMLDecodeError) as error:
-        parser.error(f"{args.config}: {error!r}")
-    here = args.config.parent
-    sources = {name: str((here / Path(source).expanduser()).resolve()) if source.endswith(".gguf") else source for name, source in sources.items()}
-    controls = {name: (here / Path(path).expanduser()).resolve() for name, path in config.get("controls", {}).items()}
-    tokenizer = config.get("tokenizer")
-    vocabulary = lm.Vocabulary(tokenizer or next(iter(sources.values())))
-    try:
-        catalog = lm.catalog(
-            sources,
-            vocabulary,
-            controls,
-            config.get("presets", []),
-            tokenizer,
-            config.get("n_ctx", 8192),
-            config.get("gpu_layers", -1),
-        )
-    except ValueError as error:
-        parser.error(f"{args.config}: {error}")
+
+    tokenizer_spec = str(Path(args.tokenizer).expanduser().resolve()) if args.tokenizer.endswith(".gguf") else args.tokenizer
+    vocabulary = lm.Vocabulary(tokenizer_spec)
+    suggestions = _discover_ggufs(tokenizer_spec, args.models_dir)
+    hf_tokenizer = None if tokenizer_spec.endswith(".gguf") else tokenizer_spec
+    catalog = lm.catalog(vocabulary, suggestions=suggestions, tokenizer=hf_tokenizer)
+
+    label = Path(tokenizer_spec).stem if tokenizer_spec.endswith(".gguf") else tokenizer_spec.rsplit("/", 1)[-1]
     manifest = [
         {
-            "name": f"live-{args.config.stem}",
-            "title": f"{', '.join(sources)} · live",
+            "name": f"live-{label}",
+            "title": f"{label} · live",
             "labels": "labels.json",
             "catalog": catalog.describe(),
         }

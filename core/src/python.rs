@@ -353,6 +353,11 @@ impl PythonSession {
     fn failed(&mut self, measure: usize, node: u64, message: &str) {
         self.inner.failed(measure, node, message);
     }
+
+    /// Forget what was sent of this distribution (e.g. on server cache eviction).
+    fn forget(&mut self, measure: usize, node: u64) {
+        self.inner.forget(measure, node);
+    }
 }
 
 #[pymodule]

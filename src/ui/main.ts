@@ -41,8 +41,10 @@ const KEY_SCALE = 1.25;
 const FOCUS_MS = 450;
 /** Opening a node fades the previous view out over this long. */
 const TRANSITION_MS = 320;
-/** The flight to a node closes this share of its distance every ``FLIGHT_MS``. */
+/** While a flight's path is still streaming, it closes this share of its distance every ``FLIGHT_MS``. */
 const FLIGHT_MS = 140;
+/** Once a streaming flight's path is placed, it eases out to the target over this long. */
+const FLIGHT_LAND_MS = 300;
 const SEARCH_MS = 150;
 const SAVE_MS = 200;
 const UNITS_KEY = "natlas.units";
@@ -69,6 +71,8 @@ interface Flight {
   reached: number;
   listed: boolean;
   time: number | null;
+  chased: boolean;
+  landing: { to: { x: number; a: number }; start: number; duration: number; easeOut: boolean; eased: number } | null;
   land: Camera | null;
 }
 
@@ -400,7 +404,7 @@ export class App {
     } else this.open(ROOT);
     const { origin } = this.cam;
     const chain = tree.chain(origin, target);
-    const flight: Flight = { chain, reached: 0, listed: false, time: null, land };
+    const flight: Flight = { chain, reached: 0, listed: false, time: null, chased: false, landing: null, land };
     if (below) {
       // Down the camera's path while the target's goes the same way, and p
       // and q both place it.
@@ -428,7 +432,7 @@ export class App {
     });
   }
 
-  /** One frame of the flight: move the point down to the deepest placed node, then close in on it. */
+  /** One frame of the flight: advance along placed edges, chase while streaming, then ease deterministically to the target. */
   private stepFlight(time: number): void {
     const flight = this.flight!;
     const tree = this.tree!;
@@ -445,18 +449,46 @@ export class App {
       flight.reached++;
     }
     if (from < flight.reached) this.cam.anchor = top(chain.slice(1, flight.reached + 1).map((node) => tree.branch(node)));
-    const dt = flight.time === null ? 0 : Math.min(MAX_FRAME_MS, time - flight.time);
-    flight.time = time;
-    const close = this.reducedMotion.matches ? 1 : 1 - Math.exp(-dt / FLIGHT_MS);
-    const there = placed(flight.reached);
-    const toX = rootLike(there.lnMass, there.x);
-    const height = Math.exp(there.lnMass + toX);
-    glide(this.cam, { x: toX, a: 0.5 - height / 2 }, close);
-    const arrived = flight.reached === chain.length - 1;
-    if (arrived && flight.listed && Math.abs(toX - this.cam.x) < 1e-3) {
+
+    const arrived = flight.reached === chain.length - 1 && flight.listed;
+    if (!arrived) {
+      const dt = flight.time === null ? 0 : Math.min(MAX_FRAME_MS, time - flight.time);
+      flight.time = time;
+      const close = this.reducedMotion.matches ? 1 : 1 - Math.exp(-dt / FLIGHT_MS);
+      const there = placed(flight.reached);
+      glide(this.cam, standing(there.lnMass, there.x), close);
+      if (dt > 0) flight.chased = true;
+      return;
+    }
+
+    if (flight.landing === null) {
+      const there = placed(flight.reached);
+      flight.landing = {
+        to: standing(there.lnMass, there.x),
+        start: time,
+        duration: flight.chased ? FLIGHT_LAND_MS : FOCUS_MS,
+        easeOut: flight.chased,
+        eased: 0,
+      };
+    }
+
+    const landing = flight.landing;
+    const t = this.reducedMotion.matches ? 1 : Math.min(1, Math.max(0, (time - landing.start) / landing.duration));
+    const eased = landing.easeOut
+      ? 1 - (1 - t) ** 3
+      : t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
+    glide(this.cam, landing.to, landing.eased < 1 ? (eased - landing.eased) / (1 - landing.eased) : 1);
+    landing.eased = eased;
+
+    if (t === 1) {
       this.flight = null;
-      if (flight.land !== null) this.cam = { ...flight.land };
-      else this.showPath(chain.at(-1)!, null);
+      if (flight.land !== null) {
+        this.cam = { ...flight.land };
+      } else {
+        this.cam.x = this.cam.origin === ROOT ? Math.max(0, landing.to.x) : landing.to.x;
+        this.cam.a = landing.to.a;
+        this.showPath(chain.at(-1)!, null);
+      }
     }
   }
 
@@ -593,6 +625,7 @@ export class App {
       glyph: (node, branch) => this.glyph(node, branch),
       conversation: this.reading?.conversation,
       note: origin && { text: origin.text, sweep: origin.loading && !this.reducedMotion.matches ? time : null },
+      debug: this.debug,
     });
     this.fadeOut(time);
     this.drawProgress();

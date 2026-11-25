@@ -286,6 +286,13 @@ impl Session {
         }
     }
 
+    /// Forget what was sent of `(measure, node)` so a recomputed distribution
+    /// is sent fresh instead of leaving a client stuck on contradicted runs.
+    pub fn forget(&mut self, measure: usize, node: NodeId) {
+        self.sent.remove(&(measure, node));
+        self.never.remove(&(measure, node));
+    }
+
     /// Whether `measure`'s distribution of `node` is there to read. Where
     /// it is missing, `interval` waits on it; where the source will never
     /// have it, nothing does.

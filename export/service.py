@@ -560,6 +560,8 @@ class Model:
         while self.cache < self.kept_bytes and len(nodes) < len(self.kept):
             (forgotten, of), size = self.kept.popitem(last=False)
             self.tree.forget(forgotten, of)
+            for client in self.clients:
+                client.session.forget(of, forgotten)
             self.kept_bytes -= size
 
 

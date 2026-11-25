@@ -672,37 +672,10 @@ impl ClientMeasure {
             }
         };
         let mut values = Vec::with_capacity(fixed.items.len());
-        for (position, &item) in fixed.items.iter().enumerate() {
+        for &item in &fixed.items {
             let next = match item {
                 Item::Child { run, at } => width(self.segments[run].view(), at),
-                Item::Gap { before } => {
-                    let prev = before.checked_sub(1).map(|i| self.segments[i].view());
-                    let next_run = self.segments.get(before).map(Segment::view);
-                    let rank = prev.map_or(0, RunSlice::end);
-                    let end = next_run.map(|run| run.rank()).or(self.count);
-                    if let (true, Some(end)) = (same, end) {
-                        let start = crate::qlayout::QLayout::start(&fixed.p, position);
-                        let bottom = u128::from(fixed.p.ends()[position]) + 1;
-                        -(((bottom - start) as f64 / CDF_SIZE as f64) / f64::from(end - rank)).ln()
-                    } else {
-                        let (mut sum, mut count) = (0.0, 0.0);
-                        for value in prev
-                            .map(|run| width(run, run.len() - 1))
-                            .into_iter()
-                            .chain(next_run.map(|run| width(run, 0)))
-                        {
-                            if value.is_finite() {
-                                sum += value;
-                                count += 1.0;
-                            }
-                        }
-                        if 0.0 < count {
-                            sum / count
-                        } else {
-                            f64::INFINITY
-                        }
-                    }
-                }
+                Item::Gap { .. } => f64::INFINITY,
             };
             values.push(next);
         }

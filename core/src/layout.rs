@@ -435,21 +435,20 @@ fn item_box(
             let nats = known.map_or_else(|| tree.nats_q(node, lens, branch, ln_p), Ok)?;
             (rank, 1, kind, Some(branch), ln_p, nats)
         }
-        Item::Gap { before } => {
+        Item::Gap { .. } => {
             let rank = d.item_rank(item);
             let end = d.item_end(item);
             let ln_p = known.unwrap_or_else(|| {
                 let (top, bottom) = d.item_edges(item);
                 Point::ln_between(&top, &bottom)
             });
-            let nats = gap_nats(tree, lens, node, d, before, ln_p, rank, end)?;
             (
                 rank,
                 end.map_or(0, |end| end - rank),
                 BoxKind::Gap,
                 None,
                 ln_p,
-                nats,
+                f64::INFINITY,
             )
         }
     };
@@ -476,46 +475,6 @@ fn item_box(
         x1: placed.x + nats,
         y0,
         y1,
-    })
-}
-
-/// The surprisal of a gap's children, as well as what is known tells, until
-/// samples tell more: with q = p and their number known, that of their mean
-/// weight, since children heaviest first are nearly alike side by side;
-/// otherwise the mean surprisal of the known children beside the gap.
-/// Infinite with neither.
-#[allow(clippy::too_many_arguments)]
-fn gap_nats(
-    tree: &impl LayoutTree,
-    lens: Lens,
-    node: NodeId,
-    d: &impl RankView,
-    before: usize,
-    ln_mass: f64,
-    rank: Rank,
-    end: Option<Rank>,
-) -> Result<f64> {
-    if let (true, Some(end)) = (lens.p == lens.q, end) {
-        if rank < end {
-            return Ok(f64::from(end - rank).ln() - ln_mass);
-        }
-    }
-    let above = before
-        .checked_sub(1)
-        .map(|run| d.run(run))
-        .map(|run| (run, run.len() - 1));
-    let below = d.run_at(before).map(|run| (run, 0));
-    let (mut sum, mut known) = (0.0, 0.0);
-    for (run, at) in above.into_iter().chain(below) {
-        let nats = tree.nats_q(node, lens, run.branch(at), run.ln_p(at))?;
-        if nats.is_finite() {
-            (sum, known) = (sum + nats, known + 1.0);
-        }
-    }
-    Ok(if 0.0 < known {
-        sum / known
-    } else {
-        f64::INFINITY
     })
 }
 
@@ -822,11 +781,7 @@ impl<T: LayoutTree> Layout<'_, T> {
                     Ok,
                 )?
             }
-            Item::Gap { before } => {
-                let ln_mass = (y1 - y0).ln() - placed.ln_scale;
-                let (rank, end) = (d.item_rank(item), d.item_end(item));
-                gap_nats(self.tree, self.lens, node, d, before, ln_mass, rank, end)?
-            }
+            Item::Gap { .. } => f64::INFINITY,
         };
         raster.add(y0, y1, width);
         let chain = matches!(item, Item::Child { .. }) && skip == Some(d.item_rank(item));
@@ -2094,9 +2049,10 @@ mod tests {
     }
 
     #[test]
-    fn a_row_holding_a_thin_gap_takes_its_estimated_width() {
+    fn a_row_holding_a_thin_gap_uses_known_children_only() {
         // A heavy child to 798, a gap of four unknown children to 798.8, and
-        // a child from there to the bottom.
+        // a child from there to the bottom: the gap is a hole and never
+        // fabricates a wider width than the known children in the row.
         let mut tree = Tree::new();
         let runs = vec![
             listed(0, &[0], &[0.9975], 0.0),
@@ -2104,17 +2060,14 @@ mod tests {
         ];
         tree.insert(ROOT, 0, runs, Some(6)).unwrap();
         let frame = layout(&tree, LENS, &cam(ROOT, 0.0, top(&[]), 0.0), VIEW, 1.0).unwrap();
-        // The gap's children at their mean weight, as a gap box draws them.
-        let (heavy, gap, last) = (-0.9975f64.ln(), (4.0f64 / 0.001).ln(), -0.0015f64.ln());
+        let (heavy, last) = (-0.9975f64.ln(), -0.0015f64.ln());
         let rows = spans(&frame, ROOT);
         assert_eq!(rows.len(), 4);
         near_all(
             &rows[..2],
             &[(0.0, 1.0, 0.0, heavy), (1.0, 798.0, heavy, heavy)],
         );
-        // The row from 798 holds the step from the heavy child to the gap,
-        // and from the gap to the last child.
-        near_all(&rows[2..3], &[(798.0, 799.0, 0.0, gap)]);
+        near_all(&rows[2..3], &[(798.0, 799.0, 0.0, last)]);
         assert!((rows[3].2 - last).abs() < 1e-6 && (rows[3].3 - last).abs() < 1e-6);
     }
 
@@ -2273,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn gaps_draw_at_their_mean_weight_and_rows_from_their_samples() {
+    fn gaps_have_unknown_width_and_rows_draw_from_their_samples() {
         let mut tree = Tree::new();
         // The two heaviest children of the root, and the node's end at rank
         // 1000: a quarter of its mass in 998 unknown children.
@@ -2285,11 +2238,12 @@ mod tests {
             .iter()
             .find(|b| b.kind == BoxKind::Gap)
             .expect("the unknown quarter is a gap");
-        // Until sampled, its 998 children are drawn at their mean weight.
+        // Gaps never fabricate a width before their children arrive.
         assert_eq!((gap.rank, gap.count), (2, 998));
-        near(gap.x1 - gap.x0, (998.0f64 / 0.25).ln());
+        assert!(gap.x1.is_infinite());
+        assert!(gap.q.is_nan());
         near(gap.y0, 0.75);
-        // Not knowing how many, it is drawn as the child above it.
+        // Same when the count is unknown.
         let mut uncounted = Tree::new();
         let run = listed(0, &[4, 7], &[0.5, 0.25], 0.0);
         uncounted.insert(ROOT, 0, vec![run], None).unwrap();
@@ -2299,9 +2253,11 @@ mod tests {
             .iter()
             .find(|b| b.kind == BoxKind::Gap)
             .unwrap();
-        near(gap_.x1 - gap_.x0, 4f64.ln());
+        assert!(gap_.x1.is_infinite());
+        assert!(gap_.q.is_nan());
         // An answer of four samples splits the gap: each sample, thinner
-        // than a pixel, is drawn in its row at its own width.
+        // than a pixel, is drawn in its row at its own width, while unsampled
+        // rows between them stay empty.
         let samples: Vec<_> = (0..4)
             .map(|i| {
                 let below = 0.25 - 0.0625 * f64::from(i);
@@ -2317,6 +2273,7 @@ mod tests {
             let row = rows.iter().find(|row| row.0 <= top && top < row.1).unwrap();
             assert!(row.2 <= width && width <= row.3, "{row:?}");
         }
+        assert!(rows.iter().all(|row| !(row.0 <= 625.0 && 625.0 < row.1)));
     }
 
     #[test]

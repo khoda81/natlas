@@ -29,6 +29,8 @@ export interface DrawState {
   timeline: Timeline | null;
   /** The known children of a laid-out node in view, however thin. */
   known: (node: NodeId) => readonly Known[];
+  /** Show debug overlays (such as bare child counts for unloaded gaps). */
+  debug?: boolean;
 }
 
 const FAMILY = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
@@ -222,12 +224,13 @@ export function draw(
   ctx.fillStyle = scheme.stroke;
   ctx.fill();
 
-  // Labels on the boxes: a gap no width is known for is the background's.
+  // Labels on the boxes: gaps have no box, and only show bare count text in debug mode.
   const labels: { box: Box; rect: ScreenRect; ink: string }[] = [];
   for (const box of frame.boxes) {
+    if (box.kind === "gap" && !state.debug) continue;
     const rect = screenRect(box, cam, view);
     if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0) continue;
-    const ink = box.kind === "gap" && !Number.isFinite(box.x1) ? scheme.inkMuted : palette.ink;
+    const ink = box.kind === "gap" ? scheme.inkMuted : palette.ink;
     if (box.count !== 0) labels.push({ box, rect, ink });
   }
 

@@ -25,6 +25,7 @@ import { parseView, type SavedView, serializeView, viewKey } from "./view-state"
 import { Palette } from "./color";
 import { describe, heard, Measures } from "./measures";
 import { BITS, draw, NATS, RULER_HEIGHT, pixelCorner, rulerCaption, type Units } from "./render";
+import { Toasts } from "./toast";
 
 /** Held arrow keys move the view at these speeds: px of depth and view heights per second. */
 const KEY_DEPTH_SPEED = 300;
@@ -108,6 +109,7 @@ export class App {
   private pendingView: { id: string; view: SavedView } | null = null;
   private readonly readout = element<HTMLElement>("readout");
   private readonly status = element<HTMLElement>("status");
+  private readonly toasts = new Toasts(element<HTMLElement>("toasts"));
   /** Choosing p and q, from the dataset's catalog. */
   private measures: Measures | null = null;
   private readonly unitsButton = element<HTMLButtonElement>("units");
@@ -199,7 +201,10 @@ export class App {
       this.setDataset(dataset);
       this.setStatus("");
     } catch (error) {
-      if (generation === this.loading) this.setStatus(String(error));
+      if (generation === this.loading) {
+        this.setStatus("");
+        this.toasts.error(error, `loading ${entry.title}`);
+      }
     }
   }
 
@@ -224,21 +229,17 @@ export class App {
     this.dataset = dataset;
     this.tree = tree;
     this.link = new Link(tree, dataset.server);
-    let failing = false;
     this.link.onError = (error) => {
       if (tree !== this.tree) return;
-      failing = true;
-      this.setStatus(String(error));
+      this.toasts.error(error, "session");
     };
     tree.subscribe(() => {
       if (tree !== this.tree) return;
-      if (failing) this.setStatus("");
-      failing = false;
       this.invalidate();
     });
     element("title").textContent = dataset.title;
     const failed = (error: unknown) => {
-      if (dataset === this.dataset) this.setStatus(String(error));
+      if (dataset === this.dataset) this.toasts.error(error, "measures");
     };
     const measures = this.measures = new Measures(dataset.catalog, dataset.holdings, dataset.recordings,
       (which, spec) => this.setSpecs({ ...this.specs, [which]: spec }), failed);
@@ -378,7 +379,7 @@ export class App {
     try {
       if (await this.walk(parent, origin) && tree === this.tree) this.invalidate();
     } catch (error) {
-      if (tree === this.tree) this.setStatus(String(error));
+      if (tree === this.tree) this.toasts.error(error, "place");
     } finally {
       if (this.placing === origin) this.placing = null;
     }
@@ -428,7 +429,7 @@ export class App {
       this.invalidate();
     }, (error: unknown) => {
       if (this.flight === flight) this.flight = null;
-      if (tree === this.tree) this.setStatus(String(error));
+      if (tree === this.tree) this.toasts.error(error, "flight");
     });
   }
 
@@ -541,7 +542,7 @@ export class App {
         if (tree === this.tree) this.fly(tree.descend(tree.root, path));
       },
       failed: (error) => {
-        if (tree === this.tree) this.setStatus(String(error));
+        if (tree === this.tree) this.toasts.error(error, "reading");
       },
     }, p);
     this.glyphs.clear();
@@ -652,7 +653,19 @@ export class App {
       return { text: "This recording does not continue here · press 0 for the root", loading: false };
     }
     if (specs.every((spec) => tree.has(origin, tree.measure(spec)))) return null;
-    return { text: "Waiting for branches…", loading: true };
+    const dataset = this.dataset;
+    const held = this.measures?.held;
+    if (dataset?.holdings !== undefined && held !== undefined) {
+      const byModel = new Map(held.models.map((model) => [model.spec, model]));
+      const needed = [...new Set(specs.map((spec) => modelOf(dataset.catalog, spec)))];
+      const loading = needed.find((model) => byModel.get(model)?.state === "loading");
+      if (loading !== undefined) return { text: `${loading} is loading…`, loading: true };
+      const failed = needed.find((model) => byModel.get(model)?.state === "failed");
+      if (failed !== undefined) return { text: `${failed} failed to load`, loading: false };
+      const unloaded = needed.find((model) => !byModel.has(model));
+      if (unloaded !== undefined) return { text: `Load ${unloaded} under models… above`, loading: false };
+    }
+    return { text: "Computing branches…", loading: true };
   }
 
   /** Draw the previous view over this one, fading and growing as if passed through. */
@@ -883,7 +896,7 @@ export class App {
       if (files.length === 1 && this.dataset?.recordings != null &&
         (audio.type.startsWith("audio/") || audio.name.toLowerCase().endsWith(".m4a"))) {
         this.setStatus(`Uploading ${audio.name} …`);
-        this.measures!.hear(audio).then(() => this.setStatus(""), (error: unknown) => this.setStatus(String(error)));
+        this.measures!.hear(audio).then(() => this.setStatus(""), (error: unknown) => { this.setStatus(""); this.toasts.error(error, "upload"); });
         return;
       }
       const generation = ++this.loading;
@@ -893,7 +906,10 @@ export class App {
         this.setDataset(dataset);
         this.setStatus("");
       } catch (error) {
-        if (generation === this.loading) this.setStatus(String(error));
+        if (generation === this.loading) {
+          this.setStatus("");
+          this.toasts.error(error, "drop");
+        }
       }
     });
   }
@@ -998,7 +1014,6 @@ export class App {
       this.result.hidden = true;
       this.where.classList.remove("found");
       this.where.removeAttribute("title");
-      this.setStatus("");
       this.fly(this.tree!.descend(this.tree!.root, path));
       this.where.blur();
     } catch (error) {
@@ -1009,7 +1024,7 @@ export class App {
       this.result.textContent = String(error);
       this.result.disabled = true;
       this.result.hidden = false;
-      if (anchor) this.setStatus(String(error));
+      if (anchor) this.toasts.error(error, "search");
     }
   }
 

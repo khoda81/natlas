@@ -205,6 +205,7 @@ export function project(
   const raw = projectFrame(tree.raw, lens.p, lens.q, cam, viewport, pixelRatio);
   const { anchor, a, demand } = raw.takeProjection() as { anchor: Anchor; a: number; demand: View };
   cam.anchor = anchor;
+  tree.descend(cam.origin, cam.anchor.path);
   cam.a = a;
   return { frame: new Frame(raw), demand };
 }

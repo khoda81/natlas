@@ -21,7 +21,7 @@ use std::f64::consts::LN_2;
 use crate::client::{ClientMeasure, ClientTree, FixedIndex, IdHasher};
 use crate::distribution::{Distribution, Edge, Item, Rank, RankView};
 use crate::point::Point;
-use crate::pstore::CDF_SIZE;
+use crate::pstore::{BranchHit, CDF_SIZE};
 use crate::qlayout::{QLayout, WidthIndex};
 use crate::session::View;
 use crate::tree::{bytes, child_hash, node_id, Branch, Lens, NodeId, Tree, ROOT};
@@ -390,6 +390,8 @@ pub struct Frame {
     pub top: NodeId,
     pub origin_top: f64,
     pub origin_bottom: f64,
+    /// Reusable per-depth hit buffers for `lay_quantile` (zero allocs when warm).
+    hit_pool: Vec<Vec<BranchHit>>,
 }
 
 impl Frame {
@@ -870,21 +872,14 @@ impl<T: LayoutTree> Layout<'_, T> {
         let q = self.tree.client_measure(node, self.lens.q);
         let key = (self.lens.q, q.map_or(0, ClientMeasure::revision));
         let mut cached = fixed.widths.borrow_mut();
-        if cached
-            .as_ref()
-            .is_none_or(|(prior, widths)| *prior != key || !widths.covers(&visible))
-        {
-            *cached = Some((
-                key,
-                d.fixed_widths(fixed, visible.clone(), q, self.lens.p == self.lens.q),
-            ));
+        if cached.as_ref().is_none_or(|(prior, _)| *prior != key) {
+            *cached = Some((key, d.fixed_widths(fixed, q, self.lens.p == self.lens.q)));
         }
         let (_, widths) = cached.as_ref().expect("a width index for this lens");
-        let mut hits = Vec::new();
-        geometry.tall(&fixed.p, [-self.row, 1.0], self.row, &mut hits);
-        // Keep boxes and child traversal in rank order, as in the exact path.
-        hits.sort_unstable_by_key(|hit| hit.start);
-        for hit in hits {
+        let mut hits = self.frame.hit_pool.pop().unwrap_or_default();
+        geometry.tall_in_order(&fixed.p, [-self.row, 1.0], self.row, &mut hits);
+        let mut lay_err = Ok(());
+        for &hit in &hits {
             let item = fixed.items[hit.branch as usize];
             if skip
                 .is_some_and(|rank| matches!(item, Item::Child { .. }) && rank == d.item_rank(item))
@@ -898,7 +893,7 @@ impl<T: LayoutTree> Layout<'_, T> {
             }
             let ln_extent = || cdf_ln(u128::from(hit.start), end);
             let ln_gap = matches!(item, Item::Gap { .. }).then(ln_extent);
-            let b = item_box(
+            let b = match item_box(
                 self.tree,
                 self.lens,
                 node,
@@ -907,12 +902,28 @@ impl<T: LayoutTree> Layout<'_, T> {
                 item,
                 (y0, y1),
                 ln_gap,
-            )?;
-            match item {
-                Item::Child { .. } => self.child(node, placed, b, ln_extent)?,
-                Item::Gap { .. } => self.push(b),
+            ) {
+                Ok(b) => b,
+                Err(err) => {
+                    lay_err = Err(err);
+                    break;
+                }
+            };
+            let res = match item {
+                Item::Child { .. } => self.child(node, placed, b, ln_extent),
+                Item::Gap { .. } => {
+                    self.push(b);
+                    Ok(())
+                }
+            };
+            if let Err(err) = res {
+                lay_err = Err(err);
+                break;
             }
         }
+        hits.clear();
+        self.frame.hit_pool.push(hits);
+        lay_err?;
 
         quantile_rows(&row_geometry, fixed, widths, rows, visible, |span| {
             self.span(node, placed, span)

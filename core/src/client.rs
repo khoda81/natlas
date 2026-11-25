@@ -20,32 +20,20 @@ use crate::Result;
 #[derive(Clone, Copy)]
 struct Width {
     rank: Rank,
-    nats: f32,
-    precise: Option<f64>,
-}
-
-impl Width {
-    fn new(rank: Rank, nats: f64) -> Self {
-        let narrow = nats as f32;
-        Self {
-            rank,
-            nats: narrow,
-            precise: (nats != f64::from(narrow)).then_some(nats),
-        }
-    }
+    nats: f64,
 }
 
 /// Branch-indexed ranks and conditional surprisal. As a dense prefix forms,
-/// each entry moves from the sparse table to arrays at most once.
+/// each entry moves from the sparse table to flat arrays at most once.
 #[derive(Default)]
 pub(crate) struct QStore {
     ranks: Vec<Rank>,
-    nats: Vec<f32>,
-    precise: Vec<Option<f64>>,
+    nats: Vec<f64>,
     sparse: HashMap<Branch, Width, BuildHasherDefault<BranchHasher>>,
 }
 
 impl QStore {
+    #[inline]
     fn get(&self, branch: Branch) -> Option<Width> {
         let at = branch as usize;
         self.ranks.get(at).map_or_else(
@@ -54,56 +42,36 @@ impl QStore {
                 Some(Width {
                     rank,
                     nats: self.nats[at],
-                    precise: self.precise[at],
                 })
             },
         )
     }
 
-    pub(crate) fn nats(&self, branch: Branch) -> f32 {
+    #[inline]
+    pub(crate) fn nats(&self, branch: Branch) -> f64 {
         self.nats
             .get(branch as usize)
             .copied()
             .or_else(|| self.sparse.get(&branch).map(|width| width.nats))
-            .unwrap_or(f32::INFINITY)
-    }
-
-    fn exact_nats(&self, branch: Branch) -> f64 {
-        // Wire samples can carry more precision than the compact lane.
-        let precise = self
-            .precise
-            .get(branch as usize)
-            .copied()
-            .or_else(|| self.sparse.get(&branch).map(|width| width.precise))
-            .flatten();
-        precise.unwrap_or_else(|| f64::from(self.nats(branch)))
+            .unwrap_or(f64::INFINITY)
     }
 
     fn insert(&mut self, branch: Branch, rank: Rank, nats: f64) {
         let at = branch as usize;
-        let width = Width::new(rank, nats);
+        let width = Width { rank, nats };
         if at < self.ranks.len() {
-            self.set_dense(at, width);
+            self.ranks[at] = rank;
+            self.nats[at] = nats;
         } else if self.ranks.len() < at {
             self.sparse.insert(branch, width);
         } else {
-            self.push(width);
-            while let Some(width) = self.sparse.remove(&(self.ranks.len() as Branch)) {
-                self.push(width);
+            self.ranks.push(rank);
+            self.nats.push(nats);
+            while let Some(next) = self.sparse.remove(&(self.ranks.len() as Branch)) {
+                self.ranks.push(next.rank);
+                self.nats.push(next.nats);
             }
         }
-    }
-
-    fn set_dense(&mut self, at: usize, width: Width) {
-        self.ranks[at] = width.rank;
-        self.nats[at] = width.nats;
-        self.precise[at] = width.precise;
-    }
-
-    fn push(&mut self, width: Width) {
-        self.ranks.push(width.rank);
-        self.nats.push(width.nats);
-        self.precise.push(width.precise);
     }
 
     fn from_segments(segments: &[Segment], len: usize) -> Result<Self> {
@@ -116,13 +84,13 @@ impl QStore {
             // is an exclusive end, so it also marks an empty slot during validation.
             result.ranks = vec![Rank::MAX; len];
             result.nats = vec![0.0; len];
-            result.precise = vec![None; len];
             for (branch, rank, nats) in segments.iter().flat_map(Segment::children) {
                 let at = branch as usize;
                 if result.ranks[at] != Rank::MAX {
                     return Err(format!("branch {branch} is placed twice"));
                 }
-                result.set_dense(at, Width::new(rank, nats));
+                result.ranks[at] = rank;
+                result.nats[at] = nats;
             }
         } else {
             result.sparse.reserve(len);
@@ -142,9 +110,8 @@ impl QStore {
 
     pub(crate) fn heap_bytes(&self) -> usize {
         self.ranks.capacity() * size_of::<Rank>()
-            + self.nats.capacity() * size_of::<f32>()
+            + self.nats.capacity() * size_of::<f64>()
             + self.sparse.capacity() * (size_of::<(Branch, Width)>() + 1)
-            + self.precise.capacity() * size_of::<Option<f64>>()
     }
 }
 
@@ -461,7 +428,7 @@ impl ClientMeasure {
     }
 
     pub(crate) fn nats(&self, branch: Branch) -> f64 {
-        self.q.exact_nats(branch)
+        self.q.nats(branch)
     }
 
     pub(crate) fn entry(&self, branch: Branch) -> Option<(Rank, Point, f64)> {
@@ -529,11 +496,27 @@ impl ClientMeasure {
             self.invalidate();
             return Ok(true);
         }
-        let mut seen =
-            HashSet::with_capacity_and_hasher(len, BuildHasherDefault::<BranchHasher>::default());
-        for &branch in fresh.iter().flat_map(|segment| segment.view().branches()) {
-            if !seen.insert(branch) {
-                return Err(format!("branch {branch} is placed twice"));
+        if len > 1 {
+            if len <= 16 {
+                let mut small = [0 as Branch; 16];
+                let mut count_seen = 0;
+                for &branch in fresh.iter().flat_map(|segment| segment.view().branches()) {
+                    if small[..count_seen].contains(&branch) {
+                        return Err(format!("branch {branch} is placed twice"));
+                    }
+                    small[count_seen] = branch;
+                    count_seen += 1;
+                }
+            } else {
+                let mut seen = HashSet::with_capacity_and_hasher(
+                    len,
+                    BuildHasherDefault::<BranchHasher>::default(),
+                );
+                for &branch in fresh.iter().flat_map(|segment| segment.view().branches()) {
+                    if !seen.insert(branch) {
+                        return Err(format!("branch {branch} is placed twice"));
+                    }
+                }
             }
         }
         let mut changed = self.count != merged_count;
@@ -673,15 +656,10 @@ impl ClientMeasure {
     pub(crate) fn fixed_widths(
         &self,
         fixed: &FixedIndex,
-        visible: Range<usize>,
         q: Option<&Self>,
         same: bool,
     ) -> WidthIndex {
-        let range = if self.complete() {
-            0..fixed.items.len()
-        } else {
-            visible
-        };
+        let range = 0..fixed.items.len();
         let (first_run, include_first) = match fixed.items[range.start] {
             Item::Child { run, at } => (run, at != 0),
             Item::Gap { before } => (before.saturating_sub(1), 0 < before),

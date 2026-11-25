@@ -155,8 +155,10 @@ export function draw(
   const row = (y: number) => Math.round(within(y, -1, 2) * view.height * scale) / scale;
   const spans = new Map<NodeId, Painted[]>();
   for (const span of frame.spans) {
-    const painted = { y0: row(span.y0), y1: row(span.y1), left: column(span.x0),
-      fill: span.x0 < span.fill ? column(span.fill) : null, reach: column(span.reach) + pixel };
+    const painted = {
+      y0: row(span.y0), y1: row(span.y1), left: column(span.x0),
+      fill: span.x0 < span.fill ? column(span.fill) : null, reach: column(span.reach) + pixel
+    };
     if (painted.y1 <= painted.y0) continue;
     const node = spans.get(span.node);
     if (node === undefined) spans.set(span.node, [painted]);
@@ -222,11 +224,9 @@ export function draw(
 
   // Labels on the boxes: a gap no width is known for is the background's.
   const labels: { box: Box; rect: ScreenRect; ink: string }[] = [];
-  let visible = spans.size !== 0;
   for (const box of frame.boxes) {
     const rect = screenRect(box, cam, view);
     if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0) continue;
-    visible = true;
     const ink = box.kind === "gap" && !Number.isFinite(box.x1) ? scheme.inkMuted : palette.ink;
     if (box.count !== 0) labels.push({ box, rect, ink });
   }
@@ -246,8 +246,8 @@ export function draw(
       glyphs = parent === undefined || glyph === undefined || fitOf(parent) !== null
         ? []
         : windowed(glyph)
-        ? carried(parent.node)
-        : [...carried(parent.node), glyph];
+          ? carried(parent.node)
+          : [...carried(parent.node), glyph];
       carriedBy.set(node, glyphs);
     }
     return glyphs;
@@ -321,8 +321,7 @@ export function draw(
     ctx.restore();
   }
 
-  const note = state.note ?? (visible ? null : { text: "No continuation discovered here · press 0 for the root", sweep: null });
-  if (note !== null) drawNote(ctx, view, palette, note.text, note.sweep);
+  if (state.note !== null) drawNote(ctx, view, palette, state.note.text, state.note.sweep);
 
   outline(ctx, frame, cam, view, state, scheme.hover);
   ruler(ctx, cam, view, state.units, palette);
@@ -516,7 +515,7 @@ function largestFit(pieces: readonly Piece[], width: number, height: number, lar
 function wrap(pieces: readonly Piece[], across: number, along: number, largest: number): Omit<Fit, "vertical"> {
   let limit = Math.max(...pieces.map((piece) => piece.ems));
   let best: Omit<Fit, "vertical"> | null = null;
-  for (;;) {
+  for (; ;) {
     const lines: Piece[][] = [[pieces[0]!]];
     let line = pieces[0]!.ems;
     let widest = line;

@@ -855,7 +855,12 @@ impl TieredPStore {
         self.query_spans(range, min_mass.saturating_sub(1), out);
     }
 
-    pub(crate) fn query_spans(&self, range: CdfRange, min_span_m1: u64, out: &mut Vec<BranchHit>) {
+    pub(crate) fn query_spans_unsorted(
+        &self,
+        range: CdfRange,
+        min_span_m1: u64,
+        out: &mut Vec<BranchHit>,
+    ) {
         out.clear();
         let (start, end) = range.bounds();
         let last_tier = min_span_m1.leading_zeros() as usize;
@@ -875,6 +880,10 @@ impl TieredPStore {
                 }
             }
         }
+    }
+
+    pub(crate) fn query_spans(&self, range: CdfRange, min_span_m1: u64, out: &mut Vec<BranchHit>) {
+        self.query_spans_unsorted(range, min_span_m1, out);
         out.sort_unstable_by(|a, b| {
             b.span_m1()
                 .cmp(&a.span_m1())

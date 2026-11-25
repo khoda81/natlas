@@ -1,7 +1,6 @@
 //! Fixed-point CDF geometry and exact per-row width queries for the browser.
 
 use std::mem::size_of;
-use std::ops::Range;
 
 use crate::point::Point;
 use crate::pstore::{BranchHit, CdfRange, TieredPStore, CDF_SIZE};
@@ -158,7 +157,13 @@ impl QLayout {
             .map_or(0, |at| u128::from(p.ends()[at]) + 1)
     }
 
-    pub(crate) fn tall(&self, p: &TieredPStore, y: [f64; 2], row: f64, out: &mut Vec<BranchHit>) {
+    pub(crate) fn tall_in_order(
+        &self,
+        p: &TieredPStore,
+        y: [f64; 2],
+        row: f64,
+        out: &mut Vec<BranchHit>,
+    ) {
         let start = self.cut(y[0], f64::floor).max(0);
         let end = self.cut(y[1], f64::ceil).min(CDF_SIZE as i128);
         // A conservative threshold leaves the final pixel-height decision to
@@ -166,7 +171,8 @@ impl QLayout {
         let span = (row * self.units) as u128;
         if start < end {
             if let Ok(span_m1) = u64::try_from(span.saturating_sub(2)) {
-                p.query_spans(CdfRange::new(start as u64, (end - 1) as u64), span_m1, out);
+                p.query_spans_unsorted(CdfRange::new(start as u64, (end - 1) as u64), span_m1, out);
+                out.sort_unstable_by_key(|hit| hit.start);
                 return;
             }
         }
@@ -232,10 +238,6 @@ impl WidthIndex {
     #[inline]
     pub(crate) fn at(&self, index: usize) -> f64 {
         self.values[index - self.start]
-    }
-
-    pub(crate) fn covers(&self, range: &Range<usize>) -> bool {
-        self.start <= range.start && range.end <= self.start + self.values.len()
     }
 
     #[inline]

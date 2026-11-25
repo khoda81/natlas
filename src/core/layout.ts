@@ -12,6 +12,7 @@ import {
   settle as settleAnchor,
   type LayoutFrame,
   view as viewOf,
+  wasmMemory,
 } from "./wasm";
 import type { Branch, IntervalTree, Lens, NodeId, Rank } from "./tree";
 
@@ -168,7 +169,8 @@ export class Frame {
     strokeRgb: number,
     out: Uint8Array,
   ): void {
-    this.raw.rasterize(tree.raw, lens.p, lens.q, cam.x, cam.k, widthPx, heightPx, dpr, surfaceRgb, tileRgb, strokeRgb, out);
+    const ptr = this.raw.rasterize(tree.raw, lens.p, lens.q, cam.x, cam.k, widthPx, heightPx, dpr, surfaceRgb, tileRgb, strokeRgb);
+    out.set(new Uint8Array(wasmMemory.buffer, ptr, widthPx * heightPx * 4));
   }
 
   /** All frame views are invalid after disposal; buffers may be reused. */

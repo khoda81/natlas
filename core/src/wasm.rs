@@ -140,6 +140,7 @@ fn update_message(update: &Update) -> UpdateMessage<'_> {
 pub struct Tree {
     pub(crate) inner: ClientTree,
     frames: Rc<RefCell<Vec<Frame>>>,
+    rgba: RefCell<Vec<u8>>,
 }
 
 #[wasm_bindgen]
@@ -149,6 +150,7 @@ impl Tree {
         Self {
             inner: ClientTree::new(),
             frames: Rc::default(),
+            rgba: RefCell::default(),
         }
     }
 
@@ -603,8 +605,12 @@ impl LayoutFrame {
         surface_rgb: u32,
         tile_rgb: u32,
         stroke_rgb: u32,
-        out: &mut [u8],
-    ) {
+    ) -> usize {
+        let len = width_px.saturating_mul(height_px).saturating_mul(4);
+        let mut buf = tree.rgba.borrow_mut();
+        if buf.len() != len {
+            buf.resize(len, 0);
+        }
         crate::raster::rasterize(
             &tree.inner,
             Lens { p, q },
@@ -617,8 +623,9 @@ impl LayoutFrame {
             surface_rgb,
             tile_rgb,
             stroke_rgb,
-            out,
+            &mut buf,
         );
+        buf.as_ptr() as usize
     }
 
     #[allow(clippy::too_many_arguments)]

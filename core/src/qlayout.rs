@@ -241,6 +241,20 @@ impl WidthIndex {
     }
 
     #[inline]
+    pub(crate) fn monotonic(&self) -> Option<bool> {
+        match self.order {
+            WidthOrder::Increasing => Some(true),
+            WidthOrder::Decreasing => Some(false),
+            WidthOrder::Blocks { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn slice(&self, start: usize, end: usize) -> &[f64] {
+        &self.values[start - self.start..end - self.start]
+    }
+
+    #[inline]
     pub(crate) fn maximum(&self, start: usize, end: usize) -> f64 {
         let (start, end) = (start - self.start, end - self.start);
         match &self.order {

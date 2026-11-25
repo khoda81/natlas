@@ -284,12 +284,22 @@ def _llama_ends(llm, path: Path) -> tuple[tuple[int, ...], frozenset[int]]:
     return (bos if bos >= 0 else eos,), frozenset({eos} if eos >= 0 else ())
 
 
+def is_gguf(source: str) -> bool:
+    """Whether ``source`` is a readable local GGUF file (by magic bytes, not extension)."""
+    path = Path(source).expanduser()
+    try:
+        with path.open("rb") as file:
+            return file.read(4) == b"GGUF"
+    except OSError:
+        return False
+
+
 class Vocabulary:
     """A source's tokenizer, read without its weights: what a server's
     branches mean, every model it offers sharing it."""
 
     def __init__(self, source: str):
-        if source.endswith(".gguf"):
+        if is_gguf(source):
             from llama_cpp import Llama
 
             path = Path(source).expanduser()
@@ -510,7 +520,7 @@ def control_vector(path: Path, layers: int, width: int) -> np.ndarray:
 
 def open_language(spec: str, device: str, dtype: str = "float32", tokenizer: str | None = None, **llama) -> Language:
     """A .gguf file through llama.cpp, taking ``llama``'s options, else a Hugging Face model."""
-    if spec.endswith(".gguf"):
+    if is_gguf(spec):
         return LlamaCpp(Path(spec).expanduser(), **llama)
     return Transformers(spec, device, dtype, tokenizer)
 
@@ -545,7 +555,7 @@ def catalog(
         if not source:
             raise ValueError("source must be a Hugging Face model id or path to a .gguf file")
         device, dtype = values["device"], values["dtype"]
-        if source.endswith(".gguf"):
+        if is_gguf(source):
             if dtype != "auto":
                 raise ValueError("a .gguf file's weights are as it stores them: its dtype is auto")
             n_ctx = int(values["n_ctx"])

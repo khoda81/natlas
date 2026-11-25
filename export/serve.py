@@ -49,7 +49,7 @@ def _discover_ggufs(tokenizer: str, dirs: list[Path]) -> list[str]:
             seen.add(item)
             suggestions.append(item)
 
-    if tokenizer.endswith(".gguf"):
+    if lm.is_gguf(tokenizer):
         resolved = Path(tokenizer).expanduser().resolve()
         add(str(resolved))
         dirs = [resolved.parent, *dirs]
@@ -88,10 +88,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8421)
     args = parser.parse_args()
 
-    tokenizer_spec = str(Path(args.tokenizer).expanduser().resolve()) if args.tokenizer.endswith(".gguf") else args.tokenizer
+    is_local_gguf = lm.is_gguf(args.tokenizer)
+    tokenizer_spec = str(Path(args.tokenizer).expanduser()) if is_local_gguf else args.tokenizer
     vocabulary = lm.Vocabulary(tokenizer_spec)
     suggestions = _discover_ggufs(tokenizer_spec, args.models_dir)
-    hf_tokenizer = None if tokenizer_spec.endswith(".gguf") else tokenizer_spec
+    hf_tokenizer = None if is_local_gguf else tokenizer_spec
     catalog = lm.catalog(vocabulary, suggestions=suggestions, tokenizer=hf_tokenizer)
 
     label = Path(tokenizer_spec).stem if tokenizer_spec.endswith(".gguf") else tokenizer_spec.rsplit("/", 1)[-1]

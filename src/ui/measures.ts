@@ -151,6 +151,13 @@ export class Measures {
     return this.panel;
   }
 
+  dispose(): void {
+    if (this.poll !== null) {
+      clearTimeout(this.poll);
+      this.poll = null;
+    }
+  }
+
   /** Show ``specs`` as chosen. */
   set(specs: { p: string; q: string }): void {
     this.specs = specs;

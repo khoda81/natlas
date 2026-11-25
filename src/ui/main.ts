@@ -64,8 +64,7 @@ interface Focus {
 /**
  * A flight down ``chain`` to its last node. The camera's point stays the
  * top of ``chain[reached]``, the deepest node placed so far. ``listed`` once
- * the walks have answered; ``time`` is the last frame's. Arrived, the camera
- * becomes ``land`` where there is one.
+ * the walk has answered; ``time`` is the last frame's.
  */
 interface Flight {
   chain: NodeId[];
@@ -74,7 +73,6 @@ interface Flight {
   time: number | null;
   chased: boolean;
   landing: { to: { x: number; a: number }; start: number; duration: number; easeOut: boolean; eased: number } | null;
-  land: Camera | null;
 }
 
 export class App {
@@ -86,11 +84,12 @@ export class App {
   private readonly pathPanel = element<HTMLElement>("path-panel");
   /** While the inspector has focus as an editor. */
   private editing = false;
+  /** Initial text when the editor gained focus, to detect whether the user edited it. */
+  private editBase = "";
   /** Text edited when the editor last lost focus, given back when it regains it. */
   private draft: string | null = null;
-  private shownText = "";
   private shownPath: { node: NodeId; branch: number | null; more?: string } | null = null;
-  /** The box the path panel shows, as node:rank:kind. */
+  /** Render-dedup key for the path panel DOM. */
   private shown = "";
   private whereHeight: number | null = null;
   private windowHeight = window.innerHeight;
@@ -102,9 +101,10 @@ export class App {
   private nodeStatistics: { key: string; value: { entropy: number; cross: number; bounded: boolean } } | null = null;
   private readonly glyphs = new Map<string, Glyph>();
   private loading = 0;
-  private navigation = 0;
-  /** The saved view, flown to once its measures' models have loaded. */
+  /** The saved view, restored directly once its measures' models have loaded. */
   private saved: SavedView | null = null;
+  private restoring = false;
+  private wasSuppressing = false;
   private readonly result = element<HTMLButtonElement>("search-result");
   private pendingView: { id: string; view: SavedView } | null = null;
   private readonly readout = element<HTMLElement>("readout");
@@ -219,6 +219,7 @@ export class App {
   private setDataset(dataset: Dataset): void {
     this.flushView();
     this.loading++;
+    this.measures?.dispose();
     this.link?.dispose();
     this.frame?.dispose();
     this.lastPick = null;
@@ -271,8 +272,9 @@ export class App {
       this.read();
     }, failed);
     this.editing = false;
+    this.editBase = "";
     this.draft = null;
-    this.shownText = "";
+    this.shownPath = null;
     this.shownPath = null;
     this.where.replaceChildren();
     this.whereHeight = null;
@@ -316,9 +318,10 @@ export class App {
   }
 
   private cancelNavigation(): void {
-    this.navigation++;
     this.saved = null;
+    this.restoring = false;
     this.flight = null;
+    this.focus = null;
     this.link?.stop();
   }
 
@@ -339,9 +342,9 @@ export class App {
   }
 
   /**
-   * Fly to the saved view once the models of its measures have loaded: from
-   * the root, as a search's result is flown to, so the path above its origin
-   * is placed too, and the depth counts from the root.
+   * Restore the saved view directly once its measures' models have loaded:
+   * place the ancestor path from the root, then apply the saved camera
+   * without animating a flight.
    */
   private restore(held: Held): void {
     const saved = this.saved;
@@ -352,7 +355,24 @@ export class App {
     this.saved = null;
     const tree = this.tree!;
     const origin = tree.descend(tree.root, saved.origin);
-    this.fly(tree.descend(origin, saved.anchor.path), { origin, x: saved.x, k: saved.k, anchor: saved.anchor, a: saved.a });
+    const target = tree.descend(origin, saved.anchor.path);
+    this.restoring = true;
+    this.invalidate();
+    void this.walk(ROOT, target).then((placed) => {
+      if (tree !== this.tree || !this.restoring) return;
+      this.restoring = false;
+      if (placed === true) {
+        this.cam = { origin, x: saved.x, k: saved.k, anchor: saved.anchor, a: saved.a };
+        this.invalidate();
+      } else if (placed === false) {
+        this.open(target, saved.k);
+      }
+    }, (error: unknown) => {
+      if (tree !== this.tree) return;
+      this.restoring = false;
+      this.toasts.error(error, "restore");
+      this.invalidate();
+    });
   }
 
   /**
@@ -366,8 +386,8 @@ export class App {
     const { origin } = this.cam;
     const parent = tree.parent(origin);
     if (parent === null || !(this.cam.x < 0 || frame.originTop > 0 || frame.originBottom < 1)) return;
-    // A flight's path comes first: one path at a time.
-    if (this.flight !== null) return;
+    // A flight's or restore's path comes first: one path at a time.
+    if (this.flight !== null || this.restoring) return;
     const edge = tree.entry(parent, this.lens, tree.branch(origin));
     if (edge === undefined || !Number.isFinite(edge.natsQ)) {
       void this.place(parent, origin);
@@ -404,18 +424,16 @@ export class App {
    * ``target`` opens as the origin instead. Arrived, the camera becomes
    * ``land`` where there is one.
    */
-  private fly(target: NodeId, land: Camera | null = null): void {
+  private fly(target: NodeId): void {
     const tree = this.tree!;
     const above = tree.path(this.cam.origin);
     const path = tree.path(target);
     const below = above.length <= path.length && above.every((branch, i) => branch === path[i]);
-    if (below) {
-      this.cancelNavigation();
-      this.focus = null;
-    } else this.open(ROOT);
+    if (below) this.cancelNavigation();
+    else this.open(ROOT);
     const { origin } = this.cam;
     const chain = tree.chain(origin, target);
-    const flight: Flight = { chain, reached: 0, listed: false, time: null, chased: false, landing: null, land };
+    const flight: Flight = { chain, reached: 0, listed: false, time: null, chased: false, landing: null };
     if (below) {
       // Down the camera's path while the target's goes the same way, and p
       // and q both place it.
@@ -493,13 +511,8 @@ export class App {
 
     if (t === 1) {
       this.flight = null;
-      if (flight.land !== null) {
-        this.cam = { ...flight.land };
-      } else {
-        this.cam.x = this.cam.origin === ROOT ? Math.max(0, landing.to.x) : landing.to.x;
-        this.cam.a = landing.to.a;
-        this.showPath(chain.at(-1)!, null);
-      }
+      this.cam.x = this.cam.origin === ROOT ? Math.max(0, landing.to.x) : landing.to.x;
+      this.cam.a = landing.to.a;
     }
   }
 
@@ -517,22 +530,20 @@ export class App {
       image.getContext("2d")!.drawImage(this.canvas, 0, 0);
       this.transition = { image, start: performance.now() };
     }
-    this.focus = null;
     this.cam = { origin: node, x: 0, k, anchor: top(), a: 0 };
-    if (this.dataset?.searchable) this.showPath(node, null);
     this.invalidate();
   }
 
   private setSpecs(specs: Specs): void {
     if (this.measures === null) return;
     this.cancelNavigation();
-    this.focus = null;
     this.result.hidden = true;
     const p = specs.p !== this.specs.p;
     // Digits are fractions of p's mass: under another p only the path holds.
     if (p) this.cam.anchor = top(this.cam.anchor.path);
     this.specs = specs;
     this.measures.set(specs);
+    this.link?.setSpecs(specs);
     if (p) this.read();
     this.found = null;
     this.searchGeneration++;
@@ -614,12 +625,15 @@ export class App {
     this.stepKeys(time);
     const previous = this.frame;
     const { frame, demand } = this.currentFrame();
-    if (previous !== frame) {
-      previous?.dispose();
-      if (this.specs.p !== "" && this.specs.q !== "") this.link?.look(this.specs, demand);
+    const suppressing = this.flight !== null || this.restoring;
+    if (previous !== frame || this.wasSuppressing !== suppressing) {
+      if (previous !== frame) previous?.dispose();
+      this.wasSuppressing = suppressing;
+      if (this.specs.p !== "" && this.specs.q !== "") this.link?.look(this.specs, suppressing ? null : demand);
     }
     this.reachOut(frame);
     this.updateHover();
+    this.syncPreview(demand);
     const origin = this.originNote(tree);
     // The reading's time, from the page's pixels to the canvas's.
     const timeline = this.reading?.timeline?.() ?? null;
@@ -932,20 +946,21 @@ export class App {
       if (!this.dataset?.searchable || this.editing) return;
       this.held.clear();
       this.editing = true;
+      this.editBase = this.shownPath === null ? "" : (this.reading?.text?.(this.shownPath.node, this.shownPath.branch) ?? "");
       const draft = this.draft;
       this.draft = null;
-      this.where.textContent = draft ?? this.shownText;
+      this.where.textContent = draft ?? this.editBase;
       this.whereHeight = null;
       if (draft !== null) void this.search(false, ++this.searchGeneration);
       this.invalidate();
     });
-    // Focus leaving the editor and its result puts the hovered path back,
+    // Focus leaving the editor and its result puts the preview path back,
     // and keeps what was edited for the next focus.
     const left = (event: FocusEvent) => {
       const to = event.relatedTarget;
       if (!this.editing || to === this.where || to === this.result) return;
       // textContent is exactly what focus set while nothing was edited.
-      const edited = this.where.textContent !== this.shownText;
+      const edited = this.where.textContent !== this.editBase;
       const text = this.where.innerText;
       this.stopEditing();
       if (edited) this.draft = text;
@@ -978,10 +993,11 @@ export class App {
     });
   }
 
-  /** Show the hovered path again, leaving the editor's text behind. */
+  /** Leave edit mode; the next frame's syncPreview() restores the preview path. */
   private stopEditing(): void {
     if (!this.editing) return;
     this.editing = false;
+    this.editBase = "";
     this.found = null;
     this.searchGeneration++;
     if (this.searchTimer !== null) clearTimeout(this.searchTimer);
@@ -990,9 +1006,6 @@ export class App {
     this.where.classList.remove("found");
     this.where.removeAttribute("title");
     this.shown = "";
-    if (this.hover !== null) this.showSelectionPath(this.hover);
-    else if (this.shownPath === null) this.where.replaceChildren();
-    else this.showPath(this.shownPath.node, this.shownPath.branch, this.shownPath.more);
     this.invalidate();
   }
 
@@ -1087,12 +1100,22 @@ export class App {
     } else this.hover = null;
     this.avoidPointer();
     this.updateInspect();
-    if (this.hover) this.showSelectionPath(this.hover);
   }
 
-  private showSelectionPath({ box, exact }: Selection): void {
-    const more = !exact || box.branch === null ? " …" : undefined;
-    this.showPath(box.node, box.branch, more);
+  /**
+   * Single source of truth for the preview panel: hover always wins inside the
+   * canvas; otherwise fall back to the smallest branch containing the viewport.
+   */
+  private syncPreview(demand: View): void {
+    if (this.reading === null || this.editing) return;
+    if (this.hover !== null) {
+      const { box, exact } = this.hover;
+      const more = !exact || box.branch === null ? " …" : undefined;
+      this.showPath(box.node, box.branch, more);
+      return;
+    }
+    if (!this.dataset?.searchable && demand.node === ROOT) return;
+    this.showPath(demand.node, null);
   }
 
   /**
@@ -1117,7 +1140,6 @@ export class App {
     if (this.reading === null || this.editing || key === this.shown) return;
     this.shown = key;
     this.shownPath = { node, branch, more };
-    this.shownText = this.reading.text?.(node, branch) ?? "";
     this.found = null;
     this.searchGeneration++;
     if (this.searchTimer !== null) clearTimeout(this.searchTimer);
@@ -1254,7 +1276,7 @@ export class App {
   }
 
   private saveView(): void {
-    if (!this.storage || this.saved !== null || this.flight || this.dataset === null || this.tree === null) return;
+    if (!this.storage || this.saved !== null || this.restoring || this.flight || this.dataset === null || this.tree === null) return;
     if (this.saveTimer !== null) clearTimeout(this.saveTimer);
     const { origin, x, k, anchor, a } = this.cam;
     this.pendingView = {

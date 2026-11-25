@@ -39,6 +39,12 @@ export class Link {
     this.connection.reconnect?.();
   }
 
+  /** The active measures, kept in sync before any path or view demand. */
+  setSpecs(specs: Specs): void {
+    this.specs = specs;
+    this.tell();
+  }
+
   /** What the page looks at now, under the measures ``specs`` names. */
   look(specs: Specs, view: View | null): void {
     this.specs = specs;
@@ -77,15 +83,17 @@ export class Link {
    * learned is named down a path from the root, which teaches it. */
   private tell(): void {
     const specs = this.specs;
-    if (specs === null) return;
+    if (specs === null || specs.p === "" || specs.q === "") return;
     let path = this.path?.path ?? null;
     if (path !== null && this.unknown.has(path.node)) {
       path = { node: ROOT, branches: [...this.tree.path(path.node), ...path.branches] };
     }
-    if (path === null && this.view !== null && this.unknown.has(this.view.node)) {
-      path = { node: ROOT, branches: this.tree.path(this.view.node) };
+    // Suppress viewport expansion while a path (flight or restore) is being placed.
+    const view = path !== null ? null : this.view;
+    if (path === null && view !== null && this.unknown.has(view.node)) {
+      path = { node: ROOT, branches: this.tree.path(view.node) };
     }
-    const demand: Demand = { specs, view: this.view, path };
+    const demand: Demand = { specs, view, path };
     const said = JSON.stringify(demand, (_, value: unknown) =>
       typeof value === "bigint" ? `${value}` : value instanceof Uint8Array ? [...value] : value);
     if (said === this.said) return;

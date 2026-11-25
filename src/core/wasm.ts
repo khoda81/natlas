@@ -19,8 +19,7 @@ import init, {
 const wasm = typeof document === "undefined"
   ? new URL("./generated/natlas_core_bg.wasm", import.meta.url)
   : new URL("generated/natlas_core_bg.wasm", document.baseURI);
-const wasmExports = await init({ module_or_path: wasm });
-export const wasmMemory = wasmExports.memory;
+await init({ module_or_path: wasm });
 
 const emptyPath = new Uint32Array();
 function frame(

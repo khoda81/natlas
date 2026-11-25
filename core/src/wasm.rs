@@ -140,7 +140,7 @@ fn update_message(update: &Update) -> UpdateMessage<'_> {
 pub struct Tree {
     pub(crate) inner: ClientTree,
     frames: Rc<RefCell<Vec<Frame>>>,
-    rgba: RefCell<Vec<u8>>,
+    aa_buf: RefCell<Vec<i32>>,
 }
 
 #[wasm_bindgen]
@@ -150,7 +150,7 @@ impl Tree {
         Self {
             inner: ClientTree::new(),
             frames: Rc::default(),
-            rgba: RefCell::default(),
+            aa_buf: RefCell::default(),
         }
     }
 
@@ -592,7 +592,8 @@ impl LayoutFrame {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn rasterize(
+    #[wasm_bindgen(js_name = aaSpans)]
+    pub fn aa_spans(
         &self,
         tree: &Tree,
         p: usize,
@@ -602,16 +603,9 @@ impl LayoutFrame {
         width_px: usize,
         height_px: usize,
         dpr: f64,
-        surface_rgb: u32,
-        tile_rgb: u32,
-        stroke_rgb: u32,
-    ) -> usize {
-        let len = width_px.saturating_mul(height_px).saturating_mul(4);
-        let mut buf = tree.rgba.borrow_mut();
-        if buf.len() != len {
-            buf.resize(len, 0);
-        }
-        crate::raster::rasterize(
+    ) -> Vec<i32> {
+        let mut buf = tree.aa_buf.borrow_mut();
+        crate::raster::aa_spans(
             &tree.inner,
             Lens { p, q },
             &self.inner,
@@ -620,12 +614,14 @@ impl LayoutFrame {
             width_px,
             height_px,
             dpr,
-            surface_rgb,
-            tile_rgb,
-            stroke_rgb,
             &mut buf,
         );
-        buf.as_ptr() as usize
+        buf.clone()
+    }
+
+    #[wasm_bindgen(js_name = aaPalette)]
+    pub fn aa_palette(surface_rgb: u32, stroke_rgb: u32) -> Vec<u32> {
+        crate::raster::linear_palette(surface_rgb, stroke_rgb).to_vec()
     }
 
     #[allow(clippy::too_many_arguments)]

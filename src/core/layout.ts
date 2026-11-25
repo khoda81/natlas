@@ -10,9 +10,8 @@ import {
   project as projectFrame,
   reach as reachOf,
   settle as settleAnchor,
-  type LayoutFrame,
+  LayoutFrame,
   view as viewOf,
-  wasmMemory,
 } from "./wasm";
 import type { Branch, IntervalTree, Lens, NodeId, Rank } from "./tree";
 
@@ -157,20 +156,15 @@ export class Frame {
   get originTop(): number { return this.raw.originTop(); }
   get originBottom(): number { return this.raw.originBottom(); }
 
-  rasterize(
+  aaSpans(
     tree: IntervalTree,
     lens: Lens,
     cam: Camera,
     widthPx: number,
     heightPx: number,
     dpr: number,
-    surfaceRgb: number,
-    tileRgb: number,
-    strokeRgb: number,
-    out: Uint8Array,
-  ): void {
-    const ptr = this.raw.rasterize(tree.raw, lens.p, lens.q, cam.x, cam.k, widthPx, heightPx, dpr, surfaceRgb, tileRgb, strokeRgb);
-    out.set(new Uint8Array(wasmMemory.buffer, ptr, widthPx * heightPx * 4));
+  ): Int32Array {
+    return this.raw.aaSpans(tree.raw, lens.p, lens.q, cam.x, cam.k, widthPx, heightPx, dpr);
   }
 
   /** All frame views are invalid after disposal; buffers may be reused. */
@@ -277,4 +271,9 @@ export function clamp(tree: IntervalTree, lens: Lens, cam: Camera): void {
  * ``x``, ``y``, shows, however thin, found in the frame drawn with ``cam``. */
 export function pick(tree: IntervalTree, lens: Lens, frame: Frame, cam: Camera, view: Viewport, x: number, y: number, pixel: number): Selection | null {
   return frame.raw.pick(tree.raw, lens.p, lens.q, cam, view, x, y, pixel) as Selection | null;
+}
+
+export function linearPalette(surfaceRgb: number, strokeRgb: number): string[] {
+  const rgbs = LayoutFrame.aaPalette(surfaceRgb, strokeRgb);
+  return Array.from(rgbs, (c) => `#${c.toString(16).padStart(6, "0")}`);
 }

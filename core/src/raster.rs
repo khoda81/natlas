@@ -1,26 +1,22 @@
-//! Exact sub-pixel vertical coverage rasterizer with linear-RGB blending.
+//! Boundary coverage as horizontal rectangles for Canvas2D.
 //!
-//! Tall box interiors and sub-pixel boundary/thin-tail rows are painted in a
-//! single unified pass per laid-out node (eliminating seam flicker and
-//! redundant span walks), compositing `stroke` in IEC 61966-2-1 linear light.
+//! Fractional rows use 16 coverage levels blended in linear light. Dense
+//! unordered widths use a maximum per block to approximate coverage.
+//! Grid-aligned and exact-layout edges retain the layout span's outline.
 
 use std::sync::OnceLock;
 
 use crate::client::{ClientMeasure, ClientTree};
-use crate::layout::{Frame, LayoutTree, Placed};
-use crate::pstore::CDF_SIZE;
+use crate::layout::{Frame, LayoutTree, Span};
 use crate::qlayout::QLayout;
 use crate::tree::Lens;
 
 const ON_GRID: f64 = 1e-6;
-/// Up to this many children in one pixel row, accumulate every child's exact
-/// clipped height into the row coverage buffer.
 const EXACT_ROW_LIMIT: usize = 64;
-const LIN_LUT_LEN: usize = 4096;
+pub const AA_BUCKETS: usize = 16;
 
 struct SrgbLuts {
     to_lin: [f32; 256],
-    to_srgb: [u8; LIN_LUT_LEN],
 }
 
 fn luts() -> &'static SrgbLuts {
@@ -35,18 +31,7 @@ fn luts() -> &'static SrgbLuts {
                 ((s + 0.055) / 1.055).powf(2.4)
             }) as f32;
         }
-        let mut to_srgb = [0u8; LIN_LUT_LEN];
-        let denom = (LIN_LUT_LEN - 1) as f64;
-        for (i, slot) in to_srgb.iter_mut().enumerate() {
-            let l = i as f64 / denom;
-            let s = if l <= 0.0031308 {
-                12.92 * l
-            } else {
-                1.055 * l.powf(1.0 / 2.4) - 0.055
-            };
-            *slot = (s * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-        SrgbLuts { to_lin, to_srgb }
+        SrgbLuts { to_lin }
     })
 }
 
@@ -60,30 +45,41 @@ fn unpack_rgb(rgb: u32) -> [u8; 3] {
 }
 
 #[inline]
-fn rgb_to_lin(rgb: [u8; 3], lut: &SrgbLuts) -> [f32; 3] {
-    [
-        lut.to_lin[rgb[0] as usize],
-        lut.to_lin[rgb[1] as usize],
-        lut.to_lin[rgb[2] as usize],
-    ]
+fn lin_to_srgb_byte(l: f32) -> u8 {
+    let l = l.clamp(0.0, 1.0) as f64;
+    let s = if l <= 0.0031308 {
+        12.92 * l
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-#[inline]
-fn lin_to_srgb(v: f32, lut: &SrgbLuts) -> u8 {
-    let idx = (v.clamp(0.0, 1.0) * (LIN_LUT_LEN - 1) as f32 + 0.5) as usize;
-    lut.to_srgb[idx.min(LIN_LUT_LEN - 1)]
-}
-
-#[inline]
-fn blend_linear(bg: [u8; 3], fg_lin: [f32; 3], alpha: f32, lut: &SrgbLuts) -> [u8; 4] {
-    let a = alpha.clamp(0.0, 1.0);
-    let bg_lin = rgb_to_lin(bg, lut);
-    [
-        lin_to_srgb(bg_lin[0] + a * (fg_lin[0] - bg_lin[0]), lut),
-        lin_to_srgb(bg_lin[1] + a * (fg_lin[1] - bg_lin[1]), lut),
-        lin_to_srgb(bg_lin[2] + a * (fg_lin[2] - bg_lin[2]), lut),
-        255,
-    ]
+/// Precompute `AA_BUCKETS` packed `0xRRGGBB` colors for `stroke` blended over
+/// `surface` at coverage `1/N .. N/N` in IEC 61966-2-1 linear light.
+pub fn linear_palette(surface_rgb: u32, stroke_rgb: u32) -> [u32; AA_BUCKETS] {
+    let lut = luts();
+    let bg = unpack_rgb(surface_rgb);
+    let fg = unpack_rgb(stroke_rgb);
+    let bg_lin = [
+        lut.to_lin[bg[0] as usize],
+        lut.to_lin[bg[1] as usize],
+        lut.to_lin[bg[2] as usize],
+    ];
+    let fg_lin = [
+        lut.to_lin[fg[0] as usize],
+        lut.to_lin[fg[1] as usize],
+        lut.to_lin[fg[2] as usize],
+    ];
+    let mut out = [0u32; AA_BUCKETS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let a = (i + 1) as f32 / AA_BUCKETS as f32;
+        let r = lin_to_srgb_byte(bg_lin[0] + a * (fg_lin[0] - bg_lin[0])) as u32;
+        let g = lin_to_srgb_byte(bg_lin[1] + a * (fg_lin[1] - bg_lin[1])) as u32;
+        let b = lin_to_srgb_byte(bg_lin[2] + a * (fg_lin[2] - bg_lin[2])) as u32;
+        *slot = (r << 16) | (g << 8) | b;
+    }
+    out
 }
 
 #[inline]
@@ -91,37 +87,10 @@ fn col_of(x: f64, cam_x: f64, px_per_nat: f64) -> i32 {
     ((x - cam_x) * px_per_nat + ON_GRID).floor() as i32
 }
 
-#[inline]
-fn write_pixel(out: &mut [u8], off: usize, rgba: [u8; 4]) {
-    out[off] = rgba[0];
-    out[off + 1] = rgba[1];
-    out[off + 2] = rgba[2];
-    out[off + 3] = rgba[3];
-}
-
-#[inline]
-fn blend_pixel(
-    out: &mut [u8],
-    off: usize,
-    surface: [u8; 3],
-    stroke_lin: [f32; 3],
-    stroke_over_surface: &[[u8; 4]; 256],
-    acc: f32,
-    lut: &SrgbLuts,
-) {
-    let bg = [out[off], out[off + 1], out[off + 2]];
-    let rgba = if bg == surface {
-        stroke_over_surface[(acc * 255.0 + 0.5) as usize]
-    } else {
-        blend_linear(bg, stroke_lin, acc, lut)
-    };
-    write_pixel(out, off, rgba);
-}
-
-/// Rasterize `frame`'s solid box fills and exact linear-RGB sub-pixel
-/// anti-aliased borders & thin tails into `out` (RGBA8, `width_px * height_px * 4`).
+/// Emit merged AA span quads `[bucket, px0, py, width]` (4 `i32`s per rect)
+/// for all boundary and thin-tail rows of `frame`.
 #[allow(clippy::too_many_arguments)]
-pub fn rasterize(
+pub fn aa_spans(
     tree: &ClientTree,
     lens: Lens,
     frame: &Frame,
@@ -130,62 +99,62 @@ pub fn rasterize(
     width_px: usize,
     height_px: usize,
     dpr: f64,
-    surface_rgb: u32,
-    tile_rgb: u32,
-    stroke_rgb: u32,
-    out: &mut [u8],
+    out: &mut Vec<i32>,
 ) {
-    if width_px == 0 || height_px == 0 || out.len() < width_px * height_px * 4 {
+    out.clear();
+    if width_px == 0 || height_px == 0 {
         return;
     }
-    let lut = luts();
-    let surface = unpack_rgb(surface_rgb);
-    let tile = unpack_rgb(tile_rgb);
-    let stroke = unpack_rgb(stroke_rgb);
-    let surface_rgba = [surface[0], surface[1], surface[2], 255];
-    let tile_rgba = [tile[0], tile[1], tile[2], 255];
-    let stroke_rgba = [stroke[0], stroke[1], stroke[2], 255];
-    let stroke_lin = rgb_to_lin(stroke, lut);
-
-    let mut stroke_over_surface = [[0u8; 4]; 256];
-    for (i, slot) in stroke_over_surface.iter_mut().enumerate() {
-        *slot = blend_linear(surface, stroke_lin, i as f32 / 255.0, lut);
-    }
-
-    // 1. Fill background with surface (copy first row, then memcpy row-by-row).
-    let stride = width_px * 4;
-    for chunk in out[..stride].as_chunks_mut::<4>().0 {
-        chunk.copy_from_slice(&surface_rgba);
-    }
-    for py in 1..height_px {
-        let (src, dst) = out.split_at_mut(py * stride);
-        dst[..stride].copy_from_slice(&src[..stride]);
-    }
-
     let px_per_nat = cam_k * dpr;
-    let inv_px_per_nat = 1.0 / px_per_nat;
-    let height_f = height_px as f64;
-    let width_i = width_px as i32;
-    let row_h = 1.0 / height_f;
-
-    let mut cov = vec![0.0f32; width_px];
-    let mut any_non_quantile = false;
-
-    // 2. Single unified pass over all quantile-laid-out nodes: paints both
-    //    crisp tall-box interiors AND exact linear-RGB AA boundary/thin rows.
-    for (&node, placed) in &frame.placed {
-        let Some(d) = tree.client_measure(node, lens.p) else {
-            continue;
-        };
-        let (Some(fixed), Some(geometry)) = (d.fixed(), placed.quantile()) else {
-            any_non_quantile = true;
-            continue;
-        };
-        let col0 = col_of(placed.x, cam_x, px_per_nat);
-        if col0 >= width_i {
-            continue;
+    let inv_px_per_nat = px_per_nat.recip();
+    let height = height_px as f64;
+    let width = width_px as i32;
+    let columns_of = |span: &Span| {
+        let left = col_of(span.x0, cam_x, px_per_nat).max(0) as usize;
+        let right = col_of(span.reach, cam_x, px_per_nat).saturating_add(1);
+        left..right.clamp(0, width) as usize
+    };
+    let rows_of = |span: &Span| {
+        let row = |y: f64| (y * height).round().clamp(0.0, height) as usize;
+        row(span.y0)..row(span.y1)
+    };
+    let emit = |out: &mut Vec<i32>, bucket: u8, x: usize, y: usize, len: usize| {
+        out.extend_from_slice(&[i32::from(bucket - 1), x as i32, y as i32, len as i32]);
+    };
+    let full = AA_BUCKETS as u8;
+    let bucket = |coverage: f32| {
+        if 0.0 < coverage {
+            ((coverage * f32::from(full)).round() as u8).clamp(1, full)
+        } else {
+            0
         }
-        let col0_u = col0.max(0) as usize;
+    };
+    let mut coverage = vec![0.0f32; width_px];
+    let mut row_buckets = vec![0u8; width_px];
+
+    // Layout already identifies which rows need an outline across the span.
+    for spans in frame.spans.chunk_by(|left, right| left.node == right.node) {
+        let mut boundaries = spans.iter().filter(|span| span.x0 == span.fill).peekable();
+        let Some(first_boundary) = boundaries.peek() else {
+            continue;
+        };
+        let node = first_boundary.node;
+        let placed = &frame.placed[&node];
+        let fixed_geometry = placed.quantile().and_then(|geometry| {
+            let d = tree.client_measure(node, lens.p)?;
+            Some((d, d.fixed()?, geometry))
+        });
+        let Some((d, fixed, geometry)) = fixed_geometry else {
+            for span in boundaries {
+                let columns = columns_of(span);
+                if !columns.is_empty() {
+                    for y in rows_of(span) {
+                        emit(out, full, columns.start, y, columns.len());
+                    }
+                }
+            }
+            continue;
+        };
 
         let q = tree.client_measure(node, lens.q);
         let key = (lens.q, q.map_or(0, ClientMeasure::revision));
@@ -194,254 +163,80 @@ pub fn rasterize(
             *cached = Some((key, d.fixed_widths(fixed, q, lens.p == lens.q)));
         }
         let (_, widths) = cached.as_ref().expect("width index");
-
-        let row_geo = geometry.in_rows(row_h);
+        let rows = geometry.in_rows(1.0 / height);
         let p = &fixed.p;
-        let len = p.ends().len();
-        if len == 0 {
-            continue;
-        }
-        let top_row = (row_geo.y(0) + ON_GRID).floor() as i64;
-        let end_row = ((row_geo.y(CDF_SIZE) + ON_GRID).floor() as i64 + 1).min(height_px as i64);
-        let start_py = top_row.max(0);
-        if end_row <= start_py {
-            continue;
-        }
-        let mut cursor = if row_geo.y(0) >= 0.0 {
-            0
-        } else {
-            row_geo.position(p, start_py as f64)
-        };
-        let limit = if row_geo.y(CDF_SIZE) <= height_f {
-            len
-        } else {
-            row_geo.tops_before(p, height_f, cursor)
-        };
-
-        let mut py = start_py;
-        while py < end_row {
-            let py_f = py as f64;
-            let first = row_geo.bottom_at(p, py_f + ON_GRID, cursor);
-            let end = row_geo
-                .tops_before(p, py_f + 1.0 - ON_GRID, first)
-                .min(limit);
-            if first < end {
-                cursor = end - 1;
-                // Interior of a single tall child: crisp opaque fill + 1px borders.
-                if first + 1 == end {
-                    let top = row_geo.y(QLayout::start(p, first));
-                    let bot = row_geo.end_y(p.ends()[first]);
-                    if top <= py_f + ON_GRID && py_f + 1.0 - ON_GRID <= bot {
-                        let w = widths.at(first);
-                        let skip_to = ((bot - 2.0 * ON_GRID).floor() as i64)
-                            .max(py + 1)
-                            .min(end_row);
-                        if 0.0 < w {
-                            let col1 = col_of(placed.x + w, cam_x, px_per_nat);
-                            if 0 <= col1 {
-                                let f0 = (col0 + 1).max(0).min(width_i) as usize;
-                                let f1 = col1.max(0).min(width_i) as usize;
-                                for r in py..skip_to {
-                                    let row_off = r as usize * stride;
-                                    if 0 <= col0 && col0 < width_i {
-                                        write_pixel(out, row_off + col0 as usize * 4, stroke_rgba);
-                                    }
-                                    for px in f0..f1 {
-                                        write_pixel(out, row_off + px * 4, tile_rgba);
-                                    }
-                                    if 0 <= col1 && col1 < width_i {
-                                        write_pixel(out, row_off + col1 as usize * 4, stroke_rgba);
-                                    }
-                                }
-                            }
-                        }
-                        py = skip_to;
-                        continue;
-                    }
+        let increasing = widths.monotonic() == Some(true);
+        let mut cursor = 0;
+        for span in boundaries {
+            let columns = columns_of(span);
+            if columns.is_empty() {
+                continue;
+            }
+            for y in rows_of(span) {
+                let row = y as f64;
+                let first = rows.bottom_at(p, row + ON_GRID, cursor);
+                let end = rows.tops_before(p, row + 1.0 - ON_GRID, first);
+                // Layout's reach includes both neighbors at a grid line.
+                if end <= first || (rows.y(QLayout::start(p, first)) - row).abs() <= ON_GRID {
+                    emit(out, full, columns.start, y, columns.len());
+                    continue;
                 }
-
+                cursor = end - 1;
                 let count = end - first;
-                if count <= EXACT_ROW_LIMIT {
-                    // Exact per-child vertical coverage accumulation.
-                    let mut max_col: Option<usize> = None;
-                    for pos in first..end {
-                        let w = widths.at(pos);
+                if EXACT_ROW_LIMIT < count && increasing {
+                    let row_top = rows.y(QLayout::start(p, first)).max(row);
+                    let row_bottom = rows.end_y(p.ends()[end - 1]).min(row + 1.0);
+                    let ordered = widths.slice(first, end);
+                    for x in columns.clone() {
+                        let target = cam_x + (x as f64 - ON_GRID) * inv_px_per_nat - placed.x;
+                        let offset = ordered.partition_point(|&w| w <= 0.0 || w < target);
+                        row_buckets[x] = if offset < ordered.len() {
+                            let top = rows.y(QLayout::start(p, first + offset)).max(row_top);
+                            bucket((row_bottom - top).clamp(0.0, 1.0) as f32)
+                        } else {
+                            0
+                        };
+                    }
+                } else {
+                    let step = if count <= EXACT_ROW_LIMIT {
+                        1
+                    } else {
+                        count.div_ceil(32)
+                    };
+                    for start in (first..end).step_by(step) {
+                        let stop = (start + step).min(end);
+                        let w = widths.maximum(start, stop);
                         if w <= 0.0 {
                             continue;
                         }
-                        let top = row_geo.y(QLayout::start(p, pos));
-                        let bot = row_geo.end_y(p.ends()[pos]);
-                        let h = (bot.min(py_f + 1.0) - top.max(py_f)).clamp(0.0, 1.0) as f32;
-                        if h <= 0.0 {
+                        let right = col_of(placed.x + w, cam_x, px_per_nat);
+                        if right < columns.start as i32 {
                             continue;
                         }
-                        let col1 = col_of(placed.x + w, cam_x, px_per_nat);
-                        if col1 < 0 {
-                            continue;
-                        }
-                        let c = (col1.min(width_i - 1) as usize).max(col0_u);
-                        cov[c] += h;
-                        max_col = Some(max_col.map_or(c, |m| m.max(c)));
+                        let x = (right as usize).min(columns.end - 1);
+                        let top = rows.y(QLayout::start(p, start));
+                        let bottom = rows.end_y(p.ends()[stop - 1]);
+                        coverage[x] +=
+                            (bottom.min(row + 1.0) - top.max(row)).clamp(0.0, 1.0) as f32;
                     }
-                    if let Some(right_col) = max_col {
-                        let row_off = py as usize * stride;
-                        let mut acc = 0.0f32;
-                        for px in (col0_u..=right_col).rev() {
-                            acc = (acc + cov[px]).min(1.0);
-                            cov[px] = 0.0;
-                            if 0.0 < acc {
-                                blend_pixel(
-                                    out,
-                                    row_off + px * 4,
-                                    surface,
-                                    stroke_lin,
-                                    &stroke_over_surface,
-                                    acc,
-                                    lut,
-                                );
-                            }
-                        }
-                    }
-                } else if widths.monotonic() == Some(true) {
-                    // Exact O(log m) coverage for monotonically increasing widths (heaviest p==q):
-                    // all children with width >= w_px form a contiguous suffix [k..end).
-                    let max_w = widths.at(end - 1);
-                    let max_col_i = col_of(placed.x + max_w, cam_x, px_per_nat);
-                    if 0.0 < max_w && 0 <= max_col_i {
-                        let right_col = (max_col_i.min(width_i - 1) as usize).max(col0_u);
-                        let row_top = row_geo.y(QLayout::start(p, first)).max(py_f);
-                        let row_bot = row_geo.end_y(p.ends()[end - 1]).min(py_f + 1.0);
-                        let w_slice = widths.slice(first, end);
-                        let row_off = py as usize * stride;
-                        for px in col0_u..=right_col {
-                            let w_thresh = (cam_x + (px as f64) * inv_px_per_nat) - placed.x;
-                            let k = w_slice.partition_point(|&w| w < w_thresh);
-                            if w_slice.len() <= k {
-                                break;
-                            }
-                            let k_top = row_geo.y(QLayout::start(p, first + k)).max(row_top);
-                            let acc = (row_bot - k_top).clamp(0.0, 1.0) as f32;
-                            if 0.0 < acc {
-                                blend_pixel(
-                                    out,
-                                    row_off + px * 4,
-                                    surface,
-                                    stroke_lin,
-                                    &stroke_over_surface,
-                                    acc,
-                                    lut,
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    // Arbitrary order with > 64 children in one pixel row:
-                    // stride into 32 contiguous mass blocks (zero binary searches).
-                    let blocks = 32usize;
-                    let step = count.div_ceil(blocks);
-                    let mut max_col: Option<usize> = None;
-                    let mut pos = first;
-                    while pos < end {
-                        let blk_end = (pos + step).min(end);
-                        let top = row_geo.y(QLayout::start(p, pos));
-                        let bot = row_geo.end_y(p.ends()[blk_end - 1]);
-                        let h = (bot.min(py_f + 1.0) - top.max(py_f)).clamp(0.0, 1.0) as f32;
-                        if 0.0 < h {
-                            let w = widths.maximum(pos, blk_end);
-                            if 0.0 < w {
-                                let col1 = col_of(placed.x + w, cam_x, px_per_nat);
-                                if 0 <= col1 {
-                                    let c = (col1.min(width_i - 1) as usize).max(col0_u);
-                                    cov[c] += h;
-                                    max_col = Some(max_col.map_or(c, |m| m.max(c)));
-                                }
-                            }
-                        }
-                        pos = blk_end;
-                    }
-                    if let Some(right_col) = max_col {
-                        let row_off = py as usize * stride;
-                        let mut acc = 0.0f32;
-                        for px in (col0_u..=right_col).rev() {
-                            acc = (acc + cov[px]).min(1.0);
-                            cov[px] = 0.0;
-                            if 0.0 < acc {
-                                blend_pixel(
-                                    out,
-                                    row_off + px * 4,
-                                    surface,
-                                    stroke_lin,
-                                    &stroke_over_surface,
-                                    acc,
-                                    lut,
-                                );
-                            }
-                        }
+                    let mut mass = 0.0;
+                    for x in columns.clone().rev() {
+                        mass = (mass + coverage[x]).min(1.0);
+                        coverage[x] = 0.0;
+                        row_buckets[x] = bucket(mass);
                     }
                 }
-            }
-            py += 1;
-        }
-    }
 
-    // 3. Fallback for ultra-deep nodes (> 2^44 QLayout range) only when present.
-    if any_non_quantile {
-        for span in &frame.spans {
-            if has_quantile(tree, lens, frame, span.node) {
-                continue;
-            }
-            let y0 = (span.y0.clamp(-1.0, 2.0) * height_f).round() as i32;
-            let y1 = (span.y1.clamp(-1.0, 2.0) * height_f).round() as i32;
-            let r0 = y0.max(0) as usize;
-            let r1 = y1.min(height_px as i32).max(0) as usize;
-            if r1 <= r0 {
-                continue;
-            }
-            let left = col_of(span.x0, cam_x, px_per_nat);
-            let reach = col_of(span.reach, cam_x, px_per_nat) + 1;
-            let has_fill = span.x0 < span.fill;
-            let fill = if has_fill {
-                col_of(span.fill, cam_x, px_per_nat)
-            } else {
-                left
-            };
-            for py in r0..r1 {
-                let row_off = py * stride;
-                if has_fill {
-                    if 0 <= left && left < width_i {
-                        write_pixel(out, row_off + left as usize * 4, stroke_rgba);
+                let mut x = columns.start;
+                for run in row_buckets[columns.clone()].chunk_by(|left, right| left == right) {
+                    if run[0] != 0 {
+                        emit(out, run[0], x, y, run.len());
                     }
-                    let f0 = (left + 1).max(0).min(width_i) as usize;
-                    let f1 = fill.max(0).min(width_i) as usize;
-                    for px in f0..f1 {
-                        write_pixel(out, row_off + px * 4, tile_rgba);
-                    }
-                    let s0 = fill.max(0).min(width_i) as usize;
-                    let s1 = reach.max(0).min(width_i) as usize;
-                    for px in s0..s1 {
-                        write_pixel(out, row_off + px * 4, stroke_rgba);
-                    }
-                } else {
-                    let s0 = left.max(0).min(width_i) as usize;
-                    let s1 = reach.max(0).min(width_i) as usize;
-                    for px in s0..s1 {
-                        write_pixel(out, row_off + px * 4, stroke_rgba);
-                    }
+                    x += run.len();
                 }
             }
         }
     }
-}
-
-fn has_quantile(tree: &ClientTree, lens: Lens, frame: &Frame, node: u64) -> bool {
-    let Some(placed): Option<&Placed> = frame.placed.get(&node) else {
-        return false;
-    };
-    placed.quantile().is_some()
-        && tree
-            .client_measure(node, lens.p)
-            .and_then(ClientMeasure::fixed)
-            .is_some()
 }
 
 #[cfg(test)]
@@ -452,20 +247,21 @@ mod tests {
     fn srgb_linear_round_trip_is_exact_for_all_256_values() {
         let lut = luts();
         for v in 0u8..=255 {
-            let lin = lut.to_lin[v as usize];
-            assert_eq!(lin_to_srgb(lin, lut), v, "mismatch at sRGB {v}");
+            assert_eq!(
+                lin_to_srgb_byte(lut.to_lin[v as usize]),
+                v,
+                "mismatch at sRGB {v}"
+            );
         }
     }
 
     #[test]
     fn linear_blend_half_coverage_is_gamma_correct() {
-        let lut = luts();
-        let white_lin = rgb_to_lin([255, 255, 255], lut);
-        let mid = blend_linear([0, 0, 0], white_lin, 0.5, lut);
-        // 0.5^(1/2.4) * 1.055 - 0.055 ≈ 0.7354 -> 188 (not sRGB 128).
-        assert!((186..=189).contains(&mid[0]), "got {mid:?}");
-        assert_eq!(mid[0], mid[1]);
-        assert_eq!(mid[1], mid[2]);
-        assert_eq!(mid[3], 255);
+        let pal = linear_palette(0x000000, 0xffffff);
+        let [r, g, b] = unpack_rgb(pal[AA_BUCKETS / 2 - 1]);
+        assert!((186..=189).contains(&r), "got {r}, {g}, {b}");
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        assert_eq!(pal[AA_BUCKETS - 1], 0xffffff);
     }
 }

@@ -1,5 +1,5 @@
 // Real Canvas pixel checks, served by scripts/check-rendering.ts.
-import { layout, pick, top, type Frame } from "../src/core/layout";
+import { layout, linearPalette, pick, top, type Frame } from "../src/core/layout";
 import { IntervalTree, type Lens, ROOT } from "../src/core/tree";
 import { TextLabels } from "../src/readings/labels";
 import { Palette } from "../src/ui/color";
@@ -37,6 +37,11 @@ varying.insert(ROOT, 1, complete(p, p.map((_, i) => count - 1 - i)));
 // Thick children of distinct widths, and steps between them.
 const steps = new IntervalTree();
 steps.insert(ROOT, 0, complete([0.5, 0.3, 0.15, 0.05]));
+const boundaries = new IntervalTree();
+boundaries.insert(ROOT, 0, complete([0.5, 0.5]));
+boundaries.insert(ROOT, 1, complete([Math.exp(-50), Math.exp(-50)]));
+const aaColors = linearPalette(Number.parseInt(palette.scheme.surface.slice(1), 16), Number.parseInt(palette.scheme.stroke.slice(1), 16));
+const halfCoverage = rgb(aaColors[aaColors.length / 2 - 1]!);
 // A heavy child ending mid-pixel at every ratio, then children thinner than
 // a pixel.
 const midPixel = new IntervalTree();
@@ -89,6 +94,21 @@ function oracle(tree: IntervalTree, lens: Lens, frame: Frame, camera: ReturnType
 
 const results: { name: string; dpr: number; phase: number; error: number }[] = [];
 for (const dpr of [1, 1.25, 1.5, 2]) {
+  const halfRow = Math.floor(view.height * dpr / 2);
+  const gridPhase = halfRow / dpr - view.height / 2;
+  for (const [name, camera, lens, row, color] of [
+    ["half-covered boundary row", cam(0.5 / dpr), { p: 0, q: 0 }, 0, halfCoverage],
+    ["grid-aligned sibling boundary", cam(gridPhase), { p: 0, q: 0 }, halfRow, stroke],
+    ["deep exact sibling boundary", { ...cam(), x: 45 * Math.LN2, a: halfRow / (view.height * dpr), anchor: top([1]) }, { p: 0, q: 1 }, halfRow, stroke],
+  ] as const) {
+    const frame = layout(boundaries, lens, camera, view, { rowPx: 1 / dpr });
+    const ctx = canvas(dpr).getContext("2d")!;
+    draw(ctx, frame, camera, view, palette, { ...state, raster: { tree: boundaries, lens } });
+    const pixel = ctx.getImageData(2, row, 1, 1).data;
+    results.push({ name, dpr, phase: camera.a * view.height, error: Math.max(differs(pixel, 0, color), 255 - pixel[3]!) });
+    frame.dispose();
+  }
+
   for (const [name, tree, lens] of [
     ["steps", steps, { p: 0, q: 0 }],
     ["uniform tail", uniform, { p: 0, q: 0 }],

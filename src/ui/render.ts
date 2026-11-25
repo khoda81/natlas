@@ -39,7 +39,7 @@ const FONT = `${BASE_SIZE}px ${FAMILY}`;
 // Label sizes are text sizes, in CSS pixels like the page's own text, so they
 // scale with it across devices and zoom, never with the view.
 /** The smallest a label reads at. A label that needs less is shortened, or not drawn. */
-const LABEL_MIN_SIZE = 8;
+const LABEL_MIN_SIZE = 1;
 /** Labels grow to fit their box, up to this size. */
 const LABEL_MAX_SIZE = 96;
 /** Fraction of the box a label may fill across its text. */
@@ -283,10 +283,15 @@ export function draw(
   // a box is centered both ways and slides into view the same way. The labels
   // a box carries come first, framed and fainter, and a label wraps between
   // its pieces where lines make it larger.
+  // Measure and fit every label while ctx.font is BASE_SIZE (FONT), before
+  // changing ctx.font to draw them.
+  const fitted: { box: Box; rect: ScreenRect; ink: string; fit: Fit }[] = [];
+  for (const item of labels) {
+    const fit = fitOf(item.box);
+    if (fit !== null) fitted.push({ ...item, fit });
+  }
   let currentFont = FONT;
-  for (const { box, rect, ink } of labels) {
-    const fit = fitOf(box);
-    if (fit === null) continue;
+  for (const { box, rect, ink, fit } of fitted) {
     const { lines, vertical } = fit;
     const size = Math.max(LABEL_MIN_SIZE, Math.round(fit.size * 2) / 2);
     const left = (box.x0 - cam.x) * cam.k;
@@ -347,6 +352,7 @@ export function draw(
       ctx.globalAlpha = 1;
     }
   }
+  if (currentFont !== FONT) ctx.font = FONT;
 
   if (state.note !== null) drawNote(ctx, view, palette, state.note.text, state.note.sweep);
 

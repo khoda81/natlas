@@ -404,7 +404,7 @@ class _Reader:
                 self._decode(chunk, {sequence for sequence in reading if isinstance(sequence, int)})
                 wanted = sum(want for *_, want in chunk)
                 logits = np.ctypeslib.as_array(llama_cpp.llama_get_logits(self.context.ctx), shape=(wanted, self.vocabulary))
-                rows.extend(logits.copy())
+                rows.extend(logits.view(np.float32).copy())
                 for sequence, token, _, _ in chunk:
                     self.fed[sequence].append(token)
         except Exception:

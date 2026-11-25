@@ -1,36 +1,36 @@
 {
-  "name": "natlas",
-  "private": true,
-  "version": "0.1.0",
-  "type": "module",
-  "scripts": {
-    "core": "wasm-pack build core --target web --out-dir ../src/core/generated --out-name natlas_core --release",
-    "predev": "bun run core",
-    "dev": "bun --hot serve.ts",
-    "prebuild": "bun run core",
-    "build": "tsc --noEmit && rm -rf dist && bun build ./index.html --outdir dist --minify && cp -r public/. dist/ && mkdir -p dist/generated && cp src/core/generated/natlas_core_bg.wasm dist/generated/",
-    "pretest": "bun run core",
-    "test": "bun test && cargo test --manifest-path core/Cargo.toml && uv run tests/server_test.py && uv run tests/scribe_test.py",
-    "pretypecheck": "bun run core",
-    "typecheck": "tsc --noEmit",
-    "prebench": "bun run core",
-    "bench": "bun scripts/bench-frames.ts",
-    "proto": "scripts/gen-proto.sh",
-    "data": "cd export && uv run synthetic.py",
-    "live": "cd export && uv run serve.py",
-    "scribe": "cd export && uv run scribe.py"
-  },
-  "dependencies": {
-    "@bufbuild/protobuf": "2.16.0",
-    "@connectrpc/connect": "2.2.0",
-    "@connectrpc/connect-web": "2.2.0",
-    "@qbar/qbar": "0.2.0"
-  },
-  "devDependencies": {
-    "@bufbuild/protoc-gen-es": "2.16.0",
-    "@types/bun": "1.4.2",
-    "typescript": "7.0.2"
-  },
-  "license": "MIT",
-  "repository": "https://github.com/khoda81/natlas"
+    "dependencies": {
+        "@bufbuild/protobuf": "2.16.0",
+        "@connectrpc/connect": "2.2.0",
+        "@connectrpc/connect-web": "2.2.0",
+        "@qbar/qbar": "0.4"
+    },
+    "devDependencies": {
+        "@bufbuild/protoc-gen-es": "2.16.0",
+        "@types/bun": "1.4.2",
+        "typescript": "7.0.2"
+    },
+    "license": "MIT",
+    "name": "natlas",
+    "private": true,
+    "repository": "https://github.com/khoda81/natlas",
+    "scripts": {
+        "bench": "bun scripts/bench-frames.ts",
+        "build": "tsc --noEmit && rm -rf dist && bun build ./index.html --outdir dist --minify && cp -r public/. dist/ && mkdir -p dist/generated && cp src/core/generated/natlas_core_bg.wasm dist/generated/",
+        "core": "wasm-pack build core --target web --out-dir ../src/core/generated --out-name natlas_core --release",
+        "data": "cd export && uv run synthetic.py",
+        "dev": "bun --hot serve.ts",
+        "live": "cd export && uv run serve.py",
+        "prebench": "bun run core",
+        "prebuild": "bun run core",
+        "predev": "bun run core",
+        "pretest": "bun run core",
+        "pretypecheck": "bun run core",
+        "proto": "scripts/gen-proto.sh",
+        "scribe": "cd export && uv run scribe.py",
+        "test": "bun test && cargo test --manifest-path core/Cargo.toml && uv run tests/server_test.py && uv run tests/scribe_test.py",
+        "typecheck": "tsc --noEmit"
+    },
+    "type": "module",
+    "version": "0.1.0"
 }

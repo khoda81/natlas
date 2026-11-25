@@ -523,9 +523,13 @@ class Model:
         if error is None:
             computed = future.result()
             if [len(rows) for rows in computed] == list(map(len, job.walks)):
-                self._keep(job.measure, [node for nodes in job.walks for node in nodes], [row for rows in computed for row in rows])
-                return
-            error = RuntimeError(f"walks of {list(map(len, job.walks))} nodes gave {[len(rows) for rows in computed]} distributions")
+                try:
+                    self._keep(job.measure, [node for nodes in job.walks for node in nodes], [row for rows in computed for row in rows])
+                    return
+                except Exception as exc:
+                    error = exc
+            else:
+                error = RuntimeError(f"walks of {list(map(len, job.walks))} nodes gave {[len(rows) for rows in computed]} distributions")
         traceback.print_exception(error)
         for nodes in job.walks:
             self._fail(job.measure, nodes[0], f"{type(error).__name__}: {error}")
@@ -547,6 +551,7 @@ class Model:
 
     def _keep(self, measure: int, nodes: list[int], rows: list[np.ndarray]) -> None:
         widths = self._ready_measure(measure).widths
+        rows = [np.asarray(row, dtype=np.float32) for row in rows]
         sizes = self.tree.set_rows(nodes, measure, rows, heaviest=self.order == "heaviest", normalize=not widths)
         for node, size in zip(nodes, sizes, strict=True):
             self.kept_bytes += size - self.kept.pop((node, measure), 0)

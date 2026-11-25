@@ -743,7 +743,7 @@ impl<T: LayoutTree> Layout<'_, T> {
         {
             return match d.fixed() {
                 Some(fixed) => self.lay_quantile(node, &placed, skip, d, fixed, &geometry),
-                None => self.lay_exact(node, &placed, skip, &d.scan(), Some(&geometry)),
+                None => self.lay_exact(node, &placed, skip, d, Some(&geometry)),
             };
         }
         self.lay_exact(node, &placed, skip, d, None)

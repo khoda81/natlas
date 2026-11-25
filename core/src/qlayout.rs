@@ -296,7 +296,6 @@ impl WidthIndex {
 mod tests {
     use super::*;
     use crate::client::ClientTree;
-    use crate::pstore::{bench_logits, bench_queries, PStore, QueryScratch};
     use crate::tree::{child_hash, derive_branch, derive_parent, Branch, ROOT};
 
     #[test]
@@ -318,26 +317,6 @@ mod tests {
         assert!(tree.contains(child));
         assert_eq!(tree.parent(child), Ok(Some(ROOT)));
         assert_eq!(tree.branch(child), Ok(Some(Branch::MAX)));
-    }
-
-    #[test]
-    fn compact_tiers_agree_with_the_previous_store() {
-        let mut scratch = QueryScratch::default();
-        let mut reference = Vec::new();
-        let mut hits = Vec::new();
-        for kind in 0..3 {
-            let logits = bench_logits(kind, 4096);
-            let old = crate::pstore::BTreeMax::from_logits(&logits);
-            let new = TieredPStore::from_logits(&logits);
-            for (range, min_mass) in bench_queries(64) {
-                old.query_tall(range, min_mass, &mut scratch, &mut reference);
-                new.tall(range, min_mass, &mut hits);
-                assert_eq!(hits, reference);
-                assert_eq!(new.locate(range.midpoint()), old.locate(range.midpoint()));
-                assert_eq!(new.contains_boundary(range), old.contains_boundary(range));
-            }
-            assert_eq!(new.locate(u64::MAX), old.locate(u64::MAX));
-        }
     }
 
     #[test]

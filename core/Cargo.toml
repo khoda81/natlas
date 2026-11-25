@@ -16,7 +16,7 @@ wasm = ["dep:serde-wasm-bindgen", "dep:wasm-bindgen"]
 python = ["dep:pyo3"]
 
 [dependencies]
-num-bigint = "0.4"
+num-bigint = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
@@ -27,10 +27,6 @@ criterion = { version = "0.8", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3.80"
-
-[[bench]]
-name = "pstore"
-harness = false
 
 [[bench]]
 name = "qlayout"

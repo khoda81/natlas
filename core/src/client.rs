@@ -1,8 +1,8 @@
 //! The browser's incremental tree. Rank intervals own the wire precision;
 //! the quantile index is a read-time view of those intervals.
 
-use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::{OnceCell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::size_of;
 use std::ops::Range;
@@ -288,7 +288,7 @@ impl ClientTree {
         };
         let q = self.distribution(node, lens.q);
         stats.bounded = !p.complete();
-        for segment in p.segments.values() {
+        for segment in &p.segments {
             for (&branch, &ln_p) in segment
                 .view()
                 .branches()
@@ -395,13 +395,11 @@ pub(crate) struct FixedIndex {
 #[doc(hidden)]
 #[derive(Default)]
 pub struct ClientMeasure {
-    segments: BTreeMap<Rank, Segment>,
+    /// Disjoint rank segments sorted by ascending `ranks.start`.
+    segments: Vec<Segment>,
     q: QStore,
     count: Option<Rank>,
     revision: u64,
-    // Ordered keys are needed by the exact anchor walk. Fixed cuts and row
-    // widths depend on that same ordered set and are built only on demand.
-    keys: OnceCell<Vec<Rank>>,
     fixed: OnceCell<Option<FixedIndex>>,
 }
 
@@ -419,12 +417,15 @@ impl ClientMeasure {
         self.revision
     }
 
-    fn segment(&self, rank: Rank) -> &Segment {
+    #[inline]
+    fn segment_index(&self, rank: Rank) -> Option<usize> {
         self.segments
-            .range(..=rank)
-            .next_back()
-            .expect("a known rank has a run")
-            .1
+            .partition_point(|s| s.ranks.start <= rank)
+            .checked_sub(1)
+    }
+
+    fn segment(&self, rank: Rank) -> &Segment {
+        &self.segments[self.segment_index(rank).expect("a known rank has a run")]
     }
 
     pub(crate) fn nats(&self, branch: Branch) -> f64 {
@@ -438,19 +439,15 @@ impl ClientMeasure {
         Some((rank, run.edge(at), run.ln_weights()[at]))
     }
 
-    fn overlapping(&self, run: RunSlice<'_>) -> impl Iterator<Item = (&Rank, &Segment)> {
-        let first = self
-            .segments
-            .range(..run.rank())
-            .next_back()
-            .filter(|(_, segment)| run.rank() < segment.view().end())
-            .map_or(run.rank(), |(&rank, _)| rank);
-        self.segments.range(first..run.end())
+    fn overlapping(&self, run: RunSlice<'_>) -> &[Segment] {
+        let first = self.segments.partition_point(|s| s.ranks.end <= run.rank());
+        let last = self.segments.partition_point(|s| s.ranks.start < run.end());
+        &self.segments[first..last]
     }
 
     fn contradicts(&self, fresh: &[Segment], count: Option<Rank>, old_end: Rank) -> bool {
         if let Some(count) = count {
-            if count < old_end || fresh.last().is_some_and(|last| count < last.view().end()) {
+            if count < old_end || fresh.last().is_some_and(|last| count < last.ranks.end) {
                 return true;
             }
         }
@@ -463,9 +460,9 @@ impl ClientMeasure {
                 return true;
             }
             if run.rank() < old_end {
-                for (_, old) in self.overlapping(run) {
-                    let start = old.view().rank().max(run.rank());
-                    let end = old.view().end().min(run.end());
+                for old in self.overlapping(run) {
+                    let start = old.ranks.start.max(run.rank());
+                    let end = old.ranks.end.min(run.end());
                     if !same_branches(old.view(), run, start, end) {
                         return true;
                     }
@@ -478,20 +475,14 @@ impl ClientMeasure {
     fn insert(&mut self, mut runs: Vec<Run>, count: Option<Rank>) -> Result<bool> {
         sort_runs(&mut runs, count)?;
         let fresh: Vec<_> = runs.into_iter().map(Segment::new).collect();
-        let len = fresh.iter().map(|segment| segment.view().len()).sum();
+        let len: usize = fresh.iter().map(|segment| segment.view().len()).sum();
         let merged_count = count.or(self.count);
-        let old_end = self
-            .segments
-            .last_key_value()
-            .map_or(0, |(_, s)| s.view().end());
-        if self.segments.is_empty() && self.count.is_none()
+        let old_end = self.segments.last().map_or(0, |s| s.ranks.end);
+        if (self.segments.is_empty() && self.count.is_none())
             || self.contradicts(&fresh, merged_count, old_end)
         {
             self.q = QStore::from_segments(&fresh, len)?;
-            self.segments = fresh
-                .into_iter()
-                .map(|segment| (segment.view().rank(), segment))
-                .collect();
+            self.segments = fresh;
             self.count = count;
             self.invalidate();
             return Ok(true);
@@ -521,57 +512,87 @@ impl ClientMeasure {
         }
         let mut changed = self.count != merged_count;
         self.count = merged_count;
-        let (mut remove, mut add, mut wins) = (Vec::new(), Vec::new(), Vec::new());
-        for fresh in fresh {
-            if old_end <= fresh.view().rank() {
-                for (branch, rank, nats) in fresh.children() {
+
+        // Fast path: all fresh runs sit strictly after existing segments.
+        if fresh
+            .first()
+            .is_none_or(|first| old_end <= first.ranks.start)
+        {
+            for seg in fresh {
+                for (branch, rank, nats) in seg.children() {
                     self.q.insert(branch, rank, nats);
                 }
-                self.segments.insert(fresh.view().rank(), fresh);
+                self.segments.push(seg);
                 changed = true;
-                continue;
             }
-            let run = fresh.view();
-            let mut from = run.rank();
-            for (&rank, old) in self.overlapping(run) {
-                if old.view() == run {
-                    from = run.end();
+            if changed {
+                self.invalidate();
+            }
+            return Ok(changed);
+        }
+
+        // Linear two-pointer merge of sorted disjoint segments.
+        let mut old = VecDeque::from(std::mem::take(&mut self.segments));
+        let mut merged = Vec::with_capacity(old.len() + fresh.len());
+        for f in fresh {
+            let f_start = f.ranks.start;
+            let f_end = f.ranks.end;
+            let f_prec = f.view().precision();
+            while old.front().is_some_and(|o| o.ranks.end <= f_start) {
+                merged.push(old.pop_front().unwrap());
+            }
+            let mut from = f_start;
+            while old.front().is_some_and(|o| o.ranks.start < f_end) {
+                let o = old.pop_front().unwrap();
+                let (o_start, o_end) = (o.ranks.start, o.ranks.end);
+                if o.view() == f.view() {
+                    merged.push(o);
+                    from = f_end;
                     break;
                 }
-                if run.precision() < old.view().precision() {
-                    if from < rank {
-                        wins.push(fresh.slice(from, rank));
+                if f_prec < o.view().precision() {
+                    if from < o_start {
+                        let part = f.slice(from, o_start);
+                        for (branch, rank, nats) in part.children() {
+                            self.q.insert(branch, rank, nats);
+                        }
+                        merged.push(part);
+                        changed = true;
                     }
-                    from = old.view().end();
+                    from = o_end.min(f_end);
+                    if o_end <= f_end {
+                        merged.push(o);
+                    } else {
+                        old.push_front(o);
+                        break;
+                    }
                 } else {
-                    remove.push(rank);
-                    if rank < run.rank() {
-                        add.push(old.slice(rank, run.rank()));
+                    if o_start < from {
+                        merged.push(o.slice(o_start, from));
                     }
-                    if run.end() < old.view().end() {
-                        add.push(old.slice(run.end(), old.view().end()));
+                    if f_end < o_end {
+                        let tail = o.slice(f_end, o_end);
+                        old.push_front(tail);
+                        break;
                     }
                 }
             }
-            if from == run.rank() {
-                wins.push(fresh);
-            } else if from < run.end() {
-                wins.push(fresh.slice(from, run.end()));
-            }
-            changed |= !wins.is_empty();
-            for rank in remove.drain(..) {
-                self.segments.remove(&rank);
-            }
-            for part in wins.drain(..) {
+            if from < f_end {
+                let part = if from == f_start {
+                    f
+                } else {
+                    f.slice(from, f_end)
+                };
                 for (branch, rank, nats) in part.children() {
                     self.q.insert(branch, rank, nats);
                 }
-                add.push(part);
-            }
-            for part in add.drain(..) {
-                self.segments.insert(part.view().rank(), part);
+                merged.push(part);
+                changed = true;
             }
         }
+        merged.extend(old);
+        self.segments = merged;
+
         if changed {
             self.invalidate();
         }
@@ -580,26 +601,11 @@ impl ClientMeasure {
 
     fn invalidate(&mut self) {
         self.revision += 1;
-        self.keys.take();
         self.fixed.take();
-    }
-
-    fn keys(&self) -> &[Rank] {
-        self.keys
-            .get_or_init(|| self.segments.keys().copied().collect())
     }
 
     pub(crate) fn fixed(&self) -> Option<&FixedIndex> {
         self.fixed.get_or_init(|| self.build_fixed()).as_ref()
-    }
-
-    /// The exact scan repeatedly reads the current run and its neighbours.
-    /// Reuse those lookups without collecting the whole node for a narrow view.
-    pub(crate) fn scan(&self) -> impl RankView + '_ {
-        RunScan {
-            source: self,
-            nearby: Default::default(),
-        }
     }
 
     fn build_fixed(&self) -> Option<FixedIndex> {
@@ -615,15 +621,14 @@ impl ClientMeasure {
             cut = end;
             Some(())
         };
-        let mut segments = self.segments.values().enumerate().peekable();
         let mut rank = 0;
-        while let Some((run, segment)) = segments.next() {
+        for (run, segment) in self.segments.iter().enumerate() {
             if rank < segment.ranks.start {
                 push(Item::Gap { before: run }, segment.cuts[0])?;
             }
             let end = segment.ranks.end;
-            let last = match segments.peek() {
-                Some((_, next)) if next.ranks.start == end => next.cuts[0],
+            let last = match self.segments.get(run + 1) {
+                Some(next) if next.ranks.start == end => next.cuts[0],
                 None if self.count == Some(end) => CDF_SIZE,
                 _ => segment.cuts[1],
             };
@@ -659,18 +664,6 @@ impl ClientMeasure {
         q: Option<&Self>,
         same: bool,
     ) -> WidthIndex {
-        let range = 0..fixed.items.len();
-        let (first_run, include_first) = match fixed.items[range.start] {
-            Item::Child { run, at } => (run, at != 0),
-            Item::Gap { before } => (before.saturating_sub(1), 0 < before),
-        };
-        let rank = self.keys().get(first_run).copied().unwrap_or(Rank::MAX);
-        let mut runs = self
-            .segments
-            .range(rank..)
-            .map(|(_, s)| s.view())
-            .peekable();
-        let mut current = if include_first { runs.next() } else { None };
         let width = |run: RunSlice<'_>, at: usize| {
             if same {
                 -run.ln_weights()[at]
@@ -678,29 +671,25 @@ impl ClientMeasure {
                 q.map_or(f64::INFINITY, |q| q.nats(run.branches()[at]))
             }
         };
-        let mut values = Vec::with_capacity(range.len());
-        for position in range.clone() {
-            let item = fixed.items[position];
+        let mut values = Vec::with_capacity(fixed.items.len());
+        for (position, &item) in fixed.items.iter().enumerate() {
             let next = match item {
-                Item::Child { at, .. } => {
-                    if at == 0 {
-                        current = runs.next();
-                    }
-                    width(current.expect("a fixed child has a run"), at)
-                }
-                Item::Gap { .. } => {
-                    let rank = current.map_or(0, RunSlice::end);
-                    let end = runs.peek().map(|run| run.rank()).or(self.count);
+                Item::Child { run, at } => width(self.segments[run].view(), at),
+                Item::Gap { before } => {
+                    let prev = before.checked_sub(1).map(|i| self.segments[i].view());
+                    let next_run = self.segments.get(before).map(Segment::view);
+                    let rank = prev.map_or(0, RunSlice::end);
+                    let end = next_run.map(|run| run.rank()).or(self.count);
                     if let (true, Some(end)) = (same, end) {
                         let start = crate::qlayout::QLayout::start(&fixed.p, position);
                         let bottom = u128::from(fixed.p.ends()[position]) + 1;
                         -(((bottom - start) as f64 / CDF_SIZE as f64) / f64::from(end - rank)).ln()
                     } else {
                         let (mut sum, mut count) = (0.0, 0.0);
-                        for value in current
+                        for value in prev
                             .map(|run| width(run, run.len() - 1))
                             .into_iter()
-                            .chain(runs.peek().map(|&run| width(run, 0)))
+                            .chain(next_run.map(|run| width(run, 0)))
                         {
                             if value.is_finite() {
                                 sum += value;
@@ -717,14 +706,14 @@ impl ClientMeasure {
             };
             values.push(next);
         }
-        WidthIndex::new(range.start, values)
+        WidthIndex::new(0, values)
     }
 
     pub fn bytes(&self) -> usize {
         let mut data = HashSet::new();
         let runs: usize = self
             .segments
-            .values()
+            .iter()
             .map(|segment| {
                 size_of::<Segment>()
                     + if data.insert(Arc::as_ptr(&segment.source)) {
@@ -735,10 +724,6 @@ impl ClientMeasure {
             })
             .sum();
         runs + self.q.heap_bytes()
-            + self
-                .keys
-                .get()
-                .map_or(0, |keys| keys.capacity() * size_of::<Rank>())
             + self
                 .fixed
                 .get()
@@ -761,8 +746,7 @@ impl RankView for ClientMeasure {
     }
 
     fn run_at(&self, index: usize) -> Option<RunRef<'_>> {
-        let key = self.keys().get(index)?;
-        Some(RunRef::slice(self.segments[key].view()))
+        self.segments.get(index).map(|s| RunRef::slice(s.view()))
     }
 
     fn rank(&self, branch: Branch) -> Option<Rank> {
@@ -770,14 +754,9 @@ impl RankView for ClientMeasure {
     }
 
     fn locate_rank(&self, rank: Rank) -> Option<(usize, usize)> {
-        let segment = self.segments.range(..=rank).next_back()?.1;
-        (rank < segment.view().end()).then(|| {
-            let index = self
-                .keys()
-                .binary_search(&segment.view().rank())
-                .expect("known run key");
-            (index, (rank - segment.view().rank()) as usize)
-        })
+        let index = self.segment_index(rank)?;
+        let seg = &self.segments[index];
+        (rank < seg.ranks.end).then(|| (index, (rank - seg.ranks.start) as usize))
     }
 
     fn locate(&self, point: &Point) -> Option<Item> {
@@ -800,42 +779,6 @@ impl RankView for ClientMeasure {
 
     fn count(&self) -> Option<Rank> {
         self.count
-    }
-}
-
-struct RunScan<'a> {
-    source: &'a ClientMeasure,
-    // Three adjacent ranks in run order map to distinct slots.
-    nearby: [Cell<Option<(usize, RunRef<'a>)>>; 3],
-}
-
-impl RankView for RunScan<'_> {
-    fn run_count(&self) -> usize {
-        self.source.run_count()
-    }
-
-    fn run_at(&self, index: usize) -> Option<RunRef<'_>> {
-        let slot = &self.nearby[index % self.nearby.len()];
-        if let Some((stored, run)) = slot.get() {
-            if stored == index {
-                return Some(run);
-            }
-        }
-        let run = self.source.run_at(index)?;
-        slot.set(Some((index, run)));
-        Some(run)
-    }
-
-    fn rank(&self, branch: Branch) -> Option<Rank> {
-        self.source.rank(branch)
-    }
-
-    fn locate_rank(&self, rank: Rank) -> Option<(usize, usize)> {
-        self.source.locate_rank(rank)
-    }
-
-    fn count(&self) -> Option<Rank> {
-        self.source.count()
     }
 }
 

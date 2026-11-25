@@ -116,21 +116,23 @@ export class TextLabels implements Labels {
         const before = chat.at(node);
         return (branch === undefined ? before : readChat(before, branch)).section;
       },
-      show: (panel: HTMLElement, node: NodeId, branch: Branch | null, more?: string) => {
+      show: (panel: HTMLElement, node: NodeId, branch: Branch | null, more?: string, from?: number) => {
         const tokens = along(node).tokens;
         const current = branch === null ? null : this.shown(unfinished.at(node), branch);
-        const count = tokens.length + Number(current !== null) + Number(more !== undefined);
+        const total = tokens.length + Number(current !== null);
+        const highlightFrom = from === undefined ? tokens.length : Math.min(from, total);
+        const count = total + Number(more !== undefined);
         panel.dataset.kind = "text";
-        // Most pointer moves change only the final token. Preserve the exact
-        // span markup while avoiding reconstruction/layout of the whole path.
-        // Walk siblings, not a repeatedly invalidated live childNodes index;
-        // append new spans together so long paths incur one DOM insertion.
+        // Preserve existing span markup while avoiding reconstruction/layout of
+        // the whole path. Walk siblings, not a repeatedly invalidated live
+        // childNodes index; append new spans together for one DOM insertion.
         let child = panel.firstChild;
         const added = document.createDocumentFragment();
         for (let i = 0; i < count; i++) {
           const next = child?.nextSibling ?? null;
-          const kind = i < tokens.length ? "" : i === tokens.length && current !== null ? "current" : "more";
-          const text = kind === "" ? tokens[i]! : kind === "current" ? current! : more!;
+          const isMore = i === total;
+          const text = i < tokens.length ? tokens[i]! : !isMore ? current! : more!;
+          const kind = isMore ? "more" : i >= highlightFrom ? "current" : "";
           const className = kind === "" ? "token" : `token ${kind}`;
           if (!(child instanceof HTMLElement) || child.tagName !== "SPAN" || child.className !== className) {
             const span = token(text, kind || undefined);

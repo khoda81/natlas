@@ -57,8 +57,8 @@ export interface Labels {
 
 export interface Reading {
   glyph(node: NodeId, branch: Branch): Glyph;
-  /** Show the path to ``node``/``branch``, with an optional unknown continuation. */
-  show(panel: HTMLElement, node: NodeId, branch: Branch | null, more?: string): void;
+  /** Show the path to ``node``/``branch``, highlighting tokens from depth ``from`` on, with an optional unknown continuation. */
+  show(panel: HTMLElement, node: NodeId, branch: Branch | null, more?: string, from?: number): void;
   /** Plain text for editing/searching, for readers whose labels represent text. */
   text?(node: NodeId, branch: Branch | null): string;
   /** The chat section at this path, including ``branch`` when given. */

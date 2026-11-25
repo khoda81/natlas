@@ -1107,15 +1107,16 @@ export class App {
    * canvas; otherwise fall back to the smallest branch containing the viewport.
    */
   private syncPreview(demand: View): void {
-    if (this.reading === null || this.editing) return;
+    if (this.reading === null || this.editing || this.tree === null) return;
+    const from = this.tree.path(demand.node).length;
     if (this.hover !== null) {
       const { box, exact } = this.hover;
       const more = !exact || box.branch === null ? " …" : undefined;
-      this.showPath(box.node, box.branch, more);
+      this.showPath(box.node, box.branch, more, from);
       return;
     }
     if (!this.dataset?.searchable && demand.node === ROOT) return;
-    this.showPath(demand.node, null);
+    this.showPath(demand.node, null, undefined, from);
   }
 
   /**
@@ -1134,9 +1135,9 @@ export class App {
     if (covers(left, right) && !covers(width - right, width - left)) this.inspect.classList.toggle("left");
   }
 
-  /** Show the selected path until another box is hovered; ``more`` marks unknown continuation. */
-  private showPath(node: NodeId, branch: number | null, more?: string): void {
-    const key = `${node}:${branch}:${more ?? ""}`;
+  /** Show the selected path; tokens from depth ``from`` on are highlighted, ``more`` marks unknown continuation. */
+  private showPath(node: NodeId, branch: number | null, more?: string, from?: number): void {
+    const key = `${node}:${branch}:${more ?? ""}:${from ?? ""}`;
     if (this.reading === null || this.editing || key === this.shown) return;
     this.shown = key;
     this.shownPath = { node, branch, more };
@@ -1149,7 +1150,7 @@ export class App {
     const height = this.pathPanel.hidden || where.hidden ? 0 : this.whereHeight ?? where.offsetHeight;
     where.style.minHeight = this.pointer === null ? "" : `${height}px`;
     this.pathPanel.hidden = where.hidden = false;
-    this.reading.show(where, node, branch, more);
+    this.reading.show(where, node, branch, more, from);
     where.scrollTop = Number.MAX_SAFE_INTEGER;
     // The scroll setter has laid out the new path. Reuse this height on the
     // next selection instead of forcing layout after inspector writes, too.

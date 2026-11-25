@@ -256,16 +256,21 @@ export function draw(
     return glyphs;
   };
   const windowed = (glyph: Glyph) => glyph.time !== undefined && state.timeline !== null;
+  const minSpan = LABEL_MIN_SIZE / LABEL_FILL;
   const fits = new Map<Box, Fit | null>();
   const fitOf = (box: Box): Fit | null => {
     let fit = fits.get(box);
     if (fit === undefined) {
+      const width = (box.x1 - box.x0) * cam.k - 2;
+      const height = (box.y1 - box.y0) * view.height;
+      if (width < minSpan && height < minSpan) {
+        fits.set(box, null);
+        return null;
+      }
       // A gap's label counts children; it carries nothing to them.
       const [glyph, before] = box.branch !== null
         ? [state.glyph(box.node, box.branch), carried(box.node)]
         : [gapGlyph(box), []];
-      const width = (box.x1 - box.x0) * cam.k - 2;
-      const height = (box.y1 - box.y0) * view.height;
       fits.set(box, fit = fitLabel(ctx, before, windowed(glyph) ? null : glyph, width, height, box.branch !== null));
     }
     return fit;
@@ -278,10 +283,12 @@ export function draw(
   // a box is centered both ways and slides into view the same way. The labels
   // a box carries come first, framed and fainter, and a label wraps between
   // its pieces where lines make it larger.
+  let currentFont = FONT;
   for (const { box, rect, ink } of labels) {
     const fit = fitOf(box);
     if (fit === null) continue;
-    const { lines, size, vertical } = fit;
+    const { lines, vertical } = fit;
+    const size = Math.max(LABEL_MIN_SIZE, Math.round(fit.size * 2) / 2);
     const left = (box.x0 - cam.x) * cam.k;
     const right = left + (box.x1 - box.x0) * cam.k - 2;
     const top = box.y0 * view.height;
@@ -307,21 +314,38 @@ export function draw(
       covers = { x0: x, y0: middle - thick / 2, x1: x + span, y1: middle + thick / 2 };
     }
     if (view.width < covers.x0 || covers.x1 < 0 || view.height < covers.y0 || covers.y1 < 0) continue;
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0 - 2, rect.y1 - rect.y0);
-    ctx.clip();
-    ctx.translate(x, y);
-    if (vertical) ctx.rotate(-Math.PI / 2);
-    ctx.font = `${size}px ${FAMILY}`;
-    lines.forEach((line, row) => {
-      let at = 0;
-      for (const piece of line) {
-        drawPiece(ctx, piece, at, row * LABEL_LINE * size, size, ink, scheme.surface);
-        at += (piece.ems + TOKEN_GAP) * size;
+    const font = `${size}px ${FAMILY}`;
+    if (font !== currentFont) {
+      ctx.font = currentFont = font;
+    }
+    const needsClip = covers.x0 < rect.x0 || covers.x1 > rect.x1 - 2 || covers.y0 < rect.y0 || covers.y1 > rect.y1;
+    if (needsClip || vertical) {
+      ctx.save();
+      if (needsClip) {
+        ctx.beginPath();
+        ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0 - 2, rect.y1 - rect.y0);
+        ctx.clip();
       }
-    });
-    ctx.restore();
+      ctx.translate(x, y);
+      if (vertical) ctx.rotate(-Math.PI / 2);
+      for (let row = 0; row < lines.length; row++) {
+        let at = 0;
+        for (const piece of lines[row]!) {
+          drawPiece(ctx, piece, at, row * LABEL_LINE * size, size, ink, scheme.surface);
+          at += (piece.ems + TOKEN_GAP) * size;
+        }
+      }
+      ctx.restore();
+    } else {
+      for (let row = 0; row < lines.length; row++) {
+        let at = 0;
+        for (const piece of lines[row]!) {
+          drawPiece(ctx, piece, x + at, y + row * LABEL_LINE * size, size, ink, scheme.surface);
+          at += (piece.ems + TOKEN_GAP) * size;
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
   }
 
   if (state.note !== null) drawNote(ctx, view, palette, state.note.text, state.note.sweep);
@@ -578,6 +602,7 @@ function drawPiece(ctx: CanvasRenderingContext2D, { kind, glyph, ems }: Piece, x
 /** The longest start of ``text``, whole characters followed by an
  * ellipsis, that fits ``room`` ems; null if not even one character does. */
 function shortened(ctx: CanvasRenderingContext2D, text: string, room: number): string | null {
+  if (room <= 0) return null;
   let start = "";
   let fits: string | null = null;
   for (const { segment } of graphemes.segment(text)) {

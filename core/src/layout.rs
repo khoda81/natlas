@@ -823,10 +823,22 @@ impl<T: LayoutTree> Layout<'_, T> {
         fixed: &FixedIndex,
         geometry: &QLayout,
     ) -> Result<()> {
+        if self.right <= placed.x {
+            return Ok(());
+        }
         let rows = 1.0 / self.row;
         let row_geometry = geometry.in_rows(self.row);
-        let visible =
-            row_geometry.position(&fixed.p, -1.0)..row_geometry.tops_before(&fixed.p, rows, 0);
+        let start = if row_geometry.y(0) >= -1.0 {
+            0
+        } else {
+            row_geometry.position(&fixed.p, -1.0)
+        };
+        let end = if row_geometry.y(CDF_SIZE) <= rows {
+            fixed.p.ends().len()
+        } else {
+            row_geometry.tops_before(&fixed.p, rows, start)
+        };
+        let visible = start..end;
         if visible.is_empty() {
             return Ok(());
         }
@@ -853,7 +865,14 @@ impl<T: LayoutTree> Layout<'_, T> {
                 continue;
             }
             let ln_extent = || cdf_ln(u128::from(hit.start), end);
-            let ln_gap = matches!(item, Item::Gap { .. }).then(ln_extent);
+            let known = match item {
+                Item::Gap { .. } => Some(ln_extent()),
+                Item::Child { run, at } if self.lens.p != self.lens.q => {
+                    let branch = d.run(run).branch(at);
+                    Some(q.map_or(f64::INFINITY, |q| q.nats(branch)))
+                }
+                Item::Child { .. } => None,
+            };
             let b = match item_box(
                 self.tree,
                 self.lens,
@@ -862,7 +881,7 @@ impl<T: LayoutTree> Layout<'_, T> {
                 d,
                 item,
                 (y0, y1),
-                ln_gap,
+                known,
             ) {
                 Ok(b) => b,
                 Err(err) => {

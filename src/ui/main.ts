@@ -91,6 +91,7 @@ export class App {
   private shownPath: { node: NodeId; branch: number | null; more?: string } | null = null;
   /** Render-dedup key for the path panel DOM. */
   private shown = "";
+  private demandDepth: { node: NodeId; depth: number } | null = null;
   private whereHeight: number | null = null;
   private windowHeight = window.innerHeight;
   private inspected = "";
@@ -276,6 +277,7 @@ export class App {
     this.editBase = "";
     this.draft = null;
     this.shownPath = null;
+    this.demandDepth = null;
     this.shownPath = null;
     this.where.replaceChildren();
     this.whereHeight = null;
@@ -1113,7 +1115,10 @@ export class App {
    */
   private syncPreview(demand: View): void {
     if (this.reading === null || this.editing || this.tree === null) return;
-    const from = this.tree.path(demand.node).length;
+    if (this.demandDepth?.node !== demand.node) {
+      this.demandDepth = { node: demand.node, depth: this.tree.path(demand.node).length };
+    }
+    const from = this.demandDepth.depth;
     if (this.hover !== null) {
       const { box, exact } = this.hover;
       const more = !exact || box.branch === null ? " …" : undefined;
@@ -1192,9 +1197,8 @@ export class App {
 
   private updateReadout(): void {
     const unit = this.units.name;
-    const view = -Math.min(0, -this.cam.x);
     const text =
-      `depth ${this.depth()} · view −log v ${this.fmt(view)} · ` +
+      `depth ${this.depth()}· ` +
       `${(this.cam.k * this.units.nats).toPrecision(3)} px/${unit.slice(0, -1)}`;
     if (text !== this.readoutText) this.readout.textContent = this.readoutText = text;
   }

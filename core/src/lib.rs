@@ -9,6 +9,7 @@ pub mod tree;
 
 pub mod pstore;
 mod qlayout;
+pub mod raster;
 
 pub type Result<T> = std::result::Result<T, String>;
 

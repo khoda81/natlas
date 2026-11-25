@@ -156,6 +156,21 @@ export class Frame {
   get originTop(): number { return this.raw.originTop(); }
   get originBottom(): number { return this.raw.originBottom(); }
 
+  rasterize(
+    tree: IntervalTree,
+    lens: Lens,
+    cam: Camera,
+    widthPx: number,
+    heightPx: number,
+    dpr: number,
+    surfaceRgb: number,
+    tileRgb: number,
+    strokeRgb: number,
+    out: Uint8Array,
+  ): void {
+    this.raw.rasterize(tree.raw, lens.p, lens.q, cam.x, cam.k, widthPx, heightPx, dpr, surfaceRgb, tileRgb, strokeRgb, out);
+  }
+
   /** All frame views are invalid after disposal; buffers may be reused. */
   dispose(): void {
     if (this.disposed) return;

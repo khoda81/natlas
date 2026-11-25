@@ -654,6 +654,7 @@ export class App {
       conversation: this.reading?.conversation,
       note: origin && { text: origin.text, sweep: origin.loading && !this.reducedMotion.matches ? time : null },
       debug: this.debug,
+      raster: { tree, lens: this.lens },
     });
     this.fadeOut(time);
     this.drawProgress();

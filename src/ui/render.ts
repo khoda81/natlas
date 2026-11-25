@@ -2,7 +2,8 @@
 
 import { decimalTicks, layoutTicks } from "@qbar/qbar";
 import type { Palette } from "./color";
-import type { Box, Camera, Frame, Known, Selection, Viewport } from "../core/layout";
+import type { Box, Camera, Frame, Known, Lens, Selection, Viewport } from "../core/layout";
+import type { IntervalTree } from "../core/tree";
 import type { NodeId } from "../core/tree";
 import type { ChatSection, Glyph, Mark, Reading, Timeline, Trail } from "../readings/reading";
 
@@ -31,6 +32,8 @@ export interface DrawState {
   known: (node: NodeId) => readonly Known[];
   /** Show debug overlays (such as bare child counts for unloaded gaps). */
   debug?: boolean;
+  /** When supplied, rasterizes spans with exact linear-RGB sub-pixel vertical coverage in WASM. */
+  raster?: { tree: IntervalTree; lens: Lens };
 }
 
 const FAMILY = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
@@ -75,6 +78,11 @@ const SWEEP_MS = 1400;
 // Canvas coordinates far outside the view lose precision and can stall rasterizing.
 const OVERSCAN = 64;
 const textWidths = new WeakMap<CanvasRenderingContext2D, { scale: number; widths: Map<string, number> }>();
+const rasterBuffers = new WeakMap<CanvasRenderingContext2D, { image: ImageData; bytes: Uint8Array }>();
+
+function hexRgb(hex: string): number {
+  return Number.parseInt(hex.slice(1), 16) & 0xffffff;
+}
 
 function measure(ctx: CanvasRenderingContext2D, text: string): number {
   const widths = textWidths.get(ctx)!.widths;
@@ -145,84 +153,144 @@ export function draw(
   if (textWidths.get(ctx)?.scale !== scale) textWidths.set(ctx, { scale, widths: new Map() });
   const { scheme } = palette;
 
-  ctx.fillStyle = scheme.surface;
-  ctx.fillRect(0, 0, view.width, view.height + RULER_HEIGHT);
   ctx.font = FONT;
   ctx.textBaseline = "middle";
 
-  // Every node's children as spans of physical rows: the pixels wholly
-  // inside them filled, then the time on them, then their outline over both.
   const pixel = 1 / scale;
   const column = (x: number) => Math.floor(within((x - cam.x) * cam.k, -OVERSCAN, view.width + OVERSCAN) * scale + ON_GRID) / scale;
   const row = (y: number) => Math.round(within(y, -1, 2) * view.height * scale) / scale;
-  const spans = new Map<NodeId, Painted[]>();
-  for (const span of frame.spans) {
-    const painted = {
-      y0: row(span.y0), y1: row(span.y1), left: column(span.x0),
-      fill: span.x0 < span.fill ? column(span.fill) : null, reach: column(span.reach) + pixel
-    };
-    if (painted.y1 <= painted.y0) continue;
-    const node = spans.get(span.node);
-    if (node === undefined) spans.set(span.node, [painted]);
-    else node.push(painted);
-  }
-  // Batch spans by fill. A span without a named branch reads as its node's
-  // prefix, so thin tails require no extra child traversal.
   const conversation = state.conversation;
-  const fills = new Map<ChatSection, Path2D>();
-  ctx.beginPath();
-  for (const [node, rows] of spans) {
-    const section = conversation?.(node) ?? null;
-    let path: Path2D | CanvasRenderingContext2D = ctx;
-    if (section !== null) {
-      let tint = fills.get(section);
-      if (tint === undefined) fills.set(section, tint = new Path2D());
-      path = tint;
-    }
-    for (const { y0, y1, left, fill } of rows) {
-      if (fill !== null && left + pixel < fill) path.rect(left + pixel, y0, fill - left - pixel, y1 - y0);
+  const needSpans = state.raster === undefined || conversation !== undefined || state.timeline !== null;
+  const spans = new Map<NodeId, Painted[]>();
+  if (needSpans) {
+    for (const span of frame.spans) {
+      const painted = {
+        y0: row(span.y0), y1: row(span.y1), left: column(span.x0),
+        fill: span.x0 < span.fill ? column(span.fill) : null, reach: column(span.reach) + pixel
+      };
+      if (painted.y1 <= painted.y0) continue;
+      const node = spans.get(span.node);
+      if (node === undefined) spans.set(span.node, [painted]);
+      else node.push(painted);
     }
   }
-  ctx.fillStyle = scheme.tile;
-  ctx.fill();
-  for (const [section, path] of fills) {
-    ctx.fillStyle = scheme.conversation[section];
-    ctx.fill(path);
-  }
-  // Some branches change section. Recolor the part of their box already
-  // filled by the spans, leaving all outline pixels and holes alone.
-  if (conversation !== undefined) {
-    for (const box of frame.boxes) {
-      const rows = spans.get(box.node);
-      if (rows === undefined || box.branch === null || !Number.isFinite(box.x1)) continue;
-      const section = conversation(box.node, box.branch);
-      if (section === conversation(box.node)) continue;
-      const top = gridEdge(box.y0 * view.height, scale);
-      const bottom = gridEdge(box.y1 * view.height, scale);
-      const right = column(box.x1);
-      ctx.fillStyle = section === null ? scheme.tile : scheme.conversation[section];
-      // A node's spans are laid out from top to bottom.
-      for (const { y0, y1, left, fill } of rows) {
-        if (bottom <= y0) break;
-        const start = Math.max(y0, top), end = Math.min(y1, bottom);
-        const x1 = Math.min(fill ?? left, right);
-        if (start < end && left + pixel < x1) ctx.fillRect(left + pixel, start, x1 - left - pixel, end - start);
+
+  if (state.raster !== undefined) {
+    const widthPx = Math.max(1, Math.round(view.width * scale));
+    const heightPx = Math.max(1, Math.round(view.height * scale));
+    let buf = rasterBuffers.get(ctx);
+    if (buf === undefined || buf.image.width !== widthPx || buf.image.height !== heightPx) {
+      const image = ctx.createImageData(widthPx, heightPx);
+      buf = { image, bytes: new Uint8Array(image.data.buffer) };
+      rasterBuffers.set(ctx, buf);
+    }
+    frame.rasterize(
+      state.raster.tree,
+      state.raster.lens,
+      cam,
+      widthPx,
+      heightPx,
+      scale,
+      hexRgb(scheme.surface),
+      hexRgb(scheme.tile),
+      hexRgb(scheme.stroke),
+      buf.bytes,
+    );
+    ctx.putImageData(buf.image, 0, 0);
+    ctx.fillStyle = scheme.surface;
+    ctx.fillRect(0, view.height, view.width, RULER_HEIGHT);
+
+    // Recolor solid tall-box interiors for ChatML conversation sections (leaving AA strokes untouched).
+    if (conversation !== undefined) {
+      const fills = new Map<ChatSection, Path2D>();
+      for (const [node, rows] of spans) {
+        const section = conversation(node);
+        if (section === null) continue;
+        let path = fills.get(section);
+        if (path === undefined) fills.set(section, path = new Path2D());
+        for (const { y0, y1, left, fill } of rows) {
+          if (fill !== null && left + pixel < fill) path.rect(left + pixel, y0, fill - left - pixel, y1 - y0);
+        }
+      }
+      for (const [section, path] of fills) {
+        ctx.fillStyle = scheme.conversation[section];
+        ctx.fill(path);
+      }
+      for (const box of frame.boxes) {
+        const rows = spans.get(box.node);
+        if (rows === undefined || box.branch === null || !Number.isFinite(box.x1)) continue;
+        const section = conversation(box.node, box.branch);
+        if (section === conversation(box.node)) continue;
+        const top = gridEdge(box.y0 * view.height, scale);
+        const bottom = gridEdge(box.y1 * view.height, scale);
+        const right = column(box.x1);
+        ctx.fillStyle = section === null ? scheme.tile : scheme.conversation[section];
+        for (const { y0, y1, left, fill } of rows) {
+          if (bottom <= y0) break;
+          const start = Math.max(y0, top), end = Math.min(y1, bottom);
+          const x1 = Math.min(fill ?? left, right);
+          if (start < end && left + pixel < x1) ctx.fillRect(left + pixel, start, x1 - left - pixel, end - start);
+        }
       }
     }
-  }
-  if (state.timeline !== null) {
-    timeCdfs(ctx, spans, state.timeline, view, state.known, (node, branch) => state.glyph(node, branch).time, scheme.window, palette.ink);
-  }
-  ctx.beginPath();
-  for (const node of spans.values()) {
-    for (const { y0, y1, left, fill, reach } of node) {
-      ctx.rect(left, y0, pixel, y1 - y0);
-      const from = fill ?? left;
-      if (from < reach) ctx.rect(from, y0, reach - from, y1 - y0);
+    if (state.timeline !== null) {
+      timeCdfs(ctx, spans, state.timeline, view, state.known, (node, branch) => state.glyph(node, branch).time, scheme.window, palette.ink);
     }
+  } else {
+    ctx.fillStyle = scheme.surface;
+    ctx.fillRect(0, 0, view.width, view.height + RULER_HEIGHT);
+    const fills = new Map<ChatSection, Path2D>();
+    ctx.beginPath();
+    for (const [node, rows] of spans) {
+      const section = conversation?.(node) ?? null;
+      let path: Path2D | CanvasRenderingContext2D = ctx;
+      if (section !== null) {
+        let tint = fills.get(section);
+        if (tint === undefined) fills.set(section, tint = new Path2D());
+        path = tint;
+      }
+      for (const { y0, y1, left, fill } of rows) {
+        if (fill !== null && left + pixel < fill) path.rect(left + pixel, y0, fill - left - pixel, y1 - y0);
+      }
+    }
+    ctx.fillStyle = scheme.tile;
+    ctx.fill();
+    for (const [section, path] of fills) {
+      ctx.fillStyle = scheme.conversation[section];
+      ctx.fill(path);
+    }
+    if (conversation !== undefined) {
+      for (const box of frame.boxes) {
+        const rows = spans.get(box.node);
+        if (rows === undefined || box.branch === null || !Number.isFinite(box.x1)) continue;
+        const section = conversation(box.node, box.branch);
+        if (section === conversation(box.node)) continue;
+        const top = gridEdge(box.y0 * view.height, scale);
+        const bottom = gridEdge(box.y1 * view.height, scale);
+        const right = column(box.x1);
+        ctx.fillStyle = section === null ? scheme.tile : scheme.conversation[section];
+        for (const { y0, y1, left, fill } of rows) {
+          if (bottom <= y0) break;
+          const start = Math.max(y0, top), end = Math.min(y1, bottom);
+          const x1 = Math.min(fill ?? left, right);
+          if (start < end && left + pixel < x1) ctx.fillRect(left + pixel, start, x1 - left - pixel, end - start);
+        }
+      }
+    }
+    if (state.timeline !== null) {
+      timeCdfs(ctx, spans, state.timeline, view, state.known, (node, branch) => state.glyph(node, branch).time, scheme.window, palette.ink);
+    }
+    ctx.beginPath();
+    for (const node of spans.values()) {
+      for (const { y0, y1, left, fill, reach } of node) {
+        ctx.rect(left, y0, pixel, y1 - y0);
+        const from = fill ?? left;
+        if (from < reach) ctx.rect(from, y0, reach - from, y1 - y0);
+      }
+    }
+    ctx.fillStyle = scheme.stroke;
+    ctx.fill();
   }
-  ctx.fillStyle = scheme.stroke;
-  ctx.fill();
 
   // Labels on the boxes: gaps have no box, and only show bare count text in debug mode.
   const labels: { box: Box; rect: ScreenRect; ink: string }[] = [];

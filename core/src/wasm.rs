@@ -590,6 +590,38 @@ impl LayoutFrame {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn rasterize(
+        &self,
+        tree: &Tree,
+        p: usize,
+        q: usize,
+        cam_x: f64,
+        cam_k: f64,
+        width_px: usize,
+        height_px: usize,
+        dpr: f64,
+        surface_rgb: u32,
+        tile_rgb: u32,
+        stroke_rgb: u32,
+        out: &mut [u8],
+    ) {
+        crate::raster::rasterize(
+            &tree.inner,
+            Lens { p, q },
+            &self.inner,
+            cam_x,
+            cam_k,
+            width_px,
+            height_px,
+            dpr,
+            surface_rgb,
+            tile_rgb,
+            stroke_rgb,
+            out,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn pick(
         &self,
         tree: &Tree,

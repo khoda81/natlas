@@ -191,7 +191,7 @@ pub struct Placed {
     /// ln of view heights per unit of the node's mass.
     ln_scale: f64,
     /// Where the node's children start, in nats right of the origin's.
-    x: f64,
+    pub(crate) x: f64,
 }
 
 impl Placed {
@@ -254,7 +254,7 @@ impl Placed {
             })
     }
 
-    fn quantile(&self) -> Option<QLayout> {
+    pub(crate) fn quantile(&self) -> Option<QLayout> {
         QLayout::new(
             self.ln_scale,
             (&self.top.0, self.top.1),
@@ -382,7 +382,7 @@ pub struct Frame {
     /// What is painted: every node's children as spans of rows.
     pub spans: Vec<Span>,
     /// Every node laid out, for picking.
-    placed: HashMap<NodeId, Placed, BuildHasherDefault<IdHasher>>,
+    pub(crate) placed: HashMap<NodeId, Placed, BuildHasherDefault<IdHasher>>,
     /// The shallowest node laid out: every pixel right of where its children
     /// start is in them, so picking walks down from it.
     pub top: NodeId,

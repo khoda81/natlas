@@ -146,6 +146,14 @@ describe("layout", () => {
     expect(cam.a).toBeCloseTo(to.a + (0.5 - to.a) / 2, 12);
   });
 
+  it("glides out of depths where the full zoom ratio would overflow", () => {
+    const x = Math.log(Number.MAX_VALUE) + 1;
+    const cam: Camera = { origin: ROOT, x, k: 100, anchor: top(), a: 0.5 };
+    glide(cam, { x: 0, a: 0 }, 0.5);
+    expect(cam.x).toBe(x / 2);
+    expect(cam.a).toBe(0.5 * Math.exp(-x / 2));
+  });
+
   it("clamps the view inside the root's interval", () => {
     const tree = chainTree([0.5, 0.5], [0]);
     const cam: Camera = { origin: ROOT, x: 0.5, k: 100, anchor: top([0]), a: 0.4 };

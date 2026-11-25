@@ -447,9 +447,14 @@ export class App {
         if (edge === undefined || !Number.isFinite(edge.natsQ)) break;
         flight.reached++;
       }
-      // The point moves to that node's top, where the view shows it now.
-      this.cam.a = extent(tree, this.lens, this.cam, flight.reached).top;
-      this.cam.anchor = top(anchor.slice(0, flight.reached));
+      // Keep the settled anchor if the ancestor's top cannot be represented
+      // within a physical pixel at the current depth.
+      const topY = extent(tree, this.lens, this.cam, flight.reached).top;
+      const pixelError = Math.abs(topY) * Number.EPSILON * this.view.height * this.pixelRatio;
+      if (pixelError <= 1) {
+        this.cam.a = topY;
+        this.cam.anchor = top(anchor.slice(0, flight.reached));
+      }
       this.invalidate();
     }
     this.flight = flight;
@@ -514,6 +519,7 @@ export class App {
 
     if (t === 1) {
       this.flight = null;
+      this.cam.anchor = top(chain.slice(1).map((node) => tree.branch(node)));
       this.cam.x = this.cam.origin === ROOT ? Math.max(0, landing.to.x) : landing.to.x;
       this.cam.a = landing.to.a;
     }

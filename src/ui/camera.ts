@@ -28,10 +28,12 @@ export function glide(cam: Camera, to: { x: number; a: number }, share: number):
     cam.a += (to.a - cam.a) * share;
     return;
   }
-  // The view's height grows by r = e^−dx; the fraction f with
-  // to.a = f + (cam.a − f) / r stays where it is.
-  const r = Math.exp(-dx);
-  moveDepth(cam, dx * share, (to.a * r - cam.a) / Math.expm1(-dx));
+  // The fixed fraction satisfies to.a = f + (cam.a − f) e^dx.
+  // Use nonpositive exponents so the ratio stays finite when zooming out.
+  const fixed = dx < 0
+    ? (to.a - cam.a * Math.exp(dx)) / -Math.expm1(dx)
+    : (to.a * Math.exp(-dx) - cam.a) / Math.expm1(-dx);
+  moveDepth(cam, dx * share, fixed);
 }
 
 /** Shift content down by ``dy`` view heights. */

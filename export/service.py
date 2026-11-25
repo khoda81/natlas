@@ -204,6 +204,10 @@ class Model:
         path = (demand.path.node, list(demand.path.branches)) if demand.HasField("path") else None
 
         p, q = self._measure(demand.p), self._measure(demand.q)
+        if view is not None:
+            self._touch(view[0], p)
+            if q != p:
+                self._touch(view[0], q)
         client.session.demand(self.tree, p, q, view=view, path=path)
         client.demand = demand
         self._withdraw(client)
@@ -389,6 +393,9 @@ class Model:
     def _step(self, client: Client) -> None:
         updates = client.session.step(self.tree)
         if updates:
+            for update in updates:
+                if update[0] == "answer":
+                    self._touch(update[2], update[1])
             client.send(_encode(updates, lambda measure: self._measure_records[measure].spec))
 
     def _withdraw(self, client: Client) -> None:
@@ -484,7 +491,10 @@ class Model:
             if self._empty(source, along) or not self._reads(source, along):
                 break
             (_, child) = self.tree.walk(nodes[-1], [branch])
-            if (measure, child) in reserved or self.tree.has(child, measure):
+            if (measure, child) in reserved:
+                break
+            if self.tree.has(child, measure):
+                self._touch(child, measure)
                 break
             nodes.append(child)
         return tuple(nodes)
@@ -548,6 +558,11 @@ class Model:
     def _empty(self, measure: Measure, tokens: tuple[int, ...]) -> bool:
         """Whether a sequence has no children: finished, or past the vocabulary."""
         return measure.ends(tokens) or any(self.vocabulary <= branch for branch in tokens)
+
+    def _touch(self, node: int, measure: int) -> None:
+        key = (node, measure)
+        if key in self.kept:
+            self.kept.move_to_end(key)
 
     def _keep(self, measure: int, nodes: list[int], rows: list[np.ndarray]) -> None:
         widths = self._ready_measure(measure).widths

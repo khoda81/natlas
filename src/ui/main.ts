@@ -17,7 +17,7 @@ import {
   type Viewport,
 } from "../core/layout";
 import { modelOf, parse } from "../data/catalog";
-import { type Dataset, type DatasetEntry, droppedDataset, fetchDataset, type Held, manifest, type Specs } from "../data/source";
+import { type ConnectionState, type Dataset, type DatasetEntry, droppedDataset, fetchDataset, type Held, manifest, type Specs } from "../data/source";
 import { IntervalTree, type NodeId, ROOT } from "../core/tree";
 import type { Glyph, Reading } from "../readings/reading";
 import { glide, moveDepth, panVertical, scale } from "./camera";
@@ -110,6 +110,8 @@ export class App {
   private readonly readout = element<HTMLElement>("readout");
   private readonly status = element<HTMLElement>("status");
   private readonly toasts = new Toasts(element<HTMLElement>("toasts"));
+  private readonly wsStatus = element<HTMLButtonElement>("ws-status");
+  private wsState: ConnectionState | null = null;
   /** Choosing p and q, from the dataset's catalog. */
   private measures: Measures | null = null;
   private readonly unitsButton = element<HTMLButtonElement>("units");
@@ -166,6 +168,7 @@ export class App {
     this.unitsButton.textContent = rulerCaption(this.units);
     this.unitsButton.addEventListener("click", () => this.toggleUnits());
     element("help-toggle").addEventListener("click", () => this.toggleHelp());
+    this.wsStatus.addEventListener("click", () => { if (this.wsState === "error") this.link?.reconnect(); });
     this.bindDrop();
     window.addEventListener("pagehide", () => this.flushView());
   }
@@ -228,7 +231,14 @@ export class App {
     const tree = new IntervalTree();
     this.dataset = dataset;
     this.tree = tree;
-    this.link = new Link(tree, dataset.server);
+    this.setWsState(null);
+    let wasDisconnected = false;
+    this.link = new Link(tree, dataset.server, (state) => {
+      if (tree !== this.tree) return;
+      this.setWsState(state);
+      if (state === "live" && wasDisconnected) void this.measures?.refresh();
+      if (state !== "live") wasDisconnected = true;
+    });
     this.link.onError = (error) => {
       if (tree !== this.tree) return;
       this.toasts.error(error, "session");
@@ -1297,6 +1307,22 @@ export class App {
   private setStatus(text: string): void {
     this.status.textContent = text;
     this.status.hidden = text === "";
+  }
+
+  private setWsState(state: ConnectionState | null): void {
+    this.wsState = state;
+    this.wsStatus.hidden = state === null;
+    this.wsStatus.className = state === null ? "ws-status" : `ws-status ${state}`;
+    if (state === "live") {
+      this.wsStatus.textContent = "live";
+      this.wsStatus.title = "Connected to server";
+    } else if (state === "connecting") {
+      this.wsStatus.textContent = "connecting";
+      this.wsStatus.title = "Connecting to server…";
+    } else if (state === "error") {
+      this.wsStatus.textContent = "offline";
+      this.wsStatus.title = "Disconnected — click to retry";
+    }
   }
 }
 

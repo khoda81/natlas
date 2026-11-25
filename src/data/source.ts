@@ -41,48 +41,83 @@ export type Update =
   | { kind: "lacks"; measure: string; node: NodeId }
   | { kind: "failed"; measure: string; node: NodeId; message: string };
 
+export type ConnectionState = "live" | "connecting" | "error";
+
 /** A session with a server. */
 export interface Connection {
   demand(demand: Demand): void;
   close(): void;
+  reconnect?(): void;
 }
 
 export interface Server {
   /** A session: ``updates`` hears each batch, ``failed`` what went wrong. */
-  connect(updates: (updates: Update[]) => void, failed: (error: unknown) => void): Connection;
+  connect(
+    updates: (updates: Update[]) => void,
+    failed: (error: unknown) => void,
+    onState?: (state: ConnectionState) => void,
+  ): Connection;
   /** Map text to branches from the root, where the server has a text mapping. */
   search?(text: string, signal?: AbortSignal): Promise<Branch[]>;
 }
+
+const MAX_AUTO_RETRIES = 4;
 
 /** A live server: one WebSocket session at ``session`` beside its manifest,
  * opened again with the same demand after a drop. */
 export class LiveServer implements Server {
   constructor(private readonly base: string) {}
 
-  connect(updates: (updates: Update[]) => void, failed: (error: unknown) => void): Connection {
+  connect(
+    updates: (updates: Update[]) => void,
+    failed: (error: unknown) => void,
+    onState?: (state: ConnectionState) => void,
+  ): Connection {
     let socket: WebSocket | null = null;
     let demand: Uint8Array<ArrayBuffer> | null = null;
     let closed = false;
     let wait = 0;
+    let attempts = 0;
+    let retryTimer: number | null = null;
+    const setState = (state: ConnectionState) => onState?.(state);
+    const clearRetry = () => {
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+    };
     const open = () => {
+      clearRetry();
+      setState("connecting");
       const url = new URL("session", this.base);
       url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
       const opened = socket = new WebSocket(url);
       opened.binaryType = "arraybuffer";
       opened.onopen = () => {
+        if (opened !== socket || closed) return;
         wait = 0;
+        attempts = 0;
+        setState("live");
         if (demand !== null) opened.send(demand);
       };
-      opened.onmessage = (event) => updates(decode(new Uint8Array(event.data as ArrayBuffer)));
+      opened.onmessage = (event) => {
+        if (opened === socket && !closed) updates(decode(new Uint8Array(event.data as ArrayBuffer)));
+      };
       opened.onclose = (event) => {
-        if (closed) return;
+        if (closed || opened !== socket) return;
         // 1007: the server refused the demand; the next one may do.
         if (event.code === 1007) {
           demand = null;
           failed(new Error(`the server refused what the page asked: ${event.reason}`));
         }
+        if (attempts >= MAX_AUTO_RETRIES) {
+          setState("error");
+          return;
+        }
+        attempts++;
         wait = Math.min(4000, wait === 0 ? 250 : wait * 2);
-        setTimeout(open, wait);
+        setState("connecting");
+        retryTimer = window.setTimeout(open, wait);
       };
     };
     open();
@@ -91,9 +126,22 @@ export class LiveServer implements Server {
         demand = encode(next);
         if (socket?.readyState === WebSocket.OPEN) socket.send(demand);
       },
+      reconnect() {
+        if (closed) return;
+        clearRetry();
+        const prior = socket;
+        socket = null;
+        prior?.close();
+        wait = 0;
+        attempts = 0;
+        open();
+      },
       close() {
         closed = true;
-        socket?.close();
+        clearRetry();
+        const prior = socket;
+        socket = null;
+        prior?.close();
       },
     };
   }

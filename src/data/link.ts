@@ -4,7 +4,7 @@
 
 import type { Path, View } from "../core/layout";
 import { type Branch, type IntervalTree, type NodeId, ROOT } from "../core/tree";
-import type { Connection, Demand, Server, Specs, Update } from "./source";
+import type { Connection, ConnectionState, Demand, Server, Specs, Update } from "./source";
 
 export class Link {
   private readonly connection: Connection;
@@ -23,8 +23,20 @@ export class Link {
   private said = "";
   onError: (error: unknown) => void = (error) => console.error(error);
 
-  constructor(private readonly tree: IntervalTree, server: Server) {
-    this.connection = server.connect((updates) => this.take(updates), (error) => this.onError(error));
+  constructor(
+    private readonly tree: IntervalTree,
+    server: Server,
+    onState?: (state: ConnectionState) => void,
+  ) {
+    this.connection = server.connect(
+      (updates) => this.take(updates),
+      (error) => this.onError(error),
+      onState,
+    );
+  }
+
+  reconnect(): void {
+    this.connection.reconnect?.();
   }
 
   /** What the page looks at now, under the measures ``specs`` names. */

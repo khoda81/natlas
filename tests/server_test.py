@@ -224,7 +224,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(session.step(tree), [])
         self.assertEqual(session.blocked(), [(0, 0, 10.0, [])])
         with np.errstate(divide="ignore"):
-            tree.set([0], 0, [service.ordered_children(np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32)), "heaviest")])
+            row = np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32))
+        tree.set_rows([0], 0, [row], heaviest=True)
         ((kind, measure, node, parent, branch, runs, count),) = session.step(tree)
         self.assertEqual((kind, measure, node, parent, branch, count), ("answer", 0, 0, None, None, 3))
         self.assertEqual([branch for _, branches, _, _ in runs for branch in branches], [1, 3, 0])
@@ -235,18 +236,55 @@ class CoreTests(unittest.TestCase):
             above += sum(math.exp(ln) for ln in ln_weights)
         self.assertAlmostEqual(above, 1.0)
         # Widths are each child's own ln weight, whatever they sum to.
-        tree.set([0], 0, [service.ordered_children(np.array([-1.0, -1.0, -3.0], np.float32), "branch", widths=True)])
-        session = Session()
-        session.demand(tree, 0, 0, view=(0, b"", 0.0, 10.0, 0.1))
-        ((*_, runs, _),) = session.step(tree)
-        self.assertEqual([round(ln, 6) for _, _, ln_weights, _ in runs for ln in ln_weights], [-1.0, -1.0, -3.0])
+        widths = np.array([-1.0, -1.0, -3.0], np.float32)
+        tree.set([0], 0, [(np.arange(len(widths), dtype=np.uint32), widths.astype(np.float64))])
+        tree.set_rows([0], 1, [widths], heaviest=False, normalize=False)
+        for measure in (0, 1):
+            session = Session()
+            session.demand(tree, measure, measure, view=(0, b"", 0.0, 10.0, 0.1))
+            ((*_, runs, _),) = session.step(tree)
+            self.assertEqual([round(ln, 6) for _, _, ln_weights, _ in runs for ln in ln_weights], [-1.0, -1.0, -3.0])
         # By branch, the same weights in branch order.
-        tree.set([0], 0, [service.ordered_children(np.log(np.array([0.2, 0.5, 0.0, 0.3], np.float32)), "branch")])
+        tree.set_rows([0], 0, [row], heaviest=False)
         session = Session()
         session.demand(tree, 0, 0, view=(0, b"", 0.0, 10.0, 0.1))
         ((*_, runs, _),) = session.step(tree)
         self.assertEqual([branch for _, branches, _, _ in runs for branch in branches], [0, 1, 3])
         self.assertEqual(session.blocked(), [])
+
+    def test_inference_rows_keep_masks_ties_and_the_width_of_an_almost_certain_branch(self):
+        tree = Tree()
+        nodes = tree.walk(0, [7, 9])
+        # Take a strided row. Equal logits, including signed zeros, tie by branch.
+        row = np.array([0.0, 99.0, -0.0, 99.0, -np.inf, 99.0, 0.5, 99.0, 0.0], np.float32)[::2]
+        nearly_certain = np.array([0.0, -50.0], np.float32)
+        masked = np.full(2, -np.inf, np.float32)
+        sizes = tree.set_rows(nodes, 0, [row, nearly_certain, masked], heaviest=True)
+        self.assertEqual(len(sizes), len(nodes))
+
+        session = Session()
+        session.demand(tree, 0, 0, view=(nodes[0], b"", 0.0, 10.0, 0.1))
+        ((*_, runs, count),) = session.step(tree)
+        self.assertEqual(count, 4)
+        self.assertEqual([branch for _, branches, _, _ in runs for branch in branches], [3, 0, 1, 4])
+
+        session = Session()
+        session.demand(tree, 0, 0, path=(nodes[1], [0]))
+        ((*_, runs, count),) = [update for update in session.step(tree) if update[0] == "answer"]
+        self.assertEqual(count, 2)
+        ((_, branches, [ln_weight], _),) = runs
+        self.assertEqual(branches, [0])
+        expected = -math.log1p(math.exp(-50.0))
+        self.assertAlmostEqual(ln_weight, expected, delta=math.ulp(expected))
+
+        session = Session()
+        session.demand(tree, 0, 0, view=(nodes[2], b"", 0.0, 10.0, 0.1))
+        ((*_, runs, count),) = session.step(tree)
+        self.assertEqual((runs, count), ([], 0))
+
+        with self.assertRaisesRegex(ValueError, "a weight must be a log mass"):
+            tree.set_rows(nodes[:2], 1, [row, np.array([np.nan], np.float32)], heaviest=True)
+        self.assertFalse(tree.has(nodes[0], 1))
 
 
 class CatalogTests(unittest.TestCase):

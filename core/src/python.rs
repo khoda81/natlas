@@ -5,7 +5,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::distribution::{Distribution, Run};
+use crate::distribution::{log_softmax_offsets, Distribution, Run};
 use crate::session::{Demand, Path, Session, Update, View};
 use crate::tree::{Lens, Tree};
 
@@ -89,17 +89,46 @@ impl PythonTree {
                     .collect())
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let distributions = py.detach(|| packed(rows)).map_err(error)?;
-        let mut tree = slf.borrow_mut();
-        nodes
+        let distributions = py
+            .detach(|| packed(rows, Distribution::from_ordered))
+            .map_err(error)?;
+        slf.borrow_mut().install(nodes, measure, distributions)
+    }
+
+    /// A float32 row indexed by branch for each node. Rank ties follow
+    /// branch order. Final log widths can be supplied with normalize=False.
+    #[pyo3(signature = (nodes, measure, rows, *, heaviest, normalize=true))]
+    fn set_rows(
+        slf: &Bound<'_, Self>,
+        nodes: Vec<u64>,
+        measure: usize,
+        rows: Vec<PyBuffer<f32>>,
+        heaviest: bool,
+        normalize: bool,
+    ) -> PyResult<Vec<usize>> {
+        if nodes.len() != rows.len() {
+            return Err(error(format!(
+                "{} nodes but {} rows of weights",
+                nodes.len(),
+                rows.len()
+            )));
+        }
+        let py = slf.py();
+        // The buffer exporters can mutate their memory. Give the detached
+        // workers owned f32 rows before releasing Python.
+        let rows = rows
             .into_iter()
-            .zip(distributions)
-            .map(|(node, distribution)| {
-                let bytes = distribution.bytes();
-                tree.inner.set(node, measure, distribution).map_err(error)?;
-                Ok(bytes)
+            .map(|row| {
+                if row.dimensions() != 1 {
+                    return Err(error("each row of weights must be one-dimensional".into()));
+                }
+                row.to_vec(py)
             })
-            .collect()
+            .collect::<PyResult<Vec<_>>>()?;
+        let distributions = py
+            .detach(|| packed(rows, |row| pack_row(row, heaviest, normalize)))
+            .map_err(error)?;
+        slf.borrow_mut().install(nodes, measure, distributions)
     }
 
     fn forget(&mut self, node: u64, measure: usize) -> PyResult<()> {
@@ -107,11 +136,49 @@ impl PythonTree {
     }
 }
 
+fn pack_row(row: Vec<f32>, heaviest: bool, normalize: bool) -> crate::Result<Distribution> {
+    let count = u32::try_from(row.len()).map_err(|_| "too many children to rank".to_owned())?;
+    let mut children = Vec::with_capacity(row.len());
+    for (branch, weight) in (0..count).zip(row) {
+        if weight == f32::NEG_INFINITY {
+            continue;
+        }
+        if !weight.is_finite() {
+            return Err("a weight must be a log mass".into());
+        }
+        children.push((branch, weight));
+    }
+    if heaviest {
+        children.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .expect("finite log weights")
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+    let (max, ln_sum) = if normalize {
+        log_softmax_offsets(children.iter().map(|&(_, weight)| f64::from(weight)))
+    } else {
+        (0.0, 0.0)
+    };
+    Distribution::pack_unique(
+        children
+            .iter()
+            .map(|&(branch, weight)| (branch, (f64::from(weight) - max) - ln_sum)),
+    )
+}
+
 /// Each row's distribution, rows shared out among the cores in order.
-fn packed(mut rows: Vec<Vec<(u32, f64)>>) -> Result<Vec<Distribution>, String> {
+fn packed<T: Send>(
+    mut rows: Vec<Vec<T>>,
+    pack: impl Fn(Vec<T>) -> crate::Result<Distribution> + Sync,
+) -> crate::Result<Vec<Distribution>> {
+    if rows.len() <= 1 {
+        return rows.into_iter().map(pack).collect();
+    }
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
-    let share = rows.len().div_ceil(cores).max(1);
+    let share = rows.len().div_ceil(cores);
     let count = rows.len();
+    let pack = &pack;
     std::thread::scope(|scope| {
         let workers: Vec<_> = rows
             .chunks_mut(share)
@@ -119,8 +186,8 @@ fn packed(mut rows: Vec<Vec<(u32, f64)>>) -> Result<Vec<Distribution>, String> {
                 scope.spawn(move || {
                     chunk
                         .iter_mut()
-                        .map(|row| Distribution::from_ordered(std::mem::take(row)))
-                        .collect::<Result<Vec<_>, String>>()
+                        .map(|row| pack(std::mem::take(row)))
+                        .collect::<crate::Result<Vec<_>>>()
                 })
             })
             .collect();
@@ -133,6 +200,26 @@ fn packed(mut rows: Vec<Vec<(u32, f64)>>) -> Result<Vec<Distribution>, String> {
 }
 
 impl PythonTree {
+    fn install(
+        &mut self,
+        nodes: Vec<u64>,
+        measure: usize,
+        distributions: Vec<Distribution>,
+    ) -> PyResult<Vec<usize>> {
+        for &node in &nodes {
+            self.inner.distribution(node, measure).map_err(error)?;
+        }
+        nodes
+            .into_iter()
+            .zip(distributions)
+            .map(|(node, distribution)| {
+                let bytes = distribution.bytes();
+                self.inner.set(node, measure, distribution).map_err(error)?;
+                Ok(bytes)
+            })
+            .collect()
+    }
+
     fn known(&self, node: u64) -> PyResult<()> {
         if self.inner.contains(node) {
             Ok(())

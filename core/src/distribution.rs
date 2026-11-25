@@ -42,21 +42,39 @@ pub fn ln_between(top: f64, bottom: f64) -> f64 {
 
 /// Normalize logits before ingestion, preserving the supplied branch order.
 pub fn log_softmax(children: &mut [(Branch, f64)]) {
-    let max = children
-        .iter()
-        .map(|&(_, w)| w)
-        .fold(f64::NEG_INFINITY, f64::max);
-    if max == f64::NEG_INFINITY {
-        return;
-    }
-    let log_sum = children
-        .iter()
-        .map(|&(_, w)| (w - max).exp())
-        .sum::<f64>()
-        .ln();
+    let (max, log_sum) = log_softmax_offsets(children.iter().map(|&(_, weight)| weight));
     for (_, weight) in children {
         *weight = (*weight - max) - log_sum;
     }
+}
+
+/// The peak and shifted log sum to subtract in turn, over finite logits
+/// and masked weights of negative infinity.
+pub(crate) fn log_softmax_offsets(weights: impl Iterator<Item = f64> + Clone) -> (f64, f64) {
+    let mut max = f64::NEG_INFINITY;
+    let mut peak = 0;
+    for (at, weight) in weights.clone().enumerate() {
+        if max < weight {
+            max = weight;
+            peak = at;
+        }
+    }
+    if max == f64::NEG_INFINITY {
+        return (0.0, 0.0);
+    }
+    // The peak contributes 1. Sum the other mass with compensation
+    // and use ln_1p to preserve widths of almost certain branches.
+    let mut sum = 0.0;
+    let mut correction = 0.0;
+    for (at, weight) in weights.enumerate() {
+        if at != peak {
+            let mass = (weight - max).exp() - correction;
+            let next = sum + mass;
+            correction = (next - sum) - mass;
+            sum = next;
+        }
+    }
+    (max, sum.ln_1p())
 }
 
 /// Consecutive ranks from `rank`: their branches, weights and edges.
@@ -636,9 +654,6 @@ impl Distribution {
             return Err("a weight must be a log mass".into());
         }
         children.retain(|&(_, weight)| f64::NEG_INFINITY < weight);
-        if children.is_empty() {
-            return Self::from_answer(Vec::new(), Some(0));
-        }
         let mut seen = HashSet::with_capacity_and_hasher(
             children.len(),
             BuildHasherDefault::<BranchHasher>::default(),
@@ -648,8 +663,18 @@ impl Distribution {
                 return Err(format!("branch {branch} is placed twice"));
             }
         }
+        Self::pack_unique(children.iter().copied())
+    }
+
+    /// Pack already validated unique branches and their finite final log weights.
+    pub(crate) fn pack_unique(
+        children: impl ExactSizeIterator<Item = (Branch, f64)> + Clone,
+    ) -> Result<Self> {
+        if children.len() == 0 {
+            return Self::from_answer(Vec::new(), Some(0));
+        }
         Ok(Self {
-            storage: Storage::Packed(Box::new(Packed::new(&children))),
+            storage: Storage::Packed(Box::new(Packed::new(children))),
         })
     }
 

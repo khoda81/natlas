@@ -47,17 +47,17 @@ pub(crate) struct Packed {
 
 impl Packed {
     /// Children in the measure's order: at least one, each weight finite.
-    pub(crate) fn new(children: &[(Branch, f64)]) -> Self {
-        assert!(!children.is_empty() && children.iter().all(|(_, weight)| weight.is_finite()));
+    pub(crate) fn new(children: impl ExactSizeIterator<Item = (Branch, f64)> + Clone) -> Self {
+        debug_assert!(children.clone().all(|(_, weight)| weight.is_finite()));
         let len = children.len();
         let max_branch = children
-            .iter()
-            .map(|&(branch, _)| branch)
+            .clone()
+            .map(|(branch, _)| branch)
             .max()
             .expect("children");
         let width = u32::BITS - max_branch.leading_zeros();
         let mut branches = Bits::default();
-        for &(branch, _) in children {
+        for (branch, _) in children.clone() {
             branches.push(u64::from(branch), width);
         }
         let blocks = len.div_ceil(BLOCK);
@@ -65,12 +65,13 @@ impl Packed {
         let mut shifts = Vec::with_capacity(blocks);
         let mut starts = Vec::with_capacity(blocks + 1);
         let mut steps = Bits::default();
-        for block in children.chunks(BLOCK) {
+        let mut weights = children.clone().map(|(_, weight)| weight);
+        for start in (0..len).step_by(BLOCK) {
             let mut words = [0; BLOCK];
-            for (slot, &(_, weight)) in words.iter_mut().zip(block) {
+            let words = &mut words[..BLOCK.min(len - start)];
+            for (slot, weight) in words.iter_mut().zip(weights.by_ref()) {
                 *slot = key(weight);
             }
-            let words = &words[..block.len()];
             let zeroes = words
                 .windows(2)
                 .map(|pair| pair[1].wrapping_sub(pair[0]))
@@ -98,14 +99,14 @@ impl Packed {
         keys.shrink_to_fit();
         starts.shrink_to_fit();
         let max = children
-            .iter()
-            .map(|&(_, weight)| weight)
+            .clone()
+            .map(|(_, weight)| weight)
             .fold(f64::NEG_INFINITY, f64::max);
         // Units below the lightest weight's last bit, and words enough for
         // the sum of every weight, each at most 1.
         let lo = children
-            .iter()
-            .map(|&(_, weight)| ulp_exponent(fixed(weight, max)))
+            .clone()
+            .map(|(_, weight)| ulp_exponent(fixed(weight, max)))
             .min()
             .expect("children");
         let limbs = ((1 - lo) as u64 + u64::from(usize::BITS - len.leading_zeros())).div_ceil(64)
@@ -113,7 +114,7 @@ impl Packed {
             + 1;
         let mut sums = Vec::with_capacity(len.div_ceil(SUMMED) * limbs);
         let mut sum = vec![0; limbs];
-        for (at, &(_, weight)) in children.iter().enumerate() {
+        for (at, (_, weight)) in children.enumerate() {
             if at % SUMMED == 0 {
                 sums.extend_from_slice(&sum);
             }
@@ -448,7 +449,7 @@ mod tests {
                 )
             })
             .collect();
-        let packed = Packed::new(&children);
+        let packed = Packed::new(children.iter().copied());
         for (at, &(branch, weight_)) in children.iter().enumerate() {
             assert_eq!((packed.branch(at), packed.ln_p(at)), (branch, weight_));
         }
@@ -467,7 +468,7 @@ mod tests {
         let total: f64 = children.iter().map(|&(_, weight)| weight.exp()).sum();
         let mut normalized = children.clone();
         crate::distribution::log_softmax(&mut normalized);
-        let packed = Packed::new(&normalized);
+        let packed = Packed::new(normalized.iter().copied());
         assert_eq!(packed.edge(0), Point::top());
         assert_eq!(packed.top(1000, 64), Point::bottom());
         let mut above = 0.0;

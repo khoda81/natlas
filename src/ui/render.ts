@@ -42,7 +42,7 @@ const FONT = `${BASE_SIZE}px ${FAMILY}`;
 // Label sizes are text sizes, in CSS pixels like the page's own text, so they
 // scale with it across devices and zoom, never with the view.
 /** The smallest a label reads at. A label that needs less is shortened, or not drawn. */
-const LABEL_MIN_SIZE = 1;
+const LABEL_MIN_SIZE = 8;
 /** Labels grow to fit their box, up to this size. */
 const LABEL_MAX_SIZE = 96;
 /** Fraction of the box a label may fill across its text. */

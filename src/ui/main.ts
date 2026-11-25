@@ -131,7 +131,7 @@ export class App {
   private lastPick: { frame: Frame; x: number; y: number; selection: Selection | null } | null = null;
   /** Screen coordinates, converted against the current canvas rect every frame. */
   private pointer: { x: number; y: number } | null = null;
-  private dragging: { id: number; x: number; y: number; moved: boolean } | null = null;
+  private dragging: { id: number; x: number; y: number; moved: boolean; anchored: boolean } | null = null;
   private focus: Focus | null = null;
   /** The view before the origin last changed, fading out over the new one. */
   private transition: { image: HTMLCanvasElement; start: number } | null = null;
@@ -715,7 +715,7 @@ export class App {
       this.cancelNavigation();
       canvas.setPointerCapture(event.pointerId);
       this.pointer = { x: event.clientX, y: event.clientY };
-      this.dragging = { id: event.pointerId, x: event.offsetX, y: event.offsetY, moved: false };
+      this.dragging = { id: event.pointerId, x: event.offsetX, y: event.offsetY, moved: false, anchored: false };
       this.focus = null;
       canvas.classList.add("dragging");
     });
@@ -726,9 +726,20 @@ export class App {
         const dx = event.offsetX - grab.x;
         const dy = event.offsetY - grab.y;
         if (dx !== 0 || dy !== 0) {
-          // Content follows the pointer, zooming about its height.
-          this.pan(dy / this.view.height);
-          this.zoom(-dx / this.cam.k, event.offsetY / this.view.height);
+          // Anchor once to the exact p under the cursor so it stays fixed to the
+          // pointer throughout the drag without per-frame re-aiming drift.
+          if (!grab.moved && this.tree !== null) {
+            const startFy = grab.y / this.view.height;
+            aim(this.tree, this.lens, this.cam, startFy);
+            grab.anchored = this.cam.a === startFy;
+          }
+          if (grab.anchored) {
+            if (dx !== 0) moveDepth(this.cam, -dx / this.cam.k, this.cam.a);
+            this.cam.a = event.offsetY / this.view.height;
+          } else {
+            this.pan(dy / this.view.height);
+            this.zoom(-dx / this.cam.k, event.offsetY / this.view.height);
+          }
           grab.moved = true;
         }
         grab.x = event.offsetX;
@@ -742,6 +753,9 @@ export class App {
       this.dragging = null;
       this.pointer = event.type === "pointercancel" ? null : { x: event.clientX, y: event.clientY };
       canvas.classList.remove("dragging");
+      if (grab.moved && this.tree !== null && (this.cam.a < 0 || this.cam.a > 1)) {
+        aim(this.tree, this.lens, this.cam, Math.min(1, Math.max(0, this.cam.a)));
+      }
       if (event.type === "pointerup" && !grab.moved) {
         // A click, unlike a drag, lets go of the inspector's draft.
         this.draft = null;

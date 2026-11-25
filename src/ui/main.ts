@@ -485,7 +485,7 @@ export class App {
       flight.time = time;
       const close = this.reducedMotion.matches ? 1 : 1 - Math.exp(-dt / FLIGHT_MS);
       const there = placed(flight.reached);
-      glide(this.cam, standing(there.lnMass, there.x), close);
+      glide(this.cam, standing(there.lnMass, there.x, this.lens.p === this.lens.q), close);
       if (dt > 0) flight.chased = true;
       return;
     }
@@ -493,7 +493,7 @@ export class App {
     if (flight.landing === null) {
       const there = placed(flight.reached);
       flight.landing = {
-        to: standing(there.lnMass, there.x),
+        to: standing(there.lnMass, there.x, this.lens.p === this.lens.q),
         start: time,
         duration: flight.chased ? FLIGHT_LAND_MS : FOCUS_MS,
         easeOut: flight.chased,
@@ -645,7 +645,7 @@ export class App {
         left: timeline.left - canvasLeft,
         right: timeline.right - canvasLeft,
       },
-      hover: this.hover,
+      hover: this.dragging ? null : this.hover,
       units: this.units,
       glyph: (node, branch) => this.glyph(node, branch),
       conversation: this.reading?.conversation,
@@ -1063,7 +1063,7 @@ export class App {
     // An unresolved interval is selected by its position in the view.
     aim(tree, this.lens, this.cam, box.y0);
     if (this.cam.a !== box.y0) return;
-    const to = standing(box.lnMass, box.x1);
+    const to = standing(box.lnMass, box.x1, this.lens.p === this.lens.q);
     this.focus = { to, start: performance.now(), eased: 0 };
     this.invalidate();
   }
@@ -1091,8 +1091,12 @@ export class App {
   }
 
   private updateHover(): void {
+    if (this.dragging) {
+      this.avoidPointer();
+      return;
+    }
     const pointer = this.pointerPosition();
-    if (pointer && !this.dragging && this.frame) {
+    if (pointer && this.frame) {
       if (this.lastPick?.frame !== this.frame || this.lastPick.x !== pointer.x || this.lastPick.y !== pointer.y) {
         this.lastPick = { frame: this.frame, x: pointer.x, y: pointer.y, selection: pick(this.tree!, this.lens, this.frame, this.cam, this.view, pointer.x, pointer.y, 1 / this.pixelRatio) };
       }
@@ -1352,13 +1356,9 @@ export class App {
 /** Depth at which a box of ln p mass fills the view, or its children start, if sooner. */
 /** The camera that stands a node of ``lnMass`` below the origin, its
  * children starting at ``x1``, like the root: its point at the node's top. */
-function standing(lnMass: number, x1: number): { x: number; a: number } {
-  const x = rootLike(lnMass, x1);
+function standing(lnMass: number, x1: number, sameLens: boolean): { x: number; a: number } {
+  const x = sameLens ? -lnMass : Math.min(-lnMass, x1);
   return { x, a: 0.5 - Math.exp(lnMass + x) / 2 };
-}
-
-function rootLike(lnMass: number, x1: number): number {
-  return Math.min(-lnMass, x1);
 }
 
 function storedUnits(): Units {

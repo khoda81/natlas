@@ -82,8 +82,6 @@ impl LayoutTree for ClientTree {
     }
 }
 
-/// View heights within which a node's edge is at the view's.
-const FIT: f64 = 1e-12;
 /// Physical pixels within which a coordinate is on a grid line, as the
 /// renderer rounds: rows lie on the grid only up to float error.
 const ON_GRID: f64 = 1e-6;
@@ -493,6 +491,7 @@ struct Steps {
     entries: Vec<ChainEntry>,
     edges: Vec<(Point, Point)>,
     ln_masses: Vec<f64>,
+    ln_mass_comps: Vec<f64>,
     xs: Vec<f64>,
 }
 
@@ -521,7 +520,11 @@ impl Steps {
             nats_q,
         });
         self.edges.push((top, bottom));
-        self.ln_masses.push(self.ln_masses[i] + ln_extent);
+        let y = ln_extent - self.ln_mass_comps[i];
+        let total = self.ln_masses[i] + y;
+        let comp = (total - self.ln_masses[i]) - y;
+        self.ln_masses.push(total);
+        self.ln_mass_comps.push(comp);
         self.xs.push(self.xs[i] + nats_q);
         Ok(ln_extent)
     }
@@ -531,6 +534,7 @@ impl Steps {
         self.edges.truncate(depth);
         self.nodes.truncate(depth + 1);
         self.ln_masses.truncate(depth + 1);
+        self.ln_mass_comps.truncate(depth + 1);
         self.xs.truncate(depth + 1);
     }
 }
@@ -541,6 +545,7 @@ fn steps(tree: &impl LayoutTree, lens: Lens, origin: NodeId, path: &[Branch]) ->
         entries: Vec::with_capacity(path.len()),
         edges: Vec::with_capacity(path.len()),
         ln_masses: vec![0.0],
+        ln_mass_comps: vec![0.0],
         xs: vec![0.0],
     };
     for (i, &branch) in path.iter().enumerate() {
@@ -1461,7 +1466,7 @@ fn settled(tree: &impl LayoutTree, lens: Lens, cam: &Camera) -> Result<(Anchor, 
     // covers it, whichever way its edges round.
     let covers = |point: &Point, ln_scale: f64, top: &Point, bottom: &Point| {
         let ((_, above), (_, under)) = (point.to(top), point.to(bottom));
-        cam.a - (ln_scale + above).exp() <= FIT && 1.0 - FIT <= cam.a + (ln_scale + under).exp()
+        cam.a - (ln_scale + above).exp() <= 0.0 && 1.0 <= cam.a + (ln_scale + under).exp()
     };
     while let Some((top, bottom)) = depth.checked_sub(1).map(|i| &steps.edges[i]) {
         let ln_scale = steps.ln_masses[depth] + cam.x;

@@ -490,13 +490,15 @@ impl ClientMeasure {
         if len > 1 {
             if len <= 16 {
                 let mut small = [0 as Branch; 16];
-                let mut count_seen = 0;
-                for &branch in fresh.iter().flat_map(|segment| segment.view().branches()) {
+                for (count_seen, &branch) in fresh
+                    .iter()
+                    .flat_map(|segment| segment.view().branches())
+                    .enumerate()
+                {
                     if small[..count_seen].contains(&branch) {
                         return Err(format!("branch {branch} is placed twice"));
                     }
                     small[count_seen] = branch;
-                    count_seen += 1;
                 }
             } else {
                 let mut seen = HashSet::with_capacity_and_hasher(
